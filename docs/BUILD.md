@@ -14,6 +14,8 @@
 
 `scripts/prepare_assets.py` 按 `scripts/release-assets.json` 下载并校验 FFmpeg 归档，只提取 `ffmpeg.exe`、`ffprobe.exe`、`LICENSE` 和 `README.txt` 到 `tools`。程序使用这些本地工具的绝对路径。
 
+环境准备成功后自动安装“发送到”入口，管理命令见 [README](../README.md#右键发送到)。
+
 依赖维护：
 
 ```powershell

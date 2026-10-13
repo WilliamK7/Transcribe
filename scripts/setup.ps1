@@ -35,5 +35,7 @@ try {
     }
     & $venvPython (Join-Path $PSScriptRoot 'prepare_assets.py')
     if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg preparation failed.' }
+    & (Join-Path $PSScriptRoot 'install-sendto.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'SendTo shortcut installation failed.' }
     Write-Output 'Local CLI environment ready. Run scripts\transcribe.ps1 --configure.'
 } finally { Pop-Location }
