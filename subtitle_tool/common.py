@@ -12,7 +12,7 @@ ASR_MODEL = "qwen3-asr-flash-filetrans"
 MT_MODEL = "qwen-mt-flash"
 NORMALIZER_VERSION = 2
 PROCESSING_VERSION = 2
-SUBTITLE_VERSION = 1
+SUBTITLE_VERSION = 2
 TRANSLATION_STRATEGY_VERSION = 1
 # Qwen-MT's 8192-token input limit includes translation memory and template tokens.
 # UTF-8 bytes upper-bound byte-tokenized text; reserve additional template capacity.

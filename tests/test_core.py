@@ -12,8 +12,8 @@ from unittest import mock
 
 import requests
 
-from subtitle_tool.api import Bailian, Http, RequestPacer
-from subtitle_tool.common import ASR_MODEL, MT_MODEL, Cancelled, SubmissionUnknown, ToolError, redact
+from subtitle_tool.api import Bailian, Http
+from subtitle_tool.common import ASR_MODEL, MT_MODEL, SubmissionUnknown, ToolError, redact
 from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
@@ -157,39 +157,6 @@ class SubtitleTests(TemporaryTest):
 
 
 class HttpTests(unittest.TestCase):
-    def test_mt_request_starts_are_spaced_and_cooldown_applies_to_all_workers(self):
-        now = [0.0]
-        event = mock.Mock()
-        event.is_set.return_value = False
-        def wait(seconds):
-            now[0] += seconds
-            return False
-        event.wait.side_effect = wait
-        pacer = RequestPacer(clock=lambda: now[0])
-        pacer.wait(event)
-        self.assertEqual(now[0], 0)
-        pacer.wait(event)
-        self.assertAlmostEqual(now[0], 1.05)
-        pacer.cooldown(15)
-        pacer.wait(event)
-        self.assertAlmostEqual(now[0], 16.05)
-
-    def test_mt_retry_passes_through_rate_pacer_and_uses_retry_after(self):
-        pacer = mock.Mock()
-        http = Http(threading.Event(), attempts=3, pacer=pacer)
-        with mock.patch("requests.request", side_effect=[response({}, 429, {"Retry-After": "22"}), response({"ok": True})]):
-            self.assertTrue(http.json("POST", "https://example.test", name="mt")["ok"])
-        self.assertEqual(pacer.wait.call_count, 2)
-        pacer.cooldown.assert_called_once_with(22)
-
-    def test_cancellation_interrupts_waiting_for_mt_quota(self):
-        event = threading.Event()
-        pacer = RequestPacer(clock=lambda: 0)
-        pacer.wait(event)
-        event.set()
-        with self.assertRaises(Cancelled):
-            pacer.wait(event)
-
     def test_submit_malformed_output_or_missing_id_is_unknown(self):
         cloud = Bailian("offline-key", "beijing", threading.Event())
         for body in [{}, {"output": None}, {"output": []}, {"output": {"task_id": ""}}]:

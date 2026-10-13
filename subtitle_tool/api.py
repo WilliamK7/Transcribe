@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
 import uuid
 from pathlib import Path
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -26,12 +28,16 @@ def upload_limit(policy):
 
 
 class RequestPacer:
-    """Smooth MT starts across workers; 1.05s stays below the documented 60 RPM/RPS=1."""
-    def __init__(self, interval=1.05, clock=None):
-        self.interval = interval
+    """Share adaptive spacing, cooldown and recovery epochs across MT workers."""
+    def __init__(self, clock=None):
+        self.interval = 0.0
         self.clock = clock or time.monotonic
         self.lock = threading.Lock()
         self.not_before = 0.0
+        self.cooldown_until = 0.0
+        self.last_started = None
+        self.generation = 0
+        self.successes = 0
 
     def wait(self, cancel):
         while True:
@@ -40,14 +46,57 @@ class RequestPacer:
                 now = self.clock()
                 delay = self.not_before - now
                 if delay <= 0:
+                    self.last_started = now
                     self.not_before = now + self.interval
-                    return
-            if cancel.wait(delay):
+                    return self.generation
+            if cancel.wait(min(delay, 60)):
                 check_cancel(cancel)
 
-    def cooldown(self, seconds):
+    def throttle(self, seconds):
         with self.lock:
-            self.not_before = max(self.not_before, self.clock() + seconds)
+            self.interval = min(8.0, max(1.05, self.interval * 2))
+            self.generation += 1
+            self.successes = 0
+            now = self.clock()
+            previous = max(now, self.cooldown_until)
+            self.cooldown_until = max(previous, now + seconds)
+            self.not_before = max(self.not_before, self.cooldown_until)
+            if self.last_started is not None:
+                self.not_before = max(self.not_before, self.last_started + self.interval)
+            return self.cooldown_until - previous
+
+    def success(self, generation):
+        with self.lock:
+            # Replies to requests started before the latest 429 cannot recover the rate.
+            if generation != self.generation or not self.interval:
+                return
+            self.successes += 1
+            if self.successes == 20:
+                reduced = self.interval * 0.8
+                self.interval = reduced if reduced >= 0.1 else 0.0
+                self.successes = 0
+
+    def failure(self, generation):
+        with self.lock:
+            if generation == self.generation:
+                self.successes = 0
+
+
+def retry_after_seconds(value):
+    """Accept finite nonnegative seconds or an HTTP date; invalid headers use fallback."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                return None
+            seconds = max(0.0, date.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 _MT_PACERS = {}
@@ -71,13 +120,16 @@ class Http:
     def request(self, method, url, *, name="http", headers=None, retry=True, **kwargs):
         for attempt in range(self.attempts if retry else 1):
             check_cancel(self.cancel)
+            generation = None
             if name == "mt":
-                self.pacer.wait(self.cancel)
+                generation = self.pacer.wait(self.cancel)
             self.count(name)
             try:
                 response = requests.request(method, url, headers=headers, timeout=(15, 90),
                                             allow_redirects=False, **kwargs)
             except requests.RequestException as e:
+                if name == "mt":
+                    self.pacer.failure(generation)
                 if not retry:
                     raise SubmissionUnknown() from e
                 if attempt + 1 == self.attempts:
@@ -85,22 +137,25 @@ class Http:
                 self.progress("retry", attempt + 1, self.attempts)
                 self.pause(attempt)
                 continue
+            throttled = name == "mt" and response.status_code == 429
+            retry_after = response.headers.get("Retry-After", "")
+            if throttled:
+                self.count("mt_429")
+                cooldown = retry_after_seconds(retry_after)
+                if cooldown is None:
+                    cooldown = min(60, 15 * 2 ** attempt)
+                added = self.pacer.throttle(cooldown)
+                self.progress("mt_cooldown", added, self.pacer.interval)
+            elif name == "mt" and not 200 <= response.status_code < 300:
+                self.pacer.failure(generation)
             if response.status_code == 429 or response.status_code >= 500:
                 if not retry and response.status_code >= 500:
                     response.close()
                     raise SubmissionUnknown()
                 if retry and attempt + 1 < self.attempts:
-                    retry_after = response.headers.get("Retry-After", "")
-                    throttled = name == "mt" and response.status_code == 429
                     response.close()
                     self.progress("retry", attempt + 1, self.attempts)
-                    if throttled:
-                        try:
-                            cooldown = float(retry_after) if retry_after else 15 * 2 ** attempt
-                        except ValueError:
-                            cooldown = 15 * 2 ** attempt
-                        self.pacer.cooldown(min(60, max(1, cooldown)))
-                    else:
+                    if not throttled:
                         self.pause(attempt, retry_after)
                     continue
             if not 200 <= response.status_code < 300:
@@ -120,6 +175,9 @@ class Http:
                         429: "请求限流", 400: "请求参数或文件格式被拒绝", 404: "任务或服务不存在"}.get(
                             status, "服务或网络请求失败")
                 raise ToolError(f"{hint}（HTTP {status}，{code}）。", code, request_id)
+            if name == "mt":
+                self.pacer.success(generation)
+                self.count("mt_success")
             return response
         raise ToolError("重试次数已用尽。", "retry_exhausted")
 

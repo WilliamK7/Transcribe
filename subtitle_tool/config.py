@@ -17,7 +17,7 @@ def app_root() -> Path:
 class Settings:
     region: str = "beijing"
     workspace_id: str = ""
-    mt_workers: int = 2
+    mt_workers: int = 4
     channel: str = "ask"
     poll_seconds: float = 4
     poll_timeout_seconds: float = 6 * 3600

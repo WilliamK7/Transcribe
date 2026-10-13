@@ -12,7 +12,7 @@ from unittest import mock
 
 import requests
 
-from subtitle_tool.api import Http, RequestPacer
+from subtitle_tool.api import Http
 from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
@@ -37,6 +37,17 @@ def response(body, status=200, headers=None):
     resp._content_consumed = True
     resp.headers.update(headers or {})
     return resp
+
+
+def timed_raw(tokens, *, word_ms=200, language="en", pauses=None, start=0):
+    words, at = [], start
+    for index, token in enumerate(tokens):
+        at += (pauses or {}).get(index, 0)
+        words.append({"begin_time": at, "end_time": at + word_ms, "text": token, "punctuation": ""})
+        at += word_ms
+    return {"transcripts": [{"channel_id": 0, "sentences": [{
+        "begin_time": start, "end_time": at, "text": ("" if language in {"zh", "yue", "ja"} else " ").join(tokens),
+        "language": language, "words": words}]}]}
 
 
 class FakeService:
@@ -92,8 +103,6 @@ class FakeService:
 
 class TemporaryTest(unittest.TestCase):
     def setUp(self):
-        self.pacing = mock.patch.object(RequestPacer, "wait")
-        self.pacing.start()
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
         os.environ.pop("DASHSCOPE_API_KEY", None)
@@ -103,7 +112,6 @@ class TemporaryTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
         self.environment.stop()
-        self.pacing.stop()
 
 
 def point_sentence(at, text="Yes.", language="en"):

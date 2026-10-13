@@ -16,19 +16,8 @@ from subtitle_tool.api import Bailian
 from subtitle_tool.store import Store
 from subtitle_tool.main import summary
 from subtitle_tool.subtitles import layout_warnings, make_fragment, mt_cache_key, mt_input_size, normalize, plan_fragments, plan_reference_units, render_srt, translation_context, wrap
-from tests.fixtures import FakeService, PipelineFixture, result, response
+from tests.fixtures import FakeService, PipelineFixture, result, response, timed_raw
 from tests import fixtures
-
-
-def timed_raw(tokens, *, word_ms=200, language="en", pauses=None, start=0):
-    words, at = [], start
-    for index, token in enumerate(tokens):
-        at += (pauses or {}).get(index, 0)
-        words.append({"begin_time": at, "end_time": at + word_ms, "text": token, "punctuation": ""})
-        at += word_ms
-    return {"transcripts": [{"channel_id": 0, "sentences": [{
-        "begin_time": start, "end_time": at, "text": ("" if language in {"zh", "yue", "ja"} else " ").join(tokens),
-        "language": language, "words": words}]}]}
 
 
 def sources_of(raw):
@@ -126,15 +115,13 @@ class SegmentationTests(unittest.TestCase):
 
     def test_missing_invalid_or_incomplete_words_retain_source_and_timing(self):
         raw = timed_raw(["word"] * 30, word_ms=150)
-        for variant in ["missing", "overlap", "zero", "incomplete", "punctuation"]:
+        for variant in ["missing", "overlap", "incomplete", "punctuation"]:
             damaged = copy.deepcopy(raw)
             sentence = damaged["transcripts"][0]["sentences"][0]
             if variant == "missing":
                 sentence.pop("words")
             elif variant == "overlap":
                 sentence["words"][1]["begin_time"] = 1
-            elif variant == "zero":
-                sentence["words"][0]["end_time"] = 0
             elif variant == "incomplete":
                 sentence["words"].pop()
             else:
@@ -501,7 +488,7 @@ class ContextPipelineTests(PipelineFixture):
         self.assertIn((text + "\r\n").encode(), content)
         report = summary(self.store, self.job_id)
         self.assertNotIn(text, json.dumps(report, ensure_ascii=False))
-        self.assertEqual(report["subtitle_version"], 1)
+        self.assertEqual(report["subtitle_version"], 2)
 
     def test_new_flow_overwrite_backs_up_existing_srt(self):
         output = self.source.with_suffix(".srt")

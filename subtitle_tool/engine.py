@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -29,7 +30,7 @@ class Engine:
         self.cancel = cancel or threading.Event()
         self.progress, self.api_factory = progress, api_factory
 
-    def identity(self, job_id, manifest):
+    def identity(self, job_id, manifest, *, persist=True):
         identity = connection_identity(manifest)
         version = manifest.get("processing_version", 1)
         if version not in {1, PROCESSING_VERSION}:
@@ -50,8 +51,125 @@ class Engine:
             raise ToolError("媒体缓存的版本／音轨／声道与任务记录不一致。", "cache_mismatch")
         manifest.update(identity)
         manifest["account"], manifest["cache_identity"] = account, scope
-        self.store.update(job_id, manifest=manifest)
+        if persist:
+            self.store.update(job_id, manifest=manifest)
         return key, scope
+
+    def reflow(self, job_id, *, overwrite=False, output_dir=None):
+        """Prepare a recoverable local reflow; only run() may translate and commit SRT."""
+        job = self.store.job(job_id)
+        manifest = job["manifest"]
+        output = (Path(output_dir).resolve() / Path(job["source"]).with_suffix(".srt").name
+                  if output_dir else Path(job["output"]))
+        self.store.check_reflow_output(job_id, output, overwrite)
+        self.identity(job_id, manifest, persist=False)
+        self.validate_subtitle_settings(manifest)
+        self.config.settings.validate()
+        contract = {"asr": ASR_MODEL, "mt": MT_MODEL, "normalizer": NORMALIZER_VERSION,
+                    "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}}
+        saved = manifest.get("contract")
+        if saved and (saved.get("normalizer") not in {1, NORMALIZER_VERSION} or
+                      {k: v for k, v in saved.items() if k != "normalizer"} !=
+                      {k: v for k, v in contract.items() if k != "normalizer"}):
+            raise ToolError("本地转写的模型／参数契约不受支持，不能重排。", "cache_version")
+        cache = self.config.data / "cache" / job_id
+        offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
+        if type(offset) is not int:
+            raise ToolError("本地转写缺少有效的时间偏移记录。", "cache_mismatch")
+        if not manifest["segments"]:
+            raise ToolError("重排缺少完整本地转写；不会重新上传或识别。", "reflow_cache_missing")
+        sources, warnings = [], []
+        for segment in manifest["segments"]:
+            check_cancel(self.cancel)
+            segment_id = segment.get("id", "")
+            if not isinstance(segment_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", segment_id):
+                raise ToolError("转写分段标识无效。", "cache_mismatch")
+            path = cache / ("raw-" + segment_id + ".json")
+            if not path.is_file():
+                raise ToolError("重排缺少完整本地转写；不会重新上传或识别。", "reflow_cache_missing")
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ToolError("重排无法读取本地转写，原任务及字幕已保留。", "reflow_cache_invalid") from error
+            items, notes = normalize(raw, offset + segment["offset_ms"], segment_id,
+                                     duration_ms=segment.get("duration_ms"), preserve_sentences=True,
+                                     subtitle_version=SUBTITLE_VERSION)
+            sources.extend(items)
+            warnings.extend(notes)
+        sources.sort(key=lambda s: (s["begin_ms"], s["end_ms"], s["sentence_id"]))
+        self.preserve_review_decisions(sources, self.store.sources(job_id), self.store.cues(job_id))
+        token = str(time.time_ns())
+        previous_version = manifest.get("subtitle_version", 0)
+        snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
+        self.store.snapshot(job_id, snapshot)
+        for name in ["references_planned", "layout_planned", "layout_round", "layout_complete",
+                     "expected_srt_sha256", "backup", "cue_count", "output_settings", "no_speech"]:
+            manifest.pop(name, None)
+        normalized_file = f"subtitle-sources-v{SUBTITLE_VERSION}-reflow-{token}.json"
+        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+                        subtitle_settings={k: getattr(self.config.settings, k) for k in
+                                           ["zh_line_width", "other_line_width", "chinese_first"]},
+                        normalized=True, normalized_version=NORMALIZER_VERSION, normalized_file=normalized_file,
+                        warnings=warnings, overwrite=bool(overwrite), contract=contract,
+                        reflow={"snapshot": str(snapshot.relative_to(self.config.root)), "prepared_at": time.time(),
+                                "from_subtitle_version": previous_version})
+        atomic_json(cache / normalized_file, sources)
+        check_cancel(self.cancel)
+        self.store.commit_reflow(job_id, sources, [make_fragment(s) for s in sources], manifest, output)
+
+    @staticmethod
+    def preserve_review_decisions(sources, previous_sources, previous_cues):
+        previous = {s["sentence_id"]: s for s in previous_sources}
+        accounted = set()
+        compact = lambda value: re.sub(r"\s", "", value)
+        for source in sources:
+            sentence_id = source["sentence_id"]
+            old = previous.get(sentence_id)
+            cues = [c for c in previous_cues if c.get("sentence_id", ":".join(c["cue_id"].split(":")[:2])) == sentence_id]
+            manual = [c for c in cues if c["reason"] == "用户在终端确认"]
+            if old and old["reason"] == "用户在终端确认":
+                if any(old.get(k) != source.get(k) for k in ["text", "language", "original_timings"]):
+                    raise ToolError("本地转写与人工语种决定的完整句来源不一致，原任务已保留。", "reflow_review")
+                decision = old["decision"], old.get("source_lang", "auto")
+                if any((c["decision"], c["source_lang"]) != decision for c in manual):
+                    raise ToolError("同一完整句的人工语种决定不一致，原任务已保留。", "reflow_review")
+            elif manual:
+                decisions = {(c["decision"], c["source_lang"]) for c in cues}
+                if (len(decisions) != 1 or compact("".join(c["text"] for c in cues)) != compact(source["text"]) or
+                        any(c["language"] != source["language"] for c in cues)):
+                    raise ToolError("旧片段的人工语种决定无法完整对应原句，原任务已保留。", "reflow_review")
+                decision = next(iter(decisions))
+            else:
+                continue
+            source.update(decision=decision[0], source_lang=decision[1], reason="用户在终端确认")
+            accounted.add(sentence_id)
+        expected = {s["sentence_id"] for s in previous_sources if s["reason"] == "用户在终端确认"}
+        expected.update(c.get("sentence_id", ":".join(c["cue_id"].split(":")[:2])) for c in previous_cues
+                        if c["reason"] == "用户在终端确认")
+        if not expected.issubset(accounted):
+            raise ToolError("部分人工语种决定缺少对应完整句，原任务已保留。", "reflow_review")
+
+    def validate_subtitle_settings(self, manifest):
+        settings = self.config.settings
+        version = manifest.get("subtitle_version", 0)
+        if version:
+            if (version not in {1, SUBTITLE_VERSION} or
+                    manifest.get("translation_strategy_version") != TRANSLATION_STRATEGY_VERSION or
+                    set(manifest.get("subtitle_settings", {})) != {"zh_line_width", "other_line_width", "chinese_first"}):
+                raise ToolError("任务的字幕／翻译策略版本或排版快照不受支持。", "cache_version")
+            settings = replace(settings, **manifest["subtitle_settings"])
+            settings.validate()
+        return settings
+
+    @staticmethod
+    def prepare_output(output):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd, test_name = tempfile.mkstemp(prefix=".subtitle-write-test-", dir=output.parent)
+            os.close(fd)
+            Path(test_name).unlink()
+        except OSError as error:
+            raise ToolError("视频输出目录不可写；请用 --output-dir 明确选择可写位置。", "output_readonly") from error
 
     def select_input(self, job_id, track=None, channel=None):
         job = self.store.job(job_id)
@@ -105,11 +223,29 @@ class Engine:
         cache = self.config.data / "cache" / job_id
         cache.mkdir(parents=True, exist_ok=True)
         source, output = Path(job["source"]), Path(job["output"])
-        settings = self.config.settings
         api, key, scope = None, None, None
+        started = time.monotonic()
+        stage_started, current_stage = started, None
+        stage_times = {}
+
+        def measure_stage():
+            nonlocal stage_started
+            now = time.monotonic()
+            if current_stage:
+                stage_times[current_stage] = stage_times.get(current_stage, 0) + now - stage_started
+            stage_started = now
 
         def stage(name, done=None, total=None):
+            nonlocal current_stage
+            if name != current_stage:
+                measure_stage()
+                current_stage = name
             self.store.update(job_id, name, manifest)
+            self.progress(job_id, name, done, total)
+
+        def cloud_progress(name, done, total):
+            if name == "mt_cooldown":
+                self.store.count(job_id, "mt_cooldown_ms", round(done * 1000))
             self.progress(job_id, name, done, total)
 
         def client():
@@ -117,36 +253,30 @@ class Engine:
             if api is None:
                 api = self.api_factory(key, manifest["region"], self.cancel,
                     count=lambda name: self.store.count(job_id, name),
-                    progress=lambda name, done, total: self.progress(job_id, name, done, total),
+                    progress=cloud_progress,
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
             return api
 
         try:
             check_cancel(self.cancel)
             subtitle_version = manifest.get("subtitle_version", 0)
-            if subtitle_version:
-                if (subtitle_version != SUBTITLE_VERSION or
-                        manifest.get("translation_strategy_version") != TRANSLATION_STRATEGY_VERSION or
-                        set(manifest.get("subtitle_settings", {})) != {"zh_line_width", "other_line_width", "chinese_first"}):
-                    raise ToolError("任务的字幕／翻译策略版本或排版快照不受支持。", "cache_version")
-                settings = replace(settings, **manifest["subtitle_settings"])
-                settings.validate()
+            settings = self.validate_subtitle_settings(manifest)
             if output.exists() and not manifest["overwrite"]:
                 if manifest.get("expected_srt_sha256") == hashlib.sha256(output.read_bytes()).hexdigest():
                     stage("completed")
                     return "completed"
                 stage("skipped")
                 return "skipped"
+            if manifest.get("reflow"):
+                if subtitle_version != SUBTITLE_VERSION or not manifest.get("normalized"):
+                    raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
+                self.prepare_output(output)
+                key, scope = self.identity(job_id, manifest)
+                return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache)
             stage("probing")
             if not source.is_file():
                 raise ToolError("源文件已移动或删除；请重新选择文件。", "input")
-            output.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                fd, test_name = tempfile.mkstemp(prefix=".subtitle-write-test-", dir=output.parent)
-                os.close(fd)
-                Path(test_name).unlink()
-            except OSError as e:
-                raise ToolError("视频输出目录不可写；请用 --output-dir 明确选择可写位置。", "output_readonly") from e
+            self.prepare_output(output)
             current = fingerprint(source, self.cancel)
             if manifest.get("fingerprint") and manifest["fingerprint"] != current:
                 raise ToolError("源文件内容或时间发生变化；缓存未复用。请停止此任务后重新入队。", "source_changed")
@@ -308,7 +438,8 @@ class Engine:
                 for segment in manifest["segments"]:
                     raw = json.loads((cache / ("raw-" + segment["id"] + ".json")).read_text(encoding="utf-8"))
                     items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
-                                                duration_ms=segment.get("duration_ms"), preserve_sentences=bool(subtitle_version))
+                                                duration_ms=segment.get("duration_ms"), preserve_sentences=bool(subtitle_version),
+                                                subtitle_version=subtitle_version)
                     cues.extend(items)
                     manifest["warnings"].extend(warnings)
                 cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
@@ -323,35 +454,12 @@ class Engine:
                 else:
                     self.store.replace_cues(job_id, cues)
                     self.store.update(job_id, manifest=manifest)
-            cues = self.store.cues(job_id)
-            if not cues:
-                manifest["no_speech"] = True
-                stage("completed")
-                self.cleanup_audio(cache)
-                return "completed"
-            if any(c["decision"] == "uncertain" for c in cues):
-                raise NeedsReview("部分字幕语种不确定，请用 --review 逐条确认原文或翻译。", "language_uncertain")
-            if subtitle_version:
-                self.process_subtitles(job_id, manifest, settings, scope, client, stage)
-            else:
-                stage("translating")
-                self.translate(job_id, cues, scope, client)
-            cues = self.store.cues(job_id)
-            check_cancel(self.cancel)
-            stage("writing")
-            content = render_srt(cues, settings, subtitle_version=subtitle_version)
-            manifest["expected_srt_sha256"] = hashlib.sha256(content).hexdigest()
-            self.store.update(job_id, manifest=manifest)
-            manifest["backup"] = write_srt(output, content, manifest["overwrite"])
-            manifest["cue_count"] = len(cues)
-            manifest["output_settings"] = asdict(settings)
-            stage("completed")
-            self.cleanup_audio(cache)
-            return "completed"
+            return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache)
         except (Cancelled, KeyboardInterrupt) as e:
             self.cancel.set()
             e = Cancelled()
-            ambiguous = any(s.get("submitting") and not s.get("task_id") for s in manifest["segments"])
+            ambiguous = (not manifest.get("reflow") and
+                         any(s.get("submitting") and not s.get("task_id") for s in manifest["segments"]))
             self.store.update(job_id, "submission_unknown" if ambiguous else "cancelled", manifest,
                               str(e), "submission_unknown" if ambiguous else e.code)
         except SubmissionUnknown as e:
@@ -364,9 +472,45 @@ class Engine:
             # Exception text may contain transcripts or credentials; only class is reported.
             self.store.update(job_id, "failed", manifest,
                               "本地数据／文件操作失败（" + type(e).__name__ + "）。请检查磁盘空间、权限或缓存结构。", "local_io")
+        finally:
+            measure_stage()
+            for name, seconds in stage_times.items():
+                self.store.count(job_id, "stage_" + name + "_ms", round(seconds * 1000))
+            self.store.count(job_id, "run_ms", round((time.monotonic() - started) * 1000))
         state = self.store.job(job_id)["state"]
         self.progress(job_id, state, None, None)
         return state
+
+    def finish_subtitles(self, job_id, manifest, settings, scope, client, stage, output, cache):
+        cues = self.store.cues(job_id)
+        if not cues:
+            if manifest.get("subtitle_version") and self.store.sources(job_id):
+                raise ToolError("字幕片段记录缺失，完整句来源已保留。", "cache_mismatch")
+            manifest["no_speech"] = True
+            stage("completed")
+            if not manifest.get("reflow"):
+                self.cleanup_audio(cache)
+            return "completed"
+        if any(c["decision"] == "uncertain" for c in cues):
+            raise NeedsReview("部分字幕语种不确定，请用 --review 逐条确认原文或翻译。", "language_uncertain")
+        if manifest.get("subtitle_version"):
+            self.process_subtitles(job_id, manifest, settings, scope, client, stage)
+        else:
+            stage("translating")
+            self.translate(job_id, cues, scope, client)
+        cues = self.store.cues(job_id)
+        check_cancel(self.cancel)
+        stage("writing")
+        content = render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", 0))
+        manifest["expected_srt_sha256"] = hashlib.sha256(content).hexdigest()
+        self.store.update(job_id, manifest=manifest)
+        manifest["backup"] = write_srt(output, content, manifest["overwrite"])
+        manifest["cue_count"] = len(cues)
+        manifest["output_settings"] = asdict(settings)
+        stage("completed")
+        if not manifest.get("reflow"):
+            self.cleanup_audio(cache)
+        return "completed"
 
     def process_subtitles(self, job_id, manifest, settings, scope, client, stage):
         sources = self.store.sources(job_id)
@@ -479,6 +623,7 @@ class Engine:
                 text, request_id = cloud.translate(cue["text"], cue["source_lang"])
             self.store.cache_put(key, text)
             update(job_id, cue["cue_id"], translated=text, error="")
+            self.store.count(job_id, "mt_" + cache_stage + "_completed")
             return request_id
         workers = self.config.settings.mt_workers
         with ThreadPoolExecutor(max_workers=workers) as executor:

@@ -28,6 +28,7 @@ def parser():
     result.add_argument("files", nargs="*", help="本地视频／音频文件，逐个处理")
     actions = result.add_mutually_exclusive_group()
     actions.add_argument("--resume", metavar="JOB_ID", help="恢复本地任务")
+    actions.add_argument("--reflow", metavar="JOB_ID", help="仅从完整本地转写重排字幕，覆盖须搭配 --overwrite")
     actions.add_argument("--review", metavar="JOB_ID", help="终端确认音轨、声道或逐条语种后继续")
     actions.add_argument("--jobs", action="store_true", help="列出任务（每行 JSON）")
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
@@ -78,6 +79,8 @@ class Progress:
                 message = f"音频：{method}，{done['codec']}/{done['container']}，{done['segments']} 段，{done['bytes']:,} 字节；{done['reason']}"
             elif stage == "retry":
                 message = f"网络重试 {done}/{total}，有限退避"
+            elif stage == "mt_cooldown":
+                message = f"翻译限流：共享冷却增加 {done:.2f} 秒，请求间隔 {total:.2f} 秒"
             elif stage in {"translating", "reference_translating", "subtitle_translating"} and total is not None:
                 message = f"{STATES[stage]}／已处理 {done}/{total}"
             elif stage == "layout_adjusting" and total is not None:
@@ -171,6 +174,13 @@ def summary(store, job_id):
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
     item["models"] = {"asr": ASR_MODEL, "mt": MT_MODEL}
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
+    counts = item["counts"]
+    item["timings"] = {"run_seconds": counts.get("run_ms", 0) / 1000,
+                       "mt_cooldown_seconds": counts.get("mt_cooldown_ms", 0) / 1000,
+                       "stages_seconds": {k[6:-3]: v / 1000 for k, v in counts.items()
+                                          if k.startswith("stage_") and k.endswith("_ms")}}
+    if manifest.get("reflow"):
+        item["reflow"] = {k: manifest["reflow"][k] for k in ["prepared_at", "from_subtitle_version"]}
     if manifest.get("media_plan"):
         item["audio"] = {k: manifest["media_plan"][k] for k in ["method", "codec", "container", "audio_offset_ms"]}
         item["audio"]["segments"] = len(manifest["segments"])
@@ -196,7 +206,7 @@ def hint(store, job_id):
 def main(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    action = args.resume or args.review or args.jobs or args.cancel or args.configure or args.configure_key or args.self_test
+    action = args.resume or args.reflow or args.review or args.jobs or args.cancel or args.configure or args.configure_key or args.self_test
     if not args.files and not action:
         argument_parser.print_help()
         return 0
@@ -208,6 +218,8 @@ def main(argv=None):
         raise ToolError("绑定已知 ID 与重新提交只能选择一种。", "input")
     if args.track is not None and args.track < 0:
         raise ToolError("音轨索引不能为负。", "input")
+    if args.reflow and (args.track is not None or args.channel is not None):
+        raise ToolError("重排沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
     config = Config()
     if args.workspace_id is not None:
         config.settings.workspace_id = validate_workspace_id(args.workspace_id)
@@ -274,18 +286,22 @@ def main(argv=None):
 
         if threading.current_thread() is threading.main_thread():
             previous_signal = signal.signal(signal.SIGINT, interrupt)
-        ids = [args.resume or args.review] if args.resume or args.review else []
+        ids = [args.resume or args.review or args.reflow] if args.resume or args.review or args.reflow else []
         if ids:
             current_job = ids[0]
             job = store.job(current_job)
             if args.workspace_id is not None and (job["manifest"].get("access_mode") != "workspace" or
                     job["manifest"].get("workspace_id") != config.settings.workspace_id):
                 raise ToolError("恢复沿用任务原接入方式和工作空间；--workspace-id 不能迁移旧任务。", "cache_mismatch")
-            engine.select_input(current_job, args.track, args.channel)
-            if args.overwrite or args.output_dir:
-                store.change_output(current_job, args.output_dir, args.overwrite)
+            if args.reflow:
+                engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
+            else:
+                engine.select_input(current_job, args.track, args.channel)
+                if args.overwrite or args.output_dir:
+                    store.change_output(current_job, args.output_dir, args.overwrite)
             if args.resume and job["state"] == "cancelled":
-                ambiguous = any(s.get("submitting") and not s.get("task_id") for s in job["manifest"]["segments"])
+                ambiguous = (not job["manifest"].get("reflow") and
+                             any(s.get("submitting") and not s.get("task_id") for s in job["manifest"]["segments"]))
                 store.update(current_job, "submission_unknown" if ambiguous else "queued")
             if args.bind_task_id or args.allow_resubmit:
                 engine.resolve_unknown(current_job, args.bind_task_id, args.allow_resubmit)
@@ -325,7 +341,8 @@ def main(argv=None):
         cancel.set()
         if store and current_job:
             job = store.job(current_job)
-            ambiguous = any(s.get("submitting") and not s.get("task_id") for s in job["manifest"]["segments"])
+            ambiguous = (not job["manifest"].get("reflow") and
+                         any(s.get("submitting") and not s.get("task_id") for s in job["manifest"]["segments"]))
             if job["state"] not in {"completed", "skipped"}:
                 store.update(current_job, "submission_unknown" if ambiguous else "cancelled", code="submission_unknown" if ambiguous else "cancelled")
             hint(store, current_job)

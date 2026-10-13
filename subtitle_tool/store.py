@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from .common import (PROCESSING_VERSION, SUBTITLE_VERSION, TRANSLATION_STRATEGY_VERSION,
-                     ToolError, output_key, validate_workspace_id)
+                     ToolError, atomic_json, output_key, validate_workspace_id)
 from .config import Settings
 
 TERMINAL = {"completed", "skipped", "cancelled"}
@@ -161,12 +161,41 @@ class Store:
 
     def initialize_subtitles(self, job_id, sources, cues, manifest):
         with self.lock, self.db:
-            self.db.execute("DELETE FROM subtitle_sources WHERE job_id=?", (job_id,))
-            self.db.executemany("INSERT INTO subtitle_sources VALUES(?,?,?)",
-                                [(job_id, s["sentence_id"], json.dumps(s, ensure_ascii=False)) for s in sources])
-            self.db.execute("DELETE FROM mt_references WHERE job_id=?", (job_id,))
-            self._replace_records("cues", job_id, cues)
-            self.db.execute("UPDATE jobs SET manifest=? WHERE id=?", (json.dumps(manifest, ensure_ascii=False), job_id))
+            self._initialize_subtitles(job_id, sources, cues, manifest)
+
+    def _initialize_subtitles(self, job_id, sources, cues, manifest):
+        self.db.execute("DELETE FROM subtitle_sources WHERE job_id=?", (job_id,))
+        self.db.executemany("INSERT INTO subtitle_sources VALUES(?,?,?)",
+                            [(job_id, s["sentence_id"], json.dumps(s, ensure_ascii=False)) for s in sources])
+        self.db.execute("DELETE FROM mt_references WHERE job_id=?", (job_id,))
+        self._replace_records("cues", job_id, cues)
+        self.db.execute("UPDATE jobs SET manifest=? WHERE id=?", (json.dumps(manifest, ensure_ascii=False), job_id))
+
+    def check_reflow_output(self, job_id, output, overwrite):
+        with self.lock:
+            job = self.job(job_id)
+            key = output_key(output)
+            for row in self.db.execute("SELECT id,state,source FROM jobs WHERE output_key=? AND id<>?", (key, job_id)):
+                if (row["state"] not in TERMINAL or
+                        (output.exists() and output_key(Path(row["source"])) != output_key(Path(job["source"])))):
+                    raise ToolError("目标 SRT 与其他任务冲突。", "output_conflict")
+            if output.exists() and not overwrite:
+                raise ToolError("重排目标 SRT 已存在，必须明确搭配 --overwrite；原文件已保留。", "overwrite_required")
+
+    def snapshot(self, job_id, path):
+        """Private local task snapshot, including text; never use as an ordinary report."""
+        with self.lock:
+            atomic_json(path, {"job": self.job(job_id), "sources": self.sources(job_id),
+                               "cues": self.cues(job_id), "references": self.references(job_id),
+                               "counts": self.counts(job_id)})
+
+    def commit_reflow(self, job_id, sources, cues, manifest, output):
+        """Atomically replace local subtitle inputs and the explicit resume marker."""
+        with self.lock, self.db:
+            self.check_reflow_output(job_id, output, manifest["overwrite"])
+            self._initialize_subtitles(job_id, sources, cues, manifest)
+            self.db.execute("UPDATE jobs SET output=?,output_key=?,state='queued',error='',error_code='',"
+                            "request_id='',updated=? WHERE id=?", (str(output), output_key(output), time.time(), job_id))
 
     def save_layout(self, job_id, cues, manifest, *, references=None):
         """Commit range changes and their resume marker in one SQLite transaction."""
@@ -232,10 +261,10 @@ class Store:
         with self.lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO mt_cache VALUES(?,?)", (key, text))
 
-    def count(self, job_id, name):
+    def count(self, job_id, name, amount=1):
         with self.lock, self.db:
-            self.db.execute("INSERT INTO counters VALUES(?,?,1) ON CONFLICT(job_id,name) DO UPDATE SET value=value+1",
-                            (job_id, name))
+            self.db.execute("INSERT INTO counters VALUES(?,?,?) ON CONFLICT(job_id,name) DO UPDATE SET value=value+excluded.value",
+                            (job_id, name, amount))
 
     def counts(self, job_id):
         with self.lock:
@@ -248,7 +277,8 @@ class Store:
                 if row["state"] in TERMINAL:
                     continue
                 manifest = json.loads(row["manifest"])
-                ambiguous = any(s.get("submitting") and not s.get("task_id") for s in manifest.get("segments", []))
+                ambiguous = (not manifest.get("reflow") and
+                             any(s.get("submitting") and not s.get("task_id") for s in manifest.get("segments", [])))
                 if ambiguous or (row["state"] == "submitting" and not any(s.get("task_id") for s in manifest.get("segments", []))):
                     self.update(row["id"], "submission_unknown", error="提交被中断，结果未知；请确认云端任务。", code="submission_unknown")
                 elif row["state"] not in {"failed", "submission_unknown", "needs_review", "queued"}:

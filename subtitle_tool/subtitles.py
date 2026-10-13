@@ -10,7 +10,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from .common import MT_INPUT_BUDGET, MT_MODEL, MT_TEMPLATE_RESERVE, ToolError
+from .common import MT_INPUT_BUDGET, MT_MODEL, MT_TEMPLATE_RESERVE, SUBTITLE_VERSION, ToolError
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
              "id", "th", "tr", "uk", "vi", "cs", "da", "fil", "fi", "is", "ms", "no", "pl", "sv"}
@@ -180,7 +180,7 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
 
 
 def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
-              preserve_sentences=False) -> tuple[list[dict], list[str]]:
+              preserve_sentences=False, subtitle_version=SUBTITLE_VERSION) -> tuple[list[dict], list[str]]:
     if not isinstance(raw, dict) or not isinstance(raw.get("transcripts"), list):
         raise ToolError("Qwen3 结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
     cues, warnings = [], []
@@ -219,7 +219,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
             if sentence["_adjustments"]:
                 cue["timing_adjustments"] = sentence["_adjustments"]
             if preserve_sentences:
-                words, status = aligned_words(sentence, offset_ms)
+                words, status = aligned_words(sentence, offset_ms, subtitle_version=subtitle_version)
                 if start == 0 and sentence["begin_time"] + offset_ms < 0:
                     words, status = [], "clipped_timeline"
                 cue.update(sentence_id=f"{segment_id}:{index:08}", words=words,
@@ -376,7 +376,7 @@ def wrap(text, width):
     return lines
 
 
-def aligned_words(sentence, offset_ms):
+def aligned_words(sentence, offset_ms, *, subtitle_version=SUBTITLE_VERSION):
     """Map complete, monotonic ASR words onto the unchanged cleaned source text."""
     if sentence.get("_adjustments"):
         return [], "repaired_sentence"
@@ -391,7 +391,8 @@ def aligned_words(sentence, offset_ms):
         if not isinstance(word, dict) or not isinstance(word.get("text"), str) or not isinstance(word.get("punctuation", ""), str):
             return [], "invalid_words"
         b, e = word.get("begin_time"), word.get("end_time")
-        if type(b) is not int or type(e) is not int or b < last or e <= b or e > sentence["end_time"]:
+        if (type(b) is not int or type(e) is not int or b < last or e < b or
+                (e == b and subtitle_version < 2) or e > sentence["end_time"]):
             return [], "invalid_word_timeline"
         value = re.sub(r"\s", "", clean_text(word["text"]) + word.get("punctuation", ""))
         if not value or compact[at:at + len(value)] != value:
@@ -402,6 +403,21 @@ def aligned_words(sentence, offset_ms):
         last = e
     if at != len(compact):
         return [], "incomplete_word_text"
+    if any(w["begin_ms"] == w["end_ms"] for w in result):
+        groups, pending = [], []
+        for word in result:
+            if word["end_ms"] == word["begin_ms"]:
+                pending.append(word)
+                continue
+            if pending:
+                word = {**word, "begin_ms": pending[0]["begin_ms"], "char_start": pending[0]["char_start"]}
+                pending = []
+            groups.append(word)
+        if not groups:
+            return [], "invalid_word_timeline"
+        if pending:
+            groups[-1] = {**groups[-1], "end_ms": pending[-1]["end_ms"], "char_end": pending[-1]["char_end"]}
+        return groups, "reliable_grouped_points"
     return result, "reliable"
 
 
@@ -612,7 +628,7 @@ def layout_warnings(cues, settings):
     return warnings
 
 
-def render_srt(cues, settings, *, subtitle_version=1) -> bytes:
+def render_srt(cues, settings, *, subtitle_version=SUBTITLE_VERSION) -> bytes:
     rows, last = [], -1
     for number, cue in enumerate(cues, 1):
         if cue["begin_ms"] < last or cue["end_ms"] <= cue["begin_ms"]:

@@ -14,9 +14,9 @@ Windows x64 本地 CLI。使用北京工作空间的 `qwen3-asr-flash-filetrans`
 
 准备环境使用 Python 3.12.10 x64、哈希锁定依赖和项目 FFmpeg。已有对应 Python 可使用 `setup.ps1 -PythonPath "C:\Python312\python.exe"`。
 
-无参数或 `--help` 显示帮助。也可运行 `.\.venv\Scripts\python.exe -m subtitle_tool.main`。多个文件顺序处理，MT 默认并发 2，请求开始间隔至少 1.05 秒。
+无参数或 `--help` 显示帮助。也可运行 `.\.venv\Scripts\python.exe -m subtitle_tool.main`。多个文件顺序处理，翻译默认并发 4；遇到限流自动降速，连续成功后逐步恢复。
 
-`--configure` 填写北京 Workspace ID 并隐藏输入 Key；`--configure-key` 只更新 Key。Workspace ID 是 1～63 位字母、数字或内部连字符组成的域名标签。`--workspace-id ID` 可为本次新任务指定工作空间。
+`--configure` 填写北京 Workspace ID 并隐藏输入 Key；`--configure-key` 只更新 Key。`--workspace-id ID` 可为本次新任务指定工作空间。
 
 Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先。`data` 还包含上传引用、转写和任务缓存，应留在本机。
 
@@ -40,11 +40,20 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 - 默认输出视频同目录的 `视频名.srt`，只替换最终扩展名。`--output-dir` 可指定目录。
 - 外语原文在上、简体中文译文在下；中文／粤语保留原文并跳过 MT。无语音时完成任务且不生成字幕。
 - 先翻译完整句作为参考，再结合所属句和相邻句的参考翻译字幕片段。两阶段翻译会增加请求量和费用；孤立整句可直接复用参考译文。
-- 排版优先原文、译文各一行，长句各两行；保留完整单词和标点，平衡英文尾行。`data/settings.json` 中 `zh_line_width` 默认 22，`other_line_width` 默认 42；实际显示也受播放器字体和窗口影响。
-- 文字过多或超过 7 秒时，按可靠词时间拆分，新片段至少 1 秒。最终译文过长时最多追加两轮分段翻译。无法继续拆分时保留完整内容和已有时间，在报告中记录排版超限警告。
+- 原文、译文各以两行为目标，短句保持一行；保留完整单词和标点，平衡英文尾行。实际显示也受播放器字体和窗口影响。
+- 文字过多或超过 7 秒时，按可靠词时间拆分，新片段至少 1 秒。零时长词与相邻词组合后参与分段。无法继续拆分时保留完整内容和已有时间，在报告中记录排版超限警告。
 - 已有 SRT 默认跳过；`--overwrite` 先备份再覆盖。同名不同扩展视频的目标冲突需要调整文件名或输出目录。
 - 优先复制 AAC→M4A、MP3→MP3、FLAC→FLAC、Opus／Vorbis→OGG；需要声道处理或时间轴校正时转换为 16kHz 单声道 FLAC。
 - 保留音轨偏移、静音和编码延迟；超过 12 小时或上传容量时按 PCM 样本精确分段。上传容量取 1 GB 与服务返回限额中的较小值。
+
+可在 `data/settings.json` 调整以下设置；已有任务的排版设置在重排时更新。
+
+| 设置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `mt_workers` | `4` | 翻译并发数，1～4 |
+| `zh_line_width` | `22` | 中文每行宽度，12～36 |
+| `other_line_width` | `42` | 其他语种每行宽度，24～80 |
+| `chinese_first` | `false` | 译文是否排在原文上方 |
 
 ## 复核与任务管理
 
@@ -55,6 +64,7 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 .\scripts\transcribe.ps1 --jobs
 .\scripts\transcribe.ps1 --review 本地任务ID
 .\scripts\transcribe.ps1 --resume 本地任务ID
+.\scripts\transcribe.ps1 --reflow 本地任务ID --overwrite
 .\scripts\transcribe.ps1 --resume 本地任务ID --track 音轨索引 --channel right
 .\scripts\transcribe.ps1 --cancel 本地任务ID
 ```
@@ -65,7 +75,9 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 
 任务库由单个进程独占。运行中按 Ctrl+C 保存状态并停止本地处理，网络请求结束或超时前可能需要等待；已提交云端任务仍可能计费。`--cancel` 停止已保存任务，之后用 `--resume` 显式恢复。
 
-恢复复用已知云端 ID、本地转写、整句参考和成功片段译文，补齐缺失项，并沿用保存的账号、端点、源文件、媒体方案和排版设置。历史数据读取规则见[接口与恢复契约](docs/API_CONTRACT.md#数据与恢复)。
+`--resume` 沿用任务保存的账号、识别输入和字幕策略，复用已有结果并补齐缺失项。
+
+`--reflow` 使用当前字幕策略和排版设置，从完整本地转写重建字幕，源媒体可已移走；复用有效翻译缓存，仅补必要翻译。目标已存在时搭配 `--overwrite` 备份后替换，或用 `--output-dir` 写到其他目录；中断后用 `--resume` 继续。缓存、人工语种决定及历史数据的处理见[接口与恢复契约](docs/API_CONTRACT.md#数据与恢复)。
 
 提交超时或响应缺少 ID 时，任务保存为 `submission_unknown`。可绑定已有 ID，或明确接受可能重复计费后重发：
 
@@ -74,7 +86,7 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 .\scripts\transcribe.ps1 --resume 本地任务ID --allow-resubmit
 ```
 
-进度写入 stderr；任务结果以每行 JSON 写入 stdout，`--report "结果.json"` 另存 JSON 数组。报告包含状态、版本、调用／复用计数和排版警告，省略 Key、上传链接、原文及译文。计数含义见[接口与恢复契约](docs/API_CONTRACT.md)。
+进度写入 stderr；任务结果以每行 JSON 写入 stdout，`--report "结果.json"` 另存 JSON 数组。报告包含状态、调用／复用计数、限流和耗时统计及排版警告，省略凭据、上传链接和字幕文字。字段含义见[报告字段](docs/API_CONTRACT.md#报告字段)。
 
 退出码：`0` 完成／跳过或管理操作成功；`2` 待复核／任务失败；`3` 启动／本地异常；`130` Ctrl+C。
 
