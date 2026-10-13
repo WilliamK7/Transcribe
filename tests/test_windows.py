@@ -10,17 +10,7 @@ import unittest
 from subtitle_tool.config import Blob, Config
 from subtitle_tool.instance import ProcessLock
 from subtitle_tool.media import Media, run_process
-from tests.test_core import ROOT, TemporaryTest
-
-
-class InstanceTests(TemporaryTest):
-    def test_exclusive_lock_and_release(self):
-        first, second = ProcessLock(self.path), ProcessLock(self.path)
-        self.assertTrue(first.acquire())
-        self.assertFalse(second.acquire())
-        first.close()
-        self.assertTrue(second.acquire())
-        second.close()
+from tests.fixtures import ROOT, TemporaryTest
 
 
 @unittest.skipUnless(os.name == "nt", "Windows integration required")
@@ -50,15 +40,20 @@ class WindowsTests(TemporaryTest):
         self.assertFalse(legacy.exists())
         self.assertEqual((config.data / "key.txt").read_bytes(), b"offline-legacy-key")
 
-    def test_exclusive_lock_in_another_process(self):
-        first = ProcessLock(self.path)
+    def test_exclusive_lock_and_release_across_instances_and_processes(self):
+        first, second = ProcessLock(self.path), ProcessLock(self.path)
         self.assertTrue(first.acquire())
         script = "import sys; from pathlib import Path; from subtitle_tool.instance import ProcessLock; lock=ProcessLock(Path(sys.argv[1])); ok=lock.acquire(); lock.close(); sys.exit(0 if ok else 2)"
         try:
+            self.assertFalse(second.acquire())
             process = subprocess.run([sys.executable, "-c", script, str(self.path)], cwd=ROOT, capture_output=True, timeout=15, shell=False)
             self.assertEqual(process.returncode, 2)
         finally:
             first.close()
+        try:
+            self.assertTrue(second.acquire())
+        finally:
+            second.close()
         process = subprocess.run([sys.executable, "-c", script, str(self.path)], cwd=ROOT, capture_output=True, timeout=15, shell=False)
         self.assertEqual(process.returncode, 0)
 

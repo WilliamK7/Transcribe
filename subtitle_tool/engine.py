@@ -8,16 +8,19 @@ import tempfile
 import threading
 import time
 from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from .api import Bailian, upload_limit
-from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, Cancelled, NeedsReview,
+from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
+                     TRANSLATION_STRATEGY_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
                      SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint)
 from .config import Config, decrypt_legacy
 from .media import Media
 from .store import Store
-from .subtitles import mt_cache_key, normalize, render_srt, write_srt
+from .subtitles import (layout_warnings, make_fragment, mt_cache_key, normalize, plan_fragments,
+                        plan_reference_units, reference_sources, render_srt, translation_context,
+                        validate_fragment, validate_mt_input, wrap, write_srt)
 
 
 class Engine:
@@ -120,6 +123,14 @@ class Engine:
 
         try:
             check_cancel(self.cancel)
+            subtitle_version = manifest.get("subtitle_version", 0)
+            if subtitle_version:
+                if (subtitle_version != SUBTITLE_VERSION or
+                        manifest.get("translation_strategy_version") != TRANSLATION_STRATEGY_VERSION or
+                        set(manifest.get("subtitle_settings", {})) != {"zh_line_width", "other_line_width", "chinese_first"}):
+                    raise ToolError("任务的字幕／翻译策略版本或排版快照不受支持。", "cache_version")
+                settings = replace(settings, **manifest["subtitle_settings"])
+                settings.validate()
             if output.exists() and not manifest["overwrite"]:
                 if manifest.get("expected_srt_sha256") == hashlib.sha256(output.read_bytes()).hexdigest():
                     stage("completed")
@@ -297,17 +308,21 @@ class Engine:
                 for segment in manifest["segments"]:
                     raw = json.loads((cache / ("raw-" + segment["id"] + ".json")).read_text(encoding="utf-8"))
                     items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
-                                                duration_ms=segment.get("duration_ms"))
+                                                duration_ms=segment.get("duration_ms"), preserve_sentences=bool(subtitle_version))
                     cues.extend(items)
                     manifest["warnings"].extend(warnings)
                 cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
-                self.store.replace_cues(job_id, cues)
-                normalized_file = f"normalized-v{NORMALIZER_VERSION}.json"
+                normalized_file = (f"subtitle-sources-v{subtitle_version}.json" if subtitle_version else
+                                   f"normalized-v{NORMALIZER_VERSION}.json")
                 atomic_json(cache / normalized_file, cues)
                 manifest["normalized"] = True
                 manifest["normalized_version"] = NORMALIZER_VERSION
                 manifest["normalized_file"] = normalized_file
-                self.store.update(job_id, manifest=manifest)
+                if subtitle_version:
+                    self.store.initialize_subtitles(job_id, cues, [make_fragment(s) for s in cues], manifest)
+                else:
+                    self.store.replace_cues(job_id, cues)
+                    self.store.update(job_id, manifest=manifest)
             cues = self.store.cues(job_id)
             if not cues:
                 manifest["no_speech"] = True
@@ -316,12 +331,15 @@ class Engine:
                 return "completed"
             if any(c["decision"] == "uncertain" for c in cues):
                 raise NeedsReview("部分字幕语种不确定，请用 --review 逐条确认原文或翻译。", "language_uncertain")
-            stage("translating")
-            self.translate(job_id, cues, scope, client)
+            if subtitle_version:
+                self.process_subtitles(job_id, manifest, settings, scope, client, stage)
+            else:
+                stage("translating")
+                self.translate(job_id, cues, scope, client)
             cues = self.store.cues(job_id)
             check_cancel(self.cancel)
             stage("writing")
-            content = render_srt(cues, settings)
+            content = render_srt(cues, settings, subtitle_version=subtitle_version)
             manifest["expected_srt_sha256"] = hashlib.sha256(content).hexdigest()
             self.store.update(job_id, manifest=manifest)
             manifest["backup"] = write_srt(output, content, manifest["overwrite"])
@@ -350,30 +368,117 @@ class Engine:
         self.progress(job_id, state, None, None)
         return state
 
-    def translate(self, job_id, cues, scope, client):
+    def process_subtitles(self, job_id, manifest, settings, scope, client, stage):
+        sources = self.store.sources(job_id)
+        if not sources:
+            raise ToolError("新任务缺少完整句来源记录，不能改用旧断句规则恢复。", "cache_mismatch")
+        if not manifest.get("references_planned"):
+            references = plan_reference_units(sources)
+            manifest["references_planned"] = True
+            self.store.save_layout(job_id, self.store.cues(job_id), manifest, references=references)
+        stage("reference_translating")
+        references = self.store.references(job_id)
+        source_ids = {s["sentence_id"]: s for s in sources}
+        for reference in references:
+            if reference.get("sentence_id") not in source_ids:
+                raise ToolError("参考翻译缺少对应完整句来源。", "cache_mismatch")
+            validate_fragment(source_ids[reference["sentence_id"]], reference, reference_stage=True)
+        self.translate(job_id, references, scope, client, stage_name="reference_translating",
+                       reference_stage=True, strategy_version=manifest["translation_strategy_version"])
+        references = self.store.references(job_id)
+        sources = reference_sources(sources, references)
+        if not manifest.get("layout_planned"):
+            stage("layout_adjusting", 0, MAX_LAYOUT_ROUNDS)
+            cues = []
+            for source in sources:
+                cues.extend(plan_fragments(source, settings, reference=source["reference"]))
+            for cue in cues:
+                if cue["decision"] == "translate":
+                    validate_mt_input(cue["text"], cue["source_lang"])
+            manifest.update(layout_planned=True, layout_round=0)
+            self.store.save_layout(job_id, cues, manifest)
+        while True:
+            check_cancel(self.cancel)
+            stage("subtitle_translating")
+            cues = self.store.cues(job_id)
+            contexts = {}
+            for cue in cues:
+                if cue.get("sentence_id") not in source_ids:
+                    raise ToolError("字幕片段缺少对应完整句来源。", "cache_mismatch")
+                validate_fragment(source_ids[cue["sentence_id"]], cue)
+                if cue["decision"] != "translate" or cue["translated"]:
+                    continue
+                context = translation_context(cue, sources)
+                # Reuse only an exact first-stage input when no translation memory is available.
+                exact = next((r for r in references if r["sentence_id"] == cue["sentence_id"] and
+                              r["text"] == cue["text"] and r["source_lang"] == cue["source_lang"]), None)
+                if not context and exact:
+                    self.store.cue_update(job_id, cue["cue_id"], translated=exact["translated"], error="")
+                    self.store.count(job_id, "mt_reference_reused")
+                else:
+                    contexts[cue["cue_id"]] = context
+            self.translate(job_id, self.store.cues(job_id), scope, client, stage_name="subtitle_translating",
+                           strategy_version=manifest["translation_strategy_version"], contexts=contexts)
+            cues = self.store.cues(job_id)
+            if manifest.get("layout_complete"):
+                return
+            round_number = manifest["layout_round"]
+            changed, revised = False, []
+            if round_number < MAX_LAYOUT_ROUNDS:
+                stage("layout_adjusting", round_number + 1, MAX_LAYOUT_ROUNDS)
+                by_id = {s["sentence_id"]: s for s in sources}
+                for cue in cues:
+                    parts = [cue]
+                    if cue["decision"] == "translate" and len(wrap(cue["translated"], settings.zh_line_width * 2)) > 2:
+                        parts = plan_fragments(by_id[cue["sentence_id"]], settings, cue=cue,
+                                               reference=cue["translated"], layout_round=round_number + 1, force=True)
+                    changed |= len(parts) > 1
+                    revised.extend(parts)
+            if not changed:
+                for warning in layout_warnings(cues, settings):
+                    if warning not in manifest["warnings"]:
+                        manifest["warnings"].append(warning)
+                manifest["layout_complete"] = True
+                self.store.update(job_id, manifest=manifest)
+                return
+            manifest["layout_round"] = round_number + 1
+            self.store.save_layout(job_id, revised, manifest)
+
+    def translate(self, job_id, cues, scope, client, *, stage_name="translating", reference_stage=False,
+                  strategy_version=0, contexts=None):
+        update = self.store.reference_update if reference_stage else self.store.cue_update
+        cache_stage = "reference" if reference_stage else "subtitle"
         pending, done = [], 0
         for cue in cues:
             if cue["decision"] != "translate" or cue["translated"]:
                 done += 1
                 continue
-            key = mt_cache_key(cue["text"], cue["source_lang"], **scope)
+            context = (contexts or {}).get(cue["cue_id"], [])
+            key = mt_cache_key(cue["text"], cue["source_lang"], **scope, stage=cache_stage,
+                               strategy_version=strategy_version, tm_list=context, asr_language=cue["language"].lower().strip())
             cached = self.store.cache_get(key)
             if cached:
-                self.store.cue_update(job_id, cue["cue_id"], translated=cached, error="")
+                update(job_id, cue["cue_id"], translated=cached, error="")
+                if strategy_version:
+                    self.store.count(job_id, "mt_" + cache_stage + "_cache_hit")
                 done += 1
             else:
-                pending.append((cue, key))
-        self.progress(job_id, "translating", done, len(cues))
+                pending.append((cue, key, context))
+        self.progress(job_id, stage_name, done, len(cues))
         if not pending:
             return
         cloud = client()
         errors = []
-        def translate_one(cue, key):
+        def translate_one(cue, key, context):
             check_cancel(self.cancel)
-            self.store.cue_update(job_id, cue["cue_id"], attempts=cue["attempts"] + 1, error="")
-            text, request_id = cloud.translate(cue["text"], cue["source_lang"])
+            update(job_id, cue["cue_id"], attempts=cue["attempts"] + 1, error="")
+            if strategy_version:
+                self.store.count(job_id, "mt_" + cache_stage + "_request")
+                text, request_id = cloud.translate(cue["text"], cue["source_lang"], tm_list=context)
+            else:
+                text, request_id = cloud.translate(cue["text"], cue["source_lang"])
             self.store.cache_put(key, text)
-            self.store.cue_update(job_id, cue["cue_id"], translated=text, error="")
+            update(job_id, cue["cue_id"], translated=text, error="")
             return request_id
         workers = self.config.settings.mt_workers
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -384,8 +489,8 @@ class Engine:
                     item = next(remaining, None)
                     if item is None:
                         break
-                    cue, key = item
-                    futures[executor.submit(translate_one, cue, key)] = cue
+                    cue, key, context = item
+                    futures[executor.submit(translate_one, cue, key, context)] = cue
             schedule()
             while futures:
                 completed, _ = wait(futures, return_when=FIRST_COMPLETED)
@@ -395,11 +500,11 @@ class Engine:
                         future.result()
                         done += 1
                     except ToolError as e:
-                        self.store.cue_update(job_id, cue["cue_id"], error=str(e))
+                        update(job_id, cue["cue_id"], error=str(e))
                         errors.append(e)
                     except CancelledError:
                         errors.append(Cancelled())
-                    self.progress(job_id, "translating", done, len(cues))
+                    self.progress(job_id, stage_name, done, len(cues))
                 # Stop scheduling after a failed request. Keep the at-most-workers in-flight successes.
                 schedule()
         check_cancel(self.cancel)

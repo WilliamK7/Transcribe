@@ -10,7 +10,7 @@ from unittest import mock
 
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.common import NeedsReview
-from tests.test_core import ROOT, TemporaryTest
+from tests.fixtures import ROOT, TemporaryTest
 
 
 @unittest.skipUnless(os.name == "nt" and (ROOT / "tools/ffmpeg.exe").exists(), "Pinned FFmpeg required")

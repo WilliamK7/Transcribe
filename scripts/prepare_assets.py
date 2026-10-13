@@ -28,7 +28,6 @@ def download_tools():
     if not archive.exists():
         temporary = archive.with_suffix(".download")
         try:
-            # urllib uses OS-backed default TLS verification; never disable certificate checks.
             urllib.request.urlretrieve(asset["url"], temporary)
             if sha(temporary) != asset["sha256"]:
                 raise RuntimeError("FFmpeg archive hash mismatch")
@@ -49,7 +48,6 @@ def download_tools():
             with files.open(candidates[0]) as source, output.open("wb") as destination:
                 shutil.copyfileobj(source, destination)
     return archive
-
 
 
 if __name__ == "__main__":

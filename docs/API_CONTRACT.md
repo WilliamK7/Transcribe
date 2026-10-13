@@ -1,42 +1,71 @@
 # 接口与恢复契约
 
-以下记录程序使用的请求与恢复格式；真实工作空间闭环的验证状态见 [README](../README.md)。
+## 云端请求
 
-| 接口 | 当前应用契约 | 官方来源 |
+| 接口 | 请求 | 官方来源 |
 | --- | --- | --- |
-| 新任务 ASR | POST https://{workspace_id}.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/asr/transcription | [Qwen-ASR](https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference) |
-| 新任务查询 | GET 同一工作空间 /api/v1/tasks/{task_id} | 同上 |
-| 新任务 MT | POST 同一工作空间 /compatible-mode/v1/chat/completions | [Qwen-MT](https://help.aliyun.com/zh/model-studio/qwen-mt-api) |
-| 上传策略 | GET https://dashscope.aliyuncs.com/api/v1/uploads，action=getPolicy，model=qwen3-asr-flash-filetrans | [临时上传](https://help.aliyun.com/zh/model-studio/get-temporary-file-url) |
-| 文件上传 | 返回的 upload_host，流式整文件 multipart，file 最后；不携带百炼 Authorization | 同上 |
-| 音频规格 | 所选模型支持 m4a、mp3、flac、ogg 等；单段不超过 12 小时 | [所选 ASR 音频规格](https://help.aliyun.com/zh/model-studio/asr-model) |
+| ASR | POST `https://{workspace_id}.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/asr/transcription` | [Qwen-ASR](https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference) |
+| 查询 | GET 同一工作空间 `/api/v1/tasks/{task_id}` | 同上 |
+| MT | POST 同一工作空间 `/compatible-mode/v1/chat/completions` | [Qwen-MT](https://help.aliyun.com/zh/model-studio/qwen-mt-api) |
+| 上传策略 | GET `https://dashscope.aliyuncs.com/api/v1/uploads`，`action=getPolicy`，`model=qwen3-asr-flash-filetrans` | [临时上传](https://help.aliyun.com/zh/model-studio/get-temporary-file-url) |
+| 文件上传 | 返回的 `upload_host`，流式整文件 multipart，`file` 字段最后，使用上传策略鉴权 | 同上 |
 
-上传使用返回的 upload_host、默认代理和单文件整表单请求。容量取项目 1,000,000,000 字节上限和返回 max_file_size_mb 的较小值，每次新策略重新检查实际大小。
+上传使用系统默认代理，容量取 1,000,000,000 字节与策略 `max_file_size_mb` 的较小值，每次获取策略后重新检查。上传与结果下载均省略百炼 Authorization。
 
-ASR 固定 qwen3-asr-flash-filetrans，单数 input.file_url；X-DashScope-Async 和 X-DashScope-OssResourceResolve 均为 enable。parameters 为 channel_id:[0]、enable_words:true、enable_itn:false，language 省略以自动识别。成功立刻持久化 output.task_id；查询成功地址取 output.result.transcription_url，原始结果按 transcripts[].sentences[] 解析。结果下载省略百炼 Key；链接从普通日志隐藏。
+ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`。`X-DashScope-Async`、`X-DashScope-OssResourceResolve` 均为 `enable`；`parameters` 为 `channel_id:[0]`、`enable_words:true`、`enable_itn:false`，省略 `language` 以自动识别。提交成功即持久化 `output.task_id`；查询成功后从 `output.result.transcription_url` 下载结果，按 `transcripts[].sentences[]` 解析。
 
-MT 固定 qwen-mt-flash，一条 user 文字消息，stream:false，顶层 translation_options 为 source_lang:auto（或用户确认的 MT 语言名称）、target_lang:Chinese。不传字幕 ID、时间或编号；译文按本地稳定 cue_id 对应。finish_reason:stop 且非空、合法内容才使用，OpenCC t2s 仅作用于译文。中文／粤语分流在发出请求前完成。
+MT 模型为 `qwen-mt-flash`，`stream:false`，每次一条 user 文本消息。顶层 `translation_options` 包含 `source_lang:auto`（或人工确认的 MT 语言名）、`target_lang:Chinese`，有上下文时增加 `tm_list:[{"source":"参考原文","target":"参考译文"}]`。响应须为 `finish_reason:stop` 且内容合法、非空；译文经 OpenCC t2s 后按稳定 `cue_id` 保存。中文／粤语跳过 MT，语种复核在所有 MT 请求前完成。
 
-当前本地双语 SRT 默认原文在上、简体中文译文在下（chinese_first:false）；中文／粤语只保留原文。显示顺序属于本地排版，不影响 MT 请求或翻译缓存。
+MT 按 Key／地域／模型共享请求调度，包含重试的请求开始间隔至少 1.05 秒，默认并发 2。HTTP 429 优先采用 `Retry-After` 秒数，否则退避 15／30／60 秒，所有工作线程共享冷却；最多尝试四次。失败保留已成功结果并停止安排后续请求。账户额度见[官方限流说明](https://help.aliyun.com/zh/model-studio/rate-limit)。
 
-程序在同一进程内按 Key／地域／模型共享 MT 调度，每次请求（含重试）开始至少间隔 1.05 秒；并发上限由 mt_workers 控制。MT 遇到 HTTP 429 时优先使用 Retry-After 秒数，否则等待 15／30／60 秒，各工作线程共享冷却时间；最多请求四次，仍失败则保存成功译文并停止安排后续请求。账户实际额度见[官方限流说明](https://help.aliyun.com/zh/model-studio/rate-limit)。
+## 数据与恢复
 
-接入身份与旧任务：
+任务库使用进程独占锁。任务绑定账号 Key 的 SHA-256 身份、地域、工作空间、接入方式、完整源文件指纹、模型参数、音轨／声道和媒体方案；缓存命中仍校验身份。已提交输入及分段方案保持固定。Ctrl+C 保存状态；取消任务由用户显式恢复。
 
-- 新任务必须配置合法域名标签 Workspace ID，manifest 固化 region:beijing、workspace_id、access_mode:workspace、processing_version:2 和账号 Key 的 SHA-256 身份。
-- 缺少新字段的旧任务按 access_mode:legacy_public、processing_version:1 读取。北京仍用原 dashscope.aliyuncs.com 的 ASR／查询／MT，不自动归属当前配置中的工作空间；原 WAV 媒体方案继续恢复。
-- 新加坡任务保留数据，但本版在联网和缓存恢复前阻止该地域；不跨地域发送 Key。
-- cache_identity 校验账号、地域、工作空间、接入方式和处理版本；分段上传引用也绑定该身份。完整源文件指纹、模型／规范化契约、音轨／声道和媒体方案必须相容；规范化或翻译缓存命中也检查身份。
-- MT 缓存键升级到版本 2，增加账号、工作空间、接入方式和处理版本，旧全局 MT 缓存不命中。旧任务已有成功译文与规范化字幕仍保留。
+新任务 manifest 保存以下版本和设置：
 
-密钥原子明文保存于 data/key.txt，DASHSCOPE_API_KEY 优先；key.dpapi 仅用于兼容解密，成功写入新文件后移除。oss_url 明文存于个人任务库，从日志／报告隐藏；旧 oss_protected 兼容读取，无法解密且没有 task_id 或提交未知标记时才重新上传。已知 ID 可以独立恢复；未知提交需用户显式处理。
+| 字段 | 值或内容 |
+| --- | --- |
+| `region` / `access_mode` | `beijing` / `workspace` |
+| `workspace_id` | 1～63 位合法域名标签 |
+| `processing_version` | `2` |
+| `contract.normalizer` | `2` |
+| `subtitle_version` / `translation_strategy_version` | `1` / `1` |
+| `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
 
-ASR 提交 POST 不自动重试：超时、5xx、无法解析、异常 output 或无 task_id 是提交未知。持久 submitting 标记覆盖 Ctrl+C／崩溃窗口；只支持 --bind-task-id 或明确接受重复计费风险的 --allow-resubmit。明确拒绝才清除提交标记。已知任务的查询／下载失败继续原 ID，轮询／下载／MT 使用有限退避。
+原始 ASR JSON 与规范化结果分别保存。完整句保存于 `subtitle-sources-v1.json` 和 SQLite `subtitle_sources`；参考译文存于 `mt_references`，最终片段及译文存于 `cues`。`references_planned`、`layout_planned`、`layout_round` 与对应记录在同一事务提交。恢复校验来源及文字／词范围，复用本地结果、成功参考和片段译文，仅补缺失项；必要阶段全部完成后才提交 SRT。
 
-媒体处理版本 2：连续时间轴、兼容格式且无需声道转换时复制压缩音轨；多声道仅用户明确选择首声道可复制，ASR [0] 不变。复制前后验证包时间戳、编码延迟／填充、音频属性和时长，保留播放原点、静音和偏移；不可靠则按原解码校正路径转换为 16kHz 单声道 FLAC。超限经 PCM 精确样本切分后编码 FLAC，逐段校验容量；上传 MIME 按实际容器使用 audio/mp4、audio/mpeg、audio/flac、audio/ogg 或旧 audio/wav。恢复必须沿用原方案，已提交后禁止重选输入或重新分段。
+MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。两阶段流程的版本 3 缓存另含阶段、翻译策略版本、ASR 语种及完整实际 `tm_list` 的摘要。
 
-原始 ASR JSON 与版本化规范化文件分别保存，有效规范化字幕可在云端结果链接过期后继续使用。
+ASR 提交 POST 由持久化 `submitting` 标记覆盖中断窗口。超时、5xx、无法解析或缺少 `task_id` 均保存为 `submission_unknown`，通过 `--bind-task-id` 绑定已知任务，或由用户以 `--allow-resubmit` 接受重复计费风险后重发。明确拒绝才清除标记；查询和下载失败继续沿用原 ID。
 
-规范化版本 2 增加零时长短句处理：仅当句级时间点与完整 words 文字／标点及其时间点一致、语种支持且文字不超过 12 字时，保留该点并补最多 1000ms 的字幕显示区间，受下一句开始和音频时长限制。显示空间不足 400ms 时，可合并距离不超过 400ms 的相邻同语种有效句，保留两句文字和已有句级边界；无法安全显示或跨语种共享边界仍报错。补充的是显示区间，不声明真实词级语音时长，不改原始响应，不把零时长词用于细分。normalized-v2.json 保存源句索引和修复元数据，警告保存在任务记录中；语种上下文扩展到前后各两句。
+Key 原子明文保存于 `data/key.txt`，`DASHSCOPE_API_KEY` 优先。任务库明文保存上传引用；日志和普通报告隐藏凭据、签名链接、原文、译文及原始异常。终端语种复核可显示原文。
 
-旧契约的 ASR／MT 模型及参数完全一致时，尚未规范化的 normalizer:1 任务允许从原始本地结果升级到 2，不重新上传或提交 ASR；已经有效规范化的 v1 字幕及成功译文继续复用。反向时间、非整数时间、缺少一致时间点证据的零时长句仍然拒绝。
+兼容读取规则：
+
+- 缺少接入与媒体版本字段的任务按 `legacy_public`、媒体版本 1 读取，北京任务沿用公共端点和 WAV 方案。新加坡任务保留数据，恢复时在联网和缓存复用前返回 `legacy_region`。
+- 缺少 `subtitle_version` 的任务沿用原断句、单阶段翻译、版本 2 MT 缓存和排版。已有有效规范化字幕及成功译文继续使用。
+- 规范化版本 1 的任务在模型与参数相同时，可从尚未规范化的本地原始结果升级至 2；已有有效 v1 结果保持原样。
+- `key.dpapi` 解密并成功写入新文件后移除。旧 `oss_protected` 仍可解密读取；解密失败时，仅尚未提交的分段可重新上传，已知 ID 或提交未知标记优先用于恢复。
+
+## 时间轴与字幕
+
+媒体版本 2 优先复制兼容压缩音轨，并验证包时间戳、编码延迟／填充、音频属性和时长。多声道仅明确选择首声道时可复制；需要处理声道或时间轴时转换为 16kHz 单声道 FLAC。超限按 PCM 样本精确切分后编码，逐段校验容量；单段最长 12 小时，规格见[ASR 音频说明](https://help.aliyun.com/zh/model-studio/asr-model)。MIME 随实际容器使用 `audio/mp4`、`audio/mpeg`、`audio/flac`、`audio/ogg` 或旧 `audio/wav`。FFmpeg 使用参数数组和 `shell=False`。
+
+规范化保留原文、源句索引和原始时间依据。零时长短句仅在句级与完整词级文字、标点和时间点一致，且语种支持、文字不超过 12 字时修复：补最多 1000ms 显示区间，受下一句和音频结尾限制；可用区间不足 400ms 时，可合并距离不超过 400ms 的同语种有效邻句。修复保存来源与警告，词时间不用于继续细分；其他无效时间返回错误。
+
+完整句的词时间须覆盖清理后的全部文字及标点，为整数、正时长、单调不重叠且位于句内。零时长修复或负时间裁剪后的句子使用句级边界。片段 ID 由源句和词范围稳定生成；无可靠词时间时使用完整文字范围。
+
+原文或参考译文预计超过各两行，或时长超过 7 秒时尝试分段。断点依次选择句末标点／至少 400ms 停顿、逗号／分号、完整词边界，同级取文字量更均衡的位置。新片段使用真实首末词时间且至少 1000ms，原有更短句保留。最终译文超过两行时，仅重拆超限片段，最多追加两轮翻译；无法继续安全拆分时保留内容和时间并记录警告。
+
+换行依次优化行数、英文短尾行和长度均衡，保留完整词及标点。宽字符计 2、普通字符计 1、组合附加符计 0；中文宽度设置乘 2，其他语言按原值。尾部标点允许最多 4 单位超宽，不可拆长词允许超宽。SRT 为 UTF-8 无 BOM、CRLF、合法毫秒时间，同目录原子提交，覆盖前备份；无语音时完成任务且不生成 SRT。
+
+## 上下文与输入预算
+
+先为完整 ASR 句生成固定参考，再按片段翻译。拆分片段优先引用所属整句的原译文对；其他上下文按时间距离选择前后各最多两句。未拆分整句排除自身参考。相邻句须具有一致 ASR 语种、翻译决定、MT 源语言及人工确认状态，扩展路径上的间隔不超过 5000ms；未知语种且未指定 MT 语言时仅使用所属句参考。
+
+上下文始终来自固定参考阶段，按完整条目裁剪，优先所属句和最近邻句。无上下文且输入与参考阶段完全一致时直接复用参考译文。
+
+官方[生产使用说明](https://help.aliyun.com/zh/model-studio/machine-translation)的输入上限为 8192 Token，包含翻译记忆。本地按 `messages` 与实际 `translation_options` 的 JSON UTF-8 字节数加 512 估算，预算为 6000。超长参考仅按可靠词边界拆成单元并持久化，按来源顺序组合用于上下文；最终字幕仍独立按词时间翻译。无法安全拆分时保存 `mt_input_budget` 错误及恢复进度。
+
+普通报告中的 `mt` 为包含重试的 HTTP 尝试总数；`mt_reference_request`、`mt_subtitle_request` 为阶段请求条数。阶段缓存命中和参考复用分别计数，报告附版本、调整轮次及只含片段 ID、行数和原因的排版警告。

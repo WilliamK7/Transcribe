@@ -1,6 +1,6 @@
 # 百炼命令行字幕工具
 
-Windows x64 本地 CLI，版本 0.2.0。使用北京工作空间的 `qwen3-asr-flash-filetrans` 自动识别语音，使用 `qwen-mt-flash` 翻译为简体中文。
+Windows x64 本地 CLI。使用北京工作空间的 `qwen3-asr-flash-filetrans` 自动识别语音，使用 `qwen-mt-flash` 翻译为简体中文。
 
 ## 开始使用
 
@@ -24,6 +24,9 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 
 - 默认输出视频同目录的 `视频名.srt`，只替换最终扩展名。`--output-dir` 可指定目录。
 - 外语原文在上、简体中文译文在下；中文／粤语保留原文并跳过 MT。无语音时完成任务且不生成字幕。
+- 先翻译完整句作为参考，再结合所属句和相邻句的参考翻译字幕片段。两阶段翻译会增加请求量和费用；孤立整句可直接复用参考译文。
+- 排版优先原文、译文各一行，长句各两行；保留完整单词和标点，平衡英文尾行。`data/settings.json` 中 `zh_line_width` 默认 22，`other_line_width` 默认 42；实际显示也受播放器字体和窗口影响。
+- 文字过多或超过 7 秒时，按可靠词时间拆分，新片段至少 1 秒。最终译文过长时最多追加两轮分段翻译。无法继续拆分时保留完整内容和已有时间，在报告中记录排版超限警告。
 - 已有 SRT 默认跳过；`--overwrite` 先备份再覆盖。同名不同扩展视频的目标冲突需要调整文件名或输出目录。
 - 优先复制 AAC→M4A、MP3→MP3、FLAC→FLAC、Opus／Vorbis→OGG；需要声道处理或时间轴校正时转换为 16kHz 单声道 FLAC。
 - 保留音轨偏移、静音和编码延迟；超过 12 小时或上传容量时按 PCM 样本精确分段。上传容量取 1 GB 与服务返回限额中的较小值。
@@ -47,7 +50,7 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 
 任务库由单个进程独占。运行中按 Ctrl+C 保存状态并停止本地处理，网络请求结束或超时前可能需要等待；已提交云端任务仍可能计费。`--cancel` 停止已保存任务，之后用 `--resume` 显式恢复。
 
-恢复复用已知云端 ID、本地转写和成功译文，仅补缺失项。任务绑定原账号、工作空间、源文件指纹和处理方案；旧北京任务沿用公共端点，旧新加坡任务保留数据但不支持恢复。
+恢复复用已知云端 ID、本地转写、整句参考和成功片段译文，仅补缺失项，并沿用保存的账号、端点、源文件、媒体方案和排版设置。旧北京任务按原流程恢复；旧新加坡任务保留数据，当前支持的运行地域为北京。
 
 提交超时或响应缺少 ID 时，任务保存为 `submission_unknown`。可绑定已有 ID，或明确接受可能重复计费后重发：
 
@@ -56,7 +59,7 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 .\scripts\transcribe.ps1 --resume 本地任务ID --allow-resubmit
 ```
 
-进度写入 stderr，任务结果以每行 JSON 写入 stdout；`--report "结果.json"` 另存 JSON 数组。报告包含任务状态和调用计数，省略 Key、上传链接及转写文字。
+进度写入 stderr；任务结果以每行 JSON 写入 stdout，`--report "结果.json"` 另存 JSON 数组。报告包含状态、版本、调用／复用计数和排版警告，省略 Key、上传链接、原文及译文。计数含义见[接口与恢复契约](docs/API_CONTRACT.md)。
 
 退出码：`0` 完成／跳过或管理操作成功；`2` 待复核／任务失败；`3` 启动／本地异常；`130` Ctrl+C。
 
@@ -64,9 +67,8 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 
 ```powershell
 .\scripts\transcribe.ps1 --self-test --report "本机诊断.json"
-.\scripts\test.ps1
 ```
 
-诊断使用隔离目录和合成音频；回归测试使用模拟云端响应、真实 FFmpeg 和 Windows 进程锁。真实北京工作空间上传→ASR→MT、真实纯中文零 MT、识别与译文质量、播放器同步仍待验证。
+诊断在隔离目录检查本机凭据写入、独占锁、FFmpeg 和字幕输出，使用合成音频，云端调用数为零。
 
 [环境维护](docs/BUILD.md) · [接口与恢复契约](docs/API_CONTRACT.md) · [第三方组件](docs/THIRD_PARTY.txt) · [源码许可](LICENSE)

@@ -7,11 +7,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
-from .common import ASR_MODEL, MT_MODEL, atomic_json
+from .common import atomic_json
 from .config import Config, Settings
 from .instance import ProcessLock
 from .media import Media, run_process
-from .subtitles import normalize, render_srt, write_srt
+from .subtitles import make_fragment, normalize, render_srt, write_srt
 
 
 def self_test(config: Config, report: Path):
@@ -42,7 +42,8 @@ def self_test(config: Config, report: Path):
         assert plan["method"] == "copy" and len(segments) == 1
         raw = {"transcripts": [{"channel_id": 0, "sentences": [
             {"begin_time": 100, "end_time": 1200, "text": "中文本地验证。", "language": "zh"}]}]}
-        cues, _ = normalize(raw, plan["audio_offset_ms"], "0")
+        sources, _ = normalize(raw, plan["audio_offset_ms"], "0", preserve_sentences=True)
+        cues = [make_fragment(source) for source in sources]
         srt = render_srt(cues, Settings())
         write_srt(sample.with_suffix(".srt"), srt)
         assert sample.with_suffix(".srt").read_bytes() == srt
@@ -52,8 +53,6 @@ def self_test(config: Config, report: Path):
               "platform": platform.platform(), "media_tools": versions,
               "checks": ["隔离目录原子明文 Key 保存", "任务库独占锁",
                          "固定 ffprobe 检查合成媒体", "AAC 音轨复制及时间轴校验", "特殊字符路径",
-                         "规范化和同名 UTF-8 CRLF SRT 原子写入"],
-              "models": {"asr": ASR_MODEL, "mt": MT_MODEL},
-              "unverified": ["真实北京工作空间临时上传／ASR／MT", "真实纯中文零 MT", "语音和翻译效果", "播放器同步"]}
+                         "规范化和同名 UTF-8 CRLF SRT 原子写入"]}
     atomic_json(report, result)
     return result

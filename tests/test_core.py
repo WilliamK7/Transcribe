@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import signal
 import io
-import tempfile
 import threading
-import time
 import unittest
 import wave
 from pathlib import Path
@@ -17,111 +14,20 @@ import requests
 
 from subtitle_tool.api import Bailian, Http, RequestPacer
 from subtitle_tool.common import ASR_MODEL, MT_MODEL, Cancelled, SubmissionUnknown, ToolError, redact
-from subtitle_tool.config import Config, Settings
+from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.main import main
-from subtitle_tool.store import Store
 from subtitle_tool.subtitles import mt_cache_key, normalize, render_srt, route, write_srt
 
-ROOT = Path(__file__).resolve().parent.parent
-TEMP = ROOT / ".build" / "test-temp"
-TEMP.mkdir(parents=True, exist_ok=True)
-
-
-def result(*sentences):
-    return {"file_url": "oss://test/audio.wav", "audio_info": {"format": "wav", "sample_rate": 16000},
-            "transcripts": [{"channel_id": 0, "sentences": [
-                {"begin_time": i * 1000, "end_time": i * 1000 + 900, "text": text, "language": lang}
-                for i, (text, lang) in enumerate(sentences)]}]}
-
-
-def response(body, status=200, headers=None):
-    resp = requests.Response()
-    resp.status_code = status
-    resp._content = json.dumps(body).encode()
-    resp._content_consumed = True
-    resp.headers.update(headers or {})
-    return resp
-
-
-class FakeService:
-    """Document-derived response shapes; never a real cloud-success claim."""
-    def __init__(self, raw):
-        self.raw, self.calls, self.uploads, self.submit_error = raw, [], [], None
-        self.mt_failure = set()
-        self.query_failure = False
-        self.download_failure = False
-
-    def request(self, method, url, **kwargs):
-        self.calls.append((method, url, kwargs))
-        if url.endswith("/uploads"):
-            return response({"request_id": "offline-policy", "data": {
-                "policy": "offline", "signature": "offline", "upload_dir": "offline/dir",
-                "upload_host": "https://offline-upload.oss-cn-beijing.aliyuncs.com",
-                "expire_in_seconds": 300, "max_file_size_mb": 1000,
-                "oss_access_key_id": "offline", "x_oss_object_acl": "private", "x_oss_forbid_overwrite": "true"}})
-        if url.endswith("/asr/transcription"):
-            if self.submit_error:
-                raise self.submit_error
-            return response({"request_id": "offline-submit", "output": {"task_id": "offline-task", "task_status": "PENDING"}})
-        if "/tasks/" in url:
-            if self.query_failure:
-                raise requests.ConnectionError()
-            return response({"request_id": "offline-query", "output": {"task_status": "SUCCEEDED", "result": {
-                "transcription_url": "https://offline-result.oss-cn-beijing.aliyuncs.com/raw.json?Signature=offline"}}})
-        if "offline-result" in url:
-            if self.download_failure:
-                raise requests.ConnectionError()
-            return response(self.raw)
-        if url.endswith("/chat/completions"):
-            source = kwargs["json"]["messages"][0]["content"]
-            if source in self.mt_failure:
-                return response({"code": "Unauthorized", "request_id": "offline-denied"}, 403)
-            if source.startswith("First"):
-                time.sleep(0.06)
-            return response({"id": "offline-mt", "choices": [{"finish_reason": "stop", "message": {
-                "content": "繁體譯文：" + source}}]})
-        raise AssertionError("Unexpected request " + url)
-
-    def upload(self, url, **kwargs):
-        monitor = kwargs["data"]
-        body = b""
-        while chunk := monitor.read(4096):
-            body += chunk
-        self.uploads.append((url, kwargs["headers"], body))
-        return response({})
-
-    def named(self, suffix):
-        return [c for c in self.calls if c[1].endswith(suffix)]
-
-
-class TemporaryTest(unittest.TestCase):
-    def setUp(self):
-        self.pacing = mock.patch.object(RequestPacer, "wait")
-        self.pacing.start()
-        self.environment = mock.patch.dict(os.environ)
-        self.environment.start()
-        os.environ.pop("DASHSCOPE_API_KEY", None)
-        self.temp = tempfile.TemporaryDirectory(dir=TEMP)
-        self.path = Path(self.temp.name)
-
-    def tearDown(self):
-        self.temp.cleanup()
-        self.environment.stop()
-        self.pacing.stop()
+from tests.fixtures import ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
 
 
 class SubtitleTests(TemporaryTest):
-    @staticmethod
-    def point_sentence(at, text="Yes.", language="en"):
-        return {"begin_time": at, "end_time": at, "text": text, "language": language,
-                "words": [{"begin_time": at, "end_time": at, "text": text[:-1], "punctuation": text[-1]}]}
-
     def test_zero_duration_short_sentence_gets_bounded_display_window_without_mutating_raw(self):
         raw = result(("First sentence.", "en"), ("Last sentence.", "en"))
         raw["transcripts"][0]["sentences"][1].update(begin_time=2400, end_time=4000)
-        raw["transcripts"][0]["sentences"].insert(1, self.point_sentence(1200))
+        raw["transcripts"][0]["sentences"].insert(1, point_sentence(1200))
         before = json.dumps(raw, sort_keys=True)
         cues, warnings = normalize(raw, 1250, "0", duration_ms=4500)
         self.assertEqual(json.dumps(raw, sort_keys=True), before)
@@ -133,7 +39,7 @@ class SubtitleTests(TemporaryTest):
     def test_zero_duration_at_shared_boundary_merges_same_language_and_preserves_text(self):
         raw = result(("First sentence.", "en"), ("Next sentence.", "en"))
         raw["transcripts"][0]["sentences"][0]["end_time"] = 1000
-        raw["transcripts"][0]["sentences"].insert(1, self.point_sentence(1000))
+        raw["transcripts"][0]["sentences"].insert(1, point_sentence(1000))
         cues, warnings = normalize(raw, 0, "0", duration_ms=3000)
         self.assertEqual(len(cues), 2)
         self.assertEqual((cues[0]["begin_ms"], cues[0]["end_ms"]), (0, 1000))
@@ -144,7 +50,7 @@ class SubtitleTests(TemporaryTest):
     def test_zero_duration_before_close_sentence_merges_into_next(self):
         raw = result(("First sentence.", "en"), ("Next sentence.", "en"))
         raw["transcripts"][0]["sentences"][1].update(begin_time=4080, end_time=4900)
-        raw["transcripts"][0]["sentences"].insert(1, self.point_sentence(4000))
+        raw["transcripts"][0]["sentences"].insert(1, point_sentence(4000))
         cues, _ = normalize(raw, 0, "0", duration_ms=5500)
         self.assertEqual(cues[1]["text"], "Yes. Next sentence.")
         self.assertEqual((cues[1]["begin_ms"], cues[1]["end_ms"]), (4000, 4900))
@@ -156,14 +62,14 @@ class SubtitleTests(TemporaryTest):
                 sentences[0]["end_time"] = sentences[0]["begin_time"]
             else:
                 sentences[0]["end_time"] = 1000
-                sentences.insert(1, self.point_sentence(1000))
+                sentences.insert(1, point_sentence(1000))
             with self.assertRaises(ToolError) as error:
                 normalize(raw, 0, "0", duration_ms=3000)
             self.assertEqual(error.exception.code, "timeline")
 
     def test_zero_duration_display_window_does_not_exceed_audio(self):
         raw = result(("First sentence.", "en"))
-        raw["transcripts"][0]["sentences"].append(self.point_sentence(4900))
+        raw["transcripts"][0]["sentences"].append(point_sentence(4900))
         cues, _ = normalize(raw, 0, "0", duration_ms=5100)
         self.assertEqual((cues[1]["begin_ms"], cues[1]["end_ms"]), (4900, 5100))
 
@@ -358,41 +264,16 @@ class MediaTests(TemporaryTest):
             media.select(info, 1, "ask")
 
 
-@unittest.skipUnless(os.name == "nt" and (ROOT / "tools" / "ffmpeg.exe").exists(), "Windows/bundled tools required")
-class PipelineTests(TemporaryTest):
-    @classmethod
-    def setUpClass(cls):
-        cls.fixture_dir = tempfile.TemporaryDirectory(dir=TEMP)
-        cls.fixture = Path(cls.fixture_dir.name) / "sample.mkv"
-        run_process([ROOT / "tools" / "ffmpeg.exe", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=160x90:r=10:d=5",
-                     "-f", "lavfi", "-i", "sine=frequency=440:duration=5:sample_rate=16000", "-c:v", "ffv1", "-c:a", "pcm_s16le", cls.fixture], threading.Event())
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.fixture_dir.cleanup()
-
+class PipelineTests(PipelineFixture):
+    """The previous task format remains a separate recovery contract."""
     def setUp(self):
         super().setUp()
-        self.media_tools = mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe"))
-        self.media_tools.start()
-        self.config = Config(self.path)
-        self.config.settings.workspace_id = "offline-space"
-        self.config.set_key("offline-test-key-no-cloud-authorization")
-        self.source = self.path / "中文 多点.片段 & (1).mkv"
-        shutil.copyfile(self.fixture, self.source)
-        self.store = Store(self.config.data / "jobs.sqlite")
-        self.job_id = self.store.enqueue(self.source, "beijing", workspace_id="offline-space")
+        manifest = self.store.job(self.job_id)["manifest"]
+        for name in ["subtitle_version", "translation_strategy_version", "subtitle_settings"]:
+            manifest.pop(name)
+        self.store.update(self.job_id, manifest=manifest)
 
-    def tearDown(self):
-        self.store.close()
-        self.media_tools.stop()
-        super().tearDown()
-
-    def run_fake(self, service):
-        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"):
-            return Engine(self.config, self.store).run(self.job_id)
-
-    def test_p0_chinese_end_to_end_zero_mt_and_contract(self):
+    def test_chinese_end_to_end_zero_mt_and_contract(self):
         fake = FakeService(result(("欢迎使用百炼。", "zh"), ("我们使用 Python 和 API。", "zh")))
         self.assertEqual(self.run_fake(fake), "completed")
         output = self.source.with_suffix(".srt")
@@ -772,7 +653,7 @@ class PipelineTests(TemporaryTest):
     def test_old_timeline_failure_reuses_raw_and_task_after_normalizer_upgrade(self):
         fake = FakeService(result(("First sentence.", "en"), ("Next sentence.", "en")))
         fake.raw["transcripts"][0]["sentences"][0]["end_time"] = 1000
-        fake.raw["transcripts"][0]["sentences"].insert(1, SubtitleTests.point_sentence(1000))
+        fake.raw["transcripts"][0]["sentences"].insert(1, point_sentence(1000))
         fake.mt_failure.add("First sentence. Yes.")
         self.assertEqual(self.run_fake(fake), "failed")
         manifest = self.store.job(self.job_id)["manifest"]

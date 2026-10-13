@@ -58,7 +58,7 @@ def decrypt_legacy(data: bytes) -> bytes:
     fn.restype = ctypes.c_int
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
     kernel.LocalFree.restype = ctypes.c_void_p
-    # CRYPTPROTECT_UI_FORBIDDEN; do not use LOCAL_MACHINE scope.
+    # CRYPTPROTECT_UI_FORBIDDEN
     if not fn(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(target)):
         raise ToolError("无法读取旧加密数据，请在原 Windows 用户下恢复或重新配置 Key。", "credentials")
     try:

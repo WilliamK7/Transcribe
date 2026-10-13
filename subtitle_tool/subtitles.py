@@ -7,9 +7,10 @@ import re
 import shutil
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
-from .common import MT_MODEL, ToolError
+from .common import MT_INPUT_BUDGET, MT_MODEL, MT_TEMPLATE_RESERVE, ToolError
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
              "id", "th", "tr", "uk", "vi", "cs", "da", "fil", "fi", "is", "ms", "no", "pl", "sv"}
@@ -178,7 +179,8 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
     return records, warnings
 
 
-def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -> tuple[list[dict], list[str]]:
+def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
+              preserve_sentences=False) -> tuple[list[dict], list[str]]:
     if not isinstance(raw, dict) or not isinstance(raw.get("transcripts"), list):
         raise ToolError("Qwen3 结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
     cues, warnings = [], []
@@ -202,7 +204,8 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
             warnings.append(f"分段 {segment_id} 第 {index + 1} 句为空，未生成字幕")
             continue
         decision, reason = route(text, sentence.get("language", ""), languages[max(0, index - 2):index] + languages[last_index + 1:last_index + 3])
-        for part, (start, stop, source) in enumerate(split_sentence(sentence)):
+        parts = [(sentence["begin_time"], sentence["end_time"], text)] if preserve_sentences else split_sentence(sentence)
+        for part, (start, stop, source) in enumerate(parts):
             start, stop = start + offset_ms, stop + offset_ms
             if stop <= 0:
                 warnings.append(f"第 {index + 1} 句在播放器时间零点之前，保留原始结果并跳过负时间字幕")
@@ -215,6 +218,18 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
                    "asr_sentence_indices": sentence["_indices"]}
             if sentence["_adjustments"]:
                 cue["timing_adjustments"] = sentence["_adjustments"]
+            if preserve_sentences:
+                words, status = aligned_words(sentence, offset_ms)
+                if start == 0 and sentence["begin_time"] + offset_ms < 0:
+                    words, status = [], "clipped_timeline"
+                cue.update(sentence_id=f"{segment_id}:{index:08}", words=words,
+                           word_timing_status=status, char_start=0, char_end=len(text),
+                           word_start=0, word_end=len(words), source_lang="auto", layout_round=0,
+                           original_timings=[{"asr_sentence_index": i,
+                                              "begin_ms": sentences[i]["begin_time"] + offset_ms,
+                                              "end_ms": sentences[i]["end_time"] + offset_ms}
+                                             for i in sentence["_indices"]])
+                cue["cue_id"] = fragment_id(cue["sentence_id"], 0, len(words), 0, len(text))
             cues.append(cue)
     cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
     for previous, current in zip(cues, cues[1:]):
@@ -226,12 +241,17 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
 
 
 def mt_cache_key(text, source_lang="auto", region="beijing", *, account="", workspace_id="",
-                 access_mode="legacy_public", processing_version=1):
-    return hashlib.sha256(json.dumps({"model": MT_MODEL, "source": source_lang, "target": "Chinese",
-                                     "text": text, "terms": [], "tm_list": [], "simplification": "opencc-t2s-0.1.7",
-                                     "region": region, "account": account, "workspace_id": workspace_id,
-                                     "access_mode": access_mode, "processing_version": processing_version,
-                                     "cache_version": 2}, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+                 access_mode="legacy_public", processing_version=1, stage="legacy", strategy_version=0,
+                 tm_list=(), asr_language=""):
+    payload = {"model": MT_MODEL, "source": source_lang, "target": "Chinese",
+               "text": text, "terms": [], "tm_list": [], "simplification": "opencc-t2s-0.1.7",
+               "region": region, "account": account, "workspace_id": workspace_id,
+               "access_mode": access_mode, "processing_version": processing_version, "cache_version": 2}
+    if strategy_version:
+        payload.update(cache_version=3, stage=stage, strategy_version=strategy_version, asr_language=asr_language,
+                       context_sha256=hashlib.sha256(json.dumps(list(tm_list), ensure_ascii=False,
+                                                               sort_keys=True).encode()).hexdigest())
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
 def timestamp(ms):
@@ -243,7 +263,7 @@ def timestamp(ms):
     return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
 
 
-def wrap(text, width):
+def legacy_wrap(text, width):
     text = clean_text(text)
     # Preserve every character; prefer boundaries between words / after punctuation.
     lines = []
@@ -264,17 +284,347 @@ def wrap(text, width):
     return lines
 
 
-def render_srt(cues, settings) -> bytes:
+OPENING = set("([{（［｛〈《「『【〔〖〘〚“‘«‹")
+CLOSING = set(")] }）］｝〉》」』】〕〗〙〛”’»›，。！？、；：,.!?;:%％…".replace(" ", ""))
+
+
+def display_width(text):
+    return sum(0 if unicodedata.category(c).startswith("M") or c in "\u200d\ufe0f" else
+               2 if unicodedata.east_asian_width(c) in {"W", "F"} else 1 for c in text)
+
+
+def _opening_at(text, index):
+    c = text[index]
+    return c in OPENING or (c in "\"'" and
+                           (index == 0 or text[index - 1].isspace() or text[index - 1] in OPENING))
+
+
+def _closing_at(text, index):
+    return text[index] in CLOSING or (text[index] in "\"'" and not _opening_at(text, index))
+
+
+def legal_break(text, position):
+    left, right = position - 1, position
+    while left >= 0 and text[left].isspace():
+        left -= 1
+    while right < len(text) and text[right].isspace():
+        right += 1
+    return (left >= 0 and right < len(text) and not _opening_at(text, left) and
+            not _closing_at(text, right) and not unicodedata.category(text[right]).startswith("M") and
+            text[right] != "\u200d" and text[left] != "\u200d")
+
+
+def _wrap_positions(text):
+    positions = [0]
+    for i in range(1, len(text)):
+        # Ordinary alphabetic tokens stay intact, including apostrophes and hyphens.
+        if word_boundary(text, i) and legal_break(text, i) and not text[i - 1].isspace():
+            positions.append(i)
+    positions.append(len(text))
+    return positions
+
+
+def word_boundary(text, position):
+    if not 0 < position < len(text):
+        return False
+    a, b = text[position - 1], text[position]
+    return (a.isspace() or b.isspace() or unicodedata.east_asian_width(a) in {"W", "F"} or
+            unicodedata.east_asian_width(b) in {"W", "F"})
+
+
+def punctuation_overflow(line, width):
+    at = len(line)
+    while at and _closing_at(line, at - 1):
+        at -= 1
+    return display_width(line) <= width + 4 and display_width(line[:at]) <= width
+
+
+def wrap(text, width):
+    """Choose all breaks together: fewest lines, no avoidable short tail, balanced widths."""
+    text = clean_text(text)
+    if not text:
+        return []
+    if width <= 0:
+        raise ValueError("Invalid display width")
+    positions = _wrap_positions(text)
+    # Each suffix records its best cost and next boundary. Candidate rows are capacity-bounded,
+    # except for indivisible tokens and a small punctuation overhang.
+    best = {len(positions) - 1: ((0, 0, 0), None)}
+    total_words = len(LATIN.findall(text))
+    for start in range(len(positions) - 2, -1, -1):
+        choice = None
+        for stop in range(start + 1, len(positions)):
+            line = text[positions[start]:positions[stop]].strip()
+            size = display_width(line)
+            fits = size <= width or punctuation_overflow(line, width) or stop == start + 1
+            if fits and stop in best:
+                suffix = best[stop][0]
+                short = int(stop == len(positions) - 1 and start > 0 and
+                            ((total_words > 2 and 0 < len(LATIN.findall(line)) <= 2) or size < width / 4))
+                cost = (suffix[0] + 1, suffix[1] + short, suffix[2] + (width - size) ** 2)
+                if choice is None or cost < choice[0]:
+                    choice = (cost, stop)
+            if size > width + 4:
+                break
+        if choice:
+            best[start] = choice
+    lines, at = [], 0
+    while at < len(positions) - 1:
+        stop = best[at][1]
+        lines.append(text[positions[at]:positions[stop]].strip())
+        at = stop
+    return lines
+
+
+def aligned_words(sentence, offset_ms):
+    """Map complete, monotonic ASR words onto the unchanged cleaned source text."""
+    if sentence.get("_adjustments"):
+        return [], "repaired_sentence"
+    words = sentence.get("words")
+    if sentence.get("language") not in WORD_LANGS or not isinstance(words, list) or not words:
+        return [], "missing_words"
+    text = clean_text(sentence["text"])
+    positions = [i for i, c in enumerate(text) if not c.isspace()]
+    compact = "".join(text[i] for i in positions)
+    result, at, last = [], 0, sentence["begin_time"]
+    for word in words:
+        if not isinstance(word, dict) or not isinstance(word.get("text"), str) or not isinstance(word.get("punctuation", ""), str):
+            return [], "invalid_words"
+        b, e = word.get("begin_time"), word.get("end_time")
+        if type(b) is not int or type(e) is not int or b < last or e <= b or e > sentence["end_time"]:
+            return [], "invalid_word_timeline"
+        value = re.sub(r"\s", "", clean_text(word["text"]) + word.get("punctuation", ""))
+        if not value or compact[at:at + len(value)] != value:
+            return [], "incomplete_word_text"
+        result.append({"begin_ms": b + offset_ms, "end_ms": e + offset_ms,
+                       "char_start": positions[at], "char_end": positions[at + len(value) - 1] + 1})
+        at += len(value)
+        last = e
+    if at != len(compact):
+        return [], "incomplete_word_text"
+    return result, "reliable"
+
+
+def fragment_id(sentence_id, word_start, word_end, char_start, char_end):
+    suffix = f"w{word_start:08}-{word_end:08}" if word_end else f"c{char_start:08}-{char_end:08}"
+    return sentence_id + ":" + suffix
+
+
+def make_fragment(source, lo=0, hi=None, *, layout_round=0):
+    words = source.get("words", [])
+    hi = len(words) if hi is None else hi
+    full = lo == 0 and hi == len(words)
+    char_start = 0 if full else words[lo]["char_start"]
+    char_end = len(source["text"]) if full else words[hi - 1]["char_end"]
+    # Whole sentences retain sentence timing. New pieces use only actual word endpoints.
+    begin = source["begin_ms"] if full else words[lo]["begin_ms"]
+    end = source["end_ms"] if full else words[hi - 1]["end_ms"]
+    cue = {k: source[k] for k in ("sentence_id", "language", "decision", "reason")}
+    cue.update(cue_id=fragment_id(source["sentence_id"], lo, hi, char_start, char_end),
+               begin_ms=begin, end_ms=end, text=source["text"][char_start:char_end].strip(),
+               source_lang=source.get("source_lang", "auto"), translated="", attempts=0, error="",
+               char_start=char_start, char_end=char_end, word_start=lo, word_end=hi, layout_round=layout_round)
+    for name in ["asr_sentence_indices", "timing_adjustments"]:
+        if name in source:
+            cue[name] = source[name]
+    return cue
+
+
+def _best_word_break(source, lo, hi):
+    words, text = source.get("words", []), source["text"]
+    choices = []
+    for at in range(lo + 1, hi):
+        if (words[at - 1]["end_ms"] - words[lo]["begin_ms"] < 1000 or
+                words[hi - 1]["end_ms"] - words[at]["begin_ms"] < 1000):
+            continue
+        char = words[at - 1]["char_end"]
+        if not legal_break(text, char) or not word_boundary(text, char):
+            continue
+        before = text[words[lo]["char_start"]:char].rstrip()
+        # Sentence punctuation may be followed by closing quotes/brackets.
+        stripped = before.rstrip("\"'”’）)]}」』】»›")
+        sentence_end = bool(re.search(r"[。！？.!?]$", stripped))
+        pause = words[at]["begin_ms"] - words[at - 1]["end_ms"] >= 400
+        clause_end = bool(re.search(r"[，,；;：:]$", stripped))
+        priority = 0 if sentence_end or pause else 1 if clause_end else 2
+        after = text[words[at]["char_start"]:words[hi - 1]["char_end"]]
+        balance = abs(display_width(before) - display_width(after))
+        choices.append((priority, balance, at))
+    return min(choices)[2] if choices else None
+
+
+def source_capacity(source, settings):
+    return settings.zh_line_width * 2 if source["language"] in {"zh", "yue"} else settings.other_line_width
+
+
+def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, force=False):
+    root = cue or make_fragment(source)
+    words = source.get("words", [])
+    if len(words) < 2 or root["end_ms"] - root["begin_ms"] < 1000:
+        return [root]
+    root_width = max(1, display_width(root["text"]))
+    target_estimate = display_width(reference)
+    # A final translation is used only to estimate capacity, never to assign translated substrings.
+    stack = [(root["word_start"], root["word_end"], True)]
+    ranges = []
+    while stack:
+        lo, hi, first = stack.pop()
+        part = make_fragment(source, lo, hi, layout_round=layout_round)
+        estimate = target_estimate * display_width(part["text"]) / root_width
+        over = (len(wrap(part["text"], source_capacity(source, settings))) > 2 or
+                estimate > settings.zh_line_width * 4 or
+                (first and reference and len(wrap(reference, settings.zh_line_width * 2)) > 2))
+        needs = over or part["end_ms"] - part["begin_ms"] > 7000 or (first and force)
+        at = _best_word_break(source, lo, hi) if needs else None
+        if at is None:
+            ranges.append((lo, hi))
+        else:
+            stack.extend([(at, hi, False), (lo, at, False)])
+    if ranges == [(root["word_start"], root["word_end"])]:
+        return [root]
+    return [make_fragment(source, lo, hi, layout_round=layout_round) for lo, hi in sorted(ranges)]
+
+
+def mt_input_size(text, source_lang="auto", tm_list=()):
+    payload = {"messages": [{"role": "user", "content": text}],
+               "translation_options": {"source_lang": source_lang, "target_lang": "Chinese"}}
+    if tm_list:
+        payload["translation_options"]["tm_list"] = list(tm_list)
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + MT_TEMPLATE_RESERVE
+
+
+def validate_mt_input(text, source_lang="auto", tm_list=()):
+    if mt_input_size(text, source_lang, tm_list) > MT_INPUT_BUDGET:
+        raise ToolError("待翻译文本超过保守输入预算，且无法在可靠词时间边界安全拆分；进度已保存，可恢复。", "mt_input_budget")
+
+
+def plan_reference_units(sources):
+    units = []
+    for source in sources:
+        if source["decision"] != "translate":
+            continue
+        root = make_fragment(source)
+        stack = [root]
+        while stack:
+            cue = stack.pop()
+            if mt_input_size(cue["text"], cue["source_lang"]) > MT_INPUT_BUDGET:
+                at = _best_word_break(source, cue["word_start"], cue["word_end"])
+                if at is None:
+                    validate_mt_input(cue["text"], cue["source_lang"])
+                stack.extend([make_fragment(source, at, cue["word_end"]),
+                              make_fragment(source, cue["word_start"], at)])
+                continue
+            cue["cue_id"] += ":reference"
+            units.append(cue)
+    return sorted(units, key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
+
+
+def reference_sources(sources, references):
+    grouped = {}
+    by_id = {s["sentence_id"]: s for s in sources}
+    for reference in references:
+        source = by_id.get(reference.get("sentence_id"))
+        if source is None:
+            raise ToolError("参考翻译的完整句来源记录不一致。", "cache_mismatch")
+        validate_fragment(source, reference, reference_stage=True)
+        if not reference.get("translated"):
+            raise ToolError("整句参考译文未全部完成，已保存进度。", "mt_incomplete")
+        grouped.setdefault(reference["sentence_id"], []).append(reference)
+    for source in sources:
+        if source["decision"] != "translate":
+            continue
+        units = sorted(grouped.get(source["sentence_id"], []), key=lambda c: c["char_start"])
+        at = 0
+        for unit in units:
+            if unit["char_start"] < at or source["text"][at:unit["char_start"]].strip():
+                raise ToolError("参考翻译的文字范围不连续。", "cache_mismatch")
+            at = unit["char_end"]
+        if not units or source["text"][at:].strip():
+            raise ToolError("整句参考翻译记录不完整，不能跳过必要阶段。", "cache_mismatch")
+    return [{**source, "reference": clean_text(" ".join(c["translated"] for c in
+                            sorted(grouped.get(source["sentence_id"], []), key=lambda c: c["char_start"])))}
+            for source in sources]
+
+
+def validate_fragment(source, cue, *, reference_stage=False):
+    lo, hi = cue.get("word_start"), cue.get("word_end")
+    count = len(source.get("words", []))
+    if (type(lo) is not int or type(hi) is not int or not 0 <= lo <= hi <= count or
+            (count and lo == hi)):
+        raise ToolError("字幕片段的词范围无效。", "cache_mismatch")
+    expected = make_fragment(source, cue["word_start"], cue["word_end"])
+    if reference_stage:
+        expected["cue_id"] += ":reference"
+    if any(cue[k] != expected[k] for k in ["cue_id", "sentence_id", "begin_ms", "end_ms", "text", "language",
+                                         "decision", "source_lang", "word_start", "word_end", "char_start", "char_end"]):
+        raise ToolError("字幕片段与完整句来源／词范围记录不一致。", "cache_mismatch")
+
+
+def translation_context(cue, sources):
+    position = next(i for i, s in enumerate(sources) if s["sentence_id"] == cue["sentence_id"])
+    source = sources[position]
+    candidates = []
+    if cue["char_start"] != 0 or cue["char_end"] != len(source["text"]):
+        candidates.append(source)
+    def compatible(s):
+        language = s["language"].lower().strip()
+        manual = s["reason"] == "用户在终端确认"
+        if not language:
+            # An absent label with automatic MT detection is not evidence of matching languages.
+            language = s.get("source_lang") if manual and s.get("source_lang") != "auto" else s["sentence_id"]
+        return language, s["decision"], s.get("source_lang", "auto"), manual
+    neighbors = []
+    for direction in [-1, 1]:
+        previous = source
+        for distance in [1, 2]:
+            index = position + direction * distance
+            if not 0 <= index < len(sources):
+                break
+            neighbor = sources[index]
+            gap = (previous["begin_ms"] - neighbor["end_ms"] if direction < 0 else
+                   neighbor["begin_ms"] - previous["end_ms"])
+            if gap > 5000 or compatible(neighbor) != compatible(source):
+                break
+            proximity = max(neighbor["begin_ms"] - cue["end_ms"], cue["begin_ms"] - neighbor["end_ms"], 0)
+            neighbors.append((proximity, distance, index, neighbor))
+            previous = neighbor
+    candidates.extend(item[3] for item in sorted(neighbors, key=lambda n: n[:3]))
+    context = []
+    for candidate in candidates:
+        if not candidate.get("reference"):
+            continue
+        item = {"source": candidate["text"], "target": candidate["reference"]}
+        if mt_input_size(cue["text"], cue["source_lang"], context + [item]) <= MT_INPUT_BUDGET:
+            context.append(item)
+    validate_mt_input(cue["text"], cue["source_lang"], context)
+    return context
+
+
+def layout_warnings(cues, settings):
+    warnings = []
+    for cue in cues:
+        for name, text, width in [("原文", cue["text"], source_capacity(cue, settings)),
+                                  ("译文", cue.get("translated", ""), settings.zh_line_width * 2)]:
+            lines = wrap(text, width)
+            over_width = any(display_width(line) > width and not punctuation_overflow(line, width) for line in lines)
+            if len(lines) > 2 or over_width:
+                warnings.append(f"片段 {cue['cue_id']} {name}排版超限（{len(lines)} 行）；可靠词时间／最短时长／不可拆词或追加轮数限制，保留完整内容与已有时间")
+    return warnings
+
+
+def render_srt(cues, settings, *, subtitle_version=1) -> bytes:
     rows, last = [], -1
     for number, cue in enumerate(cues, 1):
         if cue["begin_ms"] < last or cue["end_ms"] <= cue["begin_ms"]:
             raise ToolError("字幕时间轴无效或未排序。", "timeline")
         last = cue["begin_ms"]
-        source = wrap(cue["text"], settings.zh_line_width if cue["language"] in {"zh", "yue"} else settings.other_line_width)
+        wrapping = wrap if subtitle_version else legacy_wrap
+        zh_width = settings.zh_line_width * (2 if subtitle_version else 1)
+        source = wrapping(cue["text"], zh_width if cue["language"] in {"zh", "yue"} else settings.other_line_width)
         if cue["decision"] == "translate":
             if not cue.get("translated"):
                 raise ToolError("所需译文未全部完成，未写入残缺字幕。", "mt_incomplete")
-            target = wrap(cue["translated"], settings.zh_line_width)
+            target = wrapping(cue["translated"], zh_width)
             source = target + source if settings.chinese_first else source + target
         elif cue["decision"] != "original":
             raise ToolError("仍有语种不确定项，需确认后生成字幕。", "language_uncertain")

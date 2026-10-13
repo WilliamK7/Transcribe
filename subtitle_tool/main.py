@@ -78,8 +78,10 @@ class Progress:
                 message = f"音频：{method}，{done['codec']}/{done['container']}，{done['segments']} 段，{done['bytes']:,} 字节；{done['reason']}"
             elif stage == "retry":
                 message = f"网络重试 {done}/{total}，有限退避"
-            elif stage == "translating" and total is not None:
-                message = f"翻译／已处理字幕 {done}/{total}"
+            elif stage in {"translating", "reference_translating", "subtitle_translating"} and total is not None:
+                message = f"{STATES[stage]}／已处理 {done}/{total}"
+            elif stage == "layout_adjusting" and total is not None:
+                message = f"排版调整 {done}/{total}"
             elif stage == "recognizing" and done:
                 message = "识别：" + str(done)
             else:
@@ -163,6 +165,9 @@ def summary(store, job_id):
             "region": manifest["region"], "workspace_id": manifest.get("workspace_id", ""),
             "access_mode": manifest.get("access_mode", "legacy_public"),
             "processing_version": manifest.get("processing_version", 1), "cue_count": len(store.cues(job_id)),
+            "subtitle_version": manifest.get("subtitle_version", 0),
+            "translation_strategy_version": manifest.get("translation_strategy_version", 0),
+            "layout_round": manifest.get("layout_round", 0), "warnings": manifest.get("warnings", []),
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
     item["models"] = {"asr": ASR_MODEL, "mt": MT_MODEL}
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
@@ -289,7 +294,7 @@ def main(argv=None):
             account = hashlib.sha256(config.get_key().encode()).hexdigest()
             for source in args.files:
                 job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
-                                       workspace_id=workspace, account=account)
+                                       workspace_id=workspace, account=account, settings=config.settings)
                 engine.select_input(job_id, args.track, args.channel)
                 if job_id not in ids:
                     ids.append(job_id)

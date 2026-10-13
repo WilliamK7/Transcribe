@@ -14,7 +14,7 @@ from subtitle_tool.engine import Engine
 from subtitle_tool.main import main
 from subtitle_tool.store import Store
 from subtitle_tool.subtitles import mt_cache_key
-from tests.test_core import TemporaryTest, response
+from tests.fixtures import TemporaryTest, response
 
 
 class ConfigTests(TemporaryTest):

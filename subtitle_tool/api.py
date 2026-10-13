@@ -255,12 +255,21 @@ class Bailian:
         # Never attach the API Authorization header to result storage.
         return self.http.json("GET", url, name="result_download")
 
-    def translate(self, text: str, source_lang="auto") -> tuple[str, str]:
+    def translate(self, text: str, source_lang="auto", *, tm_list=None) -> tuple[str, str]:
+        options = {"source_lang": source_lang, "target_lang": "Chinese"}
+        if tm_list is not None:
+            from .subtitles import validate_mt_input
+            if (not isinstance(tm_list, list) or any(not isinstance(item, dict) or
+                    set(item) != {"source", "target"} or
+                    any(not isinstance(item[k], str) or not item[k] for k in ("source", "target")) for item in tm_list)):
+                raise ToolError("翻译记忆结构无效。", "mt_context")
+            validate_mt_input(text, source_lang, tm_list)
+            if tm_list:
+                options["tm_list"] = tm_list
         body = self.http.json("POST", self.base + "/compatible-mode/v1/chat/completions",
                               name="mt", headers=self.headers,
                               json={"model": MT_MODEL, "messages": [{"role": "user", "content": text}],
-                                    "stream": False, "translation_options": {
-                                        "source_lang": source_lang, "target_lang": "Chinese"}})
+                                    "stream": False, "translation_options": options})
         try:
             choice = body["choices"][0]
             translated = choice["message"]["content"]
