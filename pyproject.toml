@@ -1,0 +1,5 @@
+[project]
+name = "bailian-subtitle-cli"
+version = "0.2.0"
+description = "北京工作空间百炼命令行字幕工具"
+requires-python = ">=3.12,<3.13"

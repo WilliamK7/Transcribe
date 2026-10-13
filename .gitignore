@@ -1,0 +1,10 @@
+.venv/
+.build/
+build/
+dist/
+data/
+tools/*.exe
+__pycache__/
+*.pyc
+*.log
+artifacts/

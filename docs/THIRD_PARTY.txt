@@ -1,0 +1,16 @@
+Local third-party components (0.2.0 CLI)
+
+Application source: MIT, see ../LICENSE.
+Python 3.12.10 x64: PSF license; use the installed interpreter's LICENSE.txt.
+Python dependencies and exact versions/hashes: ../requirements.lock.
+requests / requests-toolbelt: Apache 2.0. opencc-python-reimplemented: Apache 2.0.
+Other dependency notices remain in their installed .venv package distributions.
+
+The CLI invokes separate, unmodified project-local ffmpeg.exe and ffprobe.exe processes.
+Pinned asset metadata and archive SHA-256: ../scripts/release-assets.json.
+FFmpeg binaries: Gyan Doshi, 8.1.2-essentials_build-www.gyan.dev, GPLv3.
+License: ../tools/LICENSE. Provider build details: ../tools/README.txt.
+FFmpeg release source: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+Provider archive/build information: https://www.gyan.dev/ffmpeg/builds/
+The provider README includes exact upstream build commit and configuration.
+All components retain their original licenses; application MIT does not replace them.
