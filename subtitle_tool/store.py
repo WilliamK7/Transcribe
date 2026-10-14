@@ -74,10 +74,11 @@ class Store:
             raise ToolError("所选文件不存在或不是文件：" + str(source), "input")
         if source.suffix.lower() in {".srt", ".exe", ".lnk", ".json", ".sqlite"}:
             raise ToolError("请选择视频文件。", "input")
-        output = (output_dir or source.parent) / source.with_suffix(".srt").name
+        output = ((output_dir if output_dir is not None else source.parent) / source.with_suffix(".srt").name).resolve()
         key = output_key(output)
         with self.lock, self.db:
             rows = self.db.execute("SELECT * FROM jobs WHERE output_key=? ORDER BY created DESC", (key,)).fetchall()
+            reusable = None
             for row in rows:
                 if (output_key(Path(row["source"])) != output_key(source) and
                         (row["state"] not in TERMINAL or output.exists())):
@@ -86,7 +87,14 @@ class Store:
                     previous = json.loads(row["manifest"])
                     if (previous.get("access_mode"), previous.get("workspace_id"), previous.get("account", "")) != ("workspace", workspace_id, account):
                         raise ToolError("该文件已有其他账号或接入方式的任务，请用 --resume 原任务 ID；不能自动迁移工作空间。", "cache_mismatch")
-                    return row["id"]
+                    if reusable is None:
+                        reusable = row
+            if reusable is not None:
+                manifest = json.loads(reusable["manifest"])
+                if overwrite:
+                    manifest["overwrite"] = True
+                self._save_output(reusable["id"], output, manifest)
+                return reusable["id"]
             job_id = uuid.uuid4().hex
             now = time.time()
             manifest = {"region": region, "workspace_id": workspace_id, "access_mode": "workspace",
@@ -115,19 +123,43 @@ class Store:
             job = self.job(job_id)
             if job["state"] in {"completed", "skipped"}:
                 raise ToolError("已完成任务的输出不能通过恢复修改，请新建任务。", "job")
-            output = (directory.resolve() / Path(job["source"]).with_suffix(".srt").name
-                      if directory else Path(job["output"]))
-            key = output_key(output)
-            for row in self.db.execute("SELECT id,state,source FROM jobs WHERE output_key=? AND id<>?", (key, job_id)):
-                if (row["state"] not in TERMINAL or
-                        (output.exists() and output_key(Path(row["source"])) != output_key(Path(job["source"])))):
-                    raise ToolError("目标 SRT 与其他任务冲突。", "output_conflict")
+            output = self.resolve_output(job, directory)
+            self._check_output_conflicts(job, output)
             manifest = job["manifest"]
             if overwrite:
                 manifest["overwrite"] = True
             manifest.pop("expected_srt_sha256", None)
-            self.db.execute("UPDATE jobs SET output=?,output_key=? WHERE id=?", (str(output), key, job_id))
-            self.update(job_id, manifest=manifest)
+            self._save_output(job_id, output, manifest)
+
+    @staticmethod
+    def resolve_output(job, directory=None):
+        output = (Path(directory) / Path(job["source"]).with_suffix(".srt").name
+                  if directory is not None else Path(job["output"]))
+        resolved = output.resolve()
+        if directory is None and not output.is_absolute() and output_key(resolved) != job["output_key"]:
+            raise ToolError("旧任务的相对输出路径无法确认；请用 --output-dir 明确指定目标目录。", "output_path_required")
+        return resolved
+
+    def _check_output_conflicts(self, job, output):
+        for row in self.db.execute("SELECT state,source FROM jobs WHERE output_key=? AND id<>?",
+                                   (output_key(output), job["id"])):
+            if (row["state"] not in TERMINAL or
+                    (output.exists() and output_key(Path(row["source"])) != output_key(Path(job["source"])))):
+                raise ToolError("目标 SRT 与其他任务冲突。", "output_conflict")
+
+    def _save_output(self, job_id, output, manifest):
+        self.db.execute("UPDATE jobs SET output=?,output_key=?,manifest=?,updated=? WHERE id=?",
+                        (str(output), output_key(output), json.dumps(manifest, ensure_ascii=False), time.time(), job_id))
+
+    def ensure_output(self, job_id):
+        """Fix an unambiguous legacy path only when preparing this task to run."""
+        with self.lock, self.db:
+            job = self.job(job_id)
+            output = self.resolve_output(job)
+            self._check_output_conflicts(job, output)
+            if str(output) != job["output"] or output_key(output) != job["output_key"]:
+                self._save_output(job_id, output, job["manifest"])
+            return output
 
     def jobs(self):
         with self.lock:
@@ -174,11 +206,8 @@ class Store:
     def check_reflow_output(self, job_id, output, overwrite):
         with self.lock:
             job = self.job(job_id)
-            key = output_key(output)
-            for row in self.db.execute("SELECT id,state,source FROM jobs WHERE output_key=? AND id<>?", (key, job_id)):
-                if (row["state"] not in TERMINAL or
-                        (output.exists() and output_key(Path(row["source"])) != output_key(Path(job["source"])))):
-                    raise ToolError("目标 SRT 与其他任务冲突。", "output_conflict")
+            output = Path(output).resolve()
+            self._check_output_conflicts(job, output)
             if output.exists() and not overwrite:
                 raise ToolError("重排目标 SRT 已存在，必须明确搭配 --overwrite；原文件已保留。", "overwrite_required")
 
@@ -192,6 +221,7 @@ class Store:
     def commit_reflow(self, job_id, sources, cues, manifest, output):
         """Atomically replace local subtitle inputs and the explicit resume marker."""
         with self.lock, self.db:
+            output = Path(output).resolve()
             self.check_reflow_output(job_id, output, manifest["overwrite"])
             self._initialize_subtitles(job_id, sources, cues, manifest)
             self.db.execute("UPDATE jobs SET output=?,output_key=?,state='queued',error='',error_code='',"
@@ -227,20 +257,14 @@ class Store:
             return self._records("mt_references", job_id)
 
     def cue_update(self, job_id, cue_id, **values):
-        self._record_update("cues", job_id, cue_id, values)
-
-    def reference_update(self, job_id, cue_id, **values):
-        self._record_update("mt_references", job_id, cue_id, values)
-
-    def _record_update(self, table, job_id, cue_id, values):
         allowed = {"decision", "reason", "translated", "source_lang", "attempts", "error"}
         if not values or not set(values).issubset(allowed):
             raise ValueError("Invalid cue update")
         with self.lock, self.db:
-            self.db.execute("UPDATE " + table + " SET " + ",".join(k + "=?" for k in values) + " WHERE job_id=? AND cue_id=?",
+            self.db.execute("UPDATE cues SET " + ",".join(k + "=?" for k in values) + " WHERE job_id=? AND cue_id=?",
                             (*values.values(), job_id, cue_id))
             changes = {k: v for k, v in values.items() if k in {"decision", "reason", "source_lang"}}
-            if table == "cues" and changes:
+            if changes:
                 row = self.db.execute("SELECT metadata FROM cues WHERE job_id=? AND cue_id=?", (job_id, cue_id)).fetchone()
                 sentence_id = json.loads(row[0]).get("sentence_id") if row else None
                 if sentence_id:
@@ -252,19 +276,38 @@ class Store:
                         self.db.execute("UPDATE subtitle_sources SET record=? WHERE job_id=? AND sentence_id=?",
                                         (json.dumps(source, ensure_ascii=False), job_id, sentence_id))
 
+    def translation_update(self, job_id, cue_ids, *, reference_stage=False, attempt=False,
+                           translated=None, error="", cache_key=None, counts=None):
+        """Persist one translation group's records, cache and counters together."""
+        if cache_key is not None and translated is None:
+            raise ValueError("Translation cache requires text")
+        table = "mt_references" if reference_stage else "cues"
+        assignments, values = ["error=?"], [error]
+        if attempt:
+            assignments.append("attempts=attempts+1")
+        if translated is not None:
+            assignments.append("translated=?")
+            values.append(translated)
+        with self.lock, self.db:
+            self.db.executemany("UPDATE " + table + " SET " + ",".join(assignments) + " WHERE job_id=? AND cue_id=?",
+                                [(*values, job_id, cue_id) for cue_id in cue_ids])
+            if cache_key is not None:
+                self.db.execute("INSERT OR REPLACE INTO mt_cache VALUES(?,?)", (cache_key, translated))
+            for name, amount in (counts or {}).items():
+                self._count(job_id, name, amount)
+
     def cache_get(self, key):
         with self.lock:
             row = self.db.execute("SELECT text FROM mt_cache WHERE key=?", (key,)).fetchone()
             return row[0] if row else None
 
-    def cache_put(self, key, text):
-        with self.lock, self.db:
-            self.db.execute("INSERT OR REPLACE INTO mt_cache VALUES(?,?)", (key, text))
-
     def count(self, job_id, name, amount=1):
         with self.lock, self.db:
-            self.db.execute("INSERT INTO counters VALUES(?,?,?) ON CONFLICT(job_id,name) DO UPDATE SET value=value+excluded.value",
-                            (job_id, name, amount))
+            self._count(job_id, name, amount)
+
+    def _count(self, job_id, name, amount):
+        self.db.execute("INSERT INTO counters VALUES(?,?,?) ON CONFLICT(job_id,name) DO UPDATE SET value=value+excluded.value",
+                        (job_id, name, amount))
 
     def counts(self, job_id):
         with self.lock:

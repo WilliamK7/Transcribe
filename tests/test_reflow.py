@@ -186,7 +186,8 @@ class ReflowTests(PipelineFixture):
         key = mt_cache_key(reference['text'], reference['source_lang'], **manifest['cache_identity'],
                            stage='reference', strategy_version=manifest['translation_strategy_version'],
                            asr_language=reference['language'])
-        self.store.cache_put(key, '更新参考')
+        with self.store.db:
+            self.store.db.execute('UPDATE mt_cache SET text=? WHERE key=?', ('更新参考', key))
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')

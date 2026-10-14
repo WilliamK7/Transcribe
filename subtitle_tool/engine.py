@@ -8,7 +8,7 @@ import re
 import tempfile
 import threading
 import time
-from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -25,10 +25,10 @@ from .subtitles import (layout_warnings, make_fragment, mt_cache_key, normalize,
 
 
 class Engine:
-    def __init__(self, config: Config, store: Store, cancel=None, progress=lambda *args: None, api_factory=Bailian):
+    def __init__(self, config: Config, store: Store, cancel=None, progress=lambda *args: None):
         self.config, self.store = config, store
         self.cancel = cancel or threading.Event()
-        self.progress, self.api_factory = progress, api_factory
+        self.progress = progress
 
     def identity(self, job_id, manifest, *, persist=True):
         identity = connection_identity(manifest)
@@ -59,8 +59,7 @@ class Engine:
         """Prepare a recoverable local reflow; only run() may translate and commit SRT."""
         job = self.store.job(job_id)
         manifest = job["manifest"]
-        output = (Path(output_dir).resolve() / Path(job["source"]).with_suffix(".srt").name
-                  if output_dir else Path(job["output"]))
+        output = self.store.resolve_output(job, output_dir)
         self.store.check_reflow_output(job_id, output, overwrite)
         self.identity(job_id, manifest, persist=False)
         self.validate_subtitle_settings(manifest)
@@ -221,8 +220,7 @@ class Engine:
             return "submission_unknown"
         manifest = job["manifest"]
         cache = self.config.data / "cache" / job_id
-        cache.mkdir(parents=True, exist_ok=True)
-        source, output = Path(job["source"]), Path(job["output"])
+        source = Path(job["source"])
         api, key, scope = None, None, None
         started = time.monotonic()
         stage_started, current_stage = started, None
@@ -251,7 +249,7 @@ class Engine:
         def client():
             nonlocal api
             if api is None:
-                api = self.api_factory(key, manifest["region"], self.cancel,
+                api = Bailian(key, manifest["region"], self.cancel,
                     count=lambda name: self.store.count(job_id, name),
                     progress=cloud_progress,
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
@@ -259,6 +257,8 @@ class Engine:
 
         try:
             check_cancel(self.cancel)
+            output = self.store.ensure_output(job_id)
+            cache.mkdir(parents=True, exist_ok=True)
             subtitle_version = manifest.get("subtitle_version", 0)
             settings = self.validate_subtitle_settings(manifest)
             if output.exists() and not manifest["overwrite"]:
@@ -590,9 +590,8 @@ class Engine:
 
     def translate(self, job_id, cues, scope, client, *, stage_name="translating", reference_stage=False,
                   strategy_version=0, contexts=None):
-        update = self.store.reference_update if reference_stage else self.store.cue_update
         cache_stage = "reference" if reference_stage else "subtitle"
-        pending, done = [], 0
+        groups, pending, done = {}, [], 0
         for cue in cues:
             if cue["decision"] != "translate" or cue["translated"]:
                 done += 1
@@ -600,31 +599,33 @@ class Engine:
             context = (contexts or {}).get(cue["cue_id"], [])
             key = mt_cache_key(cue["text"], cue["source_lang"], **scope, stage=cache_stage,
                                strategy_version=strategy_version, tm_list=context, asr_language=cue["language"].lower().strip())
+            groups.setdefault(key, ([], context))[0].append(cue)
+        for key, (members, context) in groups.items():
             cached = self.store.cache_get(key)
             if cached:
-                update(job_id, cue["cue_id"], translated=cached, error="")
-                if strategy_version:
-                    self.store.count(job_id, "mt_" + cache_stage + "_cache_hit")
-                done += 1
+                self.store.translation_update(job_id, [c["cue_id"] for c in members], reference_stage=reference_stage,
+                                              translated=cached,
+                                              counts={"mt_" + cache_stage + "_cache_hit": len(members)} if strategy_version else None)
+                done += len(members)
             else:
-                pending.append((cue, key, context))
+                pending.append((members, key, context))
         self.progress(job_id, stage_name, done, len(cues))
         if not pending:
             return
         cloud = client()
         errors = []
-        def translate_one(cue, key, context):
+        def translate_group(members, key, context):
             check_cancel(self.cancel)
-            update(job_id, cue["cue_id"], attempts=cue["attempts"] + 1, error="")
+            cue_ids = [c["cue_id"] for c in members]
+            self.store.translation_update(job_id, cue_ids, reference_stage=reference_stage, attempt=True,
+                                          counts={"mt_" + cache_stage + "_request": 1} if strategy_version else None)
+            cue = members[0]
             if strategy_version:
-                self.store.count(job_id, "mt_" + cache_stage + "_request")
-                text, request_id = cloud.translate(cue["text"], cue["source_lang"], tm_list=context)
+                text, _ = cloud.translate(cue["text"], cue["source_lang"], tm_list=context)
             else:
-                text, request_id = cloud.translate(cue["text"], cue["source_lang"])
-            self.store.cache_put(key, text)
-            update(job_id, cue["cue_id"], translated=text, error="")
-            self.store.count(job_id, "mt_" + cache_stage + "_completed")
-            return request_id
+                text, _ = cloud.translate(cue["text"], cue["source_lang"])
+            self.store.translation_update(job_id, cue_ids, reference_stage=reference_stage, translated=text,
+                                          cache_key=key, counts={"mt_" + cache_stage + "_completed": len(members)})
         workers = self.config.settings.mt_workers
         with ThreadPoolExecutor(max_workers=workers) as executor:
             remaining = iter(pending)
@@ -634,21 +635,20 @@ class Engine:
                     item = next(remaining, None)
                     if item is None:
                         break
-                    cue, key, context = item
-                    futures[executor.submit(translate_one, cue, key, context)] = cue
+                    members, key, context = item
+                    futures[executor.submit(translate_group, members, key, context)] = members
             schedule()
             while futures:
                 completed, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in completed:
-                    cue = futures.pop(future)
+                    members = futures.pop(future)
                     try:
                         future.result()
-                        done += 1
+                        done += len(members)
                     except ToolError as e:
-                        update(job_id, cue["cue_id"], error=str(e))
+                        self.store.translation_update(job_id, [c["cue_id"] for c in members],
+                                                      reference_stage=reference_stage, error=str(e))
                         errors.append(e)
-                    except CancelledError:
-                        errors.append(Cancelled())
                     self.progress(job_id, stage_name, done, len(cues))
                 # Stop scheduling after a failed request. Keep the at-most-workers in-flight successes.
                 schedule()

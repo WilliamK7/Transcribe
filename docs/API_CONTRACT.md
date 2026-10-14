@@ -24,6 +24,12 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 
 任务库使用进程独占锁。任务绑定账号 Key 的 SHA-256 身份、地域、工作空间、接入方式、完整源文件指纹、模型参数、音轨／声道和媒体方案；缓存命中仍校验身份。已提交输入及分段方案保持固定。Ctrl+C 保存状态；取消任务由用户显式恢复。
 
+`output` 保存绝对 SRT 路径，`output_key` 从该路径生成；相对 `--output-dir` 按调用目录解释。入队、恢复改目录及重排均检查目标冲突。
+
+同一源文件与同一目标复用未结束任务，先检查该目标的全部任务冲突及账号／工作空间身份。`--overwrite` 启用覆盖，省略时沿用原设置；路径和覆盖选项在同一事务保存。不同目标新建任务；`--resume --output-dir` 修改未完成任务的目标。
+
+旧相对路径在执行任务时解析：所得冲突键与保存值一致则固定为绝对路径，否则返回 `output_path_required`，由用户用 `--output-dir` 指定。路径确认先于输出目录准备和云端请求；重排的路径随重排事务提交。
+
 新任务 manifest 保存以下版本和设置：
 
 | 字段 | 值或内容 |
@@ -38,6 +44,8 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 原始 ASR JSON 与规范化结果分别保存。新完整句保存于 `subtitle-sources-v2.json` 和 SQLite `subtitle_sources`；参考译文存于 `mt_references`，最终片段及译文存于 `cues`。`references_planned`、`layout_planned`、`layout_round` 与对应记录在同一事务提交。恢复校验来源及文字／词范围，复用本地结果、成功参考和片段译文，仅补缺失项；必要阶段全部完成后才提交 SRT。
 
 MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。两阶段流程的版本 3 缓存另含阶段、翻译策略版本、ASR 语种及完整实际 `tm_list` 的摘要。各字段一致时可复用，包括字幕版本 1 与 2 之间的缓存。
+
+各翻译阶段按完整缓存键合并同批请求。组内每条记录的 `attempts` 随请求增加一次；成功译文、缓存和计数在同一事务保存。失败写回全部组员并停止调度新组；在途成功结果继续保存，供恢复复用。
 
 `--reflow JOB_ID` 读取全部本地 `raw-{segment_id}.json`，沿用识别输入、偏移和账户范围，按当前排版设置重建来源，仅在需要翻译时联网。源媒体可已移走；转写缺失或无效时保留原任务并报错。人工语种决定按完整来源对应，冲突或无法对应时返回 `reflow_review`。
 
@@ -80,10 +88,12 @@ Key 原子明文保存于 `data/key.txt`，`DASHSCOPE_API_KEY` 优先。任务�
 | `counts` 字段 | 含义 |
 | --- | --- |
 | `mt` / `mt_429` / `mt_success` | HTTP 尝试（含重试）／429／2xx 次数 |
-| `mt_reference_request` / `mt_subtitle_request` | 参考／片段翻译请求条数 |
-| `mt_reference_completed` / `mt_subtitle_completed` | 内容校验并保存成功的新译文数 |
-| `mt_reference_cache_hit` / `mt_subtitle_cache_hit` / `mt_reference_reused` | 参考缓存／片段缓存命中／直接复用参考译文次数 |
+| `mt_reference_request` / `mt_subtitle_request` | 合并后的参考／片段翻译调用数，HTTP 重试计入 `mt` |
+| `mt_reference_completed` / `mt_subtitle_completed` | 校验并保存成功的新参考／字幕译文记录数 |
+| `mt_reference_cache_hit` / `mt_subtitle_cache_hit` / `mt_reference_reused` | 参考持久缓存／片段持久缓存命中／直接复用参考译文的记录数 |
 | `mt_cooldown_ms` | 共享冷却累计增量，重叠部分只计一次 |
 | `stage_*_ms` / `run_ms` | 各阶段／运行累计耗时，含冷却及网络等待 |
+
+进度按记录计数。同批四条同键记录共享新译文时，请求数增加 1、完成数增加 4；缓存命中数只统计读取持久缓存的记录。
 
 `timings` 将耗时换算为秒；计数及耗时跨恢复累计。报告另含任务状态、版本、排版轮次及超限警告，省略凭据、上传链接和字幕文字。
