@@ -197,14 +197,18 @@ class ContextTests(unittest.TestCase):
             self.assertNotIn(sources[2]["text"], selected)
             self.assertNotIn(sources[1]["text"], selected)
 
-    def test_cache_keys_include_stage_strategy_and_actual_context(self):
+    def test_cache_keys_share_only_compatible_strategies_and_keep_request_isolation(self):
         values = [mt_cache_key("Hello", strategy_version=1, stage="reference"),
                   mt_cache_key("Hello", strategy_version=1, stage="subtitle"),
-                  mt_cache_key("Hello", strategy_version=2, stage="subtitle"),
+                  mt_cache_key("Hello", strategy_version=3, stage="subtitle"),
                   mt_cache_key("Hello", strategy_version=1, stage="subtitle", tm_list=[{"source": "one", "target": "一"}]),
                   mt_cache_key("Hello", strategy_version=1, stage="subtitle", tm_list=[{"source": "two", "target": "二"}]),
                   mt_cache_key("Hello", strategy_version=1, stage="subtitle", asr_language="fr")]
         self.assertEqual(len(set(values)), len(values))
+        for stage in ["reference", "subtitle"]:
+            for context in [[], [{"source": "Context", "target": "上下文"}]]:
+                self.assertEqual(mt_cache_key("Hello", strategy_version=1, stage=stage, tm_list=context),
+                                 mt_cache_key("Hello", strategy_version=2, stage=stage, tm_list=context))
 
     def test_budget_drops_complete_entries_and_remains_below_official_limit(self):
         sources = self.sources()
@@ -300,38 +304,69 @@ class ContextPipelineTests(PipelineFixture):
     def mt_response(text):
         return response({"id": "offline-mt", "choices": [{"finish_reason": "stop", "message": {"content": text}}]})
 
-    def test_two_stages_neighbors_concurrent_results_and_language_isolation(self):
-        fake = FakeService(result(("First sentence.", "en"), ("Second sentence.", "en"), ("今日は晴れです。", "ja")))
+    def test_reference_expansion_translates_fragments_instead_of_slicing_target(self):
+        fake = FakeService(timed_raw(["alpha", "bravo", "charlie", "delta"], word_ms=1200))
+        self.intercept_mt(fake, lambda body: self.mt_response("独立片段译文" if
+                          body["translation_options"].get("tm_list") else "中" * 70))
         self.assertEqual(self.run_fake(fake), "completed")
-        calls = [c[2]["json"] for c in fake.named("/chat/completions")]
-        self.assertEqual(len(calls), 5)
-        references = self.store.references(self.job_id)
-        self.assertEqual(len(references), 3)
-        self.assertTrue(all(r["translated"].startswith("繁体译文：") for r in references))
-        for call in calls:
-            self.assertEqual(len(call["messages"]), 1)
-            context = call["translation_options"].get("tm_list", [])
-            if context:
-                text = call["messages"][0]["content"]
-                expected = "Second sentence." if text.startswith("First") else "First sentence."
-                self.assertEqual(context, [{"source": expected, "target": "繁体译文：" + expected}])
-        cues = self.store.cues(self.job_id)
-        self.assertEqual([c["text"] for c in cues], ["First sentence.", "Second sentence.", "今日は晴れです。"])
-        self.assertTrue(all(c["translated"] == "繁体译文：" + c["text"] for c in cues))
-
-    def test_split_cues_request_parent_reference_and_preserve_all_words(self):
-        fake = FakeService(timed_raw([f"word{i}" for i in range(24)], word_ms=150))
-        self.assertEqual(self.run_fake(fake), "completed")
-        source = self.store.sources(self.job_id)[0]
-        reference = self.store.references(self.job_id)[0]
         cues = self.store.cues(self.job_id)
         self.assertGreater(len(cues), 1)
-        self.assertEqual(" ".join(c["text"] for c in cues), source["text"])
-        calls = fake.named("/chat/completions")
-        self.assertEqual(calls[0][2]["json"]["messages"][0]["content"], source["text"])
-        for call in calls[1:]:
-            self.assertEqual(call[2]["json"]["translation_options"]["tm_list"][0],
-                             {"source": source["text"], "target": reference["translated"]})
+        self.assertTrue(all(c["translated"] == "独立片段译文" and c["attempts"] == 1 for c in cues))
+        self.assertEqual(len(fake.named("/chat/completions")), len(cues) + 1)
+        self.assertEqual(self.store.counts(self.job_id).get("mt_reference_reused", 0), 0)
+
+    def test_split_fragments_use_parent_before_neighbor_reference(self):
+        raw = timed_raw([f"word{i}" for i in range(24)], word_ms=150)
+        raw["transcripts"][0]["sentences"].append({"begin_time": 3600, "end_time": 4500,
+                                                   "text": "Neighbor sentence.", "language": "en"})
+        fake = FakeService(raw)
+        self.assertEqual(self.run_fake(fake), "completed")
+        sources, refs = self.store.sources(self.job_id), self.store.references(self.job_id)
+        fragments = [c for c in self.store.cues(self.job_id) if c['sentence_id'] == sources[0]['sentence_id']]
+        self.assertEqual(" ".join(c['text'] for c in fragments), sources[0]['text'])
+        contextual = [call[2]["json"]["translation_options"]["tm_list"] for call in
+                      fake.named("/chat/completions") if call[2]["json"]["translation_options"].get("tm_list")]
+        self.assertGreater(len(contextual), 1)
+        expected = [{"source": s["text"], "target": r["translated"]} for s, r in zip(sources, refs)]
+        self.assertTrue(all(context == expected for context in contextual))
+
+    def test_matching_reference_units_are_reused_when_context_exceeds_budget(self):
+        fake = FakeService(timed_raw([chr(97 + i) * 2000 for i in range(4)], word_ms=500))
+        self.intercept_mt(fake, lambda body: self.mt_response("单元参考译文"))
+        self.assertEqual(self.run_fake(fake), "completed")
+        references, cues = self.store.references(self.job_id), self.store.cues(self.job_id)
+        self.assertEqual((len(references), len(cues)), (2, 2))
+        self.assertEqual([r["text"] for r in references], [c["text"] for c in cues])
+        self.assertTrue(all(c["attempts"] == 0 and c["translated"] == "单元参考译文" for c in cues))
+        counts = self.store.counts(self.job_id)
+        self.assertEqual(len(fake.named("/chat/completions")), 2)
+        self.assertEqual(counts.get("mt_subtitle_request", 0), 0)
+        self.assertEqual(counts["mt_reference_reused"], 2)
+        self.assertTrue(all(not c[2]["json"]["translation_options"].get("tm_list")
+                            for c in fake.named("/chat/completions")))
+
+    def test_matching_reference_units_use_available_neighbor_context(self):
+        raw = timed_raw([chr(97 + i) * 2000 for i in range(4)], word_ms=500)
+        raw['transcripts'][0]['sentences'].append({'begin_time': 2000, 'end_time': 2500,
+                                                  'text': 'Neighbor sentence.', 'language': 'en'})
+        fake = FakeService(raw)
+        self.intercept_mt(fake, lambda body: self.mt_response('上下文译文' if
+                          body['translation_options'].get('tm_list') else '参考译文'))
+        self.assertEqual(self.run_fake(fake), 'completed')
+        references, cues = self.store.references(self.job_id), self.store.cues(self.job_id)
+        self.assertEqual([r['text'] for r in references], [c['text'] for c in cues])
+        self.assertEqual([c['translated'] for c in cues], ['上下文译文', '上下文译文', '参考译文'])
+        self.assertEqual(len(fake.named('/chat/completions')), 5)
+        self.assertEqual(self.store.counts(self.job_id)['mt_reference_reused'], 1)
+
+    def test_reused_whole_translation_without_safe_words_keeps_content_and_warns(self):
+        fake = FakeService(result(("A sentence without word timings.", "en")))
+        self.intercept_mt(fake, lambda body: self.mt_response("中" * 50))
+        self.assertEqual(self.run_fake(fake), "completed")
+        self.assertEqual(len(fake.named("/chat/completions")), 1)
+        self.assertEqual(self.store.cues(self.job_id)[0]["translated"], "中" * 50)
+        self.assertTrue(self.store.job(self.job_id)["manifest"]["warnings"])
+        self.assertEqual(self.store.counts(self.job_id)["mt_reference_reused"], 1)
 
     def test_reference_failure_saves_first_stage_and_resume_only_fills_missing(self):
         fake = FakeService(result(("First sentence.", "en"), ("Second sentence.", "en")))
@@ -342,11 +377,11 @@ class ContextPipelineTests(PipelineFixture):
         self.assertFalse(self.source.with_suffix(".srt").exists())
         fake.mt_failure.clear()
         self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(len(fake.named("/chat/completions")), 5)
+        self.assertEqual(len(fake.named("/chat/completions")), 3)
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
 
     def test_final_failure_reuses_fixed_references_and_successful_final_translation(self):
-        fake = FakeService(result(("First sentence.", "en"), ("Second sentence.", "en")))
+        fake = FakeService(timed_raw([f"First{i}" for i in range(6)] + [f"Second{i}" for i in range(6)], word_ms=400))
         failing = [True]
         def handler(body):
             if failing[0] and body["messages"][0]["content"].startswith("Second") and body["translation_options"].get("tm_list"):
@@ -364,14 +399,14 @@ class ContextPipelineTests(PipelineFixture):
         self.assertEqual(self.store.cues(self.job_id)[0]["translated"], saved)
         calls = [c[2]["json"] for c in fake.named("/chat/completions")]
         retried = [c for c in calls if c["messages"][0]["content"].startswith("Second") and c["translation_options"].get("tm_list")]
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 4)
         self.assertEqual(retried[0], retried[1])
 
     def test_cancellation_at_either_stage_resumes_without_repeating_successes(self):
         for stage in ["reference_translating", "subtitle_translating"]:
             with self.subTest(stage=stage):
                 self.config.settings.mt_workers = 1
-                fake = FakeService(result(("First sentence.", "en"), ("Second sentence.", "en")))
+                fake = FakeService(timed_raw([f"First{i}" for i in range(6)] + [f"Second{i}" for i in range(6)], word_ms=400))
                 cancel = threading.Event()
                 current = [""]
                 def progress(job_id, name, done=None, total=None):
@@ -387,7 +422,7 @@ class ContextPipelineTests(PipelineFixture):
                 self.assertTrue(saved[0]["translated"])
                 self.store.update(self.job_id, "queued")
                 self.assertEqual(self.run_fake(fake), "completed")
-                self.assertEqual(len(fake.named("/chat/completions")), 4)
+                self.assertEqual(len(fake.named("/chat/completions")), 3)
                 if stage == "reference_translating":
                     self.source.with_suffix(".srt").unlink()
                     manifest = self.store.job(self.job_id)["manifest"]
@@ -399,22 +434,23 @@ class ContextPipelineTests(PipelineFixture):
                     self.store.db.commit()
 
     def test_two_extra_layout_rounds_then_warning_without_unbounded_requests(self):
-        raw = timed_raw(["alpha", "bravo", "charlie", "delta"], word_ms=1200)
-        raw["transcripts"][0]["sentences"].append({"begin_time": 4800, "end_time": 4900, "text": "Next sentence.", "language": "en"})
+        raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)
+        raw["transcripts"][0]["sentences"].append({"begin_time": 8000, "end_time": 8100, "text": "Next sentence.", "language": "en"})
         fake = FakeService(raw)
         self.intercept_mt(fake, lambda body: self.mt_response("中" * (50 if body["translation_options"].get("tm_list") else 10)))
         self.assertEqual(self.run_fake(fake), "completed")
         manifest = self.store.job(self.job_id)["manifest"]
         self.assertEqual(manifest["layout_round"], 2)
         self.assertTrue(manifest["warnings"])
-        self.assertEqual(len(fake.named("/chat/completions")), 10)
+        self.assertEqual(len(fake.named("/chat/completions")), 16)
         cues = self.store.cues(self.job_id)
         self.assertEqual([c["text"] for c in cues[:4]], ["alpha", "bravo", "charlie", "delta"])
-        self.assertTrue(all(c["translated"] == "中" * 50 for c in cues))
+        self.assertTrue(all(c["translated"] == "中" * 50 for c in cues[:-1]))
+        self.assertEqual(cues[-1]["translated"], "中" * 10)
 
     def test_interrupt_after_layout_transaction_resumes_current_ranges_only(self):
-        raw = timed_raw(["alpha", "bravo", "charlie", "delta"], word_ms=1200)
-        raw["transcripts"][0]["sentences"].append({"begin_time": 4800, "end_time": 4900, "text": "Next sentence.", "language": "en"})
+        raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)
+        raw["transcripts"][0]["sentences"].append({"begin_time": 8000, "end_time": 8100, "text": "Next sentence.", "language": "en"})
         fake = FakeService(raw)
         self.intercept_mt(fake, lambda body: self.mt_response("中" * (50 if body["translation_options"].get("tm_list") else 10)))
         save = self.store.save_layout
@@ -425,17 +461,17 @@ class ContextPipelineTests(PipelineFixture):
         with mock.patch.object(self.store, "save_layout", side_effect=interrupt):
             self.assertEqual(self.run_fake(fake), "cancelled")
         saved = self.store.cues(self.job_id)
-        self.assertEqual(len(saved), 3)
+        self.assertEqual(len(saved), 5)
         self.assertTrue(saved[-1]["translated"])
         self.assertFalse(self.source.with_suffix(".srt").exists())
         self.store.update(self.job_id, "queued")
         self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(len(fake.named("/chat/completions")), 10)
+        self.assertEqual(len(fake.named("/chat/completions")), 16)
         self.assertEqual(self.store.job(self.job_id)["manifest"]["layout_round"], 2)
 
     def test_failure_in_last_adjustment_round_resumes_only_missing_translation(self):
-        raw = timed_raw(["alpha", "bravo", "charlie", "delta"], word_ms=1200)
-        raw["transcripts"][0]["sentences"].append({"begin_time": 4800, "end_time": 4900, "text": "Next sentence.", "language": "en"})
+        raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)
+        raw["transcripts"][0]["sentences"].append({"begin_time": 8000, "end_time": 8100, "text": "Next sentence.", "language": "en"})
         fake = FakeService(raw)
         failing = [True]
         def handler(body):
@@ -450,7 +486,7 @@ class ContextPipelineTests(PipelineFixture):
         failing[0] = False
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertTrue(all(c["translated"] == successful[c["cue_id"]] for c in self.store.cues(self.job_id) if c["cue_id"] in successful))
-        self.assertEqual(len(fake.named("/chat/completions")), 11)
+        self.assertEqual(len(fake.named("/chat/completions")), 17)
 
     def test_review_updates_parent_decision_and_mt_source_language(self):
         fake = FakeService(result(("OK", "")))

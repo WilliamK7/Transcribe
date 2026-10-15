@@ -40,12 +40,14 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 | `workspace_id` | 1～63 位合法域名标签 |
 | `processing_version` | `2` |
 | `contract.normalizer` | `2` |
-| `subtitle_version` / `translation_strategy_version` | `2` / `1` |
+| `subtitle_version` / `translation_strategy_version` | `2` / `2` |
 | `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
 
 原始 ASR JSON 与规范化结果分别保存。新完整句保存于 `subtitle-sources-v2.json` 和 SQLite `subtitle_sources`；参考译文存于 `mt_references`，最终片段及译文存于 `cues`。`references_planned`、`layout_planned`、`layout_round` 与对应记录在同一事务提交。恢复校验来源及文字／词范围，复用本地结果、成功参考和片段译文，仅补缺失项；必要阶段全部完成后才提交 SRT。
 
-MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。两阶段流程的版本 3 缓存另含阶段、翻译策略版本、ASR 语种及完整实际 `tm_list` 的摘要。各字段一致时可复用，包括字幕版本 1 与 2 之间的缓存。
+两阶段任务恢复时，经身份与版本校验将 manifest 中的翻译策略 1 升级为 2，保留成功译文、参考、排版范围、轮次、设置及人工决定，仅补缺失项。未知版本返回 `cache_version`。已完成任务用 `--reflow` 按当前策略重建。
+
+MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。两阶段流程的版本 3 缓存另含阶段、请求兼容策略标识、ASR 语种及完整实际 `tm_list` 的摘要。任务策略 1、2 共享策略标识 1，其他策略按各自版本生成键；各字段一致时可复用，包括字幕版本 1 与 2 之间的缓存。
 
 各翻译阶段按完整缓存键合并同批请求。组内每条记录的 `attempts` 随请求增加一次；成功译文、缓存和计数在同一事务保存。失败写回全部组员并停止调度新组；在途成功结果继续保存，供恢复复用。
 
@@ -79,11 +81,13 @@ Key 原子明文保存于 `data/key.txt`，`DASHSCOPE_API_KEY` 优先。任务�
 
 ## 上下文与输入预算
 
-先为完整 ASR 句生成固定参考，再按片段翻译。拆分片段优先引用所属整句的原译文对；其他上下文按时间距离选择前后各最多两句。未拆分整句排除自身参考。相邻句须具有一致 ASR 语种、翻译决定、MT 源语言及人工确认状态，扩展路径上的间隔不超过 5000ms；未知语种且未指定 MT 语言时仅使用所属句参考。
+先为完整 ASR 句生成固定参考。参考和字幕均校验源句、词／文字范围、时间与语种；整句字幕直接复用对应的单条参考译文。片段的实际上下文为空且与参考单元完全匹配时也可复用。所有译文参与最终排版检查。
 
-上下文始终来自固定参考阶段，按完整条目裁剪，优先所属句和最近邻句。无上下文且输入与参考阶段完全一致时直接复用参考译文。
+拆分片段优先引用所属整句的原译文对；其他上下文按时间距离选择前后各最多两句。相邻句须具有一致 ASR 语种、翻译决定、MT 源语言及人工确认状态，扩展路径上的间隔不超过 5000ms；未知语种且未指定 MT 语言时仅使用所属句参考。
 
-官方[生产使用说明](https://help.aliyun.com/zh/model-studio/machine-translation)的输入上限为 8192 Token，包含翻译记忆。本地按 `messages` 与实际 `translation_options` 的 JSON UTF-8 字节数加 512 估算，预算为 6000。超长参考仅按可靠词边界拆成单元并持久化，按来源顺序组合用于上下文；最终字幕仍独立按词时间翻译。无法安全拆分时保存 `mt_input_budget` 错误及恢复进度。
+上下文始终来自固定参考阶段，按完整条目裁剪，优先所属句和最近邻句。直接复用按字幕记录响应取消，译文与 `mt_reference_reused` 计数在同一事务保存；请求、尝试和缓存命中计数仅对应实际操作，字幕请求缓存仅保存对应请求的结果。
+
+官方[生产使用说明](https://help.aliyun.com/zh/model-studio/machine-translation)的输入上限为 8192 Token，包含翻译记忆。本地按 `messages` 与实际 `translation_options` 的 JSON UTF-8 字节数加 512 估算，预算为 6000。超长参考按可靠词边界拆成单元并持久化，按来源顺序组合用于上下文。无法安全拆分时保存 `mt_input_budget` 错误及恢复进度。
 
 ## 报告字段
 

@@ -248,7 +248,9 @@ def mt_cache_key(text, source_lang="auto", region="beijing", *, account="", work
                "region": region, "account": account, "workspace_id": workspace_id,
                "access_mode": access_mode, "processing_version": processing_version, "cache_version": 2}
     if strategy_version:
-        payload.update(cache_version=3, stage=stage, strategy_version=strategy_version, asr_language=asr_language,
+        # Strategies 1 and 2 change reuse decisions, not the request or response contract.
+        cache_strategy = 1 if strategy_version in {1, 2} else strategy_version
+        payload.update(cache_version=3, stage=stage, strategy_version=cache_strategy, asr_language=asr_language,
                        context_sha256=hashlib.sha256(json.dumps(list(tm_list), ensure_ascii=False,
                                                                sort_keys=True).encode()).hexdigest())
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()

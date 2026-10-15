@@ -153,12 +153,18 @@ class Engine:
         version = manifest.get("subtitle_version", 0)
         if version:
             if (version not in {1, SUBTITLE_VERSION} or
-                    manifest.get("translation_strategy_version") != TRANSLATION_STRATEGY_VERSION or
+                    manifest.get("translation_strategy_version") not in {1, 2} or
                     set(manifest.get("subtitle_settings", {})) != {"zh_line_width", "other_line_width", "chinese_first"}):
                 raise ToolError("任务的字幕／翻译策略版本或排版快照不受支持。", "cache_version")
             settings = replace(settings, **manifest["subtitle_settings"])
             settings.validate()
         return settings
+
+    def upgrade_translation_strategy(self, job_id, manifest):
+        # Settings and identity are validated before upgrading the saved policy.
+        if manifest.get("subtitle_version") and manifest["translation_strategy_version"] == 1:
+            manifest["translation_strategy_version"] = TRANSLATION_STRATEGY_VERSION
+            self.store.update(job_id, manifest=manifest)
 
     @staticmethod
     def prepare_output(output):
@@ -272,6 +278,7 @@ class Engine:
                     raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
                 self.prepare_output(output)
                 key, scope = self.identity(job_id, manifest)
+                self.upgrade_translation_strategy(job_id, manifest)
                 return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache)
             stage("probing")
             if not source.is_file():
@@ -298,6 +305,7 @@ class Engine:
             manifest["contract"] = contract
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
+            self.upgrade_translation_strategy(job_id, manifest)
             media = Media(self.config.root, self.cancel)
             if not manifest.get("media"):
                 manifest["media"] = media.probe(source)
@@ -531,6 +539,8 @@ class Engine:
                        reference_stage=True, strategy_version=manifest["translation_strategy_version"])
         references = self.store.references(job_id)
         sources = reference_sources(sources, references)
+        # Both references and cues are validated against the same source and word ranges.
+        by_range = {(r["sentence_id"], r["word_start"], r["word_end"]): r for r in references}
         if not manifest.get("layout_planned"):
             stage("layout_adjusting", 0, MAX_LAYOUT_ROUNDS)
             cues = []
@@ -547,18 +557,19 @@ class Engine:
             cues = self.store.cues(job_id)
             contexts = {}
             for cue in cues:
+                check_cancel(self.cancel)
                 if cue.get("sentence_id") not in source_ids:
                     raise ToolError("字幕片段缺少对应完整句来源。", "cache_mismatch")
                 validate_fragment(source_ids[cue["sentence_id"]], cue)
                 if cue["decision"] != "translate" or cue["translated"]:
                     continue
-                context = translation_context(cue, sources)
-                # Reuse only an exact first-stage input when no translation memory is available.
-                exact = next((r for r in references if r["sentence_id"] == cue["sentence_id"] and
-                              r["text"] == cue["text"] and r["source_lang"] == cue["source_lang"]), None)
-                if not context and exact:
-                    self.store.cue_update(job_id, cue["cue_id"], translated=exact["translated"], error="")
-                    self.store.count(job_id, "mt_reference_reused")
+                source = source_ids[cue["sentence_id"]]
+                exact = by_range.get((cue["sentence_id"], cue["word_start"], cue["word_end"]))
+                whole = cue["char_start"] == 0 and cue["char_end"] == len(source["text"])
+                context = [] if exact and whole else translation_context(cue, sources)
+                if exact and not context:
+                    self.store.translation_update(job_id, [cue["cue_id"]], translated=exact["translated"],
+                                                  counts={"mt_reference_reused": 1})
                 else:
                     contexts[cue["cue_id"]] = context
             self.translate(job_id, self.store.cues(job_id), scope, client, stage_name="subtitle_translating",

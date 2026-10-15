@@ -180,20 +180,29 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(self.store.job(self.job_id), before)
 
     def test_changed_reference_context_does_not_reuse_previous_fragment_translation(self):
-        fake = self.complete_old_job()
+        fake = self.complete_old_job(timed_raw([f'word{i}' for i in range(24)], word_ms=200))
+        previous_cues = self.store.cues(self.job_id)
         manifest = self.store.job(self.job_id)['manifest']
         reference = self.store.references(self.job_id)[0]
         key = mt_cache_key(reference['text'], reference['source_lang'], **manifest['cache_identity'],
                            stage='reference', strategy_version=manifest['translation_strategy_version'],
                            asr_language=reference['language'])
+        updated_reference = '更新参考：' + reference['text']
         with self.store.db:
-            self.store.db.execute('UPDATE mt_cache SET text=? WHERE key=?', ('更新参考', key))
+            self.store.db.execute('UPDATE mt_cache SET text=? WHERE key=?', (updated_reference, key))
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
         requests = fake.named('/chat/completions')
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0][2]['json']['translation_options']['tm_list'][0]['target'], '更新参考')
+        self.assertGreater(len(previous_cues), 1)
+        # Initial fragments may need another layout round. Every saved final input must
+        # still be requested again when its context changes, even with an old cache entry.
+        self.assertTrue({c['text'] for c in previous_cues}.issubset(
+                        {call[2]['json']['messages'][0]['content'] for call in requests}))
+        self.assertEqual([(c['word_start'], c['word_end']) for c in self.store.cues(self.job_id)],
+                         [(c['word_start'], c['word_end']) for c in previous_cues])
+        self.assertTrue(all(call[2]['json']['translation_options']['tm_list'][0]['target'] == updated_reference
+                            for call in requests))
 
     def test_reflow_to_new_directory_keeps_original_output_without_overwrite(self):
         fake = self.complete_old_job()

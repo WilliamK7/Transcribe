@@ -13,8 +13,8 @@ from subtitle_tool.subtitles import mt_cache_key
 from tests.fixtures import FakeService, PipelineFixture, TemporaryTest, response, result, timed_raw
 
 
-PHASES = [('legacy', {}), ('reference', {'reference_stage': True, 'strategy_version': 1}),
-          ('subtitle', {'strategy_version': 1})]
+PHASES = [('legacy', {}), ('reference', {'reference_stage': True, 'strategy_version': 2}),
+          ('subtitle', {'strategy_version': 2})]
 
 
 class TranslationGroupTests(TemporaryTest):
@@ -225,6 +225,12 @@ class TranslationGroupPipelineTests(PipelineFixture):
                 raw = result(*[(f'{phase} line {i}.', 'en') for i in range(8)])
                 for index, sentence in enumerate(raw['transcripts'][0]['sentences']):
                     sentence.update(begin_time=index * 500, end_time=index * 500 + 400)
+                if phase == 'subtitle':
+                    raw = timed_raw([f'word{i}' for i in range(32)], word_ms=500)
+                    # Eight real fragments, each requiring its fixed parent reference.
+                    manifest = self.store.job(job_id)['manifest']
+                    manifest['subtitle_settings']['other_line_width'] = 24
+                    self.store.update(job_id, manifest=manifest)
                 fake = FakeService(raw)
                 cancel = threading.Event()
                 now, events, mt_calls = [0.0], [], []
@@ -305,16 +311,17 @@ class TranslationGroupPipelineTests(PipelineFixture):
                     raw = result(*[(f'Repeated {legacy} {workers}.', 'en')] * 4)
                     fake = FakeService(raw)
                     self.assertEqual(self.run_fake(fake), 'completed')
-                    # Edge sentences have two context entries; middle sentences have three.
-                    self.assertEqual(len(fake.named('/chat/completions')), 1 if legacy else 3)
+                    self.assertEqual(len(fake.named('/chat/completions')), 1)
                     self.assertEqual(len(self.store.cues(self.job_id)), 4)
                     self.assertTrue(all(c['translated'] for c in self.store.cues(self.job_id)))
                     self.assertEqual(source.with_suffix('.srt').read_text(encoding='utf-8').count('-->'), 4)
                     if not legacy:
                         self.assertEqual(len(self.store.references(self.job_id)), 4)
                         counts = self.store.counts(self.job_id)
-                        self.assertEqual((counts['mt_reference_request'], counts['mt_subtitle_request']), (1, 2))
-                        self.assertEqual((counts['mt_reference_completed'], counts['mt_subtitle_completed']), (4, 4))
+                        self.assertEqual((counts['mt_reference_request'], counts.get('mt_subtitle_request', 0)), (1, 0))
+                        self.assertEqual(counts['mt_reference_completed'], 4)
+                        self.assertEqual(counts.get('mt_subtitle_completed', 0), 0)
+                        self.assertEqual(counts['mt_reference_reused'], 4)
 
     def test_four_identical_fragments_share_one_parent_context_and_one_request(self):
         for workers in [1, 4]:
