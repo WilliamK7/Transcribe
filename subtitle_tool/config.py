@@ -22,8 +22,8 @@ class Settings:
     poll_seconds: float = 4
     poll_timeout_seconds: float = 6 * 3600
     chinese_first: bool = False
-    zh_line_width: int = 22
-    other_line_width: int = 42
+    zh_line_width: int = 44
+    other_line_width: int = 84
 
     def validate(self):
         if self.region not in {"beijing", "singapore"}:
@@ -36,7 +36,7 @@ class Settings:
             raise ToolError("声道设置无效。", "config")
         if not 1 <= self.poll_seconds <= 60 or self.poll_timeout_seconds <= 0:
             raise ToolError("轮询设置无效。", "config")
-        if not 12 <= self.zh_line_width <= 36 or not 24 <= self.other_line_width <= 80:
+        if not 12 <= self.zh_line_width <= 72 or not 24 <= self.other_line_width <= 160:
             raise ToolError("每行字幕长度设置无效。", "config")
 
 

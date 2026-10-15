@@ -31,7 +31,7 @@ class ZeroDurationWordTests(unittest.TestCase):
                 self.assertEqual(len(source['words']), 20 - len(zeros))
                 points = {w[k] for w in sentence['words'] for k in ['begin_time', 'end_time']}
                 self.assertTrue(all(w['begin_ms'] in points and w['end_ms'] in points for w in source['words']))
-                cues = plan_fragments(source, Settings())
+                cues = plan_fragments(source, Settings(zh_line_width=22, other_line_width=42))
                 self.assertGreater(len(cues), 1)
                 self.assertEqual(re.sub(r'\s', '', ''.join(c['text'] for c in cues)), re.sub(r'\s', '', sentence['text']))
                 self.assertTrue(all(c['end_ms'] - c['begin_ms'] >= 1000 for c in cues))
@@ -73,14 +73,54 @@ class ZeroDurationWordTests(unittest.TestCase):
 class ReflowTests(PipelineFixture):
     def setUp(self):
         super().setUp()
+        self.config.settings.zh_line_width = 22
+        self.config.settings.other_line_width = 42
         manifest = self.store.job(self.job_id)['manifest']
         manifest['subtitle_version'] = 1
+        manifest['subtitle_settings'].update(zh_line_width=22, other_line_width=42)
         self.store.update(self.job_id, manifest=manifest)
 
     def complete_old_job(self, raw=None):
         fake = FakeService(raw or result(('First sentence.', 'en'), ('Second sentence.', 'en')))
         self.assertEqual(self.run_fake(fake), 'completed')
         return fake
+
+    def test_resume_keeps_saved_widths_and_reflow_uses_current_settings(self):
+        self.config.settings.zh_line_width = 44
+        self.config.settings.other_line_width = 84
+        raw = timed_raw(['字'] * 60, language='zh', word_ms=50)
+        english = timed_raw(['word'] * 24, word_ms=150, start=3000)
+        raw['transcripts'][0]['sentences'].extend(english['transcripts'][0]['sentences'])
+        fake = FakeService(raw)
+
+        def interrupt(job_id, stage, done=None, total=None):
+            if stage == 'segmenting':
+                raise KeyboardInterrupt()
+
+        with mock.patch('requests.request', side_effect=fake.request), mock.patch('requests.post', side_effect=fake.upload):
+            self.assertEqual(Engine(self.config, self.store, progress=interrupt).run(self.job_id), 'cancelled')
+        self.assertFalse(self.store.job(self.job_id)['manifest'].get('normalized'))
+        self.store.update(self.job_id, 'queued')
+        fake.calls.clear()
+        self.assertEqual(self.run_fake(fake), 'completed')
+        self.assertEqual(fake.named('/asr/transcription'), [])
+        manifest = self.store.job(self.job_id)['manifest']
+        self.assertEqual((manifest['output_settings']['zh_line_width'], manifest['output_settings']['other_line_width']), (22, 42))
+        self.assertGreater(len(self.store.cues(self.job_id)), 2)
+        output = self.source.with_suffix('.srt')
+        previous = output.read_bytes()
+
+        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
+        fake.calls.clear()
+        self.assertEqual(self.run_fake(fake), 'completed')
+        self.assertEqual(fake.calls, [])
+        manifest = self.store.job(self.job_id)['manifest']
+        for name in ['subtitle_settings', 'output_settings']:
+            self.assertEqual((manifest[name]['zh_line_width'], manifest[name]['other_line_width']), (44, 84))
+        sources, cues = self.store.sources(self.job_id), self.store.cues(self.job_id)
+        self.assertEqual([c['text'] for c in cues], [s['text'] for s in sources])
+        self.assertEqual([(c['begin_ms'], c['end_ms']) for c in cues], [(0, 3000), (3000, 6600)])
+        self.assertNotEqual(output.read_bytes(), previous)
 
     def test_reflow_requires_explicit_overwrite_even_if_old_job_allowed_it(self):
         self.complete_old_job()
@@ -140,7 +180,7 @@ class ReflowTests(PipelineFixture):
         old = output.read_bytes()
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         source = self.store.sources(self.job_id)[0]
-        planned = plan_fragments(source, Settings())
+        planned = plan_fragments(source, self.config.settings)
         fake.mt_failure.add(planned[-1]['text'])
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'failed')

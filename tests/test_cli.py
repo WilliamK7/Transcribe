@@ -8,7 +8,7 @@ from unittest import mock
 
 from subtitle_tool.api import Bailian
 from subtitle_tool.common import ToolError
-from subtitle_tool.config import Config, validate_workspace_id
+from subtitle_tool.config import Config, Settings, validate_workspace_id
 from subtitle_tool.instance import ProcessLock
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import Progress, main
@@ -18,6 +18,31 @@ from tests.fixtures import TemporaryTest, response
 
 
 class ConfigTests(TemporaryTest):
+    def test_line_width_defaults_and_saved_overrides(self):
+        config = Config(self.path)
+        self.assertEqual((config.settings.zh_line_width, config.settings.other_line_width), (44, 84))
+        for values, expected in [({}, (44, 84)), ({'zh_line_width': 22}, (22, 84)),
+                                 ({'other_line_width': 42}, (44, 42)),
+                                 ({'zh_line_width': 36, 'other_line_width': 80}, (36, 80))]:
+            with self.subTest(values=values):
+                (config.data / 'settings.json').write_text(json.dumps(values), encoding='utf-8')
+                loaded = Config(self.path)
+                loaded.save()
+                settings = Config(self.path).settings
+                self.assertEqual((settings.zh_line_width, settings.other_line_width), expected)
+
+    def test_line_width_limits(self):
+        for name, lower, upper in [('zh_line_width', 12, 72), ('other_line_width', 24, 160)]:
+            for value in [lower - 1, lower, upper, upper + 1]:
+                with self.subTest(name=name, value=value):
+                    settings = Settings(**{name: value})
+                    if lower <= value <= upper:
+                        settings.validate()
+                    else:
+                        with self.assertRaises(ToolError) as error:
+                            settings.validate()
+                        self.assertEqual(error.exception.code, 'config')
+
     def test_plaintext_key_atomic_and_environment_precedence(self):
         config = Config(self.path)
         with mock.patch.dict(os.environ, {}, clear=True):

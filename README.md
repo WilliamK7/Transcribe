@@ -47,13 +47,13 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 - 优先复制 AAC→M4A、MP3→MP3、FLAC→FLAC、Opus／Vorbis→OGG；需要声道处理或时间轴校正时转换为 16kHz 单声道 FLAC。
 - 保留音轨偏移、静音和编码延迟；超过 12 小时或上传容量时按 PCM 样本精确分段。上传容量取 1 GB 与服务返回限额中的较小值。
 
-可在 `data/settings.json` 调整以下设置；已有任务的排版设置在重排时更新。
+可在 `data/settings.json` 调整以下设置，新任务和 `--reflow` 使用当前设置，`--resume` 沿用任务保存的排版设置。宽度计量见[时间轴与字幕](docs/API_CONTRACT.md#时间轴与字幕)。
 
 | 设置 | 默认值 | 含义 |
 | --- | --- | --- |
 | `mt_workers` | `4` | 翻译并发数，1～4 |
-| `zh_line_width` | `22` | 中文每行宽度，12～36 |
-| `other_line_width` | `42` | 其他语种每行宽度，24～80 |
+| `zh_line_width` | `44` | 中文每行全角字符宽度，12～72 |
+| `other_line_width` | `84` | 其他语种每行显示宽度，24～160 |
 | `chinese_first` | `false` | 译文是否排在原文上方 |
 
 ## 复核与任务管理

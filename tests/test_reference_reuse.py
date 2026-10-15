@@ -13,6 +13,16 @@ from tests.fixtures import FakeService, PipelineFixture, response, result, timed
 
 
 class ReferenceReuseTests(PipelineFixture):
+    def test_new_jobs_snapshot_wider_defaults_and_keep_short_sentences_whole(self):
+        fake = FakeService(timed_raw(['word'] * 24, word_ms=150))
+        self.assertEqual(self.run_fake(fake), 'completed')
+        manifest = self.store.job(self.job_id)['manifest']
+        for name in ['subtitle_settings', 'output_settings']:
+            self.assertEqual((manifest[name]['zh_line_width'], manifest[name]['other_line_width']), (44, 84))
+        self.assertEqual(len(self.store.cues(self.job_id)), 1)
+        self.assertEqual(manifest['warnings'], [])
+        self.assertEqual(len(fake.named('/chat/completions')), 1)
+
     def prepare_subtitle_stage(self, raw=None):
         fake = FakeService(raw or result(('First sentence.', 'en'), ('Second sentence.', 'en')))
 
@@ -164,6 +174,9 @@ class ReferenceReuseTests(PipelineFixture):
         self.assertTrue(all(self.store.cache_get(key) is None for key in keys))
 
     def test_strategy_two_uses_existing_strategy_one_fragment_cache(self):
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['subtitle_settings'].update(zh_line_width=22, other_line_width=42)
+        self.store.update(self.job_id, manifest=manifest)
         self.prepare_subtitle_stage(timed_raw([f'word{i}' for i in range(24)], word_ms=200))
         manifest = self.store.job(self.job_id)['manifest']
         manifest['translation_strategy_version'] = 1
@@ -183,6 +196,9 @@ class ReferenceReuseTests(PipelineFixture):
         self.assertEqual([c['translated'] for c in self.store.cues(self.job_id)], [f'旧片段缓存{i}' for i in range(len(cues))])
 
     def test_reused_translation_is_checked_against_saved_layout_and_split_if_needed(self):
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['subtitle_settings'].update(zh_line_width=22, other_line_width=42)
+        self.store.update(self.job_id, manifest=manifest)
         self.prepare_subtitle_stage(timed_raw(['alpha', 'bravo', 'charlie', 'delta'], word_ms=1200))
         manifest = self.store.job(self.job_id)['manifest']
         references = self.store.references(self.job_id)

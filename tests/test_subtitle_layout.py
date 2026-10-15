@@ -15,7 +15,7 @@ from subtitle_tool.engine import Engine
 from subtitle_tool.api import Bailian
 from subtitle_tool.store import Store
 from subtitle_tool.main import summary
-from subtitle_tool.subtitles import layout_warnings, make_fragment, mt_cache_key, mt_input_size, normalize, plan_fragments, plan_reference_units, render_srt, translation_context, wrap
+from subtitle_tool.subtitles import display_width, layout_warnings, make_fragment, mt_cache_key, mt_input_size, normalize, plan_fragments, plan_reference_units, render_srt, source_capacity, translation_context, wrap
 from tests.fixtures import FakeService, PipelineFixture, result, response, timed_raw
 from tests import fixtures
 
@@ -25,6 +25,51 @@ def sources_of(raw):
 
 
 class WrappingRegressionTests(unittest.TestCase):
+    @staticmethod
+    def cue(text, language, translated=''):
+        return dict(cue_id='test', begin_ms=1234, end_ms=6234, text=text, language=language,
+                    decision='translate' if translated else 'original', translated=translated)
+
+    def test_wider_defaults_reduce_lines_and_preserve_text_and_timing(self):
+        old = Settings(zh_line_width=22, other_line_width=42)
+        cases = [('zh', '字' * 30), ('yue', '字' * 30), ('en', ' '.join(['word'] * 12)),
+                 ('ja', 'あ' * 30), ('zh', '字幕' * 8 + ' Python API ' + '字幕' * 8)]
+        for language, text in cases:
+            with self.subTest(language=language, text=text):
+                cue = self.cue(text, language)
+                wide = render_srt([cue], Settings()).decode('utf-8').splitlines()
+                narrow = render_srt([cue], old).decode('utf-8').splitlines()
+                self.assertEqual(wide[2:-1], [text])
+                self.assertGreater(len(narrow), len(wide))
+                self.assertEqual(wide[1], '00:00:01,234 --> 00:00:06,234')
+
+    def test_source_and_translation_each_fit_two_lines(self):
+        cue = self.cue(' '.join(['word'] * 24), 'en', '译' * 70)
+        settings = Settings()
+        source = wrap(cue['text'], settings.other_line_width)
+        target = wrap(cue['translated'], settings.zh_line_width * 2)
+        self.assertEqual((len(source), len(target)), (2, 2))
+        rows = render_srt([cue], settings).decode('utf-8').splitlines()
+        self.assertEqual(rows[2:-1], source + target)
+        self.assertEqual(' '.join(source), cue['text'])
+        self.assertEqual(''.join(target), cue['translated'])
+        self.assertEqual(layout_warnings([cue], settings), [])
+
+    def test_wrapping_and_warnings_follow_new_source_and_translation_limits(self):
+        old = Settings(zh_line_width=22, other_line_width=42)
+        for language, count, expected in [('zh', 88, 2), ('zh', 89, 3),
+                                          ('en', 34, 2), ('en', 35, 3),
+                                          ('translation', 88, 2), ('translation', 89, 3)]:
+            with self.subTest(language=language, count=count):
+                text = ' '.join(['word'] * count) if language == 'en' else '字' * count
+                cue = self.cue('Short source.', 'en', text) if language == 'translation' else self.cue(text, language)
+                width = Settings().zh_line_width * 2 if language == 'translation' else source_capacity(cue, Settings())
+                lines = wrap(text, width)
+                self.assertEqual(len(lines), expected)
+                self.assertTrue(all(display_width(line) <= width for line in lines))
+                self.assertEqual(bool(layout_warnings([cue], Settings())), expected > 2)
+                self.assertTrue(layout_warnings([cue], old))
+
     def assert_preserved(self, source, lines):
         self.assertEqual(re.sub(r"\s", "", "".join(lines)), re.sub(r"\s", "", source))
 
@@ -33,8 +78,9 @@ class WrappingRegressionTests(unittest.TestCase):
         lines = wrap(text, 44)
         self.assertEqual(lines, [text])
         cue = {"begin_ms": 0, "end_ms": 1000, "text": text, "language": "zh", "decision": "original"}
-        self.assertIn((text + "\r\n").encode(), render_srt([cue], Settings()))
-        self.assertIn(("字" * 22 + "\r\n。").encode(), render_srt([cue], Settings(), subtitle_version=0))
+        settings = Settings(zh_line_width=22, other_line_width=42)
+        self.assertIn((text + "\r\n").encode(), render_srt([cue], settings))
+        self.assertIn(("字" * 22 + "\r\n。").encode(), render_srt([cue], settings, subtitle_version=0))
 
     def test_english_two_word_tail_is_balanced_without_breaking_words(self):
         text = "One two three four five six seven eight nine ten"
@@ -74,6 +120,45 @@ class WrappingRegressionTests(unittest.TestCase):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_source_capacity_reduces_splits_but_still_splits_overflow(self):
+        old = self.settings
+        for language, count, word_ms in [('zh', 60, 50), ('en', 24, 150), ('zh', 100, 50), ('en', 40, 100)]:
+            with self.subTest(language=language, count=count):
+                tokens = ['字' if language == 'zh' else 'word'] * count
+                raw = timed_raw(tokens, language=language, word_ms=word_ms, start=1234)
+                source = normalize(raw, 0, '0000', preserve_sentences=True)[0][0]
+                cues = plan_fragments(source, Settings())
+                if count in {60, 24}:
+                    self.assertEqual(len(cues), 1)
+                    self.assertGreater(len(plan_fragments(source, old)), 1)
+                else:
+                    self.assertGreater(len(cues), 1)
+                self.assert_ranges(source, cues)
+                self.assertEqual(layout_warnings(cues, Settings()), [])
+
+    def test_reference_capacity_controls_fragment_count(self):
+        raw = timed_raw(['alpha', 'bravo', 'charlie', 'delta'], word_ms=1200, start=1234)
+        source = normalize(raw, 0, '0000', preserve_sentences=True)[0][0]
+        old = self.settings
+        self.assertGreater(len(plan_fragments(source, old, reference='中' * 70)), 1)
+        self.assertEqual(len(plan_fragments(source, Settings(), reference='中' * 70)), 1)
+        cues = plan_fragments(source, Settings(), reference='中' * 100)
+        self.assertGreater(len(cues), 1)
+        self.assert_ranges(source, cues)
+        self.assertTrue(all(c['translated'] == '' for c in cues))
+
+    def test_seven_second_split_threshold(self):
+        for word_ms, expected in [(700, 1), (701, 2)]:
+            with self.subTest(word_ms=word_ms):
+                raw = timed_raw(['word'] * 10, word_ms=word_ms, start=1234)
+                source = normalize(raw, 0, '0000', preserve_sentences=True)[0][0]
+                cues = plan_fragments(source, Settings())
+                self.assertEqual(len(cues), expected)
+                self.assert_ranges(source, cues)
+
+    def setUp(self):
+        self.settings = Settings(zh_line_width=22, other_line_width=42)
+
     def assert_ranges(self, source, cues):
         self.assertEqual(re.sub(r"\s", "", source["text"]), re.sub(r"\s", "", "".join(c["text"] for c in cues)))
         for cue in cues:
@@ -84,16 +169,16 @@ class SegmentationTests(unittest.TestCase):
 
     def test_text_volume_splits_a_sentence_shorter_than_seven_seconds(self):
         source = sources_of(timed_raw([f"word{i}" for i in range(24)]))[0]
-        cues = plan_fragments(source, Settings())
+        cues = plan_fragments(source, self.settings)
         self.assertGreater(len(cues), 1)
         self.assert_ranges(source, cues)
         self.assertTrue(all(len(wrap(c["text"], 42)) <= 2 for c in cues))
-        self.assertEqual(cues, plan_fragments(source, Settings()))
+        self.assertEqual(cues, plan_fragments(source, self.settings))
 
     def test_reference_expansion_triggers_splitting_without_slicing_translation(self):
         source = sources_of(timed_raw(["alpha", "bravo", "charlie", "delta"], word_ms=1000))[0]
-        self.assertEqual(len(plan_fragments(source, Settings())), 1)
-        cues = plan_fragments(source, Settings(), reference="中" * 70)
+        self.assertEqual(len(plan_fragments(source, self.settings)), 1)
+        cues = plan_fragments(source, self.settings, reference="中" * 70)
         self.assertEqual(len(cues), 2)
         self.assert_ranges(source, cues)
         self.assertTrue(all(c["translated"] == "" for c in cues))
@@ -105,13 +190,13 @@ class SegmentationTests(unittest.TestCase):
             (["word"] * 4 + ["word,"] + ["word"] * 7, {}, 5),
         ]:
             source = sources_of(timed_raw(tokens, word_ms=250, pauses=pauses))[0]
-            cues = plan_fragments(source, Settings(), force=True)
+            cues = plan_fragments(source, self.settings, force=True)
             self.assertEqual(cues[0]["word_end"], expected)
             self.assert_ranges(source, cues)
 
     def test_equal_priority_chooses_balanced_word_volume(self):
         source = sources_of(timed_raw(["word"] * 12, word_ms=250))[0]
-        self.assertEqual(plan_fragments(source, Settings(), force=True)[0]["word_end"], 6)
+        self.assertEqual(plan_fragments(source, self.settings, force=True)[0]["word_end"], 6)
 
     def test_missing_invalid_or_incomplete_words_retain_source_and_timing(self):
         raw = timed_raw(["word"] * 30, word_ms=150)
@@ -127,9 +212,9 @@ class SegmentationTests(unittest.TestCase):
             else:
                 sentence["words"][0]["punctuation"] = None
             source = sources_of(damaged)[0]
-            cue = plan_fragments(source, Settings())[0]
+            cue = plan_fragments(source, self.settings)[0]
             self.assertEqual((cue["begin_ms"], cue["end_ms"], cue["text"]), (0, 4500, sentence["text"]))
-            self.assertTrue(layout_warnings([cue], Settings()))
+            self.assertTrue(layout_warnings([cue], self.settings))
             self.assertEqual(source["words"], [])
 
     def test_repaired_point_and_original_subsecond_sentence_do_not_get_fake_word_times(self):
@@ -141,21 +226,21 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(source["original_timings"][0]["end_ms"], 1000)
         self.assertEqual(source["end_ms"], 2000)
         source = sources_of(timed_raw(["word"] * 30, word_ms=20))[0]
-        self.assertEqual(len(plan_fragments(source, Settings())), 1)
+        self.assertEqual(len(plan_fragments(source, self.settings)), 1)
         self.assertEqual(source["end_ms"], 600)
 
     def test_indivisible_long_word_keeps_content_and_warns(self):
         source = sources_of(timed_raw(["x" * 100], word_ms=2000))[0]
-        cues = plan_fragments(source, Settings())
+        cues = plan_fragments(source, self.settings)
         self.assertEqual(len(cues), 1)
         self.assertEqual(cues[0]["text"], "x" * 100)
-        self.assertTrue(layout_warnings(cues, Settings()))
+        self.assertTrue(layout_warnings(cues, self.settings))
 
     def test_asr_subtokens_do_not_split_inside_an_english_word(self):
         raw = timed_raw(["abcdefgh", "ijklmnop"], word_ms=1500)
         raw["transcripts"][0]["sentences"][0]["text"] = "abcdefghijklmnop"
         source = sources_of(raw)[0]
-        self.assertEqual(len(plan_fragments(source, Settings(), force=True)), 1)
+        self.assertEqual(len(plan_fragments(source, self.settings, force=True)), 1)
 
 
 class ContextTests(unittest.TestCase):
@@ -173,7 +258,7 @@ class ContextTests(unittest.TestCase):
     def test_parent_reference_is_first_for_a_split_fragment(self):
         source = sources_of(timed_raw(["word"] * 24))[0]
         source["reference"] = "整句参考"
-        cue = plan_fragments(source, Settings())[0]
+        cue = plan_fragments(source, Settings(zh_line_width=22, other_line_width=42))[0]
         self.assertEqual(translation_context(cue, [source]), [{"source": source["text"], "target": "整句参考"}])
 
     def test_gap_language_decision_and_manual_override_stop_expansion(self):
@@ -289,6 +374,14 @@ class PersistenceTests(fixtures.TemporaryTest):
 
 
 class ContextPipelineTests(PipelineFixture):
+    def setUp(self):
+        super().setUp()
+        self.config.settings.zh_line_width = 22
+        self.config.settings.other_line_width = 42
+        manifest = self.store.job(self.job_id)["manifest"]
+        manifest["subtitle_settings"].update(zh_line_width=22, other_line_width=42)
+        self.store.update(self.job_id, manifest=manifest)
+
     def intercept_mt(self, fake, handler):
         original = fake.request
         def request(method, url, **kwargs):
