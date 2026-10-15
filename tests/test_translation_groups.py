@@ -4,7 +4,7 @@ import sqlite3
 import threading
 from unittest import mock
 
-from subtitle_tool.api import Bailian
+from subtitle_tool.api import Bailian, RequestPacer
 from subtitle_tool.common import Cancelled, ToolError
 from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
@@ -209,6 +209,86 @@ class TranslationGroupTests(TemporaryTest):
 
 
 class TranslationGroupPipelineTests(PipelineFixture):
+    def test_throttle_cancel_and_resume_keep_successes_at_each_translation_phase(self):
+        for phase, target_stage in [('legacy', 'translating'), ('reference', 'reference_translating'),
+                                    ('subtitle', 'subtitle_translating')]:
+            with self.subTest(phase=phase):
+                self.config.settings.mt_workers = 1
+                source = self.path / f'throttle-{phase}.mkv'
+                source.write_bytes(self.source.read_bytes())
+                job_id = self.store.enqueue(source, workspace_id='offline-space')
+                if phase == 'legacy':
+                    manifest = self.store.job(job_id)['manifest']
+                    for name in ['subtitle_version', 'translation_strategy_version', 'subtitle_settings']:
+                        manifest.pop(name)
+                    self.store.update(job_id, manifest=manifest)
+                raw = result(*[(f'{phase} line {i}.', 'en') for i in range(8)])
+                for index, sentence in enumerate(raw['transcripts'][0]['sentences']):
+                    sentence.update(begin_time=index * 500, end_time=index * 500 + 400)
+                fake = FakeService(raw)
+                cancel = threading.Event()
+                now, events, mt_calls = [0.0], [], []
+                pacer = RequestPacer(clock=lambda: now[0])
+                current_stage, interrupted = None, False
+
+                def advance(seconds):
+                    now[0] += seconds
+                    return cancel.is_set()
+
+                def progress(job, stage, done, total):
+                    nonlocal current_stage, interrupted
+                    events.append((stage, done, total))
+                    if stage in {'translating', 'reference_translating', 'subtitle_translating'}:
+                        current_stage = stage
+                    if stage == 'mt_cooldown' and not interrupted:
+                        interrupted = True
+                        cancel.set()
+
+                def request(method, url, **kwargs):
+                    if url.endswith('/chat/completions'):
+                        mt_calls.append((current_stage, kwargs['json']['messages'][0]['content']))
+                        if current_stage == target_stage and not interrupted:
+                            calls = sum(stage == target_stage for stage, _ in mt_calls)
+                            if calls == 2:
+                                fake.calls.append((method, url, kwargs))
+                                return response({}, 429, {'Retry-After': '15'})
+                    return fake.request(method, url, **kwargs)
+
+                engine = Engine(self.config, self.store, cancel, progress)
+                records = self.store.references if phase == 'reference' else self.store.cues
+                with mock.patch('subtitle_tool.api.mt_pacer', return_value=pacer), \
+                        mock.patch.object(cancel, 'wait', side_effect=advance), \
+                        mock.patch('requests.request', side_effect=request), \
+                        mock.patch('requests.post', side_effect=fake.upload):
+                    self.assertEqual(engine.run(job_id), 'cancelled')
+                    saved = records(job_id)
+                    self.assertTrue(saved[0]['translated'])
+                    self.assertTrue(all(not record['translated'] for record in saved[1:]))
+                    self.assertFalse(source.with_suffix('.srt').exists())
+                    before = self.store.counts(job_id)
+                    self.assertEqual(before['mt_429'], 1)
+                    self.assertEqual(before['mt_cooldown_ms'], 15000)
+                    cancel.clear()
+                    self.store.update(job_id, 'queued')
+                    self.assertEqual(engine.run(job_id), 'completed')
+                restored = records(job_id)
+                self.assertTrue(all(record['translated'] for record in restored))
+                self.assertEqual(restored[0]['translated'], saved[0]['translated'])
+                self.assertEqual(restored[0]['attempts'], saved[0]['attempts'])
+                self.assertEqual(sum(stage == target_stage and text == saved[0]['text']
+                                     for stage, text in mt_calls), 1)
+                self.assertEqual(sum(stage == target_stage for stage, _ in mt_calls), 9)
+                self.assertTrue(source.with_suffix('.srt').exists())
+                after = self.store.counts(job_id)
+                for name in ['upload_policy', 'upload', 'asr_submit', 'asr_query', 'result_download']:
+                    self.assertEqual(after.get(name, 0), before.get(name, 0))
+                self.assertEqual(after['mt_429'], 1)
+                self.assertEqual(after['mt_cooldown_ms'], 15000)
+                recoveries = [event for event in events if event[0] == 'mt_recovery']
+                self.assertTrue(recoveries)
+                self.assertEqual(recoveries[0][1], 1.05)
+                self.assertAlmostEqual(recoveries[0][2], 0.735)
+
     def test_legacy_and_two_stage_flows_deduplicate_without_changing_record_counts(self):
         for legacy in [True, False]:
             for workers in [1, 4]:

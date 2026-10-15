@@ -103,6 +103,10 @@ class FakeService:
 
 class TemporaryTest(unittest.TestCase):
     def setUp(self):
+        # Each test represents an independent CLI process; clients within it share quota.
+        pacer_scope = mock.patch.dict('subtitle_tool.api._MT_PACERS', clear=True)
+        pacer_scope.start()
+        self.addCleanup(pacer_scope.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
         os.environ.pop("DASHSCOPE_API_KEY", None)

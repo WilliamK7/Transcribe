@@ -81,6 +81,11 @@ class Progress:
                 message = f"网络重试 {done}/{total}，有限退避"
             elif stage == "mt_cooldown":
                 message = f"翻译限流：共享冷却增加 {done:.2f} 秒，请求间隔 {total:.2f} 秒"
+            elif stage == "mt_quota_wait":
+                message = f"翻译配额等待：约 {done:.2f} 秒，滚动窗口最多 {total} 次请求"
+            elif stage == "mt_recovery":
+                message = (f"翻译提速：请求间隔 {done:.2f} → {total:.2f} 秒" if total else
+                           f"翻译提速：请求间隔 {done:.2f} 秒，恢复无额外间隔")
             elif stage in {"translating", "reference_translating", "subtitle_translating"} and total is not None:
                 message = f"{STATES[stage]}／已处理 {done}/{total}"
             elif stage == "layout_adjusting" and total is not None:

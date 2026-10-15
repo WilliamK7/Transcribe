@@ -5,6 +5,7 @@ import random
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit
@@ -15,6 +16,11 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncod
 
 from .common import (API_ROOTS, ASR_MODEL, MAX_UPLOAD_BYTES, MT_MODEL, SubmissionUnknown,
                      ToolError, check_cancel, connection_identity)
+
+
+# Beijing qwen-mt-flash: 60 RPM. One extra second allows for network arrival jitter.
+MT_WINDOW_REQUESTS = 60
+MT_WINDOW_SECONDS = 61.0
 
 
 def upload_limit(policy):
@@ -28,53 +34,71 @@ def upload_limit(policy):
 
 
 class RequestPacer:
-    """Share adaptive spacing, cooldown and recovery epochs across MT workers."""
+    """Allow short bursts within shared RPM quota, with adaptive 429 recovery."""
     def __init__(self, clock=None):
         self.interval = 0.0
         self.clock = clock or time.monotonic
         self.lock = threading.Lock()
-        self.not_before = 0.0
         self.cooldown_until = 0.0
         self.last_started = None
         self.generation = 0
         self.successes = 0
+        self.starts = deque()
+        self.quota_notice_until = 0.0
 
-    def wait(self, cancel):
+    def wait(self, cancel, progress=None):
         while True:
             check_cancel(cancel)
+            notice = None
             with self.lock:
                 now = self.clock()
-                delay = self.not_before - now
+                while self.starts and self.starts[0] + MT_WINDOW_SECONDS <= now:
+                    self.starts.popleft()
+                deadline = self.cooldown_until
+                if self.last_started is not None:
+                    deadline = max(deadline, self.last_started + self.interval)
+                if len(self.starts) >= MT_WINDOW_REQUESTS:
+                    quota_until = self.starts[0] + MT_WINDOW_SECONDS
+                    if (progress is not None and quota_until > deadline and quota_until - now >= 2
+                            and quota_until > self.quota_notice_until):
+                        notice = quota_until - now
+                        self.quota_notice_until = quota_until
+                    deadline = max(deadline, quota_until)
+                delay = deadline - now
                 if delay <= 0:
                     self.last_started = now
-                    self.not_before = now + self.interval
+                    self.starts.append(now)
                     return self.generation
-            if cancel.wait(min(delay, 60)):
+            if notice is not None:
+                progress("mt_quota_wait", notice, MT_WINDOW_REQUESTS)
+            if cancel.wait(min(delay, 0.1)):
                 check_cancel(cancel)
 
-    def throttle(self, seconds):
+    def throttle(self, seconds, generation):
+        """Return added cooldown and interval as one locked snapshot."""
         with self.lock:
-            self.interval = min(8.0, max(1.05, self.interval * 2))
-            self.generation += 1
+            if generation == self.generation:
+                self.interval = min(8.0, max(1.05, self.interval * 2))
+                self.generation += 1
+            # Even late or final 429s extend cooldown and break the success window.
             self.successes = 0
             now = self.clock()
             previous = max(now, self.cooldown_until)
             self.cooldown_until = max(previous, now + seconds)
-            self.not_before = max(self.not_before, self.cooldown_until)
-            if self.last_started is not None:
-                self.not_before = max(self.not_before, self.last_started + self.interval)
-            return self.cooldown_until - previous
+            return self.cooldown_until - previous, self.interval
 
     def success(self, generation):
         with self.lock:
-            # Replies to requests started before the latest 429 cannot recover the rate.
+            # Only replies from the current scheduling generation can recover the rate.
             if generation != self.generation or not self.interval:
                 return
             self.successes += 1
-            if self.successes == 20:
-                reduced = self.interval * 0.8
+            if self.successes == 4:
+                previous = self.interval
+                reduced = previous * 0.7
                 self.interval = reduced if reduced >= 0.1 else 0.0
                 self.successes = 0
+                return previous, self.interval
 
     def failure(self, generation):
         with self.lock:
@@ -122,7 +146,7 @@ class Http:
             check_cancel(self.cancel)
             generation = None
             if name == "mt":
-                generation = self.pacer.wait(self.cancel)
+                generation = self.pacer.wait(self.cancel, self.progress)
             self.count(name)
             try:
                 response = requests.request(method, url, headers=headers, timeout=(15, 90),
@@ -144,8 +168,8 @@ class Http:
                 cooldown = retry_after_seconds(retry_after)
                 if cooldown is None:
                     cooldown = min(60, 15 * 2 ** attempt)
-                added = self.pacer.throttle(cooldown)
-                self.progress("mt_cooldown", added, self.pacer.interval)
+                added, interval = self.pacer.throttle(cooldown, generation)
+                self.progress("mt_cooldown", added, interval)
             elif name == "mt" and not 200 <= response.status_code < 300:
                 self.pacer.failure(generation)
             if response.status_code == 429 or response.status_code >= 500:
@@ -176,8 +200,10 @@ class Http:
                             status, "服务或网络请求失败")
                 raise ToolError(f"{hint}（HTTP {status}，{code}）。", code, request_id)
             if name == "mt":
-                self.pacer.success(generation)
+                recovery = self.pacer.success(generation)
                 self.count("mt_success")
+                if recovery is not None:
+                    self.progress("mt_recovery", *recovery)
             return response
         raise ToolError("重试次数已用尽。", "retry_exhausted")
 

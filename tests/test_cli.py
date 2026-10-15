@@ -11,7 +11,7 @@ from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config, validate_workspace_id
 from subtitle_tool.instance import ProcessLock
 from subtitle_tool.engine import Engine
-from subtitle_tool.main import main
+from subtitle_tool.main import Progress, main
 from subtitle_tool.store import Store
 from subtitle_tool.subtitles import mt_cache_key
 from tests.fixtures import TemporaryTest, response
@@ -95,6 +95,22 @@ class CliTests(TemporaryTest):
     def tearDown(self):
         self.config_patch.stop()
         super().tearDown()
+
+    def test_recovery_progress_displays_interval_change_and_return_to_zero(self):
+        progress = Progress()
+        with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
+            progress('offline-job', 'mt_recovery', 8, 5.6)
+            progress('offline-job', 'mt_recovery', 0.11, 0)
+        self.assertEqual(output.getvalue().splitlines(), [
+            '[offline-job] 翻译提速：请求间隔 8.00 → 5.60 秒',
+            '[offline-job] 翻译提速：请求间隔 0.11 秒，恢复无额外间隔'])
+
+    def test_quota_wait_is_distinct_from_server_throttling(self):
+        progress = Progress()
+        with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
+            progress('offline-job', 'mt_quota_wait', 40.5, 60)
+        self.assertEqual(output.getvalue().strip(),
+                         '[offline-job] 翻译配额等待：约 40.50 秒，滚动窗口最多 60 次请求')
 
     def test_no_arguments_displays_help_without_creating_store(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
