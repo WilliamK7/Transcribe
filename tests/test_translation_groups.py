@@ -209,6 +209,8 @@ class TranslationGroupTests(TemporaryTest):
 
 
 class TranslationGroupPipelineTests(PipelineFixture):
+    fixture_seconds = 20
+
     def test_throttle_cancel_and_resume_keep_successes_at_each_translation_phase(self):
         for phase, target_stage in [('legacy', 'translating'), ('reference', 'reference_translating'),
                                     ('subtitle', 'subtitle_translating')]:

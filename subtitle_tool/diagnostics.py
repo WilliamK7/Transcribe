@@ -7,15 +7,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
-from .common import atomic_json
 from .config import Config, Settings
 from .instance import ProcessLock
 from .media import Media, run_process
+from .reports import ReportWriter
 from .subtitles import make_fragment, normalize, render_srt, write_srt
 
 
 def self_test(config: Config, report: Path):
     """Isolated real local checks, zero cloud calls and no access to the user's Key."""
+    writer = ReportWriter(config, report, self_test=True)
+    writer.validate()
     versions = {}
     media = Media(config.root, threading.Event())
     for name in ["ffmpeg", "ffprobe"]:
@@ -54,5 +56,5 @@ def self_test(config: Config, report: Path):
               "checks": ["隔离目录原子明文 Key 保存", "任务库独占锁",
                          "固定 ffprobe 检查合成媒体", "AAC 音轨复制及时间轴校验", "特殊字符路径",
                          "规范化和同名 UTF-8 CRLF SRT 原子写入"]}
-    atomic_json(report, result)
+    writer.write(result)
     return result

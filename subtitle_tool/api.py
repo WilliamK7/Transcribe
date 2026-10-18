@@ -148,6 +148,7 @@ class Http:
             if name == "mt":
                 generation = self.pacer.wait(self.cancel, self.progress)
             self.count(name)
+            check_cancel(self.cancel)
             try:
                 response = requests.request(method, url, headers=headers, timeout=(15, 90),
                                             allow_redirects=False, **kwargs)
@@ -292,10 +293,12 @@ class Bailian:
                             self.progress("uploading", monitor.bytes_read, monitor.len)
                             last_update[0] = time.monotonic()
                     monitor = MultipartEncoderMonitor(encoder, update)
+                    upload_headers = {"Content-Type": monitor.content_type}
                     self.http.count("upload")
                     # No API Key is sent to the returned OSS host.
+                    check_cancel(self.http.cancel)
                     response = requests.post(policy["upload_host"], data=monitor,
-                                             headers={"Content-Type": monitor.content_type},
+                                             headers=upload_headers,
                                              timeout=(15, 120), allow_redirects=False)
                     status = response.status_code
                     response.close()

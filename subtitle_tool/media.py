@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 import subprocess
+import struct
 import threading
 import wave
 import tempfile
@@ -13,6 +14,12 @@ from pathlib import Path
 
 from .common import (MAX_ASR_SECONDS, MAX_UPLOAD_BYTES, PROCESSING_VERSION, NeedsReview,
                      ToolError, check_cancel)
+
+EXTRACT_RECIPE_VERSION = 2
+UINT32_MAX = 2**32 - 1
+PCM_SAFE_BYTES = UINT32_MAX - 4096
+PCM_MAX_SAMPLES = PCM_SAFE_BYTES // 2
+PCM_RATE = 16000
 
 
 def run_process(args, cancel: threading.Event, timeout=None, stdout=None):
@@ -147,12 +154,14 @@ class Media:
                 "packets": count, "continuous": continuous, "skip_samples": skipped,
                 "discard_padding": padding, "sample_rate": rate, "time_base": str(time_base)}
 
-    def copy_audio(self, source, target, track, begin_seconds):
+    def copy_audio(self, source, target, track, begin_seconds, *, extract_recipe_version=EXTRACT_RECIPE_VERSION):
         temp = target.with_name(target.stem + ".partial" + target.suffix)
         try:
             run_process([self.executable("ffmpeg"), "-nostdin", "-v", "error", "-y", "-copyts", "-i", source,
                          "-map", f"0:{track}", "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "copy",
-                         "-avoid_negative_ts", "disabled", "-output_ts_offset", f"{-begin_seconds:.9f}", temp], self.cancel)
+                         "-avoid_negative_ts", "disabled", "-output_ts_offset", f"{-begin_seconds:.9f}",
+                         *(["-fflags", "+bitexact"] if target.suffix == ".ogg" and extract_recipe_version == 2 else []),
+                         temp], self.cancel)
             os.replace(temp, target)
         finally:
             temp.unlink(missing_ok=True)
@@ -174,9 +183,83 @@ class Media:
                 digest.update(block)
         return {"bytes": path.stat().st_size, "sha256": digest.hexdigest()}
 
+    @staticmethod
+    def check_pcm_capacity(info, track_index, timeline=None):
+        """Use the selected stream's time range; container duration is the conservative fallback."""
+        duration = None
+        if timeline:
+            try:
+                begin, end = Fraction(str(timeline["begin_seconds"])), Fraction(str(timeline["end_seconds"]))
+                if end > begin:
+                    duration = end - begin
+            except (ValueError, KeyError, ZeroDivisionError):
+                pass
+        track = next((t for t in info["tracks"] if t["index"] == track_index), {})
+        if duration is None:
+            try:
+                time_base = Fraction(track["time_base"])
+                candidate = int(track["duration_ts"]) * time_base
+                if time_base > 0 and candidate > 0:
+                    duration = candidate
+            except (ValueError, TypeError, KeyError, ZeroDivisionError):
+                pass
+        if duration is None:
+            try:
+                candidate = Fraction(str(track["duration"]))
+                if candidate > 0:
+                    duration = candidate
+            except (ValueError, KeyError, ZeroDivisionError):
+                pass
+        if duration is None:
+            duration = Fraction(str(info["duration_ms"])) / 1000
+        if duration <= 0:
+            raise ToolError("缺少可靠的音频时长，不能预检 PCM 容量。", "media_duration")
+        if math.ceil(duration * PCM_RATE) > PCM_MAX_SAMPLES:
+            raise ToolError("音频超过当前 RIFF PCM 安全容量；请先分割输入后重试。", "media_pcm_limit")
+
+    @staticmethod
+    def validate_pcm_file(path):
+        """Check physical and declared RIFF bounds before wave can trust a 32-bit length."""
+        size = path.stat().st_size
+        limit_message = "音频超过当前 RIFF PCM 安全容量；请先分割输入后重试。"
+        invalid_message = "PCM WAV 的实际大小与声明范围不一致，未接受可能缺尾的音频。"
+        if size > UINT32_MAX:
+            raise ToolError(limit_message, "media_pcm_limit")
+        with path.open("rb") as file:
+            header = file.read(12)
+            if header[:4] == b"RF64":
+                raise ToolError(limit_message, "media_pcm_limit")
+            if len(header) != 12 or header[:4] != b"RIFF" or header[8:] != b"WAVE":
+                raise ToolError(invalid_message, "media")
+            riff_size = struct.unpack_from("<I", header, 4)[0]
+            if riff_size == UINT32_MAX or riff_size + 8 > UINT32_MAX:
+                raise ToolError(limit_message, "media_pcm_limit")
+            if riff_size + 8 != size:
+                raise ToolError(invalid_message, "media")
+            offset, data_size = 12, None
+            while offset < size:
+                file.seek(offset)
+                chunk = file.read(8)
+                if len(chunk) != 8:
+                    raise ToolError(invalid_message, "media")
+                name, length = chunk[:4], struct.unpack_from("<I", chunk, 4)[0]
+                if name == b"data":
+                    if length > PCM_SAFE_BYTES:
+                        raise ToolError(limit_message, "media_pcm_limit")
+                    if data_size is not None or length % 2:
+                        raise ToolError(invalid_message, "media")
+                    data_size = length
+                offset += 8 + length + length % 2
+                if offset > size:
+                    raise ToolError(invalid_message, "media")
+            if data_size is None:
+                raise ToolError(invalid_message, "media")
+
     def prepare(self, source, directory, info, track_index, channel, limit_bytes=MAX_UPLOAD_BYTES,
-                *, force_method=None):
+                *, force_method=None, extract_recipe_version=EXTRACT_RECIPE_VERSION):
         """Prefer lossless stream copy; every fallback uses the existing corrected PCM timeline."""
+        if type(extract_recipe_version) is not int or extract_recipe_version not in {1, EXTRACT_RECIPE_VERSION}:
+            raise ToolError("媒体提取配方版本不受支持。", "cache_version")
         directory.mkdir(parents=True, exist_ok=True)
         track = next(t for t in info["tracks"] if t["index"] == track_index)
         _, offset = self.select(info, track_index, channel)
@@ -199,7 +282,8 @@ class Media:
         if eligible and force_method != "flac":
             target = directory / ("audio" + suffix)
             try:
-                self.copy_audio(source, target, track_index, timeline["begin_seconds"])
+                self.copy_audio(source, target, track_index, timeline["begin_seconds"],
+                                extract_recipe_version=extract_recipe_version)
                 extracted = self.probe(target)
                 extracted_track = extracted["tracks"][0]
                 copied = self.packet_timeline(target, extracted_track, directory)
@@ -221,7 +305,8 @@ class Media:
                     segment = {"id": "0000", "audio": target.name, "offset_ms": 0,
                                "duration_ms": round(timeline["duration_seconds"] * 1000), "codec": codec,
                                "container": suffix[1:], **self.audio_identity(target)}
-                    return {"version": PROCESSING_VERSION, "method": "copy", "track": track_index,
+                    return {"version": PROCESSING_VERSION, "extract_recipe_version": extract_recipe_version,
+                            "method": "copy", "track": track_index,
                             "channel": channel, "codec": codec, "container": suffix[1:], "audio_offset_ms": offset,
                             "source_timeline": timeline, "extracted_timeline": copied, "limit_bytes": limit_bytes,
                             "reason": "已验证连续时间轴和编码延迟，直接复制压缩音轨"}, [segment]
@@ -237,7 +322,7 @@ class Media:
         elif timeline and timeline["duration_seconds"] > MAX_ASR_SECONDS:
             reason = "音轨超过单段时长，使用精确分段"
         pcm = directory / "audio-pcm.wav"
-        self.extract(source, pcm, track_index, channel)
+        self.extract(source, pcm, track_index, channel, info=info, timeline=timeline)
         try:
             with wave.open(str(pcm), "rb") as reader:
                 frames, rate = reader.getnframes(), reader.getframerate()
@@ -245,7 +330,8 @@ class Media:
             if frames / rate <= MAX_ASR_SECONDS:
                 self.encode_flac(pcm, target)
                 if target.stat().st_size <= limit_bytes:
-                    return {"version": PROCESSING_VERSION, "method": "flac", "track": track_index,
+                    return {"version": PROCESSING_VERSION, "extract_recipe_version": extract_recipe_version,
+                            "method": "flac", "track": track_index,
                             "channel": channel, "codec": "flac", "container": "flac", "audio_offset_ms": offset,
                             "source_timeline": timeline, "limit_bytes": limit_bytes, "reason": reason}, [
                         {"id": "0000", "audio": target.name, "offset_ms": 0, "duration_ms": round(frames * 1000 / rate),
@@ -266,7 +352,8 @@ class Media:
                 if all(s["bytes"] <= limit_bytes for s in segments):
                     for chunk in chunks:
                         (directory / chunk["audio"]).unlink(missing_ok=True)
-                    return {"version": PROCESSING_VERSION, "method": "flac", "track": track_index,
+                    return {"version": PROCESSING_VERSION, "extract_recipe_version": extract_recipe_version,
+                            "method": "flac", "track": track_index,
                             "channel": channel, "codec": "flac", "container": "flac", "audio_offset_ms": offset,
                             "source_timeline": timeline, "limit_bytes": limit_bytes, "pcm_split_limit": cap,
                             "reason": reason + "；PCM 精确切分后编码 FLAC"}, segments
@@ -277,7 +364,8 @@ class Media:
         finally:
             pcm.unlink(missing_ok=True)
 
-    def extract(self, source: Path, path: Path, track, channel):
+    def extract(self, source: Path, path: Path, track, channel, *, info=None, timeline=None):
+        self.check_pcm_capacity(info if info is not None else self.probe(source), track, timeline)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(".partial.wav")
         filters = []
@@ -288,17 +376,24 @@ class Media:
             run_process([self.executable("ffmpeg"), "-nostdin", "-v", "error", "-y", "-i", source,
                          "-map", f"0:{track}", "-vn", "-af", ",".join(filters), "-ac", "1", "-ar", "16000",
                          "-c:a", "pcm_s16le", "-f", "wav", temp], self.cancel)
+            self.validate_pcm_file(temp)
             os.replace(temp, path)
         finally:
             temp.unlink(missing_ok=True)
 
     def split(self, path: Path, directory: Path, limit_bytes=MAX_UPLOAD_BYTES):
         """Exact PCM frame slicing, no overlap, optional nearby silence. Offsets are integer ms."""
+        self.validate_pcm_file(path)
         with wave.open(str(path), "rb") as audio:
             rate, width, channels = audio.getframerate(), audio.getsampwidth(), audio.getnchannels()
             total = audio.getnframes()
             if (rate, width, channels) != (16000, 2, 1):
                 raise ToolError("提取音频不是预期的 PCM16／16kHz／单声道。", "media")
+            def read_frames(amount):
+                content = audio.readframes(amount)
+                if len(content) != amount * width * channels:
+                    raise ToolError("PCM 音频短读，未生成宣称完整的分段；请检查媒体缓存。", "media")
+                return content
             # Conservative allowance for WAV headers and upload policy caps.
             max_frames = min(int(MAX_ASR_SECONDS * rate), int((limit_bytes - 4096) / (width * channels)))
             max_frames = max_frames // (rate // 1000) * (rate // 1000)
@@ -316,7 +411,7 @@ class Media:
                     # Search the final ten seconds for >=200ms of quiet, without removing any samples.
                     window_start = max(start, end - 10 * rate)
                     audio.setpos(window_start)
-                    window = audio.readframes(end - window_start)
+                    window = read_frames(end - window_start)
                     import array
                     samples = array.array("h", window)
                     block, quiet, best = rate // 10, 0, None
@@ -338,7 +433,7 @@ class Media:
                         while remaining:
                             check_cancel(self.cancel)
                             amount = min(rate * 10, remaining)
-                            writer.writeframesraw(audio.readframes(amount))
+                            writer.writeframesraw(read_frames(amount))
                             remaining -= amount
                     os.replace(temp, target)
                 finally:

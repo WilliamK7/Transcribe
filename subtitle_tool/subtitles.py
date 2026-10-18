@@ -10,7 +10,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from .common import MT_INPUT_BUDGET, MT_MODEL, MT_TEMPLATE_RESERVE, SUBTITLE_VERSION, ToolError
+from .common import MT_INPUT_BUDGET, MT_MODEL, MT_TEMPLATE_RESERVE, NORMALIZER_VERSION, SUBTITLE_VERSION, ToolError
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
              "id", "th", "tr", "uk", "vi", "cs", "da", "fil", "fi", "is", "ms", "no", "pl", "sv"}
@@ -180,7 +180,10 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
 
 
 def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
-              preserve_sentences=False, subtitle_version=SUBTITLE_VERSION) -> tuple[list[dict], list[str]]:
+              preserve_sentences=False, subtitle_version=SUBTITLE_VERSION,
+              normalizer_version=NORMALIZER_VERSION) -> tuple[list[dict], list[str]]:
+    if type(normalizer_version) is not int or normalizer_version not in {1, 2, NORMALIZER_VERSION}:
+        raise ToolError("规范化版本不受支持。", "cache_version")
     if not isinstance(raw, dict) or not isinstance(raw.get("transcripts"), list):
         raise ToolError("Qwen3 结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
     cues, warnings = [], []
@@ -192,7 +195,25 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
             raise ToolError("结果包含未请求的通道。", "response_schema")
         if not isinstance(transcript.get("sentences"), list):
             raise ToolError("结果缺少 sentences 数组。", "response_schema")
+        if normalizer_version >= 3 and "text" in transcript and clean_text(transcript["text"]):
+            if any(not isinstance(s, dict) for s in transcript["sentences"]):
+                raise ToolError("识别句子结构无效。", "response_schema")
+            if not any(clean_text(s.get("text")) for s in transcript["sentences"]):
+                raise ToolError("识别汇总含文字但没有有效句子；原始结果已保留。", "response_schema")
         sentences.extend(transcript["sentences"])
+    if normalizer_version >= 3 and duration_ms is not None:
+        if type(duration_ms) is not int or duration_ms <= 0:
+            raise ToolError("分段时长无效，不能验证识别时间范围。", "timeline")
+        for index, sentence in enumerate(sentences):
+            if not isinstance(sentence, dict):
+                raise ToolError("识别句子结构无效。", "response_schema")
+            b, e = sentence.get("begin_time"), sentence.get("end_time")
+            if clean_text(sentence.get("text")) and (type(b) is not int or type(e) is not int or
+                                                      b >= duration_ms or e > duration_ms + 1):
+                raise ToolError(f"第 {index + 1} 句超出本段时间范围；原始结果已保留。", "timeline")
+    if normalizer_version == 1 and any(isinstance(s, dict) and s.get("begin_time") == s.get("end_time")
+                                      for s in sentences):
+        raise ToolError("旧版规范化不接受零时长句子。", "timeline")
     records, timing_warnings = prepare_sentence_timings(sentences, duration_ms, segment_id)
     warnings.extend(timing_warnings)
     languages = [s.get("language", "") for s in sentences]

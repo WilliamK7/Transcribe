@@ -10,7 +10,7 @@ from pathlib import Path
 
 ASR_MODEL = "qwen3-asr-flash-filetrans"
 MT_MODEL = "qwen-mt-flash"
-NORMALIZER_VERSION = 2
+NORMALIZER_VERSION = 3
 PROCESSING_VERSION = 2
 SUBTITLE_VERSION = 2
 TRANSLATION_STRATEGY_VERSION = 2

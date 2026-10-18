@@ -46,6 +46,7 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 - 已有 SRT 默认跳过；`--overwrite` 先备份再覆盖。同名不同扩展视频的目标冲突需要调整文件名或输出目录。
 - 优先复制 AAC→M4A、MP3→MP3、FLAC→FLAC、Opus／Vorbis→OGG；需要声道处理或时间轴校正时转换为 16kHz 单声道 FLAC。
 - 保留音轨偏移、静音和编码延迟；超过 12 小时或上传容量时按 PCM 样本精确分段。上传容量取 1 GB 与服务返回限额中的较小值。
+- 需要转换为 PCM 的音轨约以 37.28 小时为上限；遇到 `media_pcm_limit` 时，请先分割输入。
 
 可在 `data/settings.json` 调整以下设置，新任务和 `--reflow` 使用当前设置，`--resume` 沿用任务保存的排版设置。宽度计量见[时间轴与字幕](docs/API_CONTRACT.md#时间轴与字幕)。
 
@@ -93,6 +94,8 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 ```
 
 进度写入 stderr；任务结果以每行 JSON 写入 stdout，`--report "结果.json"` 另存 JSON 数组。报告包含状态、调用／复用计数、限流和耗时统计及排版警告，省略凭据、上传链接和字幕文字。字段含义见[报告字段](docs/API_CONTRACT.md#报告字段)。
+
+报告请另存到 `.build` 或其他独立位置；输入媒体、任务 SRT、备份及内部数据受路径冲突保护（`report_conflict`）。同名报告可覆盖；自检默认保存到 `data/self-test.json`。
 
 退出码：`0` 完成／跳过或管理操作成功；`2` 待复核／任务失败；`3` 启动／本地异常；`130` Ctrl+C。
 

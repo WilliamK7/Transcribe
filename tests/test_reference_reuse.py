@@ -13,6 +13,8 @@ from tests.fixtures import FakeService, PipelineFixture, response, result, timed
 
 
 class ReferenceReuseTests(PipelineFixture):
+    fixture_seconds = 60
+
     def test_new_jobs_snapshot_wider_defaults_and_keep_short_sentences_whole(self):
         fake = FakeService(timed_raw(['word'] * 24, word_ms=150))
         self.assertEqual(self.run_fake(fake), 'completed')

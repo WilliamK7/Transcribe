@@ -10,11 +10,12 @@ import threading
 import time
 from pathlib import Path
 
-from .common import ASR_MODEL, MT_MODEL, ToolError, atomic_json, validate_workspace_id
+from .common import ASR_MODEL, MT_MODEL, ToolError, validate_workspace_id
 from .config import Config
 from .engine import Engine
 from .instance import ProcessLock
 from .media import Media
+from .reports import ReportWriter
 from .store import STATES, TERMINAL, Store
 
 MT_LANGUAGES = {"auto", "Chinese", "English", "Japanese", "German", "Korean", "Russian", "French",
@@ -232,7 +233,7 @@ def main(argv=None):
     lock = ProcessLock(config.data)
     if not lock.acquire():
         raise ToolError("任务库已被其他 CLI 进程使用；请在该终端 Ctrl+C 停止后重试。", "instance_busy")
-    store, current_job = None, None
+    store, current_job, report_writer = None, None, None
     cancel = threading.Event()
     previous_signal = None
     processing = False
@@ -254,6 +255,10 @@ def main(argv=None):
             result = self_test(config, args.report or config.data / "self-test.json")
             print(json.dumps(result, ensure_ascii=False))
             return 0
+        if args.report:
+            report_writer = ReportWriter(config, args.report, inputs=args.files, output_dir=args.output_dir,
+                                         job_id=args.resume or args.reflow or args.review)
+            report_writer.validate()
         store = Store(config.data / "jobs.sqlite")
         store.recover()
         progress = Progress()
@@ -263,7 +268,7 @@ def main(argv=None):
             for item in report:
                 print(json.dumps(item, ensure_ascii=False))
             if args.report:
-                atomic_json(args.report, report)
+                report_writer.write(report)
             return 0
         if args.cancel:
             job = store.job(args.cancel)
@@ -272,7 +277,7 @@ def main(argv=None):
             item = summary(store, args.cancel)
             print(json.dumps(item, ensure_ascii=False))
             if args.report:
-                atomic_json(args.report, [item])
+                report_writer.write([item])
             return 0
 
         def interrupt(signum, frame):
@@ -340,7 +345,7 @@ def main(argv=None):
             report.append(item)
             print(json.dumps(item, ensure_ascii=False), flush=True)
         if args.report:
-            atomic_json(args.report, report)
+            report_writer.write(report)
         return 130 if cancel.is_set() else (0 if all(i["state"] in {"completed", "skipped"} for i in report) else 2)
     except KeyboardInterrupt:
         cancel.set()
@@ -353,8 +358,8 @@ def main(argv=None):
             hint(store, current_job)
             item = summary(store, current_job)
             print(json.dumps(item, ensure_ascii=False))
-            if args.report:
-                atomic_json(args.report, [item])
+            if report_writer:
+                report_writer.write([item])
         return 130
     finally:
         if previous_signal is not None:
