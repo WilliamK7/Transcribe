@@ -660,6 +660,7 @@ class Engine:
                        reference_stage=True, strategy_version=manifest["translation_strategy_version"])
         references = self.store.references(job_id)
         sources = reference_sources(sources, references)
+        source_positions = {source["sentence_id"]: i for i, source in enumerate(sources)}
         # Both references and cues are validated against the same source and word ranges.
         by_range = {(r["sentence_id"], r["word_start"], r["word_end"]): r for r in references}
         if not manifest.get("layout_planned"):
@@ -688,7 +689,8 @@ class Engine:
                 source = source_ids[cue["sentence_id"]]
                 exact = by_range.get((cue["sentence_id"], cue["word_start"], cue["word_end"]))
                 whole = cue["char_start"] == 0 and cue["char_end"] == len(source["text"])
-                context = [] if exact and whole else translation_context(cue, sources)
+                context = [] if exact and whole else translation_context(
+                    cue, sources, position=source_positions[cue["sentence_id"]])
                 if exact and not context:
                     self.store.translation_update(job_id, [cue["cue_id"]], translated=exact["translated"],
                                                   counts={"mt_reference_reused": 1})
@@ -703,11 +705,10 @@ class Engine:
             changed, revised = False, []
             if round_number < MAX_LAYOUT_ROUNDS:
                 stage("layout_adjusting", round_number + 1, MAX_LAYOUT_ROUNDS)
-                by_id = {s["sentence_id"]: s for s in sources}
                 for cue in cues:
                     parts = [cue]
                     if cue["decision"] == "translate" and len(wrap(cue["translated"], settings.zh_line_width * 2)) > 2:
-                        parts = plan_fragments(by_id[cue["sentence_id"]], settings, cue=cue,
+                        parts = plan_fragments(source_ids[cue["sentence_id"]], settings, cue=cue,
                                                reference=cue["translated"], layout_round=round_number + 1, force=True)
                     changed |= len(parts) > 1
                     revised.extend(parts)

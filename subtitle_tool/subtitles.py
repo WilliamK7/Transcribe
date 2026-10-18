@@ -644,8 +644,9 @@ def validate_fragment(source, cue, *, reference_stage=False):
         raise ToolError("字幕片段与完整句来源／词范围记录不一致。", "cache_mismatch")
 
 
-def translation_context(cue, sources):
-    position = next(i for i, s in enumerate(sources) if s["sentence_id"] == cue["sentence_id"])
+def translation_context(cue, sources, *, position=None):
+    if position is None:
+        position = next(i for i, s in enumerate(sources) if s["sentence_id"] == cue["sentence_id"])
     source = sources[position]
     candidates = []
     if cue["char_start"] != 0 or cue["char_end"] != len(source["text"]):

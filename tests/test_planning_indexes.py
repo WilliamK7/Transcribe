@@ -154,6 +154,85 @@ class WordBreakIndexTests(unittest.TestCase):
             self.assertEqual(build.call_count, 2)
 
 
+class ContextPositionTests(unittest.TestCase):
+    @staticmethod
+    def sources():
+        sentences = [timed_raw([f"sentence{i}", "ending"], word_ms=1000, start=i * 2100)
+                     ["transcripts"][0]["sentences"][0] for i in range(7)]
+        sources = subtitles.normalize({"transcripts": [{"sentences": sentences}]}, 0, "0000",
+                                      preserve_sentences=True)[0]
+        return [{**source, "reference": f"参考{i}"} for i, source in enumerate(sources)]
+
+    def test_position_and_lookup_return_identical_ordered_contexts(self):
+        modes = ["plain", "gap_5000", "gap_5001", "language", "original", "manual", "mt_language",
+                 "unknown", "unknown_manual", "empty_reference", "budget", "trim_label"]
+        for mode in modes:
+            sources = self.sources()
+            if mode.startswith("gap_"):
+                for source in sources[3:]:
+                    shift = int(mode[4:]) - 100
+                    source["begin_ms"] += shift
+                    source["end_ms"] += shift
+                    for word in source["words"]:
+                        word["begin_ms"] += shift
+                        word["end_ms"] += shift
+            elif mode == "language":
+                sources[2]["language"] = "ja"
+            elif mode == "original":
+                sources[2]["decision"] = "original"
+            elif mode == "manual":
+                sources[2]["reason"] = "用户在终端确认"
+            elif mode == "mt_language":
+                sources[2]["source_lang"] = "English"
+            elif mode.startswith("unknown"):
+                for source in sources:
+                    source["language"] = ""
+                    if mode == "unknown_manual":
+                        source.update(reason="用户在终端确认", source_lang="English")
+            elif mode == "empty_reference":
+                for source in sources:
+                    source["reference"] = ""
+            elif mode == "budget":
+                sources[2]["reference"] = "中" * 3000
+                sources[3]["reference"] = "中" * 2000
+            elif mode == "trim_label":
+                sources[2]["language"] = " EN "
+            for position, source in enumerate(sources):
+                cues = [subtitles.make_fragment(source), subtitles.make_fragment(source, 0, 1),
+                        subtitles.make_fragment(source, 1, 2)]
+                for cue in cues:
+                    with self.subTest(mode=mode, position=position, start=cue["word_start"], end=cue["word_end"]):
+                        expected = subtitles.translation_context(cue, sources)
+                        self.assertEqual(subtitles.translation_context(cue, sources, position=position), expected)
+
+    def test_parent_priority_distance_order_and_whole_entry_budget(self):
+        sources = self.sources()
+        for lo, hi, expected in [(0, 2, [2, 4, 1, 5]), (0, 1, [3, 2, 4, 1, 5]),
+                                 (1, 2, [3, 4, 2, 5, 1])]:
+            cue = subtitles.make_fragment(sources[3], lo, hi)
+            actual = subtitles.translation_context(cue, sources, position=3)
+            self.assertEqual(actual, [{"source": sources[i]["text"], "target": sources[i]["reference"]}
+                                      for i in expected])
+        sources[3]["reference"] = "中" * 3000
+        cue = subtitles.make_fragment(sources[3], 0, 1)
+        actual = subtitles.translation_context(cue, sources, position=3)
+        self.assertEqual(actual, subtitles.translation_context(cue, sources))
+        self.assertEqual(actual, [{"source": sources[i]["text"], "target": sources[i]["reference"]}
+                                  for i in [2, 4, 1, 5]])
+
+    def test_known_position_does_not_iterate_sources_and_none_keeps_lookup(self):
+        class IndexedOnlySources(list):
+            def __iter__(self):
+                raise AssertionError("Known positions must not search through sources")
+
+        sources = self.sources()
+        for position in (0, 3, 6):
+            cue = subtitles.make_fragment(sources[position], 0, 1)
+            expected = subtitles.translation_context(cue, sources)
+            self.assertEqual(subtitles.translation_context(cue, sources, position=None), expected)
+            self.assertEqual(subtitles.translation_context(cue, IndexedOnlySources(sources), position=position), expected)
+
+
 class PlanningEquivalencePipelineTests(PipelineFixture):
     def run_comparison(self, name):
         raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)
@@ -219,9 +298,18 @@ class PlanningEquivalencePipelineTests(PipelineFixture):
                         requests=[call[2]["json"] for call in fake.named("/chat/completions")])
 
     def test_old_and_indexed_planning_preserve_pipeline_requests_cache_and_resume(self):
-        with mock.patch.object(subtitles, "_WordBreakIndex", LegacyWordBreakIndex):
+        def lookup_context(cue, sources, *, position=None):
+            return subtitles.translation_context(cue, sources)
+
+        with mock.patch.object(subtitles, "_WordBreakIndex", LegacyWordBreakIndex), \
+                mock.patch("subtitle_tool.engine.translation_context", side_effect=lookup_context):
             expected = self.run_comparison("legacy")
-        self.assertEqual(self.run_comparison("indexed"), expected)
+        with mock.patch("subtitle_tool.engine.translation_context", wraps=subtitles.translation_context) as context:
+            self.assertEqual(self.run_comparison("indexed"), expected)
+        self.assertGreater(context.call_count, 0)
+        for call in context.call_args_list:
+            cue, sources = call.args
+            self.assertEqual(sources[call.kwargs["position"]]["sentence_id"], cue["sentence_id"])
 
 
 if __name__ == "__main__":
