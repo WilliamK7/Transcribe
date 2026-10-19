@@ -22,7 +22,8 @@ from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION
                      SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint)
 from .config import Config, decrypt_legacy
 from .media import EXTRACT_RECIPE_VERSION, Media
-from .mt import batch_cache_key, batch_cache_value, parse_batch_translation
+from .mt import batch_cache_key, batch_cache_value, batch_recovery_cache_key, parse_batch_translation
+from .mt_diagnostics import MTDiagnostics
 from .store import Store
 from .subtitles import (layout_warnings, make_fragment, mt_cache_key, normalize, plan_fragments,
                         plan_reference_units, reference_sources, render_srt, translation_context,
@@ -737,6 +738,7 @@ class Engine:
     def translate_batches(self, job_id, cues, sources, scope, client, *, reference_stage=False):
         cache_stage = 'reference' if reference_stage else 'subtitle'
         stage_name = cache_stage + '_translating'
+        diagnostics = MTDiagnostics(self.config.root, job_id)
         by_source = {}
         source_ids = {s['sentence_id'] for s in sources}
         for cue in cues:
@@ -755,42 +757,57 @@ class Engine:
                     continue
                 key = batch_cache_key([c['text'] for c in members], members[0]['source_lang'], **scope,
                                       context=context, stage=cache_stage, asr_language=members[0]['language'].lower().strip())
-                groups.setdefault(key, ([], context))[0].append(members)
+                recovery_key = batch_recovery_cache_key(key)
+                groups.setdefault(key, ([], context, recovery_key))[0].append(members)
 
-        def save_result(batches, key, translated, *, cached=False):
+        def save_result(batches, key, translated, *, cached=False, recovered=False):
             values = {cue['cue_id']: translated[str(i)] for batch in batches for i, cue in enumerate(batch)}
+            counts = {'mt_' + cache_stage + ('_cache_hit' if cached else '_completed'): len(values)}
+            if recovered:
+                counts['mt_recovery_cache_hit' if cached else 'mt_recovery_success'] = len(values) if cached else 1
             self.store.translation_batch_update(job_id, values, reference_stage=reference_stage,
                 cache_key=None if cached else key, cache_value=None if cached else batch_cache_value(translated),
-                counts={'mt_' + cache_stage + ('_cache_hit' if cached else '_completed'): len(values)})
+                counts=counts)
 
-        for key, (batches, context) in groups.items():
+        for key, (batches, context, recovery_key) in groups.items():
             cached = self.store.cache_get(key)
-            if cached:
+            recovered = cached is None
+            if recovered:
+                cached = self.store.cache_get(recovery_key)
+            if cached is not None:
                 try:
                     translated = parse_batch_translation(cached, [c['text'] for c in batches[0]])
                 except (ValueError, TypeError) as error:
                     raise ToolError("批量翻译缓存结构无效，未复用。", "cache_mismatch") from error
-                save_result(batches, key, translated, cached=True)
+                save_result(batches, key, translated, cached=True, recovered=recovered)
                 done += sum(not c['translated'] for batch in batches for c in batch)
             else:
-                pending.append((batches, key, context))
+                pending.append((batches, key, context, recovery_key))
         self.progress(job_id, stage_name, done, len(cues))
         if not pending:
             return
         cloud = client()
 
-        def translate_group(batches, key, context):
-            cue_ids = [c['cue_id'] for batch in batches for c in batch]
-            def attempt():
+        def translate_group(batches, key, context, recovery_key):
+            def attempt(indices):
+                cue_ids = [batch[i]['cue_id'] for batch in batches for i in indices]
                 self.store.translation_update(job_id, cue_ids, reference_stage=reference_stage, attempt=True,
                                               counts={'mt_' + cache_stage + '_request': 1})
-            translated, _ = cloud.translate_batch([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
-                                                   context=context, on_attempt=attempt)
+            def event(info):
+                members = batches[0]
+                diagnostics.write({**info, 'stage': cache_stage, 'group_key': key,
+                    'begin_ms': members[info['fragment_start']]['begin_ms'],
+                    'end_ms': members[info['fragment_end'] - 1]['end_ms']})
+                self.store.count(job_id, 'mt_invalid_response' if info['kind'] == 'invalid_response' else 'mt_split')
+                if info['kind'] == 'split':
+                    self.progress(job_id, 'mt_split', info['fragment_end'] - info['fragment_start'], info['depth'])
+            result = cloud.translate_batch([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
+                                           context=context, on_attempt=attempt, on_event=event)
             # A completed HTTP request is saved even when cancellation arrived in flight.
-            save_result(batches, key, translated)
+            save_result(batches, recovery_key if result.recovered else key, result.translations, recovered=result.recovered)
 
-        tasks = [([cue for batch in batches for cue in batch], partial(translate_group, batches, key, context))
-                 for batches, key, context in pending]
+        tasks = [([cue for batch in batches for cue in batch], partial(translate_group, batches, key, context, recovery_key))
+                 for batches, key, context, recovery_key in pending]
         self._translate_pending(job_id, tasks, stage_name=stage_name, reference_stage=reference_stage,
                                 done=done, total=len(cues))
 

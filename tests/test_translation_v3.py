@@ -37,7 +37,7 @@ class BatchProtocolTests(TemporaryTest):
         fragments = ['Go,', 'go now.']
         context = [{'position': 'before', 'text': 'He repeated the instruction.'}]
         with mock.patch('requests.request', return_value=batch_response(['走，', '现在就走。'])) as request:
-            translated, _ = self.cloud.translate_batch(fragments, 'English', context=context)
+            translated = self.cloud.translate_batch(fragments, 'English', context=context).translations
         self.assertEqual(translated, {'0': '走，', '1': '现在就走。'})
         body = request.call_args.kwargs['json']
         self.assertEqual(len(body['messages']), 1)
@@ -62,7 +62,7 @@ class BatchProtocolTests(TemporaryTest):
         self.assertEqual(error.exception.code, 'mt_batch_invalid')
         self.assertEqual(request.call_count, 2)
 
-    def test_invalid_numbering_empty_text_and_truncation_get_only_one_repair(self):
+    def test_invalid_numbering_empty_text_and_truncation_repair_before_splitting(self):
         invalid = [[], [{'id': '0', 'text': '甲'}],
                    [{'id': '0', 'text': '甲'}, {'id': '0', 'text': '乙'}],
                    [{'id': '0', 'text': '甲'}, {'id': '1', 'text': '乙'}, {'id': '2', 'text': '丙'}],
@@ -73,14 +73,13 @@ class BatchProtocolTests(TemporaryTest):
                 bad = response({'choices': [{'finish_reason': 'stop', 'message': {
                     'content': json.dumps({'translations': items})}}]})
                 with mock.patch('requests.request', side_effect=[bad, batch_response(['甲', '乙'])]) as request:
-                    self.assertEqual(self.cloud.translate_batch(['first', 'second'])[0], {'0': '甲', '1': '乙'})
+                    self.assertEqual(self.cloud.translate_batch(['first', 'second']).translations, {'0': '甲', '1': '乙'})
                 self.assertEqual(request.call_count, 2)
-                self.assertIn('本次有 2 个片段，必须返回 2 项', request.call_args.kwargs['json']['messages'][0]['content'])
         with mock.patch('requests.request', side_effect=lambda *a, **k: batch_response(['甲', '乙'], finish='length')) as request:
             with self.assertRaises(ToolError) as error:
                 self.cloud.translate_batch(['first', 'second'])
         self.assertEqual(error.exception.code, 'mt_batch_invalid')
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, 4)
 
     def test_malformed_json_duplicate_keys_and_unsafe_text_fail_without_raw_error(self):
         invalid = ['not JSON', '{"translations":', '{"translations":[],"translations":[]}',

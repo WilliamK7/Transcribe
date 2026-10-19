@@ -31,16 +31,16 @@ class WrappingRegressionTests(unittest.TestCase):
                     decision='translate' if translated else 'original', translated=translated)
 
     def test_wider_defaults_reduce_lines_and_preserve_text_and_timing(self):
-        old = Settings(zh_line_width=22, other_line_width=42)
+        narrow = Settings(zh_line_width=22, other_line_width=42)
         cases = [('zh', '字' * 30), ('yue', '字' * 30), ('en', ' '.join(['word'] * 12)),
                  ('ja', 'あ' * 30), ('zh', '字幕' * 8 + ' Python API ' + '字幕' * 8)]
         for language, text in cases:
             with self.subTest(language=language, text=text):
                 cue = self.cue(text, language)
                 wide = render_srt([cue], Settings()).decode('utf-8').splitlines()
-                narrow = render_srt([cue], old).decode('utf-8').splitlines()
+                narrow_rows = render_srt([cue], narrow).decode('utf-8').splitlines()
                 self.assertEqual(wide[2:-1], [text])
-                self.assertGreater(len(narrow), len(wide))
+                self.assertGreater(len(narrow_rows), len(wide))
                 self.assertEqual(wide[1], '00:00:01,234 --> 00:00:06,234')
 
     def test_source_and_translation_each_fit_two_lines(self):
@@ -55,8 +55,8 @@ class WrappingRegressionTests(unittest.TestCase):
         self.assertEqual(''.join(target), cue['translated'])
         self.assertEqual(layout_warnings([cue], settings), [])
 
-    def test_wrapping_and_warnings_follow_new_source_and_translation_limits(self):
-        old = Settings(zh_line_width=22, other_line_width=42)
+    def test_wrapping_and_warnings_follow_configured_line_widths(self):
+        narrow = Settings(zh_line_width=22, other_line_width=42)
         for language, count, expected in [('zh', 88, 2), ('zh', 89, 3),
                                           ('en', 34, 2), ('en', 35, 3),
                                           ('translation', 88, 2), ('translation', 89, 3)]:
@@ -68,7 +68,7 @@ class WrappingRegressionTests(unittest.TestCase):
                 self.assertEqual(len(lines), expected)
                 self.assertTrue(all(display_width(line) <= width for line in lines))
                 self.assertEqual(bool(layout_warnings([cue], Settings())), expected > 2)
-                self.assertTrue(layout_warnings([cue], old))
+                self.assertTrue(layout_warnings([cue], narrow))
 
     def assert_preserved(self, source, lines):
         self.assertEqual(re.sub(r"\s", "", "".join(lines)), re.sub(r"\s", "", source))
@@ -121,7 +121,7 @@ class WrappingRegressionTests(unittest.TestCase):
 
 class SegmentationTests(unittest.TestCase):
     def test_source_capacity_reduces_splits_but_still_splits_overflow(self):
-        old = self.settings
+        narrow = self.settings
         for language, count, word_ms in [('zh', 60, 50), ('en', 24, 150), ('zh', 100, 50), ('en', 40, 100)]:
             with self.subTest(language=language, count=count):
                 tokens = ['字' if language == 'zh' else 'word'] * count
@@ -130,7 +130,7 @@ class SegmentationTests(unittest.TestCase):
                 cues = plan_fragments(source, Settings())
                 if count in {60, 24}:
                     self.assertEqual(len(cues), 1)
-                    self.assertGreater(len(plan_fragments(source, old)), 1)
+                    self.assertGreater(len(plan_fragments(source, narrow)), 1)
                 else:
                     self.assertGreater(len(cues), 1)
                 self.assert_ranges(source, cues)
@@ -139,8 +139,8 @@ class SegmentationTests(unittest.TestCase):
     def test_reference_capacity_controls_fragment_count(self):
         raw = timed_raw(['alpha', 'bravo', 'charlie', 'delta'], word_ms=1200, start=1234)
         source = normalize(raw, 0, '0000', preserve_sentences=True)[0][0]
-        old = self.settings
-        self.assertGreater(len(plan_fragments(source, old, reference='中' * 70)), 1)
+        narrow = self.settings
+        self.assertGreater(len(plan_fragments(source, narrow, reference='中' * 70)), 1)
         self.assertEqual(len(plan_fragments(source, Settings(), reference='中' * 70)), 1)
         cues = plan_fragments(source, Settings(), reference='中' * 100)
         self.assertGreater(len(cues), 1)
@@ -251,7 +251,7 @@ class ContextTests(unittest.TestCase):
     def test_two_neighbors_each_side_excluding_unsplit_self(self):
         sources = self.sources()
         cue = make_fragment(sources[3])
-        context = translation_context(cue, sources)
+        context = translation_context(cue, sources, position=3)
         self.assertEqual({p["source"] for p in context}, {sources[i]["text"] for i in [1, 2, 4, 5]})
         self.assertNotIn(sources[3]["text"], [p["source"] for p in context])
 
@@ -259,7 +259,7 @@ class ContextTests(unittest.TestCase):
         source = sources_of(timed_raw(["word"] * 24))[0]
         source["reference"] = "整句参考"
         cue = plan_fragments(source, Settings(zh_line_width=22, other_line_width=42))[0]
-        self.assertEqual(translation_context(cue, [source]), [{"source": source["text"], "target": "整句参考"}])
+        self.assertEqual(translation_context(cue, [source], position=0), [{"source": source["text"], "target": "整句参考"}])
 
     def test_gap_language_decision_and_manual_override_stop_expansion(self):
         for mode in ["gap", "language", "original", "manual", "source_lang", "unknown"]:
@@ -278,7 +278,7 @@ class ContextTests(unittest.TestCase):
                 sources[2]["source_lang"] = "English"
             else:
                 sources[2]["language"] = sources[3]["language"] = ""
-            selected = [p["source"] for p in translation_context(make_fragment(sources[3]), sources)]
+            selected = [p["source"] for p in translation_context(make_fragment(sources[3]), sources, position=3)]
             self.assertNotIn(sources[2]["text"], selected)
             self.assertNotIn(sources[1]["text"], selected)
 
@@ -298,7 +298,7 @@ class ContextTests(unittest.TestCase):
     def test_budget_drops_complete_entries_and_remains_below_official_limit(self):
         sources = self.sources()
         sources[2]["reference"] = "中" * 3000
-        context = translation_context(make_fragment(sources[3]), sources)
+        context = translation_context(make_fragment(sources[3]), sources, position=3)
         self.assertNotIn(sources[2]["text"], [p["source"] for p in context])
         self.assertEqual(next(p for p in context if p["source"] == sources[4]["text"])["target"], "参考4")
         self.assertLessEqual(mt_input_size(sources[3]["text"], tm_list=context), MT_INPUT_BUDGET)

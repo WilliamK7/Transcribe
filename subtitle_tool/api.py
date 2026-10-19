@@ -16,7 +16,9 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncod
 
 from .common import (API_ROOTS, ASR_MODEL, MAX_UPLOAD_BYTES, MT_MODEL, SubmissionUnknown,
                      ToolError, check_cancel, connection_identity)
-from .mt import batch_payload, parse_batch_translation, validate_batch_input
+from .mt import (BatchTranslation, BatchValidationError, batch_payload, parse_batch_response,
+                 recovery_context, validate_batch_input)
+from .mt_diagnostics import safe_request_id
 
 
 # Beijing qwen-mt-flash: 60 RPM. One extra second allows for network arrival jitter.
@@ -343,28 +345,56 @@ class Bailian:
         # Never attach the API Authorization header to result storage.
         return self.http.json("GET", url, name="result_download")
 
-    def translate_batch(self, fragments, source_lang="auto", *, context=(), on_attempt=lambda: None):
+    def translate_batch(self, fragments, source_lang="auto", *, context=(), on_attempt=lambda indices: None,
+                        on_event=lambda event: None):
         validate_batch_input(fragments, source_lang, context)
-        for repair in [False, True]:
+        recovered = False
+
+        def run(start, end, depth):
+            nonlocal recovered
             check_cancel(self.http.cancel)
-            on_attempt()
-            body = {}
-            try:
-                body = self.http.json("POST", self.base + "/compatible-mode/v1/chat/completions",
-                                      name="mt", headers=self.headers,
-                                      json=batch_payload(fragments, source_lang, context, repair=repair))
-                choice = body['choices'][0]
-                if choice.get('finish_reason') != 'stop':
-                    raise ValueError('unfinished response')
-                translated = parse_batch_translation(choice['message']['content'], fragments)
-                return {key: self.cc.convert(text) for key, text in translated.items()}, body.get('id', '')
-            except ToolError as error:
-                if error.code != 'response_schema':
-                    raise
-            except (KeyError, IndexError, TypeError, ValueError):
-                pass
-            if repair:
-                raise ToolError("批量译文的编号、内容或结束状态无效；整组保留待恢复。", "mt_batch_invalid", body.get('id', ''))
+            targets = fragments[start:end]
+            background = context if start == 0 and end == len(fragments) else recovery_context(
+                fragments, start, end, source_lang, context)
+            for repair in [False, True]:
+                check_cancel(self.http.cancel)
+                on_attempt(tuple(range(start, end)))
+                try:
+                    body = self.http.json("POST", self.base + "/compatible-mode/v1/chat/completions",
+                                          name="mt", headers=self.headers,
+                                          json=batch_payload(targets, source_lang, background, repair=repair))
+                except ToolError as error:
+                    if error.code != 'response_schema':
+                        raise
+                    invalid = BatchValidationError('response_structure')
+                    request_id = safe_request_id(error.request_id)
+                else:
+                    request_id = safe_request_id(body.get('id')) if isinstance(body, dict) else ''
+                    try:
+                        translated = parse_batch_response(body, targets)
+                    except BatchValidationError as error:
+                        invalid = error
+                    else:
+                        return {str(start + int(key)): self.cc.convert(text) for key, text in translated.items()}
+                on_event({'kind': 'invalid_response', 'category': invalid.category,
+                          'expected_count': len(targets), 'actual_count': invalid.actual_count,
+                          'fragment_start': start, 'fragment_end': end, 'repair': repair,
+                          'depth': depth, 'request_id': request_id})
+            check_cancel(self.http.cancel)
+            if len(targets) == 1:
+                actual = invalid.actual_count if invalid.actual_count is not None else '未知'
+                raise ToolError(f"批量译文校验失败：{invalid}；预期 {len(targets)} 项，实际 {actual} 项，"
+                                f"原组片段 [{start},{end})；整组保留待恢复。", 'mt_batch_invalid', request_id)
+            recovered = True
+            on_event({'kind': 'split', 'fragment_start': start, 'fragment_end': end,
+                      'expected_count': len(targets), 'depth': depth})
+            middle = (start + end) // 2
+            left = run(start, middle, depth + 1)
+            right = run(middle, end, depth + 1)
+            return {**left, **right}
+
+        translated = run(0, len(fragments), 0)
+        return BatchTranslation(translated, recovered)
 
     def translate(self, text: str, source_lang="auto", *, tm_list=None) -> tuple[str, str]:
         options = {"source_lang": source_lang, "target_lang": "Chinese"}

@@ -496,7 +496,7 @@ class _WordBreakIndex:
                 continue
             before_end = space_ends[char]
             punctuation_end = closing_ends[before_end]
-            # The old regex '$' also matches immediately before a final newline exposed by quotes.
+            # A newline before closing quotes still leaves the preceding punctuation significant.
             if punctuation_end and text[punctuation_end - 1] == "\n":
                 punctuation_end -= 1
             tail = text[punctuation_end - 1] if punctuation_end else ""
@@ -735,9 +735,7 @@ def validate_fragment(source, cue, *, reference_stage=False):
         raise ToolError("字幕片段与完整句来源／词范围记录不一致。", "cache_mismatch")
 
 
-def translation_context(cue, sources, *, position=None):
-    if position is None:
-        position = next(i for i, s in enumerate(sources) if s["sentence_id"] == cue["sentence_id"])
+def translation_context(cue, sources, *, position):
     source = sources[position]
     candidates = []
     if cue["char_start"] != 0 or cue["char_end"] != len(source["text"]):

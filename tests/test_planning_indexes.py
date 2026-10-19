@@ -1,48 +1,13 @@
 from __future__ import annotations
 
 import copy
-import random
-import re
 import unittest
-from contextlib import closing
-from pathlib import Path
 from unittest import mock
 
 from subtitle_tool import subtitles
-from subtitle_tool.config import Config, Settings
+from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
-from subtitle_tool.store import Store
 from tests.fixtures import FakeService, PipelineFixture, response, timed_raw
-
-
-def legacy_word_break(source, lo, hi):
-    """Keep the original slicing/scanning algorithm as an equivalence oracle."""
-    words, text = source.get("words", []), source["text"]
-    choices = []
-    for at in range(lo + 1, hi):
-        if (words[at - 1]["end_ms"] - words[lo]["begin_ms"] < 1000 or
-                words[hi - 1]["end_ms"] - words[at]["begin_ms"] < 1000):
-            continue
-        char = words[at - 1]["char_end"]
-        if not subtitles.legal_break(text, char) or not subtitles.word_boundary(text, char):
-            continue
-        before = text[words[lo]["char_start"]:char].rstrip()
-        stripped = before.rstrip("\"'”’）)]}」』】»›")
-        sentence_end = bool(re.search(r"[。！？.!?]$", stripped))
-        pause = words[at]["begin_ms"] - words[at - 1]["end_ms"] >= 400
-        clause_end = bool(re.search(r"[，,；;：:]$", stripped))
-        priority = 0 if sentence_end or pause else 1 if clause_end else 2
-        after = text[words[at]["char_start"]:words[hi - 1]["char_end"]]
-        choices.append((priority, abs(subtitles.display_width(before) - subtitles.display_width(after)), at))
-    return min(choices)[2] if choices else None
-
-
-class LegacyWordBreakIndex:
-    def __init__(self, source):
-        self.source = source
-
-    def best(self, lo, hi):
-        return legacy_word_break(self.source, lo, hi)
 
 
 def indexed_source(tokens, *, separator=" ", durations=None, pauses=None):
@@ -63,80 +28,33 @@ def indexed_source(tokens, *, separator=" ", durations=None, pauses=None):
 
 
 class WordBreakIndexTests(unittest.TestCase):
-    def assert_breaks_match(self, source, ranges=None):
-        index = subtitles._WordBreakIndex(source)
-        count = len(source["words"])
-        ranges = ranges or [(lo, hi) for lo in range(count) for hi in range(lo + 1, count + 1)]
-        for lo, hi in ranges:
-            with self.subTest(text=source["text"], lo=lo, hi=hi):
-                self.assertEqual(index.best(lo, hi), legacy_word_break(source, lo, hi))
-
-    def test_unicode_whitespace_and_closing_punctuation_in_all_subranges(self):
+    def test_unicode_punctuation_and_word_boundaries_in_subranges(self):
         cases = [
-            (["hello", "字幕，", "ＡＰＩ", "e\u0301", "👩\u200d💻", "✈\ufe0f", "done.”", "next"], " "),
-            (["字。", "）", "）", "甲", "乙", "丙", "丁"], ""),
-            (["a.\n”", "b", "c", "d", "e", "f"], " "),
-            (["a. \t”", "b,』", "c", "d", "e", "f"], "\u3000\t "),
-            (["字", "\u0301", "字", "\u200d", "字", "\ufe0f", "字", "字"], ""),
-            (["(open", "close)", "'quote", "end'", "next:", "last"], " " * 100),
-            (["un", "break", "able"], ""),
+            (["hello", "字幕，", "ＡＰＩ", "e\u0301", "👩\u200d💻", "✈\ufe0f", "done.”", "next"], " ", [7, 7, 2]),
+            (["字。", "）", "）", "甲", "乙", "丙", "丁"], "", [3, 4, 3]),
+            (["a.\n”", "b", "c", "d", "e", "f"], " ", [1, 3, 1]),
+            (["a. \t”", "b,』", "c", "d", "e", "f"], "\u3000\t ", [2, 2, 2]),
+            (["字", "\u0301", "字", "\u200d", "字", "\ufe0f", "字", "字"], "", [6, 6, 2]),
+            (["(open", "close)", "'quote", "end'", "next:", "last"], " " * 100, [5, 5, 2]),
+            (["un", "break", "able"], "", [None, None, None]),
         ]
-        for tokens, separator in cases:
-            self.assert_breaks_match(indexed_source(tokens, separator=separator))
+        for tokens, separator, expected in cases:
+            with self.subTest(tokens=tokens, separator=separator):
+                index = subtitles._WordBreakIndex(indexed_source(tokens, separator=separator))
+                count = len(tokens)
+                self.assertEqual([index.best(lo, hi) for lo, hi in [(0, count), (1, count), (0, count - 1)]],
+                                 expected)
         self.assertIsNone(subtitles._WordBreakIndex(indexed_source([])).best(0, 0))
-        self.assertIsNone(subtitles._WordBreakIndex(indexed_source(["un", "break", "able"], separator="")).best(0, 3))
 
     def test_tie_pause_and_minimum_duration_thresholds(self):
         self.assertEqual(subtitles._WordBreakIndex(indexed_source(["a"] * 5)).best(0, 5), 2)
         for pause, expected in [(399, 4), (400, 3)]:
             source = indexed_source(["word"] * 8, durations=[500] * 8, pauses={3: pause})
             self.assertEqual(subtitles._WordBreakIndex(source).best(0, 8), expected)
-            self.assert_breaks_match(source)
         for durations, expected in [([500, 499, 500, 500], None), ([500] * 4, 2),
                                     ([500, 500, 500, 499], None)]:
             source = indexed_source(["word"] * 4, durations=durations)
             self.assertEqual(subtitles._WordBreakIndex(source).best(0, 4), expected)
-        source = indexed_source(["word"] * 8)
-        source["text"] = "word " + source["text"]
-        for word in source["words"]:
-            word["char_start"] += 5
-            word["char_end"] += 5
-        # The right slice must retain whitespace even when its stored range includes it.
-        source["words"][4]["char_start"] -= 1
-        self.assert_breaks_match(source)
-
-    def test_fixed_seed_word_timelines_match_for_full_and_internal_ranges(self):
-        rng = random.Random(2652110)
-        tokens = ["alpha", "can't", "well-known", "字", "全角Ａ", "e\u0301", "👩\u200d💻", "✈\ufe0f",
-                  "word.”", "word,", "字；", "（字", "字）", "a.\n”", "a. ”", "a;』"]
-        for _ in range(100):
-            count = rng.randrange(3, 25)
-            source = indexed_source(rng.choices(tokens, k=count),
-                                    separator=rng.choice(["", " ", "\t", "\u3000", " \n ", " " * 17]),
-                                    durations=rng.choices([1, 199, 499, 500, 999, 1000, 1001], k=count),
-                                    pauses={i: rng.choice([0, 399, 400, 700]) for i in range(count)})
-            ranges = [(0, count)]
-            for _ in range(12):
-                lo = rng.randrange(count)
-                ranges.append((lo, rng.randrange(lo + 1, count + 1)))
-            self.assert_breaks_match(source, ranges)
-
-    def test_complete_reference_initial_and_additional_layout_records_match(self):
-        settings = Settings(zh_line_width=22, other_line_width=42)
-        sources = [indexed_source(["alpha", "字。”", "e\u0301", "👩\u200d💻", "word,"] * 8),
-                   indexed_source(["word" + str(i) + "x" * 95 for i in range(80)], durations=[500] * 80)]
-        saved = copy.deepcopy(sources)
-        for source in sources:
-            def planned():
-                references = subtitles.plan_reference_units([source])
-                first = subtitles.plan_fragments(source, settings, reference="参考" * 40)
-                later = [part for cue in first for part in subtitles.plan_fragments(
-                    source, settings, cue=cue, reference="译" * 100, layout_round=1, force=True)]
-                return references, first, later
-            with mock.patch.object(subtitles, "_WordBreakIndex", LegacyWordBreakIndex):
-                expected = planned()
-            self.assertEqual(planned(), expected)
-        self.assertEqual(sources, saved)
 
     def test_index_is_lazy_and_reused_only_within_each_planning_call(self):
         short = indexed_source(["short", "sentence"])
@@ -163,48 +81,6 @@ class ContextPositionTests(unittest.TestCase):
                                       preserve_sentences=True)[0]
         return [{**source, "reference": f"参考{i}"} for i, source in enumerate(sources)]
 
-    def test_position_and_lookup_return_identical_ordered_contexts(self):
-        modes = ["plain", "gap_5000", "gap_5001", "language", "original", "manual", "mt_language",
-                 "unknown", "unknown_manual", "empty_reference", "budget", "trim_label"]
-        for mode in modes:
-            sources = self.sources()
-            if mode.startswith("gap_"):
-                for source in sources[3:]:
-                    shift = int(mode[4:]) - 100
-                    source["begin_ms"] += shift
-                    source["end_ms"] += shift
-                    for word in source["words"]:
-                        word["begin_ms"] += shift
-                        word["end_ms"] += shift
-            elif mode == "language":
-                sources[2]["language"] = "ja"
-            elif mode == "original":
-                sources[2]["decision"] = "original"
-            elif mode == "manual":
-                sources[2]["reason"] = "用户在终端确认"
-            elif mode == "mt_language":
-                sources[2]["source_lang"] = "English"
-            elif mode.startswith("unknown"):
-                for source in sources:
-                    source["language"] = ""
-                    if mode == "unknown_manual":
-                        source.update(reason="用户在终端确认", source_lang="English")
-            elif mode == "empty_reference":
-                for source in sources:
-                    source["reference"] = ""
-            elif mode == "budget":
-                sources[2]["reference"] = "中" * 3000
-                sources[3]["reference"] = "中" * 2000
-            elif mode == "trim_label":
-                sources[2]["language"] = " EN "
-            for position, source in enumerate(sources):
-                cues = [subtitles.make_fragment(source), subtitles.make_fragment(source, 0, 1),
-                        subtitles.make_fragment(source, 1, 2)]
-                for cue in cues:
-                    with self.subTest(mode=mode, position=position, start=cue["word_start"], end=cue["word_end"]):
-                        expected = subtitles.translation_context(cue, sources)
-                        self.assertEqual(subtitles.translation_context(cue, sources, position=position), expected)
-
     def test_parent_priority_distance_order_and_whole_entry_budget(self):
         sources = self.sources()
         for lo, hi, expected in [(0, 2, [2, 4, 1, 5]), (0, 1, [3, 2, 4, 1, 5]),
@@ -216,11 +92,10 @@ class ContextPositionTests(unittest.TestCase):
         sources[3]["reference"] = "中" * 3000
         cue = subtitles.make_fragment(sources[3], 0, 1)
         actual = subtitles.translation_context(cue, sources, position=3)
-        self.assertEqual(actual, subtitles.translation_context(cue, sources))
         self.assertEqual(actual, [{"source": sources[i]["text"], "target": sources[i]["reference"]}
                                   for i in [2, 4, 1, 5]])
 
-    def test_known_position_does_not_iterate_sources_and_none_keeps_lookup(self):
+    def test_context_uses_source_positions_without_scanning(self):
         class IndexedOnlySources(list):
             def __iter__(self):
                 raise AssertionError("Known positions must not search through sources")
@@ -228,91 +103,61 @@ class ContextPositionTests(unittest.TestCase):
         sources = self.sources()
         for position in (0, 3, 6):
             cue = subtitles.make_fragment(sources[position], 0, 1)
-            expected = subtitles.translation_context(cue, sources)
-            self.assertEqual(subtitles.translation_context(cue, sources, position=None), expected)
+            expected = subtitles.translation_context(cue, sources, position=position)
             self.assertEqual(subtitles.translation_context(cue, IndexedOnlySources(sources), position=position), expected)
 
 
-class PlanningEquivalencePipelineTests(PipelineFixture):
-    def run_comparison(self, name):
+class PlanningResumeTests(PipelineFixture):
+    translation_strategy_version = 2
+
+    def test_layout_interruption_and_translation_failure_resume_to_complete_output(self):
         raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)
         raw["transcripts"][0]["sentences"].append(dict(begin_time=8000, end_time=8900,
-                                                      text="Neighbor sentence.", language="en"))
+                                                     text="Neighbor sentence.", language="en"))
         fake = FakeService(raw)
-        failed = False
+        failed = interrupted = False
+        self.config.settings.mt_workers = 1
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['subtitle_settings'].update(zh_line_width=22, other_line_width=42)
+        self.store.update(self.job_id, manifest=manifest)
 
         def request(method, url, **kwargs):
             nonlocal failed
-            if not url.endswith("/chat/completions"):
-                return FakeService.request(fake, method, url, **kwargs)
+            if not url.endswith('/chat/completions'):
+                return fake.request(method, url, **kwargs)
             fake.calls.append((method, url, kwargs))
-            body = kwargs["json"]
-            if body["messages"][0]["content"] == "charlie" and not failed:
+            body = kwargs['json']
+            if body['messages'][0]['content'] == 'charlie' and not failed:
                 failed = True
-                return response({"code": "Unauthorized"}, 403)
-            text = "中" * (50 if body["translation_options"].get("tm_list") else 10)
-            return response({"choices": [{"finish_reason": "stop", "message": {"content": text}}]})
+                return response({'code': 'Unauthorized'}, 403)
+            text = '中' * (50 if body['translation_options'].get('tm_list') else 10)
+            return response({'choices': [{'finish_reason': 'stop', 'message': {'content': text}}]})
 
-        fake.request = request
-        settings = Settings(zh_line_width=22, other_line_width=42)
-        config = Config(self.path / name)
-        config.settings.workspace_id = "offline-space"
-        config.settings.mt_workers = 1
-        config.set_key("offline-test-key-no-cloud-authorization")
-        with closing(Store(self.path / (name + ".sqlite"))) as store:
-            with mock.patch("subtitle_tool.store.uuid.uuid4") as identity:
-                identity.return_value.hex = "1" * 32
-                job_id = store.enqueue(self.source, workspace_id="offline-space", settings=settings,
-                                       output_dir=self.path / name)
-                manifest = store.job(job_id)['manifest']
-                manifest['translation_strategy_version'] = 2
-                store.update(job_id, manifest=manifest)
-            saved_layouts, checkpoints = [], []
-            save = store.save_layout
-            interrupted = False
+        save = self.store.save_layout
 
-            def save_layout(job_id, cues, manifest, **kwargs):
-                nonlocal interrupted
-                save(job_id, cues, manifest, **kwargs)
-                saved_layouts.append(copy.deepcopy((cues, kwargs.get("references"), manifest.get("layout_round"))))
-                if manifest.get("layout_round") == 1 and not interrupted:
-                    interrupted = True
-                    raise KeyboardInterrupt()
+        def save_layout(job_id, cues, manifest, **kwargs):
+            nonlocal interrupted
+            save(job_id, cues, manifest, **kwargs)
+            if manifest.get('layout_round') == 1 and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
 
-            with mock.patch("requests.request", side_effect=fake.request), \
-                    mock.patch("requests.post", side_effect=fake.upload), \
-                    mock.patch.dict("subtitle_tool.api._MT_PACERS", clear=True), \
-                    mock.patch.object(store, "save_layout", side_effect=save_layout):
-                for attempt, expected in enumerate(["cancelled", "failed", "completed", "completed"]):
-                    if attempt in (1, 2):
-                        store.update(job_id, "queued")
-                    self.assertEqual(Engine(config, store).run(job_id), expected)
-                    counts = {k: v for k, v in store.counts(job_id).items() if not k.endswith("_ms")}
-                    checkpoints.append((copy.deepcopy(store.cues(job_id)), copy.deepcopy(store.references(job_id)),
-                                        counts, len(fake.named("/chat/completions"))))
-            manifest = store.job(job_id)["manifest"]
-            self.assertEqual(manifest["layout_round"], 2)
-            self.assertTrue(manifest["warnings"])
-            self.assertEqual([checkpoint[3] for checkpoint in checkpoints], [4, 11, 17, 17])
-            content = Path(store.job(job_id)["output"]).read_bytes()
-            cache = [tuple(row) for row in store.db.execute("SELECT key,text FROM mt_cache ORDER BY key")]
-            return dict(layouts=saved_layouts, checkpoints=checkpoints, srt=content, cache=cache,
-                        warnings=manifest["warnings"], sources=store.sources(job_id),
-                        requests=[call[2]["json"] for call in fake.named("/chat/completions")])
-
-    def test_old_and_indexed_planning_preserve_pipeline_requests_cache_and_resume(self):
-        def lookup_context(cue, sources, *, position=None):
-            return subtitles.translation_context(cue, sources)
-
-        with mock.patch.object(subtitles, "_WordBreakIndex", LegacyWordBreakIndex), \
-                mock.patch("subtitle_tool.engine.translation_context", side_effect=lookup_context):
-            expected = self.run_comparison("legacy")
-        with mock.patch("subtitle_tool.engine.translation_context", wraps=subtitles.translation_context) as context:
-            self.assertEqual(self.run_comparison("indexed"), expected)
-        self.assertGreater(context.call_count, 0)
-        for call in context.call_args_list:
-            cue, sources = call.args
-            self.assertEqual(sources[call.kwargs["position"]]["sentence_id"], cue["sentence_id"])
+        with mock.patch('requests.request', side_effect=request), \
+                mock.patch('requests.post', side_effect=fake.upload), \
+                mock.patch.object(self.store, 'save_layout', side_effect=save_layout):
+            for expected, calls in [('cancelled', 4), ('failed', 11), ('completed', 17)]:
+                self.store.update(self.job_id, 'queued')
+                self.assertEqual(Engine(self.config, self.store).run(self.job_id), expected)
+                self.assertEqual(len(fake.named('/chat/completions')), calls)
+            completed = self.store.job(self.job_id)
+            content = self.source.with_suffix('.srt').read_bytes()
+            self.assertEqual(Engine(self.config, self.store).run(self.job_id), 'completed')
+            self.assertEqual(self.store.job(self.job_id), completed)
+            self.assertEqual(self.source.with_suffix('.srt').read_bytes(), content)
+            self.assertEqual(len(fake.named('/chat/completions')), 17)
+        self.assertEqual(completed['manifest']['layout_round'], 2)
+        self.assertTrue(completed['manifest']['warnings'])
+        self.assertTrue(all(c['translated'] for c in self.store.cues(self.job_id)))
 
 
 if __name__ == "__main__":

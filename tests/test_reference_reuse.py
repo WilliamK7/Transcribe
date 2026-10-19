@@ -149,7 +149,8 @@ class ReferenceReuseTests(PipelineFixture):
         sources = [{**s, 'reference': r['translated']} for s, r in zip(self.store.sources(self.job_id), references)]
         keys = [mt_cache_key(c['text'], c['source_lang'], **manifest['cache_identity'],
                              stage='subtitle', strategy_version=2, asr_language=c['language'],
-                             tm_list=translation_context(c, sources)) for c in self.store.cues(self.job_id)]
+                             tm_list=translation_context(c, sources, position=i))
+                for i, c in enumerate(self.store.cues(self.job_id))]
         self.assertEqual(self.offline_resume(), 'completed')
         self.assertTrue(all(self.store.cache_get(key) is None for key in keys))
 
@@ -166,7 +167,7 @@ class ReferenceReuseTests(PipelineFixture):
         with self.store.db:
             for i, cue in enumerate(cues):
                 key = mt_cache_key(cue['text'], cue['source_lang'], **manifest['cache_identity'], stage='subtitle',
-                                   strategy_version=1, asr_language=cue['language'], tm_list=translation_context(cue, [source]))
+                                   strategy_version=1, asr_language=cue['language'], tm_list=translation_context(cue, [source], position=0))
                 self.store.db.execute('INSERT INTO mt_cache VALUES(?,?)', (key, f'旧片段缓存{i}'))
         self.assertEqual(self.offline_resume(), 'completed')
         self.assertEqual(self.store.job(self.job_id)['manifest']['translation_strategy_version'], 2)
