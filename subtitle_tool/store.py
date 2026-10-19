@@ -296,6 +296,24 @@ class Store:
             for name, amount in (counts or {}).items():
                 self._count(job_id, name, amount)
 
+    def translation_batch_update(self, job_id, translations, *, reference_stage=False,
+                                 cache_key=None, cache_value=None, counts=None):
+        """Commit distinct cue translations, the complete batch cache and counters atomically."""
+        if (not translations or any(not isinstance(text, str) or not text.strip() for text in translations.values()) or
+                (cache_key is None) != (cache_value is None)):
+            raise ValueError("Invalid translation batch")
+        table = "mt_references" if reference_stage else "cues"
+        with self.lock, self.db:
+            for cue_id, text in translations.items():
+                changed = self.db.execute("UPDATE " + table + " SET translated=?,error='' WHERE job_id=? AND cue_id=?",
+                                          (text, job_id, cue_id))
+                if changed.rowcount != 1:
+                    raise ToolError("批量翻译的字幕记录不完整，结果未保存。", "cache_mismatch")
+            if cache_key is not None:
+                self.db.execute("INSERT OR REPLACE INTO mt_cache VALUES(?,?)", (cache_key, cache_value))
+            for name, amount in (counts or {}).items():
+                self._count(job_id, name, amount)
+
     def cache_get(self, key):
         with self.lock:
             row = self.db.execute("SELECT text FROM mt_cache WHERE key=?", (key,)).fetchone()

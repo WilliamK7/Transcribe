@@ -264,6 +264,9 @@ class PlanningEquivalencePipelineTests(PipelineFixture):
                 identity.return_value.hex = "1" * 32
                 job_id = store.enqueue(self.source, workspace_id="offline-space", settings=settings,
                                        output_dir=self.path / name)
+                manifest = store.job(job_id)['manifest']
+                manifest['translation_strategy_version'] = 2
+                store.update(job_id, manifest=manifest)
             saved_layouts, checkpoints = [], []
             save = store.save_layout
             interrupted = False

@@ -81,6 +81,13 @@ class FakeService:
             return response(self.raw)
         if url.endswith("/chat/completions"):
             source = kwargs["json"]["messages"][0]["content"]
+            if source.startswith('以下是仅供理解的原文上下文'):
+                data = json.loads(source.split('INPUT_JSON:\n', 1)[1])
+                if any(item['text'] in self.mt_failure for item in data['translations']):
+                    return response({'code': 'Unauthorized', 'request_id': 'offline-denied'}, 403)
+                return response({'id': 'offline-mt', 'choices': [{'finish_reason': 'stop', 'message': {
+                    'content': json.dumps({'translations': [{'id': item['id'], 'text': '繁體譯文：' + item['text']}
+                                                           for item in data['translations']]})}}]})
             if source in self.mt_failure:
                 return response({"code": "Unauthorized", "request_id": "offline-denied"}, 403)
             if source.startswith("First"):
@@ -126,6 +133,7 @@ def point_sentence(at, text="Yes.", language="en"):
 @unittest.skipUnless(os.name == "nt" and (ROOT / "tools" / "ffmpeg.exe").exists(), "Windows/bundled tools required")
 class PipelineFixture(TemporaryTest):
     fixture_seconds = 10
+    translation_strategy_version = None
 
     @classmethod
     def setUpClass(cls):
@@ -149,6 +157,10 @@ class PipelineFixture(TemporaryTest):
         shutil.copyfile(self.fixture, self.source)
         self.store = Store(self.config.data / "jobs.sqlite")
         self.job_id = self.store.enqueue(self.source, "beijing", workspace_id="offline-space")
+        if self.translation_strategy_version is not None:
+            manifest = self.store.job(self.job_id)['manifest']
+            manifest['translation_strategy_version'] = self.translation_strategy_version
+            self.store.update(self.job_id, manifest=manifest)
 
     def tearDown(self):
         self.store.close()

@@ -209,6 +209,7 @@ class TranslationGroupTests(TemporaryTest):
 
 
 class TranslationGroupPipelineTests(PipelineFixture):
+    translation_strategy_version = 2
     fixture_seconds = 20
 
     def test_throttle_cancel_and_resume_keep_successes_at_each_translation_phase(self):
@@ -219,6 +220,9 @@ class TranslationGroupPipelineTests(PipelineFixture):
                 source = self.path / f'throttle-{phase}.mkv'
                 source.write_bytes(self.source.read_bytes())
                 job_id = self.store.enqueue(source, workspace_id='offline-space')
+                manifest = self.store.job(job_id)['manifest']
+                manifest['translation_strategy_version'] = 2
+                self.store.update(job_id, manifest=manifest)
                 if phase == 'legacy':
                     manifest = self.store.job(job_id)['manifest']
                     for name in ['subtitle_version', 'translation_strategy_version', 'subtitle_settings']:
@@ -304,6 +308,9 @@ class TranslationGroupPipelineTests(PipelineFixture):
                     source = self.path / f'video-{legacy}-{workers}.mkv'
                     source.write_bytes(self.source.read_bytes())
                     self.job_id = self.store.enqueue(source, workspace_id='offline-space')
+                    manifest = self.store.job(self.job_id)['manifest']
+                    manifest['translation_strategy_version'] = 2
+                    self.store.update(self.job_id, manifest=manifest)
                     self.config.settings.mt_workers = workers
                     if legacy:
                         manifest = self.store.job(self.job_id)['manifest']
@@ -333,6 +340,9 @@ class TranslationGroupPipelineTests(PipelineFixture):
                 self.config.settings.other_line_width = 24
                 self.config.settings.mt_workers = workers
                 self.job_id = self.store.enqueue(source, workspace_id='offline-space', settings=self.config.settings)
+                manifest = self.store.job(self.job_id)['manifest']
+                manifest['translation_strategy_version'] = 2
+                self.store.update(self.job_id, manifest=manifest)
                 fake = FakeService(timed_raw([f'word{workers}'] * 24, word_ms=200))
                 self.assertEqual(self.run_fake(fake), 'completed')
                 cues = self.store.cues(self.job_id)

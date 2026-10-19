@@ -579,7 +579,10 @@ def validate_mt_input(text, source_lang="auto", tm_list=()):
         raise ToolError("待翻译文本超过保守输入预算，且无法在可靠词时间边界安全拆分；进度已保存，可恢复。", "mt_input_budget")
 
 
-def plan_reference_units(sources):
+def plan_reference_units(sources, *, strategy_version=2):
+    if strategy_version == 3:
+        return [unit for source in sources if source['decision'] == 'translate'
+                for unit in split_mt_units(source, [make_fragment(source)], reference_stage=True)]
     units = []
     for source in sources:
         if source["decision"] != "translate":
@@ -601,6 +604,94 @@ def plan_reference_units(sources):
             cue["cue_id"] += ":reference"
             units.append(cue)
     return sorted(units, key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
+
+
+def split_mt_units(source, units, *, reference_stage=False):
+    from .mt import batch_input_size, validate_batch_input
+    result, break_index = [], None
+    stack = list(reversed(units))
+    while stack:
+        unit = stack.pop()
+        if batch_input_size([unit['text']], unit['source_lang']) > MT_INPUT_BUDGET:
+            if break_index is None:
+                break_index = _WordBreakIndex(source)
+            at = break_index.best(unit['word_start'], unit['word_end'])
+            if at is None:
+                validate_batch_input([unit['text']], unit['source_lang'])
+            stack.extend([make_fragment(source, at, unit['word_end'], layout_round=unit.get('layout_round', 0)),
+                          make_fragment(source, unit['word_start'], at, layout_round=unit.get('layout_round', 0))])
+            continue
+        if reference_stage and not unit['cue_id'].endswith(':reference'):
+            unit = {**unit, 'cue_id': unit['cue_id'] + ':reference'}
+        result.append(unit)
+    return result
+
+
+def _context_neighbors(cue, sources, position):
+    """Compatible neighbors ordered by proximity, distance and source position."""
+    source = sources[position]
+    def compatible(item):
+        language = item['language'].lower().strip()
+        manual = item['reason'] == '用户在终端确认'
+        if not language:
+            language = item.get('source_lang') if manual and item.get('source_lang') != 'auto' else item['sentence_id']
+        return language, item['decision'], item.get('source_lang', 'auto'), manual
+    neighbors = []
+    for direction in [-1, 1]:
+        previous = source
+        for distance in [1, 2]:
+            index = position + direction * distance
+            if not 0 <= index < len(sources):
+                break
+            neighbor = sources[index]
+            gap = (previous['begin_ms'] - neighbor['end_ms'] if direction < 0 else
+                   neighbor['begin_ms'] - previous['end_ms'])
+            if gap > 5000 or compatible(neighbor) != compatible(source):
+                break
+            proximity = max(neighbor['begin_ms'] - cue['end_ms'], cue['begin_ms'] - neighbor['end_ms'], 0)
+            neighbors.append((proximity, distance, index, neighbor))
+            previous = neighbor
+    return [(index, neighbor) for _, _, index, neighbor in sorted(neighbors, key=lambda n: n[:3])]
+
+
+def source_context(sources, position):
+    return [{'position': 'before' if index < position else 'after', 'text': neighbor['text']}
+            for index, neighbor in _context_neighbors(sources[position], sources, position)]
+
+
+def plan_translation_batches(units, neighbors):
+    from .mt import batch_input_size, validate_batch_input
+    groups, at = [], 0
+    while at < len(units):
+        end = at + 1
+        validate_batch_input([units[at]['text']], units[at]['source_lang'])
+        # Neighbors are all removable before a sentence is divided into contiguous groups.
+        while end < len(units) and batch_input_size([u['text'] for u in units[at:end + 1]],
+                                                    units[at]['source_lang']) <= MT_INPUT_BUDGET:
+            end += 1
+        members = units[at:end]
+        remaining = sorted([(at - i, i, 'same_sentence_before', unit) for i, unit in enumerate(units[:at])] +
+                           [(i - end + 1, i, 'same_sentence_after', units[i]) for i in range(end, len(units))])
+        context = [{'position': side, 'text': unit['text']} for _, _, side, unit in remaining] + list(neighbors)
+        texts = [u['text'] for u in members]
+        # Same-sentence context has priority; remove farthest neighbors first.
+        while context and batch_input_size(texts, members[0]['source_lang'], context) > MT_INPUT_BUDGET:
+            context.pop()
+        validate_batch_input(texts, members[0]['source_lang'], context)
+        groups.append((members, context))
+        at = end
+    return groups
+
+
+def validate_unit_coverage(source, units, *, reference_stage=False):
+    at, word = 0, 0
+    for unit in units:
+        validate_fragment(source, unit, reference_stage=reference_stage)
+        if (unit['char_start'] < at or source['text'][at:unit['char_start']].strip() or unit['word_start'] != word):
+            raise ToolError("同句片段的原文／词范围不连续。", "cache_mismatch")
+        at, word = unit['char_end'], unit['word_end']
+    if not units or source['text'][at:].strip() or word != len(source.get('words', [])):
+        raise ToolError("同句片段未覆盖完整来源，不能输出不完整字幕。", "cache_mismatch")
 
 
 def reference_sources(sources, references):
@@ -651,29 +742,7 @@ def translation_context(cue, sources, *, position=None):
     candidates = []
     if cue["char_start"] != 0 or cue["char_end"] != len(source["text"]):
         candidates.append(source)
-    def compatible(s):
-        language = s["language"].lower().strip()
-        manual = s["reason"] == "用户在终端确认"
-        if not language:
-            # An absent label with automatic MT detection is not evidence of matching languages.
-            language = s.get("source_lang") if manual and s.get("source_lang") != "auto" else s["sentence_id"]
-        return language, s["decision"], s.get("source_lang", "auto"), manual
-    neighbors = []
-    for direction in [-1, 1]:
-        previous = source
-        for distance in [1, 2]:
-            index = position + direction * distance
-            if not 0 <= index < len(sources):
-                break
-            neighbor = sources[index]
-            gap = (previous["begin_ms"] - neighbor["end_ms"] if direction < 0 else
-                   neighbor["begin_ms"] - previous["end_ms"])
-            if gap > 5000 or compatible(neighbor) != compatible(source):
-                break
-            proximity = max(neighbor["begin_ms"] - cue["end_ms"], cue["begin_ms"] - neighbor["end_ms"], 0)
-            neighbors.append((proximity, distance, index, neighbor))
-            previous = neighbor
-    candidates.extend(item[3] for item in sorted(neighbors, key=lambda n: n[:3]))
+    candidates.extend(neighbor for _, neighbor in _context_neighbors(cue, sources, position))
     context = []
     for candidate in candidates:
         if not candidate.get("reference"):

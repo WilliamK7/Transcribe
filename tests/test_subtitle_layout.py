@@ -374,6 +374,8 @@ class PersistenceTests(fixtures.TemporaryTest):
 
 
 class ContextPipelineTests(PipelineFixture):
+    # Persisted strategy 2 retains its original tm_list and per-fragment contract.
+    translation_strategy_version = 2
     def setUp(self):
         super().setUp()
         self.config.settings.zh_line_width = 22

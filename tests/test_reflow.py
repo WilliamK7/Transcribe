@@ -11,7 +11,8 @@ from unittest import mock
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main, summary
-from subtitle_tool.subtitles import mt_cache_key, normalize, plan_fragments, wrap
+from subtitle_tool.mt import batch_cache_key, batch_cache_value
+from subtitle_tool.subtitles import normalize, plan_fragments, wrap
 from subtitle_tool.config import Settings
 from tests.fixtures import FakeService, PipelineFixture, result, timed_raw
 
@@ -188,11 +189,14 @@ class ReflowTests(PipelineFixture):
         self.assertFalse(list(output.parent.glob(output.name + '.bak.*')))
         self.assertEqual(fake.named('/asr/transcription'), [])
         self.assertEqual(len(fake.uploads), 1)
-        successes = {c['cue_id']: c['translated'] for c in self.store.cues(self.job_id) if c['translated']}
-        self.assertTrue(successes)
+        self.assertFalse(any(c['translated'] for c in self.store.cues(self.job_id)))
+        references = self.store.references(self.job_id)
+        self.assertTrue(all(r['translated'] for r in references))
         fake.mt_failure.clear()
+        fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
-        self.assertTrue(all(c['translated'] == successes[c['cue_id']] for c in self.store.cues(self.job_id) if c['cue_id'] in successes))
+        self.assertEqual(self.store.references(self.job_id), references)
+        self.assertTrue(all(c['translated'] for c in self.store.cues(self.job_id)))
         self.assertEqual(fake.named('/asr/transcription'), [])
         self.assertEqual(Path(self.store.job(self.job_id)['manifest']['backup']).read_bytes(), old)
 
@@ -219,30 +223,28 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(error.exception.code, 'account_changed')
         self.assertEqual(self.store.job(self.job_id), before)
 
-    def test_changed_reference_context_does_not_reuse_previous_fragment_translation(self):
+    def test_reference_translation_change_is_not_fragment_context_in_strategy_three(self):
         fake = self.complete_old_job(timed_raw([f'word{i}' for i in range(24)], word_ms=200))
         previous_cues = self.store.cues(self.job_id)
         manifest = self.store.job(self.job_id)['manifest']
         reference = self.store.references(self.job_id)[0]
-        key = mt_cache_key(reference['text'], reference['source_lang'], **manifest['cache_identity'],
-                           stage='reference', strategy_version=manifest['translation_strategy_version'],
-                           asr_language=reference['language'])
-        updated_reference = '更新参考：' + reference['text']
+        key = batch_cache_key([reference['text']], reference['source_lang'], **manifest['cache_identity'],
+                              stage='reference', asr_language=reference['language'])
+        updated_reference = reference['translated'].replace('繁体译文：', '更新参考：')
         with self.store.db:
-            self.store.db.execute('UPDATE mt_cache SET text=? WHERE key=?', (updated_reference, key))
+            changed = self.store.db.execute('UPDATE mt_cache SET text=? WHERE key=?',
+                                           (batch_cache_value({'0': updated_reference}), key))
+            self.assertEqual(changed.rowcount, 1)
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
-        requests = fake.named('/chat/completions')
         self.assertGreater(len(previous_cues), 1)
-        # Initial fragments may need another layout round. Every saved final input must
-        # still be requested again when its context changes, even with an old cache entry.
-        self.assertTrue({c['text'] for c in previous_cues}.issubset(
-                        {call[2]['json']['messages'][0]['content'] for call in requests}))
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(self.store.references(self.job_id)[0]['translated'], updated_reference)
         self.assertEqual([(c['word_start'], c['word_end']) for c in self.store.cues(self.job_id)],
                          [(c['word_start'], c['word_end']) for c in previous_cues])
-        self.assertTrue(all(call[2]['json']['translation_options']['tm_list'][0]['target'] == updated_reference
-                            for call in requests))
+        self.assertEqual([c['translated'] for c in self.store.cues(self.job_id)],
+                         [c['translated'] for c in previous_cues])
 
     def test_reflow_to_new_directory_keeps_original_output_without_overwrite(self):
         fake = self.complete_old_job()

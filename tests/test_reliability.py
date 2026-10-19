@@ -19,6 +19,7 @@ class TransactionRecoveryTests(PipelineFixture):
                         self.job_id = self.store.enqueue(self.source, workspace_id="offline-space",
                             output_dir=self.path / (boundary + point + fault.__name__))
                         manifest = self.store.job(self.job_id)["manifest"]
+                        manifest['translation_strategy_version'] = 2
                         manifest["subtitle_settings"].update(zh_line_width=22, other_line_width=42)
                         self.store.update(self.job_id, manifest=manifest)
                         raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)

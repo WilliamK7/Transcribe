@@ -13,9 +13,10 @@ from tests.fixtures import FakeService, PipelineFixture, response, result, timed
 
 
 class ReferenceReuseTests(PipelineFixture):
+    translation_strategy_version = 2
     fixture_seconds = 60
 
-    def test_new_jobs_snapshot_wider_defaults_and_keep_short_sentences_whole(self):
+    def test_saved_layout_defaults_keep_short_sentences_whole(self):
         fake = FakeService(timed_raw(['word'] * 24, word_ms=150))
         self.assertEqual(self.run_fake(fake), 'completed')
         manifest = self.store.job(self.job_id)['manifest']
@@ -98,7 +99,7 @@ class ReferenceReuseTests(PipelineFixture):
         self.assertEqual(self.store.counts(self.job_id)['mt_reference_reused'], 2)
         self.assertTrue(all(c['attempts'] == 0 for c in self.store.cues(self.job_id)))
 
-    def test_strategy_one_upgrade_preserves_saved_work_and_only_reuses_missing(self):
+    def test_strategy_one_resume_preserves_policy_and_saved_work_and_only_reuses_missing(self):
         self.prepare_subtitle_stage()
         sources = self.store.sources(self.job_id)
         for source in sources:
@@ -118,7 +119,7 @@ class ReferenceReuseTests(PipelineFixture):
         before_cues = self.store.cues(self.job_id)
         self.assertEqual(self.offline_resume(), 'completed')
         after = self.store.job(self.job_id)['manifest']
-        self.assertEqual(after['translation_strategy_version'], 2)
+        self.assertEqual(after['translation_strategy_version'], 1)
         self.assertEqual(after['layout_round'], 2)
         self.assertEqual(after['subtitle_settings'], manifest['subtitle_settings'])
         self.assertEqual(self.store.cues(self.job_id)[0], before_cues[0])
@@ -126,30 +127,7 @@ class ReferenceReuseTests(PipelineFixture):
         self.assertEqual(self.store.references(self.job_id), references)
         self.assertEqual(self.store.counts(self.job_id)['mt_reference_reused'], 1)
 
-    def test_upgrade_is_durable_when_interrupted_and_repeat_resume_is_safe(self):
-        self.prepare_subtitle_stage()
-        manifest = self.store.job(self.job_id)['manifest']
-        manifest['translation_strategy_version'] = 1
-        self.store.update(self.job_id, manifest=manifest)
-        save = self.store.update
-        interrupted = False
-
-        def interrupt(job_id, state=None, manifest=None, *args, **kwargs):
-            nonlocal interrupted
-            save(job_id, state, manifest, *args, **kwargs)
-            if not interrupted and manifest and manifest.get('translation_strategy_version') == 2:
-                interrupted = True
-                raise KeyboardInterrupt()
-
-        with mock.patch.object(self.store, 'update', side_effect=interrupt):
-            self.assertEqual(self.offline_resume(), 'cancelled')
-        self.assertEqual(self.store.job(self.job_id)['manifest']['translation_strategy_version'], 2)
-        self.assertFalse(any(c['translated'] for c in self.store.cues(self.job_id)))
-        self.store.update(self.job_id, 'queued')
-        self.assertEqual(self.offline_resume(), 'completed')
-        self.assertEqual(self.store.counts(self.job_id)['mt_reference_reused'], 2)
-
-    def test_identity_and_unknown_versions_are_checked_before_upgrade_or_reuse(self):
+    def test_identity_and_unknown_versions_are_checked_before_reuse(self):
         self.prepare_subtitle_stage()
         original = self.store.job(self.job_id)['manifest']
         for changes, error in [({'account': hashlib.sha256(b'other-account').hexdigest()}, 'account_changed'),
@@ -181,8 +159,6 @@ class ReferenceReuseTests(PipelineFixture):
         self.store.update(self.job_id, manifest=manifest)
         self.prepare_subtitle_stage(timed_raw([f'word{i}' for i in range(24)], word_ms=200))
         manifest = self.store.job(self.job_id)['manifest']
-        manifest['translation_strategy_version'] = 1
-        self.store.update(self.job_id, manifest=manifest)
         reference = self.store.references(self.job_id)[0]
         source = {**self.store.sources(self.job_id)[0], 'reference': reference['translated']}
         cues = self.store.cues(self.job_id)

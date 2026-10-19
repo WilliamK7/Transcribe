@@ -14,7 +14,13 @@
 
 ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`。`X-DashScope-Async`、`X-DashScope-OssResourceResolve` 均为 `enable`；`parameters` 为 `channel_id:[0]`、`enable_words:true`、`enable_itn:false`，省略 `language` 以自动识别。提交成功即持久化 `output.task_id`；查询成功后从 `output.result.transcription_url` 下载结果，按 `transcripts[].sentences[]` 解析。
 
-MT 模型为 `qwen-mt-flash`，`stream:false`，每次一条 user 文本消息。顶层 `translation_options` 包含 `source_lang:auto`（或人工确认的 MT 语言名）、`target_lang:Chinese`，有上下文时增加 `tm_list:[{"source":"参考原文","target":"参考译文"}]`。响应须为 `finish_reason:stop` 且内容合法、非空；译文经 OpenCC t2s 后按稳定 `cue_id` 保存。中文／粤语跳过 MT，语种复核在所有 MT 请求前完成。
+MT 模型为 `qwen-mt-flash`，`stream:false`，每次一条 user 文本消息。中文／粤语跳过 MT，语种复核在所有 MT 请求前完成。
+
+翻译策略 3 使用[官方支持的自定义提示词](https://help.aliyun.com/zh/model-studio/machine-translation)，user 消息依次包含原文上下文、翻译要求和同一来源句的有序片段；提示词指定源语言 `auto`（或人工确认的 MT 语言名）及简体中文目标。请求省略 `translation_options`，设置 `temperature:0`、`seed:0`，采样参数不保证云端严格确定性，含义见[官方 API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。多片段请求包含固定边界示例，单片请求省略示例。
+
+内部批量接口接收上下文和有序片段，请求内编号从字符串 `"0"` 开始；输入、输出均为 `{"translations":[{"id":"0","text":"文字"}]}`，输出 `text` 为对应片段的译文。本地校验 JSON、编号完整且唯一、无多余项、译文非空且无字幕控制内容，以及 `finish_reason:stop`；原文包含文字或数字时，译文须包含文字或数字。结构异常使用同组输入和修复提示再尝试一次，仍失败返回 `mt_batch_invalid`，整组保留待恢复。译文经 OpenCC t2s 后按编号映射回稳定 `cue_id`。结构校验不代表语义质量验收。
+
+旧策略 1／2 保留单片翻译请求，顶层 `translation_options` 指定源语种及目标语种 `Chinese`，有上下文时增加 `tm_list:[{"source":"参考原文","target":"参考译文"}]`；旧单阶段任务保留原请求形式。响应须正常结束且译文合法、非空。
 
 MT 按 Key／地域／模型在进程内共享调度，并发可设为 1～4，默认 4。北京 `qwen-mt-flash` 额度为 60 RPM／35,000 TPM；本地在 61 秒滚动窗口内最多发送 60 次 HTTP 尝试，包含重试和失败，额外 1 秒用于网络到达时间余量。额度未满时无固定逐条间隔，用尽后逐条等待最早请求过期；窗口等待、共享冷却和自适应间隔取较晚期限，等待可取消。进度区分配额等待与服务端限流，配额等待不计入 `mt_cooldown_ms`。窗口不跨进程保存，账号其他调用及 TPM 限流由 429 退避处理。
 
@@ -42,18 +48,20 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 | `workspace_id` | 1～63 位合法域名标签 |
 | `processing_version` | `2` |
 | `contract.normalizer` | `3` |
-| `subtitle_version` / `translation_strategy_version` | `2` / `2` |
+| `subtitle_version` / `translation_strategy_version` | `2` / `3` |
 | `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
 
 原始 ASR JSON 与规范化结果分别保存。完整句保存于 `subtitle-sources-v2.json` 和 SQLite `subtitle_sources`，参考译文存于 `mt_references`，最终片段及译文存于 `cues`。`normalized`、`normalized_count`、`references_planned`、`layout_planned`、`layout_round` 与对应记录同事务提交，恢复以数据库已提交状态为准。恢复校验来源及文字／词范围，复用成功结果，补齐必要阶段后提交 SRT。
 
 空字幕由 `normalized_count=0` 确认。缺少此字段的旧任务使用空规范化文件或按保存版本验证的完整 raw；证据缺失或矛盾返回 `cache_mismatch`。
 
-两阶段任务恢复时，经身份与版本校验将 manifest 中的翻译策略 1 升级为 2，保留成功译文、参考、排版范围、轮次、设置及人工决定，仅补缺失项。未知版本返回 `cache_version`。已完成任务用 `--reflow` 按当前策略重建。
+恢复沿用 manifest 中的翻译策略 1、2 或 3，以及成功译文、参考、排版范围、轮次、设置及人工决定，仅补缺失项。未知版本返回 `cache_version`。显式 `--reflow` 使用当前策略 3 重建。
 
-MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。两阶段流程的版本 3 缓存另含阶段、请求兼容策略标识、ASR 语种及完整实际 `tm_list` 的摘要。任务策略 1、2 共享策略标识 1；各字段一致时可复用，包括字幕版本 1 与 2 之间的缓存。
+MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。任务策略 1／2 使用版本 3 缓存，另含阶段、请求兼容策略标识、ASR 语种及完整实际 `tm_list` 的摘要；两者共享策略标识 1，各字段一致时可跨字幕版本 1／2 复用。
 
-各翻译阶段按完整缓存键合并同批请求。组内每条记录的 `attempts` 随请求增加一次；成功译文、缓存和计数在同一事务保存。失败写回全部组员并停止调度新组；在途成功结果继续保存，供恢复复用。
+任务策略 3 使用独立的版本 4 批量缓存，键包含策略、提示词版本、完整请求（含模型、采样参数、语种、实际上下文和有序片段）、上述账户范围、阶段及 ASR 语种，值保存完整编号到译文的映射。请求内编号独立于来源句及稳定 `cue_id`，上下文或分组变化时重新匹配缓存。
+
+各翻译阶段按完整缓存键合并同批请求。组内每条记录的 `attempts` 随逻辑请求增加一次，策略 3 的修复请求也计入；HTTP 传输重试计入 `mt`。一组译文、完整缓存和计数同事务保存。失败写回全部组员并停止调度新组，在途成功结果继续保存。取消或失败后可恢复；策略 3 同组部分译文缺失时，按完整组缓存或重新请求恢复一致的分配。
 
 `--reflow JOB_ID` 读取全部本地 `raw-{segment_id}.json`，沿用识别输入、偏移和账户范围，按当前排版设置重建来源，仅在需要翻译时联网。源媒体可已移走；转写缺失或无效时保留原任务并报错。人工语种决定按完整来源对应，冲突或无法对应时返回 `reflow_review`。
 
@@ -91,13 +99,15 @@ PCM 中间文件使用 RIFF WAV，数据容量上限为 `UINT32_MAX - 4096` 字�
 
 ## 上下文与输入预算
 
-先为完整 ASR 句生成固定参考。参考和字幕均校验源句、词／文字范围、时间与语种；整句字幕直接复用对应的单条参考译文。片段的实际上下文为空且与参考单元完全匹配时也可复用。所有译文参与最终排版检查。
+先为完整 ASR 句生成排版参考。参考和字幕均校验源句、词／文字范围、时间与语种；整句字幕复用对应的单条参考译文，复用结果与 `mt_reference_reused` 计数同事务保存。所有译文参与最终排版检查。
 
-拆分片段优先引用所属整句的原译文对；其他上下文按时间距离选择前后各最多两句。相邻句须具有一致 ASR 语种、翻译决定、MT 源语言及人工确认状态，扩展路径上的间隔不超过 5000ms；未知语种且未指定 MT 语言时仅使用所属句参考。
+邻句按时间距离选择前后各最多两句。相邻句须具有一致 ASR 语种、翻译决定、MT 源语言及人工确认状态，扩展路径上的间隔不超过 5000ms；未知语种且未人工指定 MT 语言时不扩展邻句。
 
-上下文来自固定参考阶段，按完整条目裁剪，优先所属句和最近邻句。直接复用按字幕记录响应取消，译文与 `mt_reference_reused` 计数同事务保存。
+策略 3 的参考与片段翻译均使用原文上下文。同一来源句的片段联合翻译，超预算时按连续片段分组，同句剩余片段优先于邻句作为上下文。排版追加拆分时，在同一事务清除受影响来源句全部片段译文，重新联合翻译。
 
-官方[生产使用说明](https://help.aliyun.com/zh/model-studio/machine-translation)的输入上限为 8192 Token，包含翻译记忆。本地按 `messages` 与实际 `translation_options` 的 JSON UTF-8 字节数加 512 估算，预算为 6000。超长参考按可靠词边界拆成单元并持久化，按来源顺序组合用于上下文。无法安全拆分时保存 `mt_input_budget` 错误及恢复进度。
+策略 1／2 的片段使用固定参考译文构建 `tm_list`，优先所属整句，再取邻句；上下文为空且片段与参考单元范围完全匹配时也可复用参考。
+
+本地输入预算为 6000：策略 3 按完整请求 JSON 的 UTF-8 字节数加 512 模板余量估算，包含修复提示；策略 1／2 按 `messages` 与实际 `translation_options` 加同等余量估算。上下文按完整条目裁剪，策略 3 优先保留连续片段组。单片超限只按可靠词时间及完整词边界拆分，无法安全拆分则保存 `mt_input_budget` 错误及恢复进度。
 
 ## 报告字段
 

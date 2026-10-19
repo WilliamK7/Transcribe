@@ -16,6 +16,7 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncod
 
 from .common import (API_ROOTS, ASR_MODEL, MAX_UPLOAD_BYTES, MT_MODEL, SubmissionUnknown,
                      ToolError, check_cancel, connection_identity)
+from .mt import batch_payload, parse_batch_translation, validate_batch_input
 
 
 # Beijing qwen-mt-flash: 60 RPM. One extra second allows for network arrival jitter.
@@ -341,6 +342,29 @@ class Bailian:
             raise ToolError("结果下载地址不是受支持的 HTTPS 链接。", "response_schema")
         # Never attach the API Authorization header to result storage.
         return self.http.json("GET", url, name="result_download")
+
+    def translate_batch(self, fragments, source_lang="auto", *, context=(), on_attempt=lambda: None):
+        validate_batch_input(fragments, source_lang, context)
+        for repair in [False, True]:
+            check_cancel(self.http.cancel)
+            on_attempt()
+            body = {}
+            try:
+                body = self.http.json("POST", self.base + "/compatible-mode/v1/chat/completions",
+                                      name="mt", headers=self.headers,
+                                      json=batch_payload(fragments, source_lang, context, repair=repair))
+                choice = body['choices'][0]
+                if choice.get('finish_reason') != 'stop':
+                    raise ValueError('unfinished response')
+                translated = parse_batch_translation(choice['message']['content'], fragments)
+                return {key: self.cc.convert(text) for key, text in translated.items()}, body.get('id', '')
+            except ToolError as error:
+                if error.code != 'response_schema':
+                    raise
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+            if repair:
+                raise ToolError("批量译文的编号、内容或结束状态无效；整组保留待恢复。", "mt_batch_invalid", body.get('id', ''))
 
     def translate(self, text: str, source_lang="auto", *, tm_list=None) -> tuple[str, str]:
         options = {"source_lang": source_lang, "target_lang": "Chinese"}
