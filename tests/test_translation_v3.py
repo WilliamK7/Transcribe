@@ -10,6 +10,7 @@ from subtitle_tool.api import Bailian
 from subtitle_tool.common import Cancelled, ToolError, MT_INPUT_BUDGET
 from subtitle_tool.engine import Engine
 from subtitle_tool.mt import batch_cache_key, batch_input_size
+from subtitle_tool.policy import load_policy
 from subtitle_tool.subtitles import (make_fragment, normalize, plan_reference_units, plan_translation_batches,
                                      source_context, split_mt_units, validate_unit_coverage)
 from tests.fixtures import FakeService, PipelineFixture, TemporaryTest, response, result, timed_raw
@@ -187,7 +188,9 @@ class ContextTranslationTests(PipelineFixture):
                                 workspace_id='offline-space', access_mode='workspace',
                                 count=lambda name: self.store.count(self.job_id, name))
         with mock.patch('requests.request', side_effect=handler):
-            engine.translate_batches(self.job_id, self.store.cues(self.job_id), sources, self.scope, client)
+            policy = load_policy(self.store.job(self.job_id)['manifest'])
+            engine.translate_batches(self.job_id, self.store.cues(self.job_id), sources, self.scope, client,
+                                     context_version=policy.context_version)
 
     def test_same_sentence_fragments_use_one_request_without_parent_translation(self):
         sources = self.prepare_sources(timed_raw(['The', 'charges', 'move', 'through', 'the', 'wire.'], word_ms=1000))
@@ -260,13 +263,14 @@ class ContextTranslationTests(PipelineFixture):
         self.assertEqual((counts['mt'], counts['mt_subtitle_request'], counts['mt_subtitle_completed']), (2, 2, 2))
 
     def test_identical_batches_share_one_request_and_restore_missing_record_from_complete_cache(self):
-        raw = timed_raw(['alpha', 'bravo', 'charlie', 'delta'], word_ms=1000)
+        raw = timed_raw(['alpha', 'bravo', 'charlie', 'delta'], word_ms=750)
         template = raw['transcripts'][0]['sentences'][0]
         sentences = [copy.deepcopy(template) for _ in range(4)]
         for i, sentence in enumerate(sentences):
             for item in [sentence, *sentence['words']]:
-                item['begin_time'] += i * 10000
-                item['end_time'] += i * 10000
+                # A sixteen-second gap keeps each request's context empty.
+                item['begin_time'] += i * 19000
+                item['end_time'] += i * 19000
         raw['transcripts'][0]['sentences'] = sentences
         sources = self.prepare_sources(raw)
         cues = [cue for source in sources for cue in [make_fragment(source, 0, 2), make_fragment(source, 2, 4)]]

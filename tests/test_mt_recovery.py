@@ -16,6 +16,7 @@ from subtitle_tool.engine import Engine
 from subtitle_tool.mt import (BatchValidationError, batch_cache_key, batch_cache_value, batch_input_size,
                               batch_recovery_cache_key, parse_batch_response, recovery_context)
 from subtitle_tool.mt_diagnostics import MTDiagnostics, safe_request_id
+from subtitle_tool.policy import load_policy
 from subtitle_tool.subtitles import make_fragment, normalize
 from tests.fixtures import PipelineFixture, TemporaryTest, response, timed_raw
 from tests.test_translation_v3 import batch_input, batch_response
@@ -215,8 +216,8 @@ class RecoveryPersistenceTests(PipelineFixture):
         if duplicate:
             second = copy.deepcopy(raw['transcripts'][0]['sentences'][0])
             for item in [second, *second['words']]:
-                item['begin_time'] += 20000
-                item['end_time'] += 20000
+                item['begin_time'] += 22000
+                item['end_time'] += 22000
             raw['transcripts'][0]['sentences'].append(second)
         if neighbor:
             raw['transcripts'][0]['sentences'].append({'text': 'Neighbor.', 'language': 'en',
@@ -235,8 +236,9 @@ class RecoveryPersistenceTests(PipelineFixture):
         cloud = Bailian('offline-key', 'beijing', engine.cancel, count=lambda name: self.store.count(self.job_id, name))
         with mock.patch('requests.request', side_effect=handler):
             records = self.store.references(self.job_id) if reference_stage else self.store.cues(self.job_id)
+            policy = load_policy(self.store.job(self.job_id)['manifest'])
             engine.translate_batches(self.job_id, records, self.sources, self.scope, lambda: cloud,
-                                     reference_stage=reference_stage)
+                                     context_version=policy.context_version, reference_stage=reference_stage)
 
     @staticmethod
     def singletons(*args, **kwargs):

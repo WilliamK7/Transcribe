@@ -424,13 +424,13 @@ class Engine:
                 stage("skipped")
                 return "skipped"
             cache.mkdir(parents=True, exist_ok=True)
-            policy = load_policy(manifest)
-            settings = policy.settings(self.config.settings)
+            execution_policy = load_policy(manifest)
+            settings = execution_policy.settings(self.config.settings)
             if manifest.get("reflow"):
                 if subtitle_version != SUBTITLE_VERSION or not manifest.get("normalized"):
                     raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
-            contract = asr_contract(policy.normalizer_version)
-            if policy.normalizer_version == 1 and not manifest.get("normalized"):
+            contract = asr_contract(execution_policy.normalizer_version)
+            if execution_policy.normalizer_version == 1 and not manifest.get("normalized"):
                 contract["normalizer"] = 2
                 manifest["normalization_upgraded_from"] = 1
             manifest["contract"] = contract
@@ -440,7 +440,8 @@ class Engine:
             if manifest.get("normalized"):
                 self.verify_source_output(job_id, manifest, output)
                 self.prepare_output(output)
-                return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache)
+                return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache,
+                                             context_version=execution_policy.context_version)
             saved_asr = False
             if self.store.sources(job_id) or self.store.cues(job_id) or self.store.references(job_id):
                 raise mismatch()
@@ -620,7 +621,8 @@ class Engine:
                                  normalized_version=normalizer_version, normalized_file=normalized_file)
                 sources, fragments = (cues, [make_fragment(s) for s in cues]) if subtitle_version else ([], cues)
                 self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, sources, fragments)
-            return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache)
+            return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache,
+                                         context_version=execution_policy.context_version)
         except LocalStateUnavailable:
             # Never let a generic handler persist an unconfirmed in-memory state.
             raise
@@ -669,7 +671,7 @@ class Engine:
             if not manifest.get("fingerprint") or manifest["fingerprint"] != fingerprint(source, self.cancel):
                 raise ToolError("原路径媒体已变化；请使用其他目录的 --output-dir 保存原任务字幕。", "source_changed")
 
-    def finish_subtitles(self, job_id, manifest, settings, scope, client, stage, output, cache):
+    def finish_subtitles(self, job_id, manifest, settings, scope, client, stage, output, cache, *, context_version):
         self.validate_saved_subtitles(job_id, manifest, cache)
         cues = self.store.cues(job_id)
         if not cues:
@@ -687,7 +689,7 @@ class Engine:
                 self.commit_local(job_id, manifest, candidate,
                                   lambda jid, value: self.store.update(jid, manifest=value))
             if manifest.get("subtitle_version"):
-                self.process_subtitles(job_id, manifest, settings, scope, client, stage)
+                self.process_subtitles(job_id, manifest, settings, scope, client, stage, context_version=context_version)
             else:
                 stage("translating")
                 self.translate(job_id, cues, scope, client)
@@ -709,7 +711,7 @@ class Engine:
             self.cleanup_completed_audio(job_id, manifest, cache)
         return "completed"
 
-    def process_subtitles(self, job_id, manifest, settings, scope, client, stage):
+    def process_subtitles(self, job_id, manifest, settings, scope, client, stage, *, context_version):
         joint = manifest['translation_strategy_version'] == 3
         sources = self.store.sources(job_id)
         if not sources:
@@ -728,7 +730,8 @@ class Engine:
                 raise ToolError("参考翻译缺少对应完整句来源。", "cache_mismatch")
             validate_fragment(source_ids[reference["sentence_id"]], reference, reference_stage=True)
         if joint:
-            self.translate_batches(job_id, references, sources, scope, client, reference_stage=True)
+            self.translate_batches(job_id, references, sources, scope, client,
+                                   context_version=context_version, reference_stage=True)
         else:
             self.translate(job_id, references, scope, client, stage_name="reference_translating",
                            reference_stage=True, strategy_version=manifest["translation_strategy_version"])
@@ -774,7 +777,8 @@ class Engine:
                 else:
                     contexts[cue["cue_id"]] = context
             if joint:
-                self.translate_batches(job_id, self.store.cues(job_id), sources, scope, client)
+                self.translate_batches(job_id, self.store.cues(job_id), sources, scope, client,
+                                       context_version=context_version)
             else:
                 self.translate(job_id, self.store.cues(job_id), scope, client, stage_name="subtitle_translating",
                                strategy_version=manifest["translation_strategy_version"], contexts=contexts)
@@ -809,7 +813,7 @@ class Engine:
                            for cue in revised]
             self.commit_local(job_id, manifest, candidate, self.store.save_layout, revised)
 
-    def translate_batches(self, job_id, cues, sources, scope, client, *, reference_stage=False):
+    def translate_batches(self, job_id, cues, sources, scope, client, *, context_version, reference_stage=False):
         cache_stage = 'reference' if reference_stage else 'subtitle'
         stage_name = cache_stage + '_translating'
         diagnostics = MTDiagnostics(self.config.root, job_id)
@@ -826,7 +830,8 @@ class Engine:
                 continue
             units = sorted(by_source.get(source['sentence_id'], []), key=lambda c: c['char_start'])
             validate_unit_coverage(source, units, reference_stage=reference_stage)
-            for members, context in plan_translation_batches(units, source_context(sources, position)):
+            for members, context in plan_translation_batches(units, source_context(
+                    sources, position, context_version=context_version)):
                 if all(c['translated'] for c in members):
                     continue
                 key = batch_cache_key([c['text'] for c in members], members[0]['source_lang'], **scope,

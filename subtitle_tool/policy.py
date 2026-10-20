@@ -8,8 +8,12 @@ from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION
 from .media import EXTRACT_RECIPE_VERSION
 
 
+CONTEXT_VERSION = 1
+
+
 def current_execution_snapshot():
-    return dict(format_version=1, prompt_version=mt.PROMPT_VERSION, recovery_version=mt.RECOVERY_VERSION)
+    return dict(format_version=1, prompt_version=mt.PROMPT_VERSION, recovery_version=mt.RECOVERY_VERSION,
+                context_version=CONTEXT_VERSION)
 
 
 def asr_contract(normalizer=NORMALIZER_VERSION):
@@ -34,6 +38,7 @@ class LayoutPolicy:
 class ExecutionPolicy:
     normalizer_version: int
     layout: LayoutPolicy | None
+    context_version: int
 
     def settings(self, runtime):
         """Saved result settings plus current concurrency and polling parameters."""
@@ -69,10 +74,13 @@ def load_policy(manifest, *, verify_execution=True):
     plan = manifest.get("media_plan")
     _version(plan.get("extract_recipe_version", 1) if plan else EXTRACT_RECIPE_VERSION,
              {1, EXTRACT_RECIPE_VERSION})
+    context_version = 0
     if verify_execution and "execution_snapshot" in manifest:
         snapshot = manifest["execution_snapshot"]
         current = current_execution_snapshot()
-        if (not isinstance(snapshot, dict) or set(snapshot) != set(current) or
-                any(type(snapshot[k]) is not int or snapshot[k] != v for k, v in current.items())):
+        required = set(current) - {"context_version"}
+        if (not isinstance(snapshot, dict) or set(snapshot) not in (required, set(current)) or
+                any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in required)):
             raise ToolError("任务的提示词／响应恢复执行版本与当前实现不匹配，请用 --reflow 显式重排。", "cache_version")
-    return ExecutionPolicy(normalizer, layout)
+        context_version = _version(snapshot.get("context_version", 0), {0, CONTEXT_VERSION})
+    return ExecutionPolicy(normalizer, layout, context_version)

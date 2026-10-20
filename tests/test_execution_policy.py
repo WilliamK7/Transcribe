@@ -13,10 +13,12 @@ class ExecutionPolicyTests(SavedResultFixture):
         from subtitle_tool.policy import current_execution_snapshot
         self.save_result()
         original = self.store.job(self.job_id)["manifest"]
-        for field in ["format_version", "prompt_version", "recovery_version"]:
-            with self.subTest(field=field):
+        invalid = [(field, 999) for field in ["format_version", "prompt_version", "recovery_version"]]
+        invalid.extend(("context_version", value) for value in [-1, 2, True, "1", None])
+        for field, value in invalid:
+            with self.subTest(field=field, value=value):
                 manifest = copy.deepcopy(original)
-                manifest["execution_snapshot"] = {**current_execution_snapshot(), field: 999}
+                manifest["execution_snapshot"] = {**current_execution_snapshot(), field: value}
                 self.store.update(self.job_id, "queued", manifest)
                 fake = FakeService(result())
                 with mock.patch.object(self.store, "cache_get", side_effect=AssertionError("no cache")):
@@ -26,14 +28,6 @@ class ExecutionPolicyTests(SavedResultFixture):
                 self.assertIn("--reflow", job["error"])
                 self.assertEqual(fake.calls, [])
                 self.assertFalse(self.source.with_suffix(".srt").exists())
-
-    def test_legacy_task_does_not_acquire_guessed_snapshot(self):
-        self.save_result(result(("完整字幕。", "zh")))
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest.pop("execution_snapshot", None)
-        self.store.update(self.job_id, manifest=manifest)
-        self.assertEqual(self.run_fake(FakeService(result())), "completed")
-        self.assertNotIn("execution_snapshot", self.store.job(self.job_id)["manifest"])
 
     def test_reflow_refreshes_snapshot_only_after_successful_preparation(self):
         from subtitle_tool.policy import current_execution_snapshot

@@ -625,8 +625,9 @@ def split_mt_units(source, units, *, reference_stage=False):
     return result
 
 
-def _context_neighbors(cue, sources, position):
+def _context_neighbors(cue, sources, position, *, context_version=0):
     """Compatible neighbors ordered by proximity, distance and source position."""
+    sentence_limit, gap_limit = (12, 15000) if context_version == 1 else (2, 5000)
     source = sources[position]
     def compatible(item):
         language = item['language'].lower().strip()
@@ -637,24 +638,26 @@ def _context_neighbors(cue, sources, position):
     neighbors = []
     for direction in [-1, 1]:
         previous = source
-        for distance in [1, 2]:
+        for distance in range(1, sentence_limit + 1):
             index = position + direction * distance
             if not 0 <= index < len(sources):
                 break
             neighbor = sources[index]
             gap = (previous['begin_ms'] - neighbor['end_ms'] if direction < 0 else
                    neighbor['begin_ms'] - previous['end_ms'])
-            if gap > 5000 or compatible(neighbor) != compatible(source):
-                break
             proximity = max(neighbor['begin_ms'] - cue['end_ms'], cue['begin_ms'] - neighbor['end_ms'], 0)
+            if (gap > gap_limit or compatible(neighbor) != compatible(source) or
+                    (context_version == 1 and proximity > 30000)):
+                break
             neighbors.append((proximity, distance, index, neighbor))
             previous = neighbor
     return [(index, neighbor) for _, _, index, neighbor in sorted(neighbors, key=lambda n: n[:3])]
 
 
-def source_context(sources, position):
+def source_context(sources, position, *, context_version=0):
     return [{'position': 'before' if index < position else 'after', 'text': neighbor['text']}
-            for index, neighbor in _context_neighbors(sources[position], sources, position)]
+            for index, neighbor in _context_neighbors(sources[position], sources, position,
+                                                      context_version=context_version)]
 
 
 def plan_translation_batches(units, neighbors):

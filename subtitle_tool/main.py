@@ -83,7 +83,8 @@ class Progress:
                 message = (f"翻译提速：请求间隔 {done:.2f} → {total:.2f} 秒" if total else
                            f"翻译提速：请求间隔 {done:.2f} 秒，恢复无额外间隔")
             elif stage == 'mt_split':
-                message = f"批量译文校验失败：{done} 片拆为 {done // 2}＋{done - done // 2} 片，顺序重试"
+                message = (f"批量译文校验失败：缩小翻译请求，{done} 片按 {done // 2}＋{done - done // 2} 片顺序重试；"
+                           "字幕分段和时间保持不变")
             elif stage in {"translating", "reference_translating", "subtitle_translating"} and total is not None:
                 message = f"{STATES[stage]}／已处理 {done}/{total}"
             elif stage == "layout_adjusting" and total is not None:
