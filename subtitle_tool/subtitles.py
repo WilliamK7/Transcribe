@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import shutil
-import tempfile
-import time
 import unicodedata
-from pathlib import Path
 
 from .common import MT_INPUT_BUDGET, MT_MODEL, MT_TEMPLATE_RESERVE, NORMALIZER_VERSION, SUBTITLE_VERSION, ToolError
+from .review import decision_origin
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
              "id", "th", "tr", "uk", "vi", "cs", "da", "fil", "fi", "is", "ms", "no", "pl", "sv"}
@@ -236,6 +232,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
                 start = 0
             cue = {"cue_id": f"{segment_id}:{index:08}:{part:04}", "begin_ms": start, "end_ms": stop,
                    "text": source, "language": sentence.get("language", ""), "decision": decision, "reason": reason,
+                   "decision_origin": "automatic",
                    "asr_sentence_indices": sentence["_indices"]}
             if sentence["_adjustments"]:
                 cue["timing_adjustments"] = sentence["_adjustments"]
@@ -459,6 +456,7 @@ def make_fragment(source, lo=0, hi=None, *, layout_round=0):
     begin = source["begin_ms"] if full else words[lo]["begin_ms"]
     end = source["end_ms"] if full else words[hi - 1]["end_ms"]
     cue = {k: source[k] for k in ("sentence_id", "language", "decision", "reason")}
+    cue["decision_origin"] = decision_origin(source)
     cue.update(cue_id=fragment_id(source["sentence_id"], lo, hi, char_start, char_end),
                begin_ms=begin, end_ms=end, text=source["text"][char_start:char_end].strip(),
                source_lang=source.get("source_lang", "auto"), translated="", attempts=0, error="",
@@ -632,7 +630,7 @@ def _context_neighbors(cue, sources, position):
     source = sources[position]
     def compatible(item):
         language = item['language'].lower().strip()
-        manual = item['reason'] == '用户在终端确认'
+        manual = decision_origin(item) == 'manual'
         if not language:
             language = item.get('source_lang') if manual and item.get('source_lang') != 'auto' else item['sentence_id']
         return language, item['decision'], item.get('source_lang', 'auto'), manual
@@ -722,6 +720,8 @@ def reference_sources(sources, references):
 
 
 def validate_fragment(source, cue, *, reference_stage=False):
+    if decision_origin(source) != decision_origin(cue):
+        raise ToolError("字幕片段与完整句的人工决定来源不一致。", "cache_mismatch")
     lo, hi = cue.get("word_start"), cue.get("word_end")
     count = len(source.get("words", []))
     if (type(lo) is not int or type(hi) is not int or not 0 <= lo <= hi <= count or
@@ -784,40 +784,3 @@ def render_srt(cues, settings, *, subtitle_version=SUBTITLE_VERSION) -> bytes:
             raise ToolError("字幕文本含异常时间箭头或为空。", "srt_invalid")
         rows.append(str(number) + "\r\n" + timestamp(cue["begin_ms"]) + " --> " + timestamp(cue["end_ms"]) + "\r\n" + "\r\n".join(source))
     return ("\r\n\r\n".join(rows) + ("\r\n\r\n" if rows else "")).encode("utf-8")
-
-
-def write_srt(path: Path, content: bytes, overwrite=False):
-    """Prepare beside target; back up before replace. Non-overwrite commit uses exclusive link."""
-    if path.exists() and not overwrite:
-        raise ToolError("同名 SRT 已存在，已跳过。", "exists")
-    fd, name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp", dir=path.parent)
-    temp, backup = Path(name), None
-    try:
-        with os.fdopen(fd, "wb") as file:
-            file.write(content)
-            file.flush()
-            os.fsync(file.fileno())
-        if overwrite:
-            if path.exists():
-                backup = path.with_name(path.name + f".bak.{time.time_ns()}")
-                # Exclusive backup; any failure aborts before touching the original.
-                with path.open("rb") as source, backup.open("xb") as target:
-                    shutil.copyfileobj(source, target)
-                    target.flush()
-                    os.fsync(target.fileno())
-            os.replace(temp, path)
-        else:
-            # Atomic creation, including protection against a file appearing during cloud work.
-            try:
-                os.link(temp, path)
-            except FileExistsError as e:
-                raise ToolError("处理期间出现同名 SRT，已保留现有文件。", "exists") from e
-            except OSError:
-                if os.name == "nt":
-                    # Windows rename fails when the destination exists, also on non-NTFS volumes.
-                    os.rename(temp, path)
-                else:
-                    raise
-    finally:
-        temp.unlink(missing_ok=True)
-    return str(backup) if backup else ""

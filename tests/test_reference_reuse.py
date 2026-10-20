@@ -102,18 +102,21 @@ class ReferenceReuseTests(PipelineFixture):
     def test_strategy_one_resume_preserves_policy_and_saved_work_and_only_reuses_missing(self):
         self.prepare_subtitle_stage()
         sources = self.store.sources(self.job_id)
-        for source in sources:
-            self.store.cue_update(self.job_id, next(c['cue_id'] for c in self.store.cues(self.job_id)
-                                                  if c['sentence_id'] == source['sentence_id']),
-                                  reason='用户在终端确认', source_lang='English')
-        # Keep reference metadata consistent with the saved manual source decision.
         references = self.store.references(self.job_id)
+        self.store.update(self.job_id, 'needs_review')
+        from subtitle_tool.review import ReviewDecision
+        for source in sources:
+            self.store.apply_review(self.job_id, next(c['cue_id'] for c in self.store.cues(self.job_id)
+                                                    if c['sentence_id'] == source['sentence_id']),
+                                    ReviewDecision('translate', 'English'))
+        # Keep reference metadata consistent with the saved manual source decision.
         for reference in references:
-            reference.update(reason='用户在终端确认', source_lang='English')
+            reference.update(reason='用户在终端确认', source_lang='English', decision_origin='manual')
         cues = self.store.cues(self.job_id)
         cues[0].update(translated='保留旧策略成功译文', attempts=3)
         manifest = self.store.job(self.job_id)['manifest']
-        manifest.update(translation_strategy_version=1, layout_round=2, layout_complete=False)
+        manifest.update(translation_strategy_version=1, layout_round=2, layout_complete=False,
+                        references_planned=True, layout_planned=True)
         self.store.save_layout(self.job_id, cues, manifest, references=references)
         before_sources = self.store.sources(self.job_id)
         before_cues = self.store.cues(self.job_id)

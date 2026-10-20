@@ -14,14 +14,9 @@ from .common import ASR_MODEL, MT_MODEL, ToolError, validate_workspace_id
 from .config import Config
 from .engine import Engine
 from .instance import ProcessLock
-from .media import Media
 from .reports import ReportWriter
-from .store import STATES, TERMINAL, Store
-
-MT_LANGUAGES = {"auto", "Chinese", "English", "Japanese", "German", "Korean", "Russian", "French",
-                "Portuguese", "Arabic", "Italian", "Spanish", "Hindi", "Indonesian", "Thai", "Turkish",
-                "Ukrainian", "Vietnamese", "Czech", "Danish", "Filipino", "Finnish", "Icelandic", "Malay",
-                "Norwegian", "Polish", "Swedish"}
+from .store import STATES, Store
+from .review import MT_LANGUAGES, ReviewDecision
 
 
 def parser():
@@ -108,16 +103,11 @@ def review(config, store, engine, job_id):
     job = store.job(job_id)
     manifest = job["manifest"]
     if job["error_code"] in {"audio_track", "audio_channel"}:
-        info = manifest.get("media")
-        if not info:
-            info = Media(config.root, engine.cancel).probe(Path(job["source"]))
-            manifest["media"] = info
-            store.update(job_id, manifest=manifest)
+        info, selected = engine.review_media(job_id)
         for track in info["tracks"]:
             tags = track.get("tags", {})
             print(f"音轨 {track['index']}：{track.get('codec_name', '?')}，{track.get('channels', '?')} 声道，"
                   f"语言 {tags.get('language', '?')}，起始 {track.get('start_time', '?')} 秒", file=sys.stderr)
-        selected = manifest.get("track")
         if job["error_code"] == "audio_track":
             while True:
                 answer = ask("选择音轨索引（q 暂停）：")
@@ -127,8 +117,6 @@ def review(config, store, engine, job_id):
                     selected = int(answer)
                     break
                 print("请输入列表中的音轨索引。", file=sys.stderr)
-        else:
-            selected, _ = Media(config.root, engine.cancel).select(info, selected, "mix")
         track = next(t for t in info["tracks"] if t["index"] == selected)
         channel = manifest.get("channel", config.settings.channel)
         if int(track.get("channels", 1)) > 1 and channel == "ask":
@@ -145,6 +133,8 @@ def review(config, store, engine, job_id):
         if not uncertain:
             raise ToolError("此任务没有待确认的音轨／声道／语种。请用 --resume 重试当前阶段。", "review")
         for cue in uncertain:
+            if not any(c["cue_id"] == cue["cue_id"] and c["decision"] == "uncertain" for c in store.cues(job_id)):
+                continue
             print(f"字幕 {cue['cue_id']}（ASR 语种 {cue['language'] or '缺失'}，{cue['reason']}）：\n{cue['text']}", file=sys.stderr)
             while True:
                 choice = ask("o 保留原文／t 翻译为中文／q 暂停：").lower()
@@ -162,9 +152,8 @@ def review(config, store, engine, job_id):
                     if source_lang in MT_LANGUAGES:
                         break
                     print("请使用 auto 或受支持的接口语言名称，不能传 ASR 的 en/ja 标签。", file=sys.stderr)
-            store.cue_update(job_id, cue["cue_id"], decision="original" if choice == "o" else "translate",
-                             source_lang=source_lang, reason="用户在终端确认", translated="", error="")
-    store.update(job_id, "queued")
+            engine.apply_review(job_id, cue["cue_id"], ReviewDecision("original" if choice == "o" else "translate", source_lang))
+    engine.finish_review(job_id)
     return True
 
 
@@ -262,9 +251,9 @@ def main(argv=None):
                                          job_id=args.resume or args.reflow or args.review)
             report_writer.validate()
         store = Store(config.data / "jobs.sqlite")
-        store.recover()
         progress = Progress()
         engine = Engine(config, store, cancel, progress)
+        engine.recover_jobs()
         if args.jobs:
             report = [summary(store, j["id"]) for j in store.jobs()]
             for item in report:
@@ -273,9 +262,7 @@ def main(argv=None):
                 report_writer.write(report)
             return 0
         if args.cancel:
-            job = store.job(args.cancel)
-            if job["state"] not in TERMINAL:
-                store.update(args.cancel, "cancelled", error="用户停止本地任务；已提交的云端任务仍可能计费。", code="cancelled")
+            engine.cancel_job(args.cancel)
             item = summary(store, args.cancel)
             print(json.dumps(item, ensure_ascii=False))
             if args.report:
@@ -307,16 +294,13 @@ def main(argv=None):
                 raise ToolError("恢复沿用任务原接入方式和工作空间；--workspace-id 不能迁移旧任务。", "cache_mismatch")
             if args.reflow:
                 engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
+            elif args.resume:
+                engine.resume(current_job, track=args.track, channel=args.channel, output_dir=args.output_dir,
+                              overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit)
             else:
                 engine.select_input(current_job, args.track, args.channel)
                 if args.overwrite or args.output_dir:
-                    store.change_output(current_job, args.output_dir, args.overwrite)
-            if args.resume and job["state"] == "cancelled":
-                ambiguous = (not job["manifest"].get("reflow") and
-                             any(s.get("submitting") and not s.get("task_id") for s in job["manifest"]["segments"]))
-                store.update(current_job, "submission_unknown" if ambiguous else "queued")
-            if args.bind_task_id or args.allow_resubmit:
-                engine.resolve_unknown(current_job, args.bind_task_id, args.allow_resubmit)
+                    engine.change_output(current_job, args.output_dir, args.overwrite)
         else:
             workspace = validate_workspace_id(config.settings.workspace_id)
             account = hashlib.sha256(config.get_key().encode()).hexdigest()
@@ -352,11 +336,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         cancel.set()
         if store and current_job:
-            job = store.job(current_job)
-            ambiguous = (not job["manifest"].get("reflow") and
-                         any(s.get("submitting") and not s.get("task_id") for s in job["manifest"]["segments"]))
-            if job["state"] not in {"completed", "skipped"}:
-                store.update(current_job, "submission_unknown" if ambiguous else "cancelled", code="submission_unknown" if ambiguous else "cancelled")
+            engine.cancel_job(current_job, interrupted=True)
             hint(store, current_job)
             item = summary(store, current_job)
             print(json.dumps(item, ensure_ascii=False))

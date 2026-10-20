@@ -12,23 +12,28 @@ import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 
 from .api import Bailian, upload_limit
-from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
+from .common import (NORMALIZER_VERSION, SUBTITLE_VERSION,
                      TRANSLATION_STRATEGY_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
-                     SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint)
+                     SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key)
 from .config import Config, decrypt_legacy
 from .media import EXTRACT_RECIPE_VERSION, Media
 from .mt import batch_cache_key, batch_cache_value, batch_recovery_cache_key, parse_batch_translation
 from .mt_diagnostics import MTDiagnostics
-from .store import Store
+from .store import TERMINAL, Store
+from .review import ReviewDecision, decision_origin
+from .policy import asr_contract, current_execution_snapshot, load_policy
+from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
+                            validate_normalized, validate_segments)
+from .publication import file_hash, inspect_intent, prepare_intent, write_srt
 from .subtitles import (layout_warnings, make_fragment, mt_cache_key, normalize, plan_fragments,
                         plan_reference_units, reference_sources, render_srt, translation_context,
                         plan_translation_batches, source_context, split_mt_units, validate_unit_coverage,
-                        validate_fragment, validate_mt_input, wrap, write_srt)
+                        validate_fragment, validate_mt_input, wrap)
 
 
 class LocalStateUnavailable(ToolError):
@@ -36,11 +41,89 @@ class LocalStateUnavailable(ToolError):
         super().__init__("无法确认本地事务的已提交状态；已停止处理，请检查数据库后恢复。", "local_persistence")
 
 
+def unknown_submission(manifest, state):
+    """Shared uncertainty rule, including pre-segment-marker task records."""
+    return not manifest.get("reflow") and (
+        manifest.get("submitting") or
+        any(s.get("submitting") and not s.get("task_id") for s in manifest.get("segments", [])) or
+        state == "submission_unknown" or
+        state == "submitting" and not any(s.get("task_id") or "submitting" in s for s in manifest.get("segments", [])))
+
+
 class Engine:
     def __init__(self, config: Config, store: Store, cancel=None, progress=lambda *args: None):
         self.config, self.store = config, store
         self.cancel = cancel or threading.Event()
         self.progress = progress
+
+    def recover_jobs(self):
+        for job in self.store.jobs():
+            if job["state"] in TERMINAL:
+                continue
+            if unknown_submission(job["manifest"], job["state"]):
+                self.store.update(job["id"], "submission_unknown",
+                                  error="提交被中断，结果未知；请确认云端任务。", code="submission_unknown")
+            elif job["state"] not in {"failed", "needs_review", "queued"}:
+                self.store.update(job["id"], "queued")
+
+    def change_output(self, job_id, directory=None, overwrite=False):
+        self.store.change_output(job_id, directory, overwrite)
+
+    def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
+               task_id=None, allow_resubmit=False):
+        """Prepare an explicitly requested resume; run() remains the sole executor."""
+        self.select_input(job_id, track, channel)
+        job = self.store.job(job_id)
+        if job["state"] in {"completed", "skipped"}:
+            if output_dir is not None and output_key(self.store.resolve_output(job, output_dir)) != job["output_key"]:
+                raise ToolError("已完成任务的输出不能通过恢复修改，请新建任务。", "job")
+            if task_id or allow_resubmit:
+                self.resolve_unknown(job_id, task_id, allow_resubmit)
+            return
+        if overwrite or output_dir is not None:
+            self.change_output(job_id, output_dir, overwrite)
+        if unknown_submission(job["manifest"], job["state"]):
+            self.store.update(job_id, "submission_unknown")
+        elif job["state"] == "cancelled":
+            self.store.update(job_id, "queued")
+        if task_id or allow_resubmit:
+            self.resolve_unknown(job_id, task_id, allow_resubmit)
+
+    def cancel_job(self, job_id, *, interrupted=False):
+        job = self.store.job(job_id)
+        if job["state"] in TERMINAL:
+            return
+        manifest = job["manifest"]
+        ambiguous = unknown_submission(manifest, job["state"])
+        if ambiguous:
+            # Preserve old top-level uncertainty when the external state becomes cancelled.
+            manifest["submitting"] = True
+        state = "submission_unknown" if interrupted and ambiguous else "cancelled"
+        self.store.update(job_id, state, manifest,
+                          error="用户停止本地任务；已提交的云端任务仍可能计费。",
+                          code="submission_unknown" if interrupted and ambiguous else "cancelled")
+
+    def apply_review(self, job_id, cue_id, decision: ReviewDecision):
+        self.store.apply_review(job_id, cue_id, decision)
+
+    def review_media(self, job_id):
+        job = self.store.job(job_id)
+        manifest = job["manifest"]
+        if not manifest.get("media"):
+            manifest["media"] = Media(self.config.root, self.cancel).probe(Path(job["source"]))
+            self.store.update(job_id, manifest=manifest)
+        selected = manifest.get("track")
+        if job["error_code"] == "audio_channel":
+            selected, _ = Media(self.config.root, self.cancel).select(manifest["media"], selected, "mix")
+        return manifest["media"], selected
+
+    def finish_review(self, job_id):
+        job = self.store.job(job_id)
+        if job["state"] != "needs_review":
+            raise ToolError("当前任务不是待复核状态。", "review")
+        if job["error_code"] == "language_uncertain" and any(c["decision"] == "uncertain" for c in self.store.cues(job_id)):
+            raise ToolError("仍有未确认的语种决定。", "review")
+        self.store.update(job_id, "queued")
 
     def commit_local(self, job_id, manifest, candidate, operation, *args, **kwargs):
         """Only local DB boundaries reload state; cloud facts keep their existing handling."""
@@ -62,8 +145,8 @@ class Engine:
     def identity(self, job_id, manifest, *, persist=True):
         identity = connection_identity(manifest)
         version = manifest.get("processing_version", 1)
-        if version not in {1, PROCESSING_VERSION}:
-            raise ToolError("任务的媒体处理版本不受支持。", "cache_version")
+        if type(version) is not int or version < 1:
+            raise ToolError("任务的媒体处理版本无效。", "cache_version")
         key = self.config.get_key()
         account = hashlib.sha256(key.encode()).hexdigest()
         if manifest.get("account") and manifest["account"] != account:
@@ -75,9 +158,6 @@ class Engine:
             if segment.get("upload_identity") and segment["upload_identity"] != scope:
                 raise ToolError("分段的账号／工作空间身份与任务不一致。", "cache_mismatch")
         plan = manifest.get("media_plan")
-        if plan and (type(plan.get("extract_recipe_version", 1)) is not int or
-                     plan.get("extract_recipe_version", 1) not in {1, EXTRACT_RECIPE_VERSION}):
-            raise ToolError("媒体提取配方版本不受支持。", "cache_version")
         if plan and (plan.get("version") != version or plan.get("track") != manifest.get("track") or
                      plan.get("channel") != manifest.get("channel")):
             raise ToolError("媒体缓存的版本／音轨／声道与任务记录不一致。", "cache_mismatch")
@@ -93,16 +173,10 @@ class Engine:
         manifest = job["manifest"]
         output = self.store.resolve_output(job, output_dir)
         self.store.check_reflow_output(job_id, output, overwrite)
+        load_policy(manifest, verify_execution=False).settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
-        self.validate_subtitle_settings(manifest)
         self.config.settings.validate()
-        contract = {"asr": ASR_MODEL, "mt": MT_MODEL, "normalizer": NORMALIZER_VERSION,
-                    "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}}
-        saved = manifest.get("contract")
-        if saved and (saved.get("normalizer") not in {1, 2, NORMALIZER_VERSION} or
-                      {k: v for k, v in saved.items() if k != "normalizer"} !=
-                      {k: v for k, v in contract.items() if k != "normalizer"}):
-            raise ToolError("本地转写的模型／参数契约不受支持，不能重排。", "cache_version")
+        contract = asr_contract()
         cache = self.config.data / "cache" / job_id
         offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
         if type(offset) is not int:
@@ -134,10 +208,11 @@ class Engine:
         snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
         self.store.snapshot(job_id, snapshot)
         for name in ["references_planned", "layout_planned", "layout_round", "layout_complete",
-                     "expected_srt_sha256", "backup", "cue_count", "output_settings", "no_speech"]:
+                     "expected_srt_sha256", "publication_intent", "backup", "cue_count", "output_settings", "no_speech"]:
             manifest.pop(name, None)
         normalized_file = f"subtitle-sources-v{SUBTITLE_VERSION}-reflow-{token}.json"
         manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+                        execution_snapshot=current_execution_snapshot(),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
                                            ["zh_line_width", "other_line_width", "chinese_first"]},
                         normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION, normalized_file=normalized_file,
@@ -157,8 +232,8 @@ class Engine:
             sentence_id = source["sentence_id"]
             old = previous.get(sentence_id)
             cues = [c for c in previous_cues if c.get("sentence_id", ":".join(c["cue_id"].split(":")[:2])) == sentence_id]
-            manual = [c for c in cues if c["reason"] == "用户在终端确认"]
-            if old and old["reason"] == "用户在终端确认":
+            manual = [c for c in cues if decision_origin(c) == "manual"]
+            if old and decision_origin(old) == "manual":
                 if any(old.get(k) != source.get(k) for k in ["text", "language", "original_timings"]):
                     raise ToolError("本地转写与人工语种决定的完整句来源不一致，原任务已保留。", "reflow_review")
                 decision = old["decision"], old.get("source_lang", "auto")
@@ -172,25 +247,14 @@ class Engine:
                 decision = next(iter(decisions))
             else:
                 continue
-            source.update(decision=decision[0], source_lang=decision[1], reason="用户在终端确认")
+            source.update(decision=decision[0], source_lang=decision[1], decision_origin="manual",
+                          reason=(old if old and decision_origin(old) == "manual" else manual[0])["reason"])
             accounted.add(sentence_id)
-        expected = {s["sentence_id"] for s in previous_sources if s["reason"] == "用户在终端确认"}
+        expected = {s["sentence_id"] for s in previous_sources if decision_origin(s) == "manual"}
         expected.update(c.get("sentence_id", ":".join(c["cue_id"].split(":")[:2])) for c in previous_cues
-                        if c["reason"] == "用户在终端确认")
+                        if decision_origin(c) == "manual")
         if not expected.issubset(accounted):
             raise ToolError("部分人工语种决定缺少对应完整句，原任务已保留。", "reflow_review")
-
-    def validate_subtitle_settings(self, manifest):
-        settings = self.config.settings
-        version = manifest.get("subtitle_version", 0)
-        if version:
-            if (version not in {1, SUBTITLE_VERSION} or
-                    manifest.get("translation_strategy_version") not in {1, 2, 3} or
-                    set(manifest.get("subtitle_settings", {})) != {"zh_line_width", "other_line_width", "chinese_first"}):
-                raise ToolError("任务的字幕／翻译策略版本或排版快照不受支持。", "cache_version")
-            settings = replace(settings, **manifest["subtitle_settings"])
-            settings.validate()
-        return settings
 
     @staticmethod
     def prepare_output(output):
@@ -210,7 +274,7 @@ class Engine:
         if not changes:
             return
         cache = self.config.data / "cache" / job_id
-        if (manifest.get("normalized") or any(s.get("task_id") or s.get("submitting") or s.get("raw")
+        if (unknown_submission(manifest, job["state"]) or manifest.get("normalized") or any(s.get("task_id") or s.get("submitting") or s.get("raw")
                 for s in manifest["segments"]) or (cache.exists() and any(cache.glob("raw-*.json")))):
             raise ToolError("已提交或提交结果未知的任务不能改变音轨／声道；请保留原任务并新建任务。", "input_committed")
         manifest.update(changes)
@@ -283,7 +347,8 @@ class Engine:
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped", "cancelled"}:
             return job["state"]
-        if job["state"] == "submission_unknown":
+        if unknown_submission(job["manifest"], job["state"]):
+            self.store.update(job_id, "submission_unknown", code="submission_unknown")
             return "submission_unknown"
         manifest = job["manifest"]
         cache = self.config.data / "cache" / job_id
@@ -329,60 +394,86 @@ class Engine:
             # A late interrupt/cleanup error cannot undo a committed success.
             # Do not reload the shared manifest here: it may contain a newly received task_id.
             if self.store.job(job_id)["state"] != "completed":
+                if unknown_submission(manifest, current_stage):
+                    state, code = "submission_unknown", "submission_unknown"
                 self.store.update(job_id, state, manifest, error, code, request_id)
 
         try:
             check_cancel(self.cancel)
             output = self.store.ensure_output(job_id)
-            cache.mkdir(parents=True, exist_ok=True)
             subtitle_version = manifest.get("subtitle_version", 0)
-            settings = self.validate_subtitle_settings(manifest)
+            published = False
+            if "publication_intent" in manifest:
+                key, scope = self.identity(job_id, manifest, persist=False)
+                intent = manifest["publication_intent"]
+                published = inspect_intent(output, intent)
+                if manifest.get("expected_srt_sha256") != intent["expected_srt_sha256"]:
+                    raise mismatch()
+                if published:
+                    manifest["backup"] = intent["backup"] if intent["backup"] and Path(intent["backup"]).is_file() else ""
+            elif (manifest.get("expected_srt_sha256") and output.is_file() and
+                  manifest["expected_srt_sha256"] == file_hash(output)):
+                key, scope = self.identity(job_id, manifest, persist=False)
+                published = True
+            if published:
+                stage("completed")
+                if not manifest.get("reflow"):
+                    self.cleanup_completed_audio(job_id, manifest, cache)
+                return "completed"
             if output.exists() and not manifest["overwrite"]:
-                if manifest.get("expected_srt_sha256") == hashlib.sha256(output.read_bytes()).hexdigest():
-                    stage("completed")
-                    return "completed"
                 stage("skipped")
                 return "skipped"
+            cache.mkdir(parents=True, exist_ok=True)
+            policy = load_policy(manifest)
+            settings = policy.settings(self.config.settings)
             if manifest.get("reflow"):
                 if subtitle_version != SUBTITLE_VERSION or not manifest.get("normalized"):
                     raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
-                self.prepare_output(output)
-                key, scope = self.identity(job_id, manifest)
-                return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache)
-            stage("probing")
-            if not source.is_file():
-                raise ToolError("源文件已移动或删除；请重新选择文件。", "input")
-            self.prepare_output(output)
-            current = fingerprint(source, self.cancel)
-            if manifest.get("fingerprint") and manifest["fingerprint"] != current:
-                raise ToolError("源文件内容或时间发生变化；缓存未复用。请停止此任务后重新入队。", "source_changed")
-            manifest["fingerprint"] = current
-            contract = {"asr": ASR_MODEL, "mt": MT_MODEL, "normalizer": NORMALIZER_VERSION,
-                        "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}}
-            if manifest.get("contract") and manifest["contract"] != contract:
-                saved = manifest["contract"]
-                compatible = (type(saved.get("normalizer")) is int and saved["normalizer"] in {1, 2, NORMALIZER_VERSION} and
-                              {k: v for k, v in saved.items() if k != "normalizer"} ==
-                              {k: v for k, v in contract.items() if k != "normalizer"})
-                if not compatible:
-                    raise ToolError("缓存接口／断句版本不受支持；请检查任务版本。", "cache_version")
-                contract = saved
-                if saved["normalizer"] == 1 and not manifest.get("normalized"):
-                    contract = {**saved, "normalizer": 2}
-                    manifest["normalization_upgraded_from"] = 1
+            contract = asr_contract(policy.normalizer_version)
+            if policy.normalizer_version == 1 and not manifest.get("normalized"):
+                contract["normalizer"] = 2
+                manifest["normalization_upgraded_from"] = 1
             manifest["contract"] = contract
             normalizer_version = contract["normalizer"]
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
+            if manifest.get("normalized"):
+                self.verify_source_output(job_id, manifest, output)
+                self.prepare_output(output)
+                return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache)
+            saved_asr = False
+            if self.store.sources(job_id) or self.store.cues(job_id) or self.store.references(job_id):
+                raise mismatch()
+            if manifest["segments"]:
+                validate_segments(manifest)
+                saved_asr = all(saved_raw_path(cache, s).is_file() or s.get("task_id") for s in manifest["segments"])
+                # Validate already saved raw before any missing known task is queried.
+                for segment in manifest["segments"]:
+                    if saved_raw_path(cache, segment).is_file():
+                        normalize_raw(cache, manifest, segment, version=normalizer_version)
+                    elif segment.get("raw") and not segment.get("task_id"):
+                        raise mismatch()
+            self.prepare_output(output)
             media = Media(self.config.root, self.cancel)
-            if not manifest.get("media"):
-                manifest["media"] = media.probe(source)
-            track, audio_offset = media.select(manifest["media"], manifest.get("track"),
-                                               manifest.get("channel", settings.channel))
-            manifest["track"], manifest["audio_offset_ms"] = track, audio_offset
-            if manifest.get("media_plan"):
-                manifest["audio_offset_ms"] = manifest["media_plan"]["audio_offset_ms"]
-            manifest.setdefault("channel", settings.channel)
+            if saved_asr:
+                audio_offset = segment_offset(manifest)
+                self.verify_source_output(job_id, manifest, output)
+            else:
+                stage("probing")
+                if not source.is_file():
+                    raise ToolError("源文件已移动或删除；仍需提交识别，必须恢复原媒体。", "input")
+                current = fingerprint(source, self.cancel)
+                if manifest.get("fingerprint") and manifest["fingerprint"] != current:
+                    raise ToolError("源文件内容或时间发生变化；仍需识别的任务不能改变原输入。", "source_changed")
+                manifest["fingerprint"] = current
+                if not manifest.get("media"):
+                    manifest["media"] = media.probe(source)
+                track, audio_offset = media.select(manifest["media"], manifest.get("track"),
+                                                   manifest.get("channel", settings.channel))
+                manifest["track"], manifest["audio_offset_ms"] = track, audio_offset
+                if manifest.get("media_plan"):
+                    manifest["audio_offset_ms"] = manifest["media_plan"]["audio_offset_ms"]
+                manifest.setdefault("channel", settings.channel)
             self.store.update(job_id, manifest=manifest)
             if not manifest["segments"] and not manifest.get("normalized"):
                 stage("uploading")
@@ -395,6 +486,7 @@ class Engine:
                     manifest["media_plan"] = plan
                     manifest["audio_offset_ms"] = audio_offset = plan["audio_offset_ms"]
                 self.store.update(job_id, manifest=manifest)
+            validate_segments(manifest)
             if manifest.get("media_plan"):
                 audio_offset = manifest["media_plan"]["audio_offset_ms"]
                 self.progress(job_id, "audio_ready", {**manifest["media_plan"],
@@ -406,8 +498,6 @@ class Engine:
                 check_cancel(self.cancel)
                 if segment.get("upload_identity") and segment["upload_identity"] != scope:
                     raise ToolError("分段的上传／识别身份与任务记录不一致。", "cache_mismatch")
-                if manifest.get("normalized"):
-                    break
                 raw_path = cache / ("raw-" + segment["id"] + ".json")
                 if raw_path.exists():
                     position += 1
@@ -537,8 +627,7 @@ class Engine:
         except (Cancelled, KeyboardInterrupt) as e:
             self.cancel.set()
             e = Cancelled()
-            ambiguous = (not manifest.get("reflow") and
-                         any(s.get("submitting") and not s.get("task_id") for s in manifest["segments"]))
+            ambiguous = unknown_submission(manifest, current_stage)
             save_failure("submission_unknown" if ambiguous else "cancelled",
                          str(e), "submission_unknown" if ambiguous else e.code)
         except SubmissionUnknown as e:
@@ -565,50 +654,25 @@ class Engine:
         self.progress(job_id, state, None, None)
         return state
 
-    def confirm_empty_normalization(self, job_id, manifest, cache):
-        if (not manifest.get("normalized") or
-                manifest.get("subtitle_version") and self.store.sources(job_id)):
-            raise ToolError("字幕记录缺失，不能确认无语音结果。", "cache_mismatch")
-        version = manifest.get("normalized_version", manifest.get("contract", {}).get("normalizer", 1))
-        if type(version) is not int or version not in {1, 2, NORMALIZER_VERSION}:
-            raise ToolError("规范化版本不受支持。", "cache_version")
-        if "normalized_count" in manifest:
-            if type(manifest["normalized_count"]) is int and manifest["normalized_count"] == 0:
-                return
-            raise ToolError("字幕记录与规范化数量不一致。", "cache_mismatch")
-        # Legacy empty tasks need independent evidence; an empty DB alone proves nothing.
-        try:
-            name = manifest.get("normalized_file")
-            if name:
-                if not isinstance(name, str) or Path(name).name != name:
-                    raise ValueError()
-                path = cache / name
-                if path.exists():
-                    saved = json.loads(path.read_text(encoding="utf-8"))
-                    if not isinstance(saved, list) or saved:
-                        raise ValueError()
-                    return
-            if not manifest["segments"]:
-                raise ValueError()
-            for segment in manifest["segments"]:
-                segment_id = segment["id"]
-                if not isinstance(segment_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", segment_id):
-                    raise ValueError()
-                raw = json.loads((cache / ("raw-" + segment_id + ".json")).read_text(encoding="utf-8"))
-                offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
-                items, _ = normalize(raw, offset + segment["offset_ms"], segment_id,
-                                     duration_ms=segment.get("duration_ms"),
-                                     preserve_sentences=bool(manifest.get("subtitle_version")),
-                                     subtitle_version=manifest.get("subtitle_version", 0), normalizer_version=version)
-                if items:
-                    raise ValueError()
-        except (OSError, ValueError, KeyError, TypeError, ToolError) as error:
-            raise ToolError("旧任务缺少一致的空规范化证据；请检查本地缓存，不会重新提交识别。", "cache_mismatch") from error
+    def validate_saved_subtitles(self, job_id, manifest, cache):
+        if not manifest.get("normalized"):
+            raise mismatch()
+        validate_normalized(manifest, cache, self.store.sources(job_id), self.store.cues(job_id), self.store.references(job_id))
+
+    def verify_source_output(self, job_id, manifest, output):
+        source = Path(self.store.job(job_id)["source"])
+        if not source.is_file():
+            return
+        if output.exists() and output.samefile(source):
+            raise ToolError("目标 SRT 与源媒体是同一文件，请使用其他输出目录。", "output_conflict")
+        if output_key(output.parent) == output_key(source.parent):
+            if not manifest.get("fingerprint") or manifest["fingerprint"] != fingerprint(source, self.cancel):
+                raise ToolError("原路径媒体已变化；请使用其他目录的 --output-dir 保存原任务字幕。", "source_changed")
 
     def finish_subtitles(self, job_id, manifest, settings, scope, client, stage, output, cache):
+        self.validate_saved_subtitles(job_id, manifest, cache)
         cues = self.store.cues(job_id)
         if not cues:
-            self.confirm_empty_normalization(job_id, manifest, cache)
             manifest["no_speech"] = True
             stage("completed")
             if not manifest.get("reflow"):
@@ -616,20 +680,30 @@ class Engine:
             return "completed"
         if any(c["decision"] == "uncertain" for c in cues):
             raise NeedsReview("部分字幕语种不确定，请用 --review 逐条确认原文或翻译。", "language_uncertain")
-        if manifest.get("subtitle_version"):
-            self.process_subtitles(job_id, manifest, settings, scope, client, stage)
-        else:
-            stage("translating")
-            self.translate(job_id, cues, scope, client)
+        if "publication_intent" not in manifest:
+            if "expected_srt_sha256" in manifest:
+                candidate = copy.deepcopy(manifest)
+                candidate.pop("expected_srt_sha256")
+                self.commit_local(job_id, manifest, candidate,
+                                  lambda jid, value: self.store.update(jid, manifest=value))
+            if manifest.get("subtitle_version"):
+                self.process_subtitles(job_id, manifest, settings, scope, client, stage)
+            else:
+                stage("translating")
+                self.translate(job_id, cues, scope, client)
         cues = self.store.cues(job_id)
         check_cancel(self.cancel)
         stage("writing")
         content = render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", 0))
-        manifest["expected_srt_sha256"] = hashlib.sha256(content).hexdigest()
-        self.store.update(job_id, manifest=manifest)
-        manifest["backup"] = write_srt(output, content, manifest["overwrite"])
-        manifest["cue_count"] = len(cues)
-        manifest["output_settings"] = asdict(settings)
+        if "publication_intent" not in manifest:
+            candidate = copy.deepcopy(manifest)
+            intent = prepare_intent(output, content, manifest["overwrite"])
+            candidate.update(publication_intent=intent, expected_srt_sha256=intent["expected_srt_sha256"],
+                             cue_count=len(cues), output_settings=asdict(settings))
+            self.commit_local(job_id, manifest, candidate,
+                              lambda jid, value: self.store.update(jid, manifest=value))
+        self.verify_source_output(job_id, manifest, output)
+        manifest["backup"] = write_srt(output, content, manifest["overwrite"], intent=manifest["publication_intent"])
         stage("completed")
         if not manifest.get("reflow"):
             self.cleanup_completed_audio(job_id, manifest, cache)
@@ -910,21 +984,23 @@ class Engine:
         manifest = job["manifest"]
         if job["state"] != "submission_unknown":
             raise ToolError("当前任务不是提交未知状态。", "job")
-        resolved = False
-        for segment in manifest["segments"]:
-            if segment.get("submitting") and not segment.get("task_id"):
-                if task_id:
-                    if not task_id.isascii() or not all(c.isalnum() or c in "-_" for c in task_id) or len(task_id) > 200:
-                        raise ToolError("task_id 格式无效。", "input")
-                    segment["task_id"] = task_id
-                elif not allow_resubmit:
-                    raise ToolError("重新提交需要明确确认可能重复计费。", "submission_unknown")
-                segment["submitting"] = False
-                if not task_id:
-                    for name in ["oss_url", "oss_protected", "upload_expires", "upload_identity"]:
-                        segment.pop(name, None)
-                resolved = True
-                break
-        if not resolved:
+        candidates = [s for s in manifest["segments"] if s.get("submitting") and not s.get("task_id")]
+        if not candidates:
+            candidates = [s for s in manifest["segments"] if not s.get("task_id")]
+            if len(candidates) != 1:
+                candidates = []
+        if not candidates:
             raise ToolError("未知提交记录缺少对应分段，不能自动重发；请检查任务记录。", "submission_unknown")
-        self.store.update(job_id, "queued", manifest)
+        segment = candidates[0]
+        if task_id:
+            if not task_id.isascii() or not all(c.isalnum() or c in "-_" for c in task_id) or len(task_id) > 200:
+                raise ToolError("task_id 格式无效。", "input")
+            segment["task_id"] = task_id
+        elif not allow_resubmit:
+            raise ToolError("重新提交需要明确确认可能重复计费。", "submission_unknown")
+        else:
+            for name in ["oss_url", "oss_protected", "upload_expires", "upload_identity"]:
+                segment.pop(name, None)
+        segment["submitting"] = False
+        manifest.pop("submitting", None)
+        self.store.update(job_id, "submission_unknown" if unknown_submission(manifest, "queued") else "queued", manifest)

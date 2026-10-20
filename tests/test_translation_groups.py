@@ -94,8 +94,8 @@ class TranslationGroupTests(TemporaryTest):
     def test_full_key_keeps_context_source_language_and_asr_language_isolated(self):
         options = {'strategy_version': 1}
         job_id = self.prepare(['Same input.'] * 5)
-        self.store.cue_update(job_id, '2', source_lang='English')
         with self.store.db:
+            self.store.db.execute("UPDATE cues SET source_lang='English' WHERE job_id=? AND cue_id='2'", (job_id,))
             self.store.db.execute("UPDATE cues SET language='fr' WHERE job_id=? AND cue_id='3'", (job_id,))
         a = [{'source': 'Context', 'target': '甲'}]
         b = [{'source': 'Context', 'target': '乙'}]

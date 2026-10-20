@@ -158,7 +158,7 @@ class CliTests(TemporaryTest):
             self.assertEqual(json.loads(output.getvalue())["state"], "needs_review")
             self.assertEqual(main(["--cancel", job_id]), 0)
         store = Store(self.config.data / "jobs.sqlite")
-        store.recover()
+        Engine(self.config, store).recover_jobs()
         self.assertEqual(store.job(job_id)["state"], "cancelled")
         store.close()
 
@@ -211,6 +211,23 @@ class CliTests(TemporaryTest):
             return "completed"
         with mock.patch("sys.stdin", new=mock.Mock(isatty=lambda: True)), mock.patch("builtins.input", side_effect=["2", "right"]), mock.patch.object(Engine, "run", new=run), mock.patch("sys.stderr", new_callable=io.StringIO), mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(main(["--review", job_id]), 0)
+
+    def test_interactive_channel_review_uses_selected_audio_track(self):
+        job_id = self.add_review_job("audio_channel", media={"duration_ms": 1000, "origin_ms": 0, "tracks": [
+            {"index": 2, "channels": 2, "disposition": {"default": 1}}, {"index": 3, "channels": 1}]})
+
+        def run(engine, current):
+            manifest = engine.store.job(current)["manifest"]
+            self.assertEqual((manifest["track"], manifest["channel"]), (2, "right"))
+            engine.store.update(current, "completed")
+            return "completed"
+
+        with mock.patch("sys.stdin", new=mock.Mock(isatty=lambda: True)), \
+                mock.patch("builtins.input", side_effect=["right"]) as prompt, \
+                mock.patch.object(Engine, "run", new=run), \
+                mock.patch("sys.stderr", new_callable=io.StringIO), mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(main(["--review", job_id]), 0)
+        self.assertEqual(prompt.call_count, 1)
 
     def test_configure_uses_hidden_key_input_and_saves_workspace(self):
         with mock.patch("sys.stdin", new=mock.Mock(isatty=lambda: True)), mock.patch("builtins.input", return_value="SPACE-NEW"), mock.patch("getpass.getpass", return_value="offline-hidden-key") as hidden, mock.patch("sys.stderr", new_callable=io.StringIO) as output:

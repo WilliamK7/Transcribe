@@ -60,7 +60,7 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 
 ## 复核与任务管理
 
-音轨、声道或语种存在歧义时，终端会要求确认。语种复核逐条显示原文，可选择保留或翻译；手动语言只影响 MT。
+音轨、声道或语种存在歧义时，终端会要求确认。语种复核逐条显示原文，可选择保留或翻译；手动语言只影响 MT。同一完整句的片段一起确认，每条决定立即保存，输入 `q` 暂停后可继续复核。
 
 ```powershell
 .\scripts\transcribe.ps1 --non-interactive --channel mix "D:\Videos\课程.mkv"
@@ -81,11 +81,17 @@ Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先
 
 `--resume` 沿用保存的账号、识别输入、翻译策略、排版设置及人工决定，保留成功译文并补齐缺失项。旧任务可用 `--reflow` 更新为当前策略。
 
+已有完整规范化结果、完整本地转写，或缺失转写均有云端任务 ID 时，源媒体移走后仍可 `--resume`；需要新提交识别时须恢复原媒体。原路径换成其他媒体后，必须用 `--output-dir` 写到其他目录。Key 校验与账户隔离仍适用于纯本地恢复。
+
+程序升级后若提示 `cache_version`，用 `--reflow JOB_ID` 更新任务处理策略；需要完整本地转写，目标已存在时搭配 `--overwrite` 或另选 `--output-dir`。
+
 翻译校验失败的诊断保存在 `.build/mt-diagnostics/{job_id}.jsonl`，包含失败分类、数量、片段范围及请求 ID。
 
 重复传入同一文件与同一输出目标时，复用未结束任务；`--overwrite` 启用覆盖，省略时沿用原设置。用 `--resume JOB_ID --output-dir 目录` 修改未完成任务的目标；已完成或已跳过任务可重新传入文件，或使用 `--reflow` 重排。
 
 旧任务若提示 `output_path_required`，用 `--output-dir` 指定目标目录后恢复。
+
+写入字幕时中断，可用 `--resume` 继续，已写入的相同字幕和备份会复用。若目标或备份被外部修改，返回 `output_conflict` 并保留文件，可另选 `--output-dir`。
 
 `--reflow` 使用当前字幕策略和排版设置，从完整本地转写重建字幕，源媒体可已移走；复用有效翻译缓存，仅补必要翻译。目标已存在时搭配 `--overwrite` 备份后替换，或用 `--output-dir` 写到其他目录；中断后用 `--resume` 继续。缓存、人工语种决定及历史数据的处理见[接口与恢复契约](docs/API_CONTRACT.md#数据与恢复)。
 

@@ -38,6 +38,12 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 
 任务提交 `completed` 后清理音频缓存；清理失败保留文件并记录警告，完成状态保持有效。
 
+发布顺序为：渲染并校验 SRT → 同事务保存发布意图 → 备份与原子写入 → 提交 completed → 尽力清理音频。manifest 的 `publication_intent` 保存 `target`（绝对路径）、`output_key`、`expected_srt_sha256`（本次渲染字节的 SHA-256）、`overwrite`、`original_sha256`（原目标不存在时为 null）和 `backup`（预定绝对备份路径，无原目标时为空）。顶层 `expected_srt_sha256` 与意图中的预期哈希保持一致。
+
+覆盖与非覆盖统一恢复：目标已匹配预期内容时只补记完成，不翻译、不再备份或写入；此操作仍检查原账户及工作空间。未发布时目标须仍匹配原目标哈希或原有的不存在状态。备份写入临时文件并同步后才原子创建预定路径；已有备份匹配原目标哈希则复用，备份不符或目标被外部修改返回 `output_conflict`，保留全部文件。旧任务仅有顶层预期哈希时，只沿保存目标识别已发布内容，不推断历史备份归属。
+
+更换目标、重排、复核或修改输出内容时，同一事务清除过期意图与预期哈希；同目标补传 `--overwrite` 保留有效意图。预定备份路径在创建前即受普通报告路径保护。
+
 `output` 保存绝对 SRT 路径，`output_key` 从该路径生成；相对 `--output-dir` 按调用目录解释。入队、恢复改目录及重排均检查目标冲突。
 
 同一源文件与同一目标复用未结束任务，先检查该目标的全部任务冲突及账号／工作空间身份。`--overwrite` 启用覆盖，省略时沿用原设置；路径和覆盖选项在同一事务保存。不同目标新建任务；`--resume --output-dir` 修改未完成任务的目标。
@@ -54,12 +60,19 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 | `contract.normalizer` | `3` |
 | `subtitle_version` / `translation_strategy_version` | `2` / `3` |
 | `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
+| `execution_snapshot` | `format_version: 1`、`prompt_version: 9`、`recovery_version: 1` |
 
 原始 ASR JSON 与规范化结果分别保存。完整句保存于 `subtitle-sources-v2.json` 和 SQLite `subtitle_sources`，参考译文存于 `mt_references`，最终片段及译文存于 `cues`。`normalized`、`normalized_count`、`references_planned`、`layout_planned`、`layout_round` 与对应记录同事务提交，恢复以数据库已提交状态为准。恢复校验来源及文字／词范围，复用成功结果，补齐必要阶段后提交 SRT。
 
 空字幕由 `normalized_count=0` 确认。缺少此字段的旧任务使用空规范化文件或按保存版本验证的完整 raw；证据缺失或矛盾返回 `cache_mismatch`。
 
+普通恢复按保存事实选择入口：完整有效的规范化记录直接进入复核／翻译／排版；否则使用完整 raw，或查询缺失 raw 对应的原 task_id。上述入口不需要媒体或 FFmpeg，但仍校验原 Key、账户范围、模型／版本、分段身份与时间偏移。规范化校验覆盖数量、唯一来源、全部文字／词范围及参考覆盖；旧任务缺少数量证明时须用规范化文件或完整 raw 核实，缺失或矛盾返回 `cache_mismatch`，不重建已提交结果。规范化完成后无需持续保有 raw；raw 仍保留用于显式重排。未解决的提交未知不会重发；需要新提交时仍要求原媒体和完整指纹一致。
+
+输出位于原媒体目录且源文件仍存在时，首次继续处理和实际发布前均校验完整指纹；原路径媒体变化返回 `source_changed`，须另选目录的 `--output-dir`。源文件已移走或目标在其他目录时不读取源媒体内容。恢复不修改保存的源路径、指纹、音轨或分段身份。
+
 恢复沿用 manifest 中的翻译策略 1、2 或 3，以及成功译文、参考、排版范围、轮次、设置及人工决定，仅补缺失项。未知版本返回 `cache_version`。显式 `--reflow` 使用当前策略 3 重建。
+
+新任务及成功准备的 `--reflow` 保存 `execution_snapshot`。带快照的未完成任务在复用翻译缓存、云端请求及重新发布前核对提示词和响应恢复版本，不匹配返回 `cache_version`，需要显式 `--reflow`。已按保存发布意图写入的结果可补记完成。重排准备失败保留原快照。无快照的旧任务按原策略兼容读取，缺失的提示词版本不补填；线程数和轮询等待使用当前运行设置。
 
 MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。任务策略 1／2 使用版本 3 缓存，另含阶段、请求兼容策略标识、ASR 语种及完整实际 `tm_list` 的摘要；两者共享策略标识 1，各字段一致时可跨字幕版本 1／2 复用。
 
@@ -71,7 +84,7 @@ MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本�
 
 重排先保存 `.build/reflow/{job_id}/{时间标识}.json` 本机任务快照，含原 manifest、来源、字幕、参考译文及计数。新来源另存 `subtitle-sources-v2-reflow-{时间标识}.json`；来源、片段、参考阶段重置、恢复标记和输出位置在同一 SQLite 事务提交。目标已存在时使用本次 `--overwrite` 参数。准备失败保留原任务；翻译失败保存可恢复进度。SRT 在翻译完成后备份并原子替换。快照和转写均属于本机私有数据。
 
-ASR 提交 POST 由持久化 `submitting` 标记覆盖中断窗口。超时、5xx、无法解析或缺少 `task_id` 均保存为 `submission_unknown`，通过 `--bind-task-id` 绑定已知任务，或由用户以 `--allow-resubmit` 接受重复计费风险后重发。明确拒绝才清除标记；查询和下载失败继续沿用原 ID。
+ASR 提交 POST 由持久化 `submitting` 标记覆盖中断窗口。超时、5xx、无法解析或缺少 `task_id` 均保存为 `submission_unknown`，通过 `--bind-task-id` 绑定已知任务，或由用户以 `--allow-resubmit` 接受重复计费风险后重发。明确拒绝才清除标记；查询和下载失败继续沿用原 ID。旧任务仅有顶层提交标记或状态时，待提交分段唯一才能绑定或重发；取消后仍保留这项事实，须显式恢复。
 
 Key 原子明文保存于 `data/key.txt`，`DASHSCOPE_API_KEY` 优先。任务库明文保存上传引用；日志和普通报告隐藏凭据、签名链接、原文、译文及原始异常。终端语种复核可显示原文。
 
@@ -82,6 +95,8 @@ Key 原子明文保存于 `data/key.txt`，`DASHSCOPE_API_KEY` 优先。任务�
 - 字幕版本 1 的任务普通恢复仍使用严格正时长词校验和原排版快照，包括尚未规范化的本地转写；仅 `--reflow` 明确升级为 2。
 - 规范化版本 1 的任务在模型与参数相同时，可从尚未规范化的本地原始结果升级至 2；已有有效 v1 结果保持原样。版本 2 的任务沿保存版本恢复，只有新任务及显式 `--reflow` 使用规范化版本 3。
 - `key.dpapi` 解密并成功写入新文件后移除。旧 `oss_protected` 仍可解密读取；解密失败时，仅尚未提交的分段可重新上传，已知 ID 或提交未知标记优先用于恢复。
+
+来源记录及字幕／参考的 JSON metadata 使用 `decision_origin: automatic | manual` 表示决定来源，`reason` 只用于展示。新规范化结果为 automatic，终端确认同事务更新所属来源与全部片段为 manual，并清除失效译文与阶段标记；每条确认立即保存。没有来源记录的旧任务保留逐片复核。缺失字段仅以旧确认文案兼容恢复，显式未知值返回 `cache_mismatch`。
 
 ## 时间轴与字幕
 

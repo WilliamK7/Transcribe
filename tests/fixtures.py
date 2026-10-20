@@ -17,6 +17,8 @@ from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.store import Store
+from subtitle_tool.common import ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, atomic_json, fingerprint
+from subtitle_tool.subtitles import make_fragment, normalize
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMP = ROOT / ".build" / "test-temp"
@@ -128,6 +130,53 @@ class TemporaryTest(unittest.TestCase):
 def point_sentence(at, text="Yes.", language="en"):
     return {"begin_time": at, "end_time": at, "text": text, "language": language,
             "words": [{"begin_time": at, "end_time": at, "text": text[:-1], "punctuation": text[-1]}]}
+
+
+class SavedResultFixture(TemporaryTest):
+    """Saved ASR facts, real SQLite and fake HTTP, without creating media."""
+    def setUp(self):
+        super().setUp()
+        self.config = Config(self.path)
+        self.config.settings.workspace_id = "offline-space"
+        self.config.set_key("offline-test-key-no-cloud-authorization")
+        self.source = self.path / "saved.mkv"
+        self.source.write_bytes(b"saved source identity only")
+        self.store = Store(self.config.data / "jobs.sqlite")
+        self.job_id = self.store.enqueue(self.source, workspace_id="offline-space")
+        self.cache = self.config.data / "cache" / self.job_id
+        self.cache.mkdir(parents=True)
+
+    def tearDown(self):
+        self.store.close()
+        super().tearDown()
+
+    def save_result(self, raw=None, *, normalized=True):
+        raw = raw if raw is not None else result(("Hello.", "en"))
+        manifest = self.store.job(self.job_id)["manifest"]
+        manifest.update(fingerprint=fingerprint(self.source, threading.Event()), track=0, channel="left",
+                        audio_offset_ms=0, media={"origin_ms": 0, "duration_ms": 10000,
+                                                 "tracks": [{"index": 0, "channels": 1, "start_ms": 0}]},
+                        segments=[{"id": "0000", "offset_ms": 0, "duration_ms": 10000,
+                                   "task_id": "offline-task", "raw": "raw-0000.json"}],
+                        contract={"asr": ASR_MODEL, "mt": MT_MODEL, "normalizer": NORMALIZER_VERSION,
+                                  "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}})
+        atomic_json(self.cache / "raw-0000.json", raw)
+        sources, warnings = normalize(raw, 0, "0000", duration_ms=10000, preserve_sentences=True)
+        if normalized:
+            manifest.update(normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
+                            normalized_file="subtitle-sources-v2.json", warnings=warnings)
+            atomic_json(self.cache / manifest["normalized_file"], sources)
+            self.store.initialize_subtitles(self.job_id, sources, [make_fragment(s) for s in sources], manifest)
+        else:
+            for name in ["normalized", "normalized_count", "normalized_version", "normalized_file", "references_planned",
+                         "layout_planned", "layout_complete", "layout_round", "expected_srt_sha256", "publication_intent", "no_speech"]:
+                manifest.pop(name, None)
+            self.store.initialize_subtitles(self.job_id, [], [], manifest)
+        return sources
+
+    def run_fake(self, service):
+        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"):
+            return Engine(self.config, self.store).run(self.job_id)
 
 
 @unittest.skipUnless(os.name == "nt" and (ROOT / "tools" / "ffmpeg.exe").exists(), "Windows/bundled tools required")

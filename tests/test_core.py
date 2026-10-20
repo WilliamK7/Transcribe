@@ -18,7 +18,9 @@ from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.main import main
-from subtitle_tool.subtitles import mt_cache_key, normalize, render_srt, route, write_srt
+from subtitle_tool.subtitles import mt_cache_key, normalize, render_srt, route
+from subtitle_tool.publication import write_srt
+from subtitle_tool.review import ReviewDecision
 
 from tests.fixtures import ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
 
@@ -137,7 +139,7 @@ class SubtitleTests(TemporaryTest):
         with self.assertRaises(ToolError):
             write_srt(path, b"new")
         self.assertEqual(path.read_bytes(), b"original")
-        with mock.patch("subtitle_tool.subtitles.shutil.copyfileobj", side_effect=OSError("disk full")):
+        with mock.patch("subtitle_tool.publication.shutil.copyfileobj", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 write_srt(path, b"new", True)
         self.assertEqual(path.read_bytes(), b"original")
@@ -348,7 +350,7 @@ class PipelineTests(PipelineFixture):
         manifest["segments"] = [{"id": "0000", "audio": "audio.wav", "offset_ms": 0,
                                   "duration_ms": 1000, "submitting": True}]
         self.store.update(self.job_id, "submitting", manifest)
-        self.store.recover()
+        Engine(self.config, self.store).recover_jobs()
         self.assertEqual(self.store.job(self.job_id)["state"], "submission_unknown")
         fake = FakeService(result(("欢迎使用百炼。", "zh")))
         self.assertEqual(self.run_fake(fake), "submission_unknown")
@@ -388,7 +390,7 @@ class PipelineTests(PipelineFixture):
         fake = FakeService(result(("欢迎使用百炼。", "zh")))
         fake.submit_error = requests.Timeout()
         self.assertEqual(self.run_fake(fake), "submission_unknown")
-        self.store.recover()
+        Engine(self.config, self.store).recover_jobs()
         self.assertEqual(self.run_fake(fake), "submission_unknown")
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
         Engine(self.config, self.store).resolve_unknown(self.job_id, task_id="offline-task")
@@ -400,7 +402,7 @@ class PipelineTests(PipelineFixture):
         self.assertEqual(self.run_fake(fake), "needs_review")
         self.assertFalse(self.source.with_suffix(".srt").exists())
         cue = self.store.cues(self.job_id)[0]
-        self.store.cue_update(self.job_id, cue["cue_id"], decision="original", reason="user")
+        Engine(self.config, self.store).apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(len(fake.named("/chat/completions")), 0)
 
@@ -445,7 +447,7 @@ class PipelineTests(PipelineFixture):
         fake = FakeService(result(("OK", "")))
         self.assertEqual(self.run_fake(fake), "needs_review")
         cue = self.store.cues(self.job_id)[0]
-        self.store.cue_update(self.job_id, cue["cue_id"], decision="original")
+        Engine(self.config, self.store).apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
         before = len(fake.calls)
         self.config.set_key("offline-other-account")
         self.assertEqual(self.run_fake(fake), "failed")
@@ -557,7 +559,7 @@ class PipelineTests(PipelineFixture):
             self.assertEqual(json.loads(output.getvalue())["state"], "cancelled")
         manifest = self.store.job(self.job_id)["manifest"]
         self.assertEqual(manifest["segments"][0]["task_id"], "offline-task")
-        self.store.recover()
+        Engine(self.config, self.store).recover_jobs()
         self.assertEqual(self.store.job(self.job_id)["state"], "cancelled")
 
     def test_keyboard_interrupt_during_post_keeps_unknown_submission(self):

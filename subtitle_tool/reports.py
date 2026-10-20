@@ -29,7 +29,8 @@ class ReportWriter:
             return []
         # Self-test and preflight must not recover jobs, migrate schemas or read the Key.
         with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
-            return connection.execute("SELECT id,source,output,json_extract(manifest,'$.backup') FROM jobs").fetchall()
+            return connection.execute("SELECT id,source,output,json_extract(manifest,'$.backup'),"
+                                      "json_extract(manifest,'$.publication_intent.backup') FROM jobs").fetchall()
 
     def validate(self):
         try:
@@ -73,10 +74,12 @@ class ReportWriter:
         for source in self.inputs:
             protected.append((Path(self.output_dir) if self.output_dir is not None else source.parent) /
                              source.with_suffix(".srt").name)
-        for job_id, source, output, backup in self._job_paths():
+        for job_id, source, output, backup, planned_backup in self._job_paths():
             protected.extend([Path(source), Path(output)])
             if backup:
                 protected.append(Path(backup))
+            if planned_backup:
+                protected.append(Path(planned_backup))
             if job_id == self.job_id and self.output_dir is not None:
                 protected.append(Path(self.output_dir) / Path(source).with_suffix(".srt").name)
         # Existing SRT backups remain protected even after manifest.backup advances.

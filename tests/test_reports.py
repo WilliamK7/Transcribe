@@ -8,6 +8,7 @@ from unittest import mock
 
 from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config
+from subtitle_tool.engine import Engine
 from subtitle_tool.main import main
 from subtitle_tool.store import Store
 from tests.fixtures import ROOT, TemporaryTest
@@ -109,6 +110,14 @@ class ReportProtectionTests(TemporaryTest):
         backup.write_bytes(b"older subtitles")
         self.assert_conflict(["--jobs"], backup)
 
+    def test_reserved_publication_backup_is_protected_before_creation(self):
+        backup = self.path / "reserved.srt.bak.pending"
+        manifest = self.store.job(self.job_id)["manifest"]
+        manifest["publication_intent"] = {"backup": str(backup)}
+        self.store.update(self.job_id, manifest=manifest)
+        self.assert_conflict(["--jobs"], backup)
+        self.assertFalse(backup.exists())
+
     def test_unverifiable_protected_identity_is_rejected(self):
         target = self.path / "report.json"
         target.write_bytes(b"old report")
@@ -162,7 +171,7 @@ class ReportProtectionTests(TemporaryTest):
         self.store.update(self.job_id, "recognizing")
         for target in [self.config.data / "self-test.json", self.path / "diagnostics.json"]:
             with mock.patch.object(Config, "get_key", side_effect=AssertionError("must not read key")), \
-                    mock.patch.object(Store, "recover", side_effect=AssertionError("must not recover")), \
+                    mock.patch.object(Engine, "recover_jobs", side_effect=AssertionError("must not recover")), \
                     mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe")), \
                     mock.patch("requests.request") as request:
                 self.assertEqual(self.cli(["--self-test", "--report", target]), 0)

@@ -10,6 +10,8 @@ from pathlib import Path
 from .common import (PROCESSING_VERSION, SUBTITLE_VERSION, TRANSLATION_STRATEGY_VERSION,
                      ToolError, atomic_json, output_key, validate_workspace_id)
 from .config import Settings
+from .review import ReviewDecision, decision_origin
+from .policy import current_execution_snapshot
 
 TERMINAL = {"completed", "skipped", "cancelled"}
 STATES = {
@@ -102,6 +104,7 @@ class Store:
                         "overwrite": bool(overwrite), "segments": [], "warnings": []}
             settings = settings or Settings()
             manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+                            execution_snapshot=current_execution_snapshot(),
                             subtitle_settings={k: getattr(settings, k) for k in
                                                ["zh_line_width", "other_line_width", "chinese_first"]})
             self.db.execute("INSERT INTO jobs(id,source,output,output_key,state,manifest,created,updated) "
@@ -128,8 +131,17 @@ class Store:
             manifest = job["manifest"]
             if overwrite:
                 manifest["overwrite"] = True
-            manifest.pop("expected_srt_sha256", None)
+            if output_key(output) != job["output_key"]:
+                self._clear_publication(job_id, manifest)
             self._save_output(job_id, output, manifest)
+
+    def _clear_publication(self, job_id, manifest=None):
+        if manifest is not None:
+            for name in ["publication_intent", "expected_srt_sha256"]:
+                manifest.pop(name, None)
+        else:
+            self.db.execute("UPDATE jobs SET manifest=json_remove(manifest,'$.publication_intent','$.expected_srt_sha256') WHERE id=?",
+                            (job_id,))
 
     @staticmethod
     def resolve_output(job, directory=None):
@@ -196,6 +208,7 @@ class Store:
             self._initialize_subtitles(job_id, sources, cues, manifest)
 
     def _initialize_subtitles(self, job_id, sources, cues, manifest):
+        self._clear_publication(job_id, manifest)
         self.db.execute("DELETE FROM subtitle_sources WHERE job_id=?", (job_id,))
         self.db.executemany("INSERT INTO subtitle_sources VALUES(?,?,?)",
                             [(job_id, s["sentence_id"], json.dumps(s, ensure_ascii=False)) for s in sources])
@@ -230,6 +243,7 @@ class Store:
     def save_layout(self, job_id, cues, manifest, *, references=None):
         """Commit range changes and their resume marker in one SQLite transaction."""
         with self.lock, self.db:
+            self._clear_publication(job_id, manifest)
             self._replace_records("cues", job_id, cues)
             if references is not None:
                 self._replace_records("mt_references", job_id, references)
@@ -238,6 +252,8 @@ class Store:
     def sources(self, job_id):
         with self.lock:
             rows = [json.loads(r[0]) for r in self.db.execute("SELECT record FROM subtitle_sources WHERE job_id=?", (job_id,))]
+            for record in rows:
+                decision_origin(record)
             return sorted(rows, key=lambda s: (s["begin_ms"], s["end_ms"], s["sentence_id"]))
 
     def _records(self, table, job_id):
@@ -245,7 +261,9 @@ class Store:
         for row in self.db.execute("SELECT * FROM " + table + " WHERE job_id=? ORDER BY begin_ms,end_ms,cue_id", (job_id,)):
             values = dict(row)
             metadata = json.loads(values.pop("metadata"))
-            result.append({**metadata, **values})
+            record = {**metadata, **values}
+            decision_origin(record)
+            result.append(record)
         return result
 
     def cues(self, job_id):
@@ -256,25 +274,39 @@ class Store:
         with self.lock:
             return self._records("mt_references", job_id)
 
-    def cue_update(self, job_id, cue_id, **values):
-        allowed = {"decision", "reason", "translated", "source_lang", "attempts", "error"}
-        if not values or not set(values).issubset(allowed):
-            raise ValueError("Invalid cue update")
+    def apply_review(self, job_id, cue_id, decision: ReviewDecision):
+        """Save one confirmation and every dependent local record in one transaction."""
         with self.lock, self.db:
-            self.db.execute("UPDATE cues SET " + ",".join(k + "=?" for k in values) + " WHERE job_id=? AND cue_id=?",
-                            (*values.values(), job_id, cue_id))
-            changes = {k: v for k, v in values.items() if k in {"decision", "reason", "source_lang"}}
-            if changes:
-                row = self.db.execute("SELECT metadata FROM cues WHERE job_id=? AND cue_id=?", (job_id, cue_id)).fetchone()
-                sentence_id = json.loads(row[0]).get("sentence_id") if row else None
-                if sentence_id:
-                    saved = self.db.execute("SELECT record FROM subtitle_sources WHERE job_id=? AND sentence_id=?",
-                                            (job_id, sentence_id)).fetchone()
-                    if saved:
-                        source = json.loads(saved[0])
-                        source.update(changes)
-                        self.db.execute("UPDATE subtitle_sources SET record=? WHERE job_id=? AND sentence_id=?",
-                                        (json.dumps(source, ensure_ascii=False), job_id, sentence_id))
+            job = self.job(job_id)
+            if job["state"] != "needs_review":
+                raise ToolError("只有待复核任务可以保存语种决定。", "review")
+            cues, sources = self.cues(job_id), self.sources(job_id)
+            cue = next((c for c in cues if c["cue_id"] == cue_id), None)
+            if cue is None:
+                raise ToolError("待复核字幕记录不存在。", "cache_mismatch")
+            if sources:
+                source = next((s for s in sources if s["sentence_id"] == cue.get("sentence_id")), None)
+                if source is None:
+                    raise ToolError("待复核字幕缺少完整句来源。", "cache_mismatch")
+                source.update(decision.values())
+                self.db.execute("UPDATE subtitle_sources SET record=? WHERE job_id=? AND sentence_id=?",
+                                (json.dumps(source, ensure_ascii=False), job_id, source["sentence_id"]))
+                for item in cues:
+                    if item.get("sentence_id") == source["sentence_id"]:
+                        item.update(decision.values())
+                    # Neighbor context can change as well as the reviewed sentence.
+                    item.update(translated="", error="")
+                self.db.execute("DELETE FROM mt_references WHERE job_id=?", (job_id,))
+            else:
+                # Old tasks without sources retain their per-cue review behavior.
+                cue.update(decision.values(), translated="", error="")
+            manifest = job["manifest"]
+            for name in ["references_planned", "layout_planned", "layout_complete", "layout_round",
+                         "expected_srt_sha256", "publication_intent", "no_speech", "cue_count", "output_settings"]:
+                manifest.pop(name, None)
+            self._replace_records("cues", job_id, cues)
+            self.db.execute("UPDATE jobs SET manifest=?,updated=? WHERE id=?",
+                            (json.dumps(manifest, ensure_ascii=False), time.time(), job_id))
 
     def translation_update(self, job_id, cue_ids, *, reference_stage=False, attempt=False,
                            translated=None, error="", cache_key=None, counts=None):
@@ -289,6 +321,8 @@ class Store:
             assignments.append("translated=?")
             values.append(translated)
         with self.lock, self.db:
+            if translated is not None:
+                self._clear_publication(job_id)
             self.db.executemany("UPDATE " + table + " SET " + ",".join(assignments) + " WHERE job_id=? AND cue_id=?",
                                 [(*values, job_id, cue_id) for cue_id in cue_ids])
             if cache_key is not None:
@@ -304,6 +338,7 @@ class Store:
             raise ValueError("Invalid translation batch")
         table = "mt_references" if reference_stage else "cues"
         with self.lock, self.db:
+            self._clear_publication(job_id)
             for cue_id, text in translations.items():
                 changed = self.db.execute("UPDATE " + table + " SET translated=?,error='' WHERE job_id=? AND cue_id=?",
                                           (text, job_id, cue_id))
@@ -330,20 +365,6 @@ class Store:
     def counts(self, job_id):
         with self.lock:
             return {r[0]: r[1] for r in self.db.execute("SELECT name,value FROM counters WHERE job_id=?", (job_id,))}
-
-    def recover(self):
-        with self.lock, self.db:
-            # An interrupted POST without a saved id must never silently be resubmitted.
-            for row in self.db.execute("SELECT id,state,manifest FROM jobs").fetchall():
-                if row["state"] in TERMINAL:
-                    continue
-                manifest = json.loads(row["manifest"])
-                ambiguous = (not manifest.get("reflow") and
-                             any(s.get("submitting") and not s.get("task_id") for s in manifest.get("segments", [])))
-                if ambiguous or (row["state"] == "submitting" and not any(s.get("task_id") for s in manifest.get("segments", []))):
-                    self.update(row["id"], "submission_unknown", error="提交被中断，结果未知；请确认云端任务。", code="submission_unknown")
-                elif row["state"] not in {"failed", "submission_unknown", "needs_review", "queued"}:
-                    self.update(row["id"], "queued")
 
     def close(self):
         with self.lock:

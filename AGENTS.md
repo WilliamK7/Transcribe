@@ -18,4 +18,4 @@ Windows x64 自用命令行字幕工具。当前用法见 [README.md](README.md)
 
 ## 源码位置
 
-`subtitle_tool/` 中，`main.py` 负责 CLI 与复核，`api.py` 负责云端请求和重试，`mt.py` 负责批量翻译提示词与响应校验，`media.py` 与 `subtitles.py` 负责媒体和字幕，`store.py` 与 `engine.py` 负责任务持久化和恢复，`common.py` 与 `config.py` 负责配置及通用操作，`instance.py` 与 `diagnostics.py` 负责独占锁和本机诊断。`tests/` 为离线回归，`scripts/` 为环境准备、启动与测试入口。
+`subtitle_tool/` 中，`main.py` 负责 CLI 交互，`engine.py` 协调任务生命周期与恢复，`store.py` 提供持久化事务。`review.py` 表达人工决定，`policy.py` 解析执行版本，`saved_results.py` 校验恢复产物，`publication.py` 发布和恢复 SRT。`api.py` 负责云端请求和重试，`mt.py` 负责批量翻译提示词与响应校验，`media.py` 与 `subtitles.py` 负责媒体和字幕规则，`common.py` 与 `config.py` 负责配置及通用操作，`instance.py` 与 `diagnostics.py` 负责独占锁和本机诊断。`tests/` 为离线回归，`scripts/` 为环境准备、启动与测试入口。

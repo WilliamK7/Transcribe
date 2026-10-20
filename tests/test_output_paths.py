@@ -222,7 +222,8 @@ class OutputPipelineTests(PipelineFixture):
         self.assertEqual(self.store.cues(self.job_id), cues)
         self.assertTrue(self.store.job(self.job_id)['manifest']['overwrite'])
         self.assertEqual(output.read_bytes(), b'previous SRT')
-        self.store.cue_update(self.job_id, cues[0]['cue_id'], decision='original', reason='用户在终端确认')
+        from subtitle_tool.review import ReviewDecision
+        self.store.apply_review(self.job_id, cues[0]['cue_id'], ReviewDecision('original'))
         self.assertEqual(self.run_fake(fake), 'completed')
         self.assertEqual(Path(self.store.job(self.job_id)['manifest']['backup']).read_bytes(), b'previous SRT')
         self.assertEqual(len(fake.named('/asr/transcription')), 1)

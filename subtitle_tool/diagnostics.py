@@ -11,7 +11,8 @@ from .config import Config, Settings
 from .instance import ProcessLock
 from .media import Media, run_process
 from .reports import ReportWriter
-from .subtitles import make_fragment, normalize, render_srt, write_srt
+from .subtitles import make_fragment, normalize, render_srt
+from .publication import write_srt
 
 
 def self_test(config: Config, report: Path):

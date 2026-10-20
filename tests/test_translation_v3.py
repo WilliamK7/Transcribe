@@ -106,7 +106,7 @@ class BatchPlanningTests(TemporaryTest):
     def test_boundaries_keep_language_review_and_five_second_gap(self):
         sources = normalize(result(*[(f'Sentence {i}.', 'en') for i in range(7)]), 0, '0000', preserve_sentences=True)[0]
         self.assertEqual(len(source_context(sources, 3)), 4)
-        for changes in [{'language': 'fr'}, {'source_lang': 'French'}, {'reason': '用户在终端确认'},
+        for changes in [{'language': 'fr'}, {'source_lang': 'French'}, {'decision_origin': 'manual'},
                         {'decision': 'keep'}, {'begin_ms': 9001, 'end_ms': 10000}]:
             with self.subTest(changes=changes):
                 changed = copy.deepcopy(sources)
@@ -276,7 +276,9 @@ class ContextTranslationTests(PipelineFixture):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(self.store.counts(self.job_id)['mt_subtitle_completed'], 8)
         cues = self.store.cues(self.job_id)
-        self.store.cue_update(self.job_id, cues[0]['cue_id'], translated='')
+        with self.store.db:
+            self.store.db.execute("UPDATE cues SET translated='' WHERE job_id=? AND cue_id=?",
+                                  (self.job_id, cues[0]['cue_id']))
         no_network = mock.Mock(side_effect=AssertionError('cache should restore full mapping'))
         progress = mock.Mock()
         self.translate(sources, no_network, progress=progress)
@@ -290,7 +292,9 @@ class ContextTranslationTests(PipelineFixture):
         # The same partially populated group must also recover without a cache hit.
         with self.store.db:
             self.store.db.execute('DELETE FROM mt_cache')
-        self.store.cue_update(self.job_id, cues[0]['cue_id'], translated='')
+        with self.store.db:
+            self.store.db.execute("UPDATE cues SET translated='' WHERE job_id=? AND cue_id=?",
+                                  (self.job_id, cues[0]['cue_id']))
         request.reset_mock()
         self.translate(sources, request, progress=progress)
         self.assertEqual(request.call_count, 1)

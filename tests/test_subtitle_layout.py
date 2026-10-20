@@ -273,7 +273,7 @@ class ContextTests(unittest.TestCase):
             elif mode == "original":
                 sources[2]["decision"] = "original"
             elif mode == "manual":
-                sources[2]["reason"] = "用户在终端确认"
+                sources[2]["decision_origin"] = "manual"
             elif mode == "source_lang":
                 sources[2]["source_lang"] = "English"
             else:
@@ -523,6 +523,7 @@ class ContextPipelineTests(PipelineFixture):
                     manifest = self.store.job(self.job_id)["manifest"]
                     for key in ["normalized", "references_planned", "layout_planned", "layout_complete", "expected_srt_sha256"]:
                         manifest.pop(key, None)
+                    self.store.initialize_subtitles(self.job_id, [], [], manifest)
                     self.store.update(self.job_id, "queued", manifest)
                     # Use different inputs so the second scenario exercises interruption, not cache hits.
                     self.store.db.execute("DELETE FROM mt_cache")
@@ -587,7 +588,8 @@ class ContextPipelineTests(PipelineFixture):
         fake = FakeService(result(("OK", "")))
         self.assertEqual(self.run_fake(fake), "needs_review")
         cue = self.store.cues(self.job_id)[0]
-        self.store.cue_update(self.job_id, cue["cue_id"], decision="translate", source_lang="English", reason="用户在终端确认")
+        from subtitle_tool.review import ReviewDecision
+        self.store.apply_review(self.job_id, cue["cue_id"], ReviewDecision("translate", "English"))
         self.store.update(self.job_id, "queued")
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(self.store.sources(self.job_id)[0]["source_lang"], "English")

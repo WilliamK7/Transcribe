@@ -154,8 +154,8 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(fake.calls, [])
         self.assertEqual(self.store.counts(self.job_id).get('mt'), counts.get('mt'))
         self.assertEqual(output.read_bytes(), old)
-        backup = Path(self.store.job(self.job_id)['manifest']['backup'])
-        self.assertEqual(backup.read_bytes(), old)
+        self.assertEqual(self.store.job(self.job_id)['manifest']['backup'], '')
+        self.assertEqual(list(output.parent.glob(output.name + '.bak.*')), [])
         report = summary(self.store, self.job_id)
         self.assertIn('timings', report)
         self.assertGreater(report['timings']['run_seconds'], 0)
@@ -204,7 +204,8 @@ class ReflowTests(PipelineFixture):
         fake = FakeService(result(('OK', '')))
         self.assertEqual(self.run_fake(fake), 'needs_review')
         cue = self.store.cues(self.job_id)[0]
-        self.store.cue_update(self.job_id, cue['cue_id'], decision='translate', source_lang='English', reason='用户在终端确认')
+        from subtitle_tool.review import ReviewDecision
+        self.store.apply_review(self.job_id, cue['cue_id'], ReviewDecision('translate', 'English'))
         self.store.update(self.job_id, 'queued')
         self.assertEqual(self.run_fake(fake), 'completed')
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
@@ -266,7 +267,8 @@ class ReflowTests(PipelineFixture):
         fake = FakeService(result(('OK', '')))
         self.assertEqual(self.run_fake(fake), 'needs_review')
         cue = self.store.cues(self.job_id)[0]
-        self.store.cue_update(self.job_id, cue['cue_id'], decision='original', source_lang='auto', reason='用户在终端确认')
+        from subtitle_tool.review import ReviewDecision
+        self.store.apply_review(self.job_id, cue['cue_id'], ReviewDecision('original'))
         self.store.update(self.job_id, 'queued')
         self.assertEqual(self.run_fake(fake), 'completed')
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
@@ -294,7 +296,7 @@ class ReflowTests(PipelineFixture):
             self.assertEqual(main(['--reflow', self.job_id, '--overwrite', '--non-interactive']), 0)
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         self.store.update(self.job_id, 'subtitle_translating')
-        self.store.recover()
+        Engine(self.config, self.store).recover_jobs()
         self.assertEqual(self.store.job(self.job_id)['state'], 'queued')
         with mock.patch('subtitle_tool.main.Config', return_value=self.config), mock.patch('sys.stdout', new_callable=io.StringIO), mock.patch('sys.stderr', new_callable=io.StringIO), mock.patch('requests.request', side_effect=fake.request), mock.patch('requests.post', side_effect=fake.upload):
             self.assertEqual(main(['--resume', self.job_id, '--non-interactive']), 0)

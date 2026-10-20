@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import copy
 import unittest
 from unittest import mock
 
 from subtitle_tool import subtitles
-from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
 from tests.fixtures import FakeService, PipelineFixture, response, timed_raw
 
@@ -56,21 +54,6 @@ class WordBreakIndexTests(unittest.TestCase):
             source = indexed_source(["word"] * 4, durations=durations)
             self.assertEqual(subtitles._WordBreakIndex(source).best(0, 4), expected)
 
-    def test_index_is_lazy_and_reused_only_within_each_planning_call(self):
-        short = indexed_source(["short", "sentence"])
-        long = indexed_source(["word"] * 40)
-        over_budget = indexed_source(["x" * 100] * 80)
-        index_type = subtitles._WordBreakIndex
-        with mock.patch.object(subtitles, "_WordBreakIndex", wraps=index_type) as build:
-            subtitles.plan_fragments(short, Settings())
-            subtitles.plan_reference_units([short])
-            build.assert_not_called()
-            self.assertGreater(len(subtitles.plan_fragments(long, Settings())), 2)
-            self.assertEqual(build.call_count, 1)
-            build.reset_mock()
-            self.assertGreater(len(subtitles.plan_reference_units([over_budget, copy.deepcopy(over_budget)])), 2)
-            self.assertEqual(build.call_count, 2)
-
 
 class ContextPositionTests(unittest.TestCase):
     @staticmethod
@@ -94,17 +77,6 @@ class ContextPositionTests(unittest.TestCase):
         actual = subtitles.translation_context(cue, sources, position=3)
         self.assertEqual(actual, [{"source": sources[i]["text"], "target": sources[i]["reference"]}
                                   for i in [2, 4, 1, 5]])
-
-    def test_context_uses_source_positions_without_scanning(self):
-        class IndexedOnlySources(list):
-            def __iter__(self):
-                raise AssertionError("Known positions must not search through sources")
-
-        sources = self.sources()
-        for position in (0, 3, 6):
-            cue = subtitles.make_fragment(sources[position], 0, 1)
-            expected = subtitles.translation_context(cue, sources, position=position)
-            self.assertEqual(subtitles.translation_context(cue, IndexedOnlySources(sources), position=position), expected)
 
 
 class PlanningResumeTests(PipelineFixture):

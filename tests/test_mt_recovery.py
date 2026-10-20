@@ -261,7 +261,9 @@ class RecoveryPersistenceTests(PipelineFixture):
         normal_key, recovery_key = self.keys()
         self.assertIsNone(self.store.cache_get(normal_key))
         self.assertIsNotNone(self.store.cache_get(recovery_key))
-        self.store.cue_update(self.job_id, cues[1]['cue_id'], translated='')
+        with self.store.db:
+            self.store.db.execute("UPDATE cues SET translated='' WHERE job_id=? AND cue_id=?",
+                                  (self.job_id, cues[1]['cue_id']))
         no_network = mock.Mock(side_effect=AssertionError('must use recovery cache'))
         self.translate(no_network)
         no_network.assert_not_called()
@@ -271,7 +273,8 @@ class RecoveryPersistenceTests(PipelineFixture):
         normal = {'0': '普通甲', '1': '普通乙', '2': '普通丙'}
         with self.store.db:
             self.store.db.execute('INSERT INTO mt_cache VALUES(?,?)', (normal_key, batch_cache_value(normal)))
-        self.store.cue_update(self.job_id, cues[0]['cue_id'], translated='')
+            self.store.db.execute("UPDATE cues SET translated='' WHERE job_id=? AND cue_id=?",
+                                  (self.job_id, cues[0]['cue_id']))
         self.translate(no_network)
         self.assertEqual([c['translated'] for c in self.store.cues(self.job_id)[:3]], list(normal.values()))
         self.assertEqual(self.store.counts(self.job_id)['mt_recovery_cache_hit'], 3)
