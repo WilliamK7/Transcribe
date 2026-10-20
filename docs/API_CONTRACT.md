@@ -6,7 +6,8 @@
 | --- | --- | --- |
 | ASR | POST `https://{workspace_id}.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/asr/transcription` | [Qwen-ASR](https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference) |
 | 查询 | GET 同一工作空间 `/api/v1/tasks/{task_id}` | 同上 |
-| MT | POST 同一工作空间 `/compatible-mode/v1/chat/completions` | [Qwen-MT](https://help.aliyun.com/zh/model-studio/qwen-mt-api) |
+| 默认 MT（百炼） | POST 同一工作空间 `/compatible-mode/v1/chat/completions` | [Qwen-MT](https://help.aliyun.com/zh/model-studio/qwen-mt-api) |
+| 兼容 MT | POST 配置根地址 + `/chat/completions` | [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) |
 | 上传策略 | GET `https://dashscope.aliyuncs.com/api/v1/uploads`，`action=getPolicy`，`model=qwen3-asr-flash-filetrans` | [临时上传](https://help.aliyun.com/zh/model-studio/get-temporary-file-url) |
 | 文件上传 | 返回的 `upload_host`，流式整文件 multipart，`file` 字段最后，使用上传策略鉴权 | 同上 |
 
@@ -14,9 +15,15 @@
 
 ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`。`X-DashScope-Async`、`X-DashScope-OssResourceResolve` 均为 `enable`；`parameters` 为 `channel_id:[0]`、`enable_words:true`、`enable_itn:false`，省略 `language` 以自动识别。提交成功即持久化 `output.task_id`；查询成功后从 `output.result.transcription_url` 下载结果，按 `transcripts[].sentences[]` 解析。
 
-MT 模型为 `qwen-mt-flash`，`stream:false`，每次一条 user 文本消息。中文／粤语跳过 MT，语种复核在所有 MT 请求前完成。
+默认 MT 模型为 `qwen-mt-flash`，`stream:false`，每次一条 user 文本消息。中文／粤语跳过 MT，语种复核在所有 MT 请求前完成。
 
-翻译策略 3 使用[官方支持的自定义提示词](https://help.aliyun.com/zh/model-studio/machine-translation)，user 消息依次包含原文上下文、翻译要求和同一来源句的有序片段；提示词指定源语言 `auto`（或人工确认的 MT 语言名）及简体中文目标。请求省略 `translation_options`，设置 `temperature:0`、`seed:0`，采样参数不保证云端严格确定性，含义见[官方 API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。多片段请求包含固定边界示例，单片请求省略示例。
+翻译配置及环境变量见 [README](../README.md#选择翻译后端)。新任务入队前验证配置与凭据；普通恢复按保存的 MT 身份执行，并使用当前运行 RPM。
+
+兼容根地址规范化主机名、默认端口和末尾斜杠，保留路径前缀，再追加 `/chat/completions`。根地址使用无凭据、查询参数、片段及路径回退的 HTTPS URL；localhost 或回环 IP 支持 HTTP。请求使用独立 Bearer Key，字段为 `model`、`messages`、`stream:false`。
+
+两个后端共用策略 3 的提示词、上下文、编号 JSON 校验、繁转简和缩组恢复；请求构造与预算使用同一后端和模型参数。兼容服务的非 2xx 错误映射为 `mt_http_{HTTP状态}`，2xx 中的业务错误映射为 `mt_service_error`；诊断仅记录本地分类和计数，服务端消息、错误码、请求 ID 及响应原文保持私有。
+
+翻译策略 3 的 user 消息依次包含原文上下文、翻译要求和同一来源句的有序片段；提示词指定源语言 `auto`（或人工确认的 MT 语言名）及简体中文目标。多片段请求包含固定边界示例，单片请求省略示例。百炼使用[自定义提示词模式](https://help.aliyun.com/zh/model-studio/machine-translation)，省略 `translation_options`，设置 `temperature:0`、`seed:0`；采样参数含义见[官方 API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。
 
 内部批量接口接收上下文和有序片段，请求内编号从字符串 `"0"` 开始；输入、输出均为 `{"translations":[{"id":"0","text":"文字"}]}`，输出 `text` 为对应片段的译文。本地校验 JSON、编号完整且唯一、无多余项、译文非空且无字幕控制内容，以及 `finish_reason:stop`；原文包含文字或数字时，译文须包含文字或数字。校验异常使用同组输入和修复提示再尝试一次。
 
@@ -26,7 +33,7 @@ MT 模型为 `qwen-mt-flash`，`stream:false`，每次一条 user 文本消息�
 
 旧策略 1／2 保留单片翻译请求，顶层 `translation_options` 指定源语种及目标语种 `Chinese`，有上下文时增加 `tm_list:[{"source":"参考原文","target":"参考译文"}]`；旧单阶段任务保留原请求形式。响应须正常结束且译文合法、非空。
 
-MT 按 Key／地域／模型在进程内共享调度，并发可设为 1～4，默认 4。北京 `qwen-mt-flash` 额度为 60 RPM／35,000 TPM；本地在 61 秒滚动窗口内最多发送 60 次 HTTP 尝试，包含重试和失败，额外 1 秒用于网络到达时间余量。额度未满时无固定逐条间隔，用尽后逐条等待最早请求过期；窗口等待、共享冷却和自适应间隔取较晚期限，等待可取消。进度区分配额等待与服务端限流，配额等待不计入 `mt_cooldown_ms`。窗口不跨进程保存，账号其他调用及 TPM 限流由 429 退避处理。
+MT 按后端／规范化根地址／Key SHA-256／模型在进程内共享调度，并发可设为 1～4，默认 4。北京 `qwen-mt-flash` 额度为 60 RPM／35,000 TPM；本地在 61 秒滚动窗口内最多发送 60 次 HTTP 尝试，包含重试和失败，额外 1 秒用于网络到达时间余量。兼容后端按当前 `mt_rpm` 在 60 秒滚动窗口限制尝试次数，0 不主动限流；RPM 调整不改变共享调度身份。额度未满时无固定逐条间隔，用尽后逐条等待请求过期；窗口等待、共享冷却和自适应间隔取较晚期限，等待可取消。进度区分配额等待与服务端限流，配额等待不计入 `mt_cooldown_ms`。窗口不跨进程保存，账号其他调用及 TPM 限流由 429 退避处理。
 
 每次发送记录调度代次；当前代次首次收到 429 时推进代次，将间隔升至至少 1.05 秒，后续代次再次限流时翻倍，最高 8 秒。同代次其余 429 只更新冷却、计数及重试。当前代次连续成功 4 次后间隔降低 30%，不足 0.1 秒时归零；任何 429 或当前代次其他失败重置成功窗口。旧代次成功不参与恢复，成功以 HTTP 2xx 计，译文仍须校验后才保存。间隔下降立即用于后续调度，并显示提速日志。
 
@@ -46,7 +53,7 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 
 `output` 保存绝对 SRT 路径，`output_key` 从该路径生成；相对 `--output-dir` 按调用目录解释。入队、恢复改目录及重排均检查目标冲突。
 
-同一源文件与同一目标复用未结束任务，先检查该目标的全部任务冲突及账号／工作空间身份。`--overwrite` 启用覆盖，省略时沿用原设置；路径和覆盖选项在同一事务保存。不同目标新建任务；`--resume --output-dir` 修改未完成任务的目标。
+同一源文件与同一目标复用未结束任务，先检查该目标的全部任务冲突、账号／工作空间与 MT 身份。MT 后端、地址、模型或 Key 不一致时返回 `mt_config_changed`，须明确使用 `--resume` 沿原配置恢复或 `--reflow` 切换；报错前不修改覆盖选项或任务。`--overwrite` 启用覆盖，省略时沿用原设置；路径和覆盖选项在同一事务保存。不同目标新建任务；`--resume --output-dir` 修改未完成任务的目标。
 
 旧相对路径在执行任务时解析：所得冲突键与保存值一致则固定为绝对路径，否则返回 `output_path_required`，由用户用 `--output-dir` 指定。路径确认先于输出目录准备和云端请求；重排的路径随重排事务提交。
 
@@ -61,6 +68,11 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 | `subtitle_version` / `translation_strategy_version` | `2` / `3` |
 | `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
 | `execution_snapshot` | `format_version: 1`、`prompt_version: 9`、`recovery_version: 1`、`context_version: 1` |
+| `mt_snapshot` | `format_version: 1`、`provider`、`base_url`、`model`、`key_fingerprint`（SHA-256）、`request_version: 1` |
+
+`contract` 保存 ASR 模型、规范化版本与参数，读取兼容历史含 `mt:qwen-mt-flash` 的混合契约。MT 快照独立于 `cache_identity`（ASR 账户范围）；凭据仅存指纹，并发数和 RPM 使用运行设置。未知 MT 快照／请求契约版本返回 `cache_version`。
+
+普通恢复固定使用 `mt_snapshot` 中的后端、地址和模型，不受当前 MT 选择影响；在复用现有译文、缓存或重新发布 SRT 前验证对应的当前凭据指纹。不同 MT Key 返回 `mt_account_changed`。没有 MT 快照的旧任务按保存的百炼账户及工作空间处理，不增加快照、不升级翻译策略。已按保存发布意图写入的结果只补记完成时，仍按原规则校验 ASR 账户及工作空间，不要求旧 MT Key。
 
 原始 ASR JSON 与规范化结果分别保存。完整句保存于 `subtitle-sources-v2.json` 和 SQLite `subtitle_sources`，参考译文存于 `mt_references`，最终片段及译文存于 `cues`。`normalized`、`normalized_count`、`references_planned`、`layout_planned`、`layout_round` 与对应记录同事务提交，恢复以数据库已提交状态为准。恢复校验来源及文字／词范围，复用成功结果，补齐必要阶段后提交 SRT。
 
@@ -76,17 +88,17 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 
 MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。任务策略 1／2 使用版本 3 缓存，另含阶段、请求兼容策略标识、ASR 语种及完整实际 `tm_list` 的摘要；两者共享策略标识 1，各字段一致时可跨字幕版本 1／2 复用。
 
-任务策略 3 使用独立的版本 4 批量缓存，键包含策略、提示词版本、完整请求（含模型、采样参数、语种、实际上下文和有序片段）、上述账户范围、阶段及 ASR 语种，值保存完整编号到译文的映射。窗口版本变化后按实际请求匹配缓存，相同请求仍可复用。拆组恢复结果使用普通键摘要加恢复策略版本（当前为 1）的独立键，按普通缓存、恢复缓存的顺序查询，缓存内容为完整原组映射。请求内编号独立于来源句及稳定 `cue_id`。
+任务策略 3 使用独立的版本 4 批量缓存，键包含策略、提示词版本、完整请求（含模型、实际发送的采样参数、语种、实际上下文和有序片段）、上述 ASR 账户范围、阶段及 ASR 语种，值保存完整编号到译文的映射。兼容后端另含完整 MT 身份快照（后端、地址、模型、Key 指纹及请求契约版本），不跨身份共享缓存。百炼固定模型／地址／Key 已受原 ASR 范围约束，保留旧缓存键算法，缺少 MT 快照的历史任务也保持原算法。并发和 RPM 不参与缓存身份。窗口版本变化后按实际请求匹配缓存，相同请求仍可复用。拆组恢复结果使用普通键摘要加恢复策略版本（当前为 1）的独立键，按普通缓存、恢复缓存的顺序查询，缓存内容为完整原组映射。请求内编号独立于来源句及稳定 `cue_id`。
 
 各翻译阶段按完整缓存键合并同批请求。记录的 `attempts` 随实际参与的逻辑请求增加一次，包含策略 3 的修复及子组请求；HTTP 传输重试计入 `mt`。原组全部子组完成后，译文、完整缓存、完成及恢复成功计数同事务保存。失败写回全部组员并停止调度新组，其他在途成功组继续保存。取消时已完整返回的原组仍保存，部分返回的原组保留待恢复。策略 3 同组部分译文缺失时，按完整组缓存或重新请求恢复一致的分配。
 
-`--reflow JOB_ID` 读取全部本地 `raw-{segment_id}.json`，沿用识别输入、偏移和账户范围，按当前排版设置重建来源，仅在需要翻译时联网。源媒体可已移走；转写缺失或无效时保留原任务并报错。人工语种决定按完整来源对应，冲突或无法对应时返回 `reflow_review`。
+`--reflow JOB_ID` 读取全部本地 `raw-{segment_id}.json`，沿用识别输入、偏移和 ASR 账户范围，按当前 MT 后端、模型及排版设置重建来源，仅在需要翻译时联网。准备阶段校验当前 MT 配置及新凭据，不要求旧 MT Key；MT 身份变化后使用新身份的译文缓存或重新翻译，不重复 ASR。源媒体可已移走；转写缺失或无效时保留原任务并报错。人工语种决定按完整来源对应，冲突或无法对应时返回 `reflow_review`。
 
-重排先保存 `.build/reflow/{job_id}/{时间标识}.json` 本机任务快照，含原 manifest、来源、字幕、参考译文及计数。新来源另存 `subtitle-sources-v2-reflow-{时间标识}.json`；来源、片段、参考阶段重置、恢复标记和输出位置在同一 SQLite 事务提交。目标已存在时使用本次 `--overwrite` 参数。准备失败保留原任务；翻译失败保存可恢复进度。SRT 在翻译完成后备份并原子替换。快照和转写均属于本机私有数据。
+重排先保存 `.build/reflow/{job_id}/{时间标识}.json` 本机任务快照，含原 manifest、来源、字幕、参考译文及计数。新来源另存 `subtitle-sources-v2-reflow-{时间标识}.json`；来源、片段、参考阶段重置、新 MT 快照、恢复标记和输出位置在同一 SQLite 事务提交。目标已存在时使用本次 `--overwrite` 参数。准备失败保留原任务；翻译失败保存可恢复进度，`--resume` 沿新 MT 快照继续。SRT 在翻译完成后备份并原子替换。快照和转写均属于本机私有数据。
 
 ASR 提交 POST 由持久化 `submitting` 标记覆盖中断窗口。超时、5xx、无法解析或缺少 `task_id` 均保存为 `submission_unknown`，通过 `--bind-task-id` 绑定已知任务，或由用户以 `--allow-resubmit` 接受重复计费风险后重发。明确拒绝才清除标记；查询和下载失败继续沿用原 ID。旧任务仅有顶层提交标记或状态时，待提交分段唯一才能绑定或重发；取消后仍保留这项事实，须显式恢复。
 
-Key 原子明文保存于 `data/key.txt`，`DASHSCOPE_API_KEY` 优先。任务库明文保存上传引用；日志和普通报告隐藏凭据、签名链接、原文、译文及原始异常。终端语种复核可显示原文。
+百炼 Key 原子明文保存于 `data/key.txt`，`DASHSCOPE_API_KEY` 优先；独立兼容 MT Key 读取本机明文 `data/mt-key.txt`，`OPENAI_API_KEY` 优先。任务快照只保存指纹，配置文件不保存 Key。任务库明文保存上传引用；日志和普通报告隐藏凭据、签名链接、原文、译文及原始异常。终端语种复核可显示原文。
 
 兼容读取规则：
 
@@ -152,4 +164,4 @@ PCM 中间文件使用 RIFF WAV，数据容量上限为 `UINT32_MAX - 4096` 字�
 
 HTTP、MT 和上传在发送前检查取消；已登记尝试及占用额度保留，在途成功结果继续保存。ASR 提交未知状态按前述恢复规则处理。
 
-`timings` 将耗时换算为秒；计数及耗时跨恢复累计。报告另含任务状态、版本、排版轮次及超限警告，省略凭据、上传链接和字幕文字。
+`timings` 将耗时换算为秒；计数及耗时跨恢复累计。报告的 `mt_provider` 和 `models.mt` 读取任务实际 MT 快照，历史任务为 `bailian`／`qwen-mt-flash`；不使用当前模型选择，也不输出 MT 地址或指纹。报告另含任务状态、版本、排版轮次及超限警告，省略凭据、上传链接和字幕文字。

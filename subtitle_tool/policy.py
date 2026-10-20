@@ -17,7 +17,7 @@ def current_execution_snapshot():
 
 
 def asr_contract(normalizer=NORMALIZER_VERSION):
-    return {"asr": ASR_MODEL, "mt": MT_MODEL, "normalizer": normalizer,
+    return {"asr": ASR_MODEL, "normalizer": normalizer,
             "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}}
 
 
@@ -67,7 +67,7 @@ def load_policy(manifest, *, verify_execution=True):
         if not isinstance(saved, dict):
             raise ToolError("任务的识别模型契约不受支持，请用 --reflow 显式重排。", "cache_version")
         normalizer = _version(saved.get("normalizer"), {1, 2, NORMALIZER_VERSION})
-        if saved != asr_contract(normalizer):
+        if saved not in (asr_contract(normalizer), {**asr_contract(normalizer), "mt": MT_MODEL}):
             raise ToolError("任务的识别模型／参数契约不受支持，请检查保存记录。", "cache_version")
     if "normalized_version" in manifest:
         _version(manifest["normalized_version"], {1, 2, NORMALIZER_VERSION})

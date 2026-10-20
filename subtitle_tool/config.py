@@ -3,7 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .common import ToolError, atomic_bytes, atomic_json, validate_workspace_id
@@ -18,6 +18,10 @@ class Settings:
     region: str = "beijing"
     workspace_id: str = ""
     mt_workers: int = 4
+    mt_provider: str = "bailian"
+    mt_base_url: str = "https://api.openai.com/v1"
+    mt_model: str = ""
+    mt_rpm: int = 0
     channel: str = "ask"
     poll_seconds: float = 4
     poll_timeout_seconds: float = 6 * 3600
@@ -88,6 +92,29 @@ class Config:
     def save(self):
         self.settings.validate()
         atomic_json(self.data / "settings.json", asdict(self.settings))
+
+    def mt_settings(self):
+        # Resolve only for new tasks/reflow: current choices cannot alter a saved resume.
+        overrides = {name: os.environ[name.upper()] for name in
+                     ["mt_provider", "mt_base_url", "mt_model"] if name.upper() in os.environ}
+        return replace(self.settings, **overrides)
+
+    def mt_rpm(self):
+        value = os.environ.get("MT_RPM", self.settings.mt_rpm)
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            value = int(value)
+        if type(value) is not int or value < 0:
+            raise ToolError("mt_rpm 必须为非负整数；0 表示不主动限制。", "mt_config")
+        return value
+
+    def get_mt_key(self) -> str:
+        env = os.environ.get("OPENAI_API_KEY", "").strip()
+        if env:
+            return self.validate_key(env)
+        try:
+            return self.validate_key((self.data / "mt-key.txt").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError) as error:
+            raise ToolError("兼容翻译后端需要 OPENAI_API_KEY 或本机 data/mt-key.txt；不会复用百炼 Key。", "credentials") from error
 
     def set_key(self, key: str):
         key = self.validate_key(key)

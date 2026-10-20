@@ -577,10 +577,10 @@ def validate_mt_input(text, source_lang="auto", tm_list=()):
         raise ToolError("待翻译文本超过保守输入预算，且无法在可靠词时间边界安全拆分；进度已保存，可恢复。", "mt_input_budget")
 
 
-def plan_reference_units(sources, *, strategy_version=2):
+def plan_reference_units(sources, *, strategy_version=2, request_options=None):
     if strategy_version == 3:
         return [unit for source in sources if source['decision'] == 'translate'
-                for unit in split_mt_units(source, [make_fragment(source)], reference_stage=True)]
+                for unit in split_mt_units(source, [make_fragment(source)], reference_stage=True, request_options=request_options)]
     units = []
     for source in sources:
         if source["decision"] != "translate":
@@ -604,18 +604,18 @@ def plan_reference_units(sources, *, strategy_version=2):
     return sorted(units, key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
 
 
-def split_mt_units(source, units, *, reference_stage=False):
+def split_mt_units(source, units, *, reference_stage=False, request_options=None):
     from .mt import batch_input_size, validate_batch_input
     result, break_index = [], None
     stack = list(reversed(units))
     while stack:
         unit = stack.pop()
-        if batch_input_size([unit['text']], unit['source_lang']) > MT_INPUT_BUDGET:
+        if batch_input_size([unit['text']], unit['source_lang'], request_options=request_options) > MT_INPUT_BUDGET:
             if break_index is None:
                 break_index = _WordBreakIndex(source)
             at = break_index.best(unit['word_start'], unit['word_end'])
             if at is None:
-                validate_batch_input([unit['text']], unit['source_lang'])
+                validate_batch_input([unit['text']], unit['source_lang'], request_options=request_options)
             stack.extend([make_fragment(source, at, unit['word_end'], layout_round=unit.get('layout_round', 0)),
                           make_fragment(source, unit['word_start'], at, layout_round=unit.get('layout_round', 0))])
             continue
@@ -660,15 +660,15 @@ def source_context(sources, position, *, context_version=0):
                                                       context_version=context_version)]
 
 
-def plan_translation_batches(units, neighbors):
+def plan_translation_batches(units, neighbors, *, request_options=None):
     from .mt import batch_input_size, validate_batch_input
     groups, at = [], 0
     while at < len(units):
         end = at + 1
-        validate_batch_input([units[at]['text']], units[at]['source_lang'])
+        validate_batch_input([units[at]['text']], units[at]['source_lang'], request_options=request_options)
         # Neighbors are all removable before a sentence is divided into contiguous groups.
         while end < len(units) and batch_input_size([u['text'] for u in units[at:end + 1]],
-                                                    units[at]['source_lang']) <= MT_INPUT_BUDGET:
+                                                    units[at]['source_lang'], request_options=request_options) <= MT_INPUT_BUDGET:
             end += 1
         members = units[at:end]
         remaining = sorted([(at - i, i, 'same_sentence_before', unit) for i, unit in enumerate(units[:at])] +
@@ -676,9 +676,9 @@ def plan_translation_batches(units, neighbors):
         context = [{'position': side, 'text': unit['text']} for _, _, side, unit in remaining] + list(neighbors)
         texts = [u['text'] for u in members]
         # Same-sentence context has priority; remove farthest neighbors first.
-        while context and batch_input_size(texts, members[0]['source_lang'], context) > MT_INPUT_BUDGET:
+        while context and batch_input_size(texts, members[0]['source_lang'], context, request_options=request_options) > MT_INPUT_BUDGET:
             context.pop()
-        validate_batch_input(texts, members[0]['source_lang'], context)
+        validate_batch_input(texts, members[0]['source_lang'], context, request_options=request_options)
         groups.append((members, context))
         at = end
     return groups

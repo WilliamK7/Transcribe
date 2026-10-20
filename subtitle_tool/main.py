@@ -14,6 +14,7 @@ from .common import ASR_MODEL, MT_MODEL, ToolError, validate_workspace_id
 from .config import Config
 from .engine import Engine
 from .instance import ProcessLock
+from .mt_backend import configured_mt
 from .reports import ReportWriter
 from .store import STATES, Store
 from .review import MT_LANGUAGES, ReviewDecision
@@ -170,7 +171,9 @@ def summary(store, job_id):
             "translation_strategy_version": manifest.get("translation_strategy_version", 0),
             "layout_round": manifest.get("layout_round", 0), "warnings": manifest.get("warnings", []),
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
-    item["models"] = {"asr": ASR_MODEL, "mt": MT_MODEL}
+    mt = manifest.get("mt_snapshot", {})
+    item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", MT_MODEL)}
+    item["mt_provider"] = mt.get("provider", "bailian")
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
     counts = item["counts"]
     item["timings"] = {"run_seconds": counts.get("run_ms", 0) / 1000,
@@ -304,10 +307,12 @@ def main(argv=None):
                     engine.change_output(current_job, args.output_dir, args.overwrite)
         else:
             workspace = validate_workspace_id(config.settings.workspace_id)
-            account = hashlib.sha256(config.get_key().encode()).hexdigest()
+            key = config.get_key()
+            account = hashlib.sha256(key.encode()).hexdigest()
+            mt = configured_mt(config, {"region": "beijing", "workspace_id": workspace, "access_mode": "workspace"}, asr_key=key)
             for source in args.files:
                 job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
-                                       workspace_id=workspace, account=account, settings=config.settings)
+                                       workspace_id=workspace, account=account, settings=config.settings, mt_snapshot=mt.snapshot())
                 engine.select_input(job_id, args.track, args.channel)
                 if job_id not in ids:
                     ids.append(job_id)

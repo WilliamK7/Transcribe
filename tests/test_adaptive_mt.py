@@ -8,7 +8,7 @@ from unittest import mock
 
 import requests
 
-from subtitle_tool.api import Http, RequestPacer, mt_pacer
+from subtitle_tool.api import Http, RequestPacer
 from subtitle_tool.common import Cancelled, ToolError
 from subtitle_tool.config import Settings
 from tests.fixtures import response
@@ -269,11 +269,6 @@ class AdaptiveSchedulingTests(unittest.TestCase):
         self.cancel.wait.side_effect = throttle_during_wait
         self.pacer.wait(self.cancel)
         self.assertAlmostEqual(self.now, deadline)
-
-    def test_scope_shares_key_region_model_across_clients(self):
-        self.assertIs(mt_pacer('offline-adaptive', 'beijing'), mt_pacer('offline-adaptive', 'beijing'))
-        self.assertIsNot(mt_pacer('offline-adaptive', 'beijing'), mt_pacer('offline-another', 'beijing'))
-        self.assertIsNot(mt_pacer('offline-adaptive', 'beijing'), mt_pacer('offline-adaptive', 'singapore'))
 
     def test_valid_retry_after_seconds_and_dates_are_not_capped_at_sixty(self):
         for header, seconds in [('125', 125.0), (formatdate(1125, usegmt=True), 125.0),

@@ -16,7 +16,7 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 
-from .api import Bailian, upload_limit
+from .api import Bailian, OpenAICompatible, upload_limit
 from .common import (NORMALIZER_VERSION, SUBTITLE_VERSION,
                      TRANSLATION_STRATEGY_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
                      SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key)
@@ -24,6 +24,7 @@ from .config import Config, decrypt_legacy
 from .media import EXTRACT_RECIPE_VERSION, Media
 from .mt import batch_cache_key, batch_cache_value, batch_recovery_cache_key, parse_batch_translation
 from .mt_diagnostics import MTDiagnostics
+from .mt_backend import configured_mt, saved_mt
 from .store import TERMINAL, Store
 from .review import ReviewDecision, decision_origin
 from .policy import asr_contract, current_execution_snapshot, load_policy
@@ -176,6 +177,7 @@ class Engine:
         load_policy(manifest, verify_execution=False).settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
         self.config.settings.validate()
+        mt_backend = configured_mt(self.config, manifest)
         contract = asr_contract()
         cache = self.config.data / "cache" / job_id
         offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
@@ -212,6 +214,7 @@ class Engine:
             manifest.pop(name, None)
         normalized_file = f"subtitle-sources-v{SUBTITLE_VERSION}-reflow-{token}.json"
         manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+                        mt_snapshot=mt_backend.snapshot(),
                         execution_snapshot=current_execution_snapshot(),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
                                            ["zh_line_width", "other_line_width", "chinese_first"]},
@@ -353,7 +356,8 @@ class Engine:
         manifest = job["manifest"]
         cache = self.config.data / "cache" / job_id
         source = Path(job["source"])
-        api, key, scope = None, None, None
+        api, mt_api, key, scope = None, None, None, None
+        mt_backend, mt_key = None, None
         started = time.monotonic()
         stage_started, current_stage = started, None
         stage_times = {}
@@ -387,6 +391,17 @@ class Engine:
                     progress=cloud_progress,
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
             return api
+
+        def mt_client():
+            nonlocal mt_api
+            if mt_api is None:
+                options = dict(count=lambda name: self.store.count(job_id, name), progress=cloud_progress)
+                if mt_backend.provider == "openai_compatible":
+                    mt_api = OpenAICompatible(mt_key, mt_backend, self.cancel, **options, rpm=self.config.mt_rpm())
+                else:
+                    mt_api = Bailian(mt_key, manifest["region"], self.cancel, **options,
+                                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
+            return mt_api
 
         def save_failure(state, error, code, request_id=""):
             nonlocal handling_failure
@@ -437,10 +452,15 @@ class Engine:
             normalizer_version = contract["normalizer"]
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
+            mt_backend = saved_mt(manifest)
+            mt_key = mt_backend.credential(self.config)
+            if mt_backend.provider == "openai_compatible":
+                self.config.mt_rpm()
+            mt_scope = {**scope, **mt_backend.cache_scope()}
             if manifest.get("normalized"):
                 self.verify_source_output(job_id, manifest, output)
                 self.prepare_output(output)
-                return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache,
+                return self.finish_subtitles(job_id, manifest, settings, mt_scope, mt_client, stage, output, cache,
                                              context_version=execution_policy.context_version)
             saved_asr = False
             if self.store.sources(job_id) or self.store.cues(job_id) or self.store.references(job_id):
@@ -621,7 +641,7 @@ class Engine:
                                  normalized_version=normalizer_version, normalized_file=normalized_file)
                 sources, fragments = (cues, [make_fragment(s) for s in cues]) if subtitle_version else ([], cues)
                 self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, sources, fragments)
-            return self.finish_subtitles(job_id, manifest, settings, scope, client, stage, output, cache,
+            return self.finish_subtitles(job_id, manifest, settings, mt_scope, mt_client, stage, output, cache,
                                          context_version=execution_policy.context_version)
         except LocalStateUnavailable:
             # Never let a generic handler persist an unconfirmed in-memory state.
@@ -713,11 +733,13 @@ class Engine:
 
     def process_subtitles(self, job_id, manifest, settings, scope, client, stage, *, context_version):
         joint = manifest['translation_strategy_version'] == 3
+        request_options = saved_mt(manifest).request_options()
         sources = self.store.sources(job_id)
         if not sources:
             raise ToolError("新任务缺少完整句来源记录，不能改用旧断句规则恢复。", "cache_mismatch")
         if not manifest.get("references_planned"):
-            references = plan_reference_units(sources, strategy_version=manifest['translation_strategy_version'])
+            references = plan_reference_units(sources, strategy_version=manifest['translation_strategy_version'],
+                                              request_options=request_options)
             candidate = copy.deepcopy(manifest)
             candidate["references_planned"] = True
             self.commit_local(job_id, manifest, candidate, self.store.save_layout,
@@ -746,10 +768,10 @@ class Engine:
             for source in sources:
                 parts = plan_fragments(source, settings, reference=source["reference"])
                 if joint and source['decision'] == 'translate':
-                    parts = split_mt_units(source, parts)
+                    parts = split_mt_units(source, parts, request_options=request_options)
                 cues.extend(parts)
             for cue in cues:
-                if cue["decision"] == "translate":
+                if cue["decision"] == "translate" and not joint:
                     validate_mt_input(cue["text"], cue["source_lang"])
             candidate = copy.deepcopy(manifest)
             candidate.update(layout_planned=True, layout_round=0)
@@ -817,6 +839,7 @@ class Engine:
         cache_stage = 'reference' if reference_stage else 'subtitle'
         stage_name = cache_stage + '_translating'
         diagnostics = MTDiagnostics(self.config.root, job_id)
+        request_options = saved_mt(self.store.job(job_id)["manifest"]).request_options()
         by_source = {}
         source_ids = {s['sentence_id'] for s in sources}
         for cue in cues:
@@ -831,11 +854,12 @@ class Engine:
             units = sorted(by_source.get(source['sentence_id'], []), key=lambda c: c['char_start'])
             validate_unit_coverage(source, units, reference_stage=reference_stage)
             for members, context in plan_translation_batches(units, source_context(
-                    sources, position, context_version=context_version)):
+                    sources, position, context_version=context_version), request_options=request_options):
                 if all(c['translated'] for c in members):
                     continue
                 key = batch_cache_key([c['text'] for c in members], members[0]['source_lang'], **scope,
-                                      context=context, stage=cache_stage, asr_language=members[0]['language'].lower().strip())
+                                      context=context, stage=cache_stage, asr_language=members[0]['language'].lower().strip(),
+                                      request_options=request_options)
                 recovery_key = batch_recovery_cache_key(key)
                 groups.setdefault(key, ([], context, recovery_key))[0].append(members)
 

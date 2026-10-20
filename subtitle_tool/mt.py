@@ -21,7 +21,7 @@ FRAGMENT_EXAMPLE = ('分段边界示例（仅示范，不要输出示例）：\n
                     '输出：{"translations":[{"id":"0","text":"她决定"},{"id":"1","text":"等到早上。"}]}\n')
 
 
-def batch_payload(fragments, source_lang="auto", context=(), *, repair=False):
+def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, provider="bailian", model=None):
     if (not fragments or any(not isinstance(t, str) or not t.strip() for t in fragments) or
             not isinstance(source_lang, str) or not source_lang or
             any(not isinstance(c, dict) or set(c) != {"position", "text"} or
@@ -43,18 +43,23 @@ def batch_payload(fragments, source_lang="auto", context=(), *, repair=False):
                (FRAGMENT_EXAMPLE + "下面才是本次待翻译的数据：\n" if len(fragments) > 1 else "") +
                "INPUT_JSON:\n" + json.dumps(data, ensure_ascii=False))
     # The documented custom-prompt mode carries language instructions in the user message.
-    return {"model": MT_MODEL, "messages": [{"role": "user", "content": content}],
-            "stream": False, "temperature": 0, "seed": 0}
+    payload = {"model": MT_MODEL if model is None else model,
+               "messages": [{"role": "user", "content": content}], "stream": False}
+    if provider == "bailian":
+        payload.update(temperature=0, seed=0)
+    elif provider != "openai_compatible":
+        raise ToolError("翻译请求后端无效。", "mt_config")
+    return payload
 
 
-def batch_input_size(fragments, source_lang="auto", context=()):
+def batch_input_size(fragments, source_lang="auto", context=(), *, request_options=None):
     # Include the repair instruction so a second attempt always fits the same budget.
-    return len(json.dumps(batch_payload(fragments, source_lang, context, repair=True),
+    return len(json.dumps(batch_payload(fragments, source_lang, context, repair=True, **(request_options or {})),
                           ensure_ascii=False).encode('utf-8')) + MT_TEMPLATE_RESERVE
 
 
-def validate_batch_input(fragments, source_lang="auto", context=()):
-    if batch_input_size(fragments, source_lang, context) > MT_INPUT_BUDGET:
+def validate_batch_input(fragments, source_lang="auto", context=(), *, request_options=None):
+    if batch_input_size(fragments, source_lang, context, request_options=request_options) > MT_INPUT_BUDGET:
         raise ToolError("待翻译文本超过保守输入预算，且无法在可靠词时间边界安全拆分；进度已保存，可恢复。", "mt_input_budget")
 
 
@@ -149,7 +154,7 @@ def parse_batch_response(body, fragments):
     return parse_batch_translation(message['content'], fragments)
 
 
-def recovery_context(fragments, start, end, source_lang='auto', context=()):
+def recovery_context(fragments, start, end, source_lang='auto', context=(), *, request_options=None):
     """Keep nearest original siblings first, then the original ordered background."""
     siblings = sorted([(start - i, i, 'same_sentence_before') for i in range(start)] +
                       [(i - end + 1, i, 'same_sentence_after') for i in range(end, len(fragments))])
@@ -161,9 +166,9 @@ def recovery_context(fragments, start, end, source_lang='auto', context=()):
             kept.append(item)
             seen.add(identity)
     targets = fragments[start:end]
-    while kept and batch_input_size(targets, source_lang, kept) > MT_INPUT_BUDGET:
+    while kept and batch_input_size(targets, source_lang, kept, request_options=request_options) > MT_INPUT_BUDGET:
         kept.pop()
-    validate_batch_input(targets, source_lang, kept)
+    validate_batch_input(targets, source_lang, kept, request_options=request_options)
     return kept
 
 
@@ -172,9 +177,9 @@ def batch_cache_value(translated):
                       ensure_ascii=False)
 
 
-def batch_cache_key(fragments, source_lang="auto", *, context=(), stage="subtitle", asr_language="", **scope):
+def batch_cache_key(fragments, source_lang="auto", *, context=(), stage="subtitle", asr_language="", request_options=None, **scope):
     value = {"cache_version": 4, "strategy_version": 3, "prompt_version": PROMPT_VERSION,
-             "request": batch_payload(fragments, source_lang, context), "stage": stage,
+             "request": batch_payload(fragments, source_lang, context, **(request_options or {})), "stage": stage,
              "asr_language": asr_language, "scope": scope, "simplification": "opencc-t2s-0.1.7"}
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 

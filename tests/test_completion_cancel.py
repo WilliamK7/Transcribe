@@ -87,7 +87,6 @@ class CompletionTests(PipelineFixture):
             if kwargs.get("attempt"):
                 cancel.set()
         with mock.patch.object(self.store, "translation_update", side_effect=persist), \
-                mock.patch.object(Bailian, "translate", side_effect=AssertionError("must not start MT")), \
                 mock.patch("requests.request", side_effect=fake.request), mock.patch("requests.post", side_effect=fake.upload):
             self.assertEqual(Engine(self.config, self.store, cancel).run(self.job_id), "cancelled")
         self.assertEqual(fake.named("/chat/completions"), [])

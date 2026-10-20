@@ -19,6 +19,7 @@ from .common import (API_ROOTS, ASR_MODEL, MAX_UPLOAD_BYTES, MT_MODEL, Submissio
 from .mt import (BatchTranslation, BatchValidationError, batch_payload, parse_batch_response,
                  recovery_context, validate_batch_input)
 from .mt_diagnostics import safe_request_id
+from .mt_backend import MTBackend, bailian_mt_url, key_fingerprint
 
 
 # Beijing qwen-mt-flash: 60 RPM. One extra second allows for network arrival jitter.
@@ -38,7 +39,7 @@ def upload_limit(policy):
 
 class RequestPacer:
     """Allow short bursts within shared RPM quota, with adaptive 429 recovery."""
-    def __init__(self, clock=None):
+    def __init__(self, clock=None, *, requests_per_window=MT_WINDOW_REQUESTS, window_seconds=MT_WINDOW_SECONDS):
         self.interval = 0.0
         self.clock = clock or time.monotonic
         self.lock = threading.Lock()
@@ -48,6 +49,12 @@ class RequestPacer:
         self.successes = 0
         self.starts = deque()
         self.quota_notice_until = 0.0
+        self.requests_per_window = requests_per_window
+        self.window_seconds = window_seconds
+
+    def configure_quota(self, requests_per_window):
+        with self.lock:
+            self.requests_per_window = requests_per_window
 
     def wait(self, cancel, progress=None):
         while True:
@@ -55,13 +62,13 @@ class RequestPacer:
             notice = None
             with self.lock:
                 now = self.clock()
-                while self.starts and self.starts[0] + MT_WINDOW_SECONDS <= now:
+                while self.starts and self.starts[0] + self.window_seconds <= now:
                     self.starts.popleft()
                 deadline = self.cooldown_until
                 if self.last_started is not None:
                     deadline = max(deadline, self.last_started + self.interval)
-                if len(self.starts) >= MT_WINDOW_REQUESTS:
-                    quota_until = self.starts[0] + MT_WINDOW_SECONDS
+                if self.requests_per_window and len(self.starts) >= self.requests_per_window:
+                    quota_until = self.starts[-self.requests_per_window] + self.window_seconds
                     if (progress is not None and quota_until > deadline and quota_until - now >= 2
                             and quota_until > self.quota_notice_until):
                         notice = quota_until - now
@@ -73,7 +80,7 @@ class RequestPacer:
                     self.starts.append(now)
                     return self.generation
             if notice is not None:
-                progress("mt_quota_wait", notice, MT_WINDOW_REQUESTS)
+                progress("mt_quota_wait", notice, self.requests_per_window)
             if cancel.wait(min(delay, 0.1)):
                 check_cancel(cancel)
 
@@ -130,19 +137,28 @@ _MT_PACERS = {}
 _MT_PACERS_LOCK = threading.Lock()
 
 
-def mt_pacer(key, region):
-    import hashlib
-    identity = (hashlib.sha256(key.encode()).hexdigest(), region, MT_MODEL)
+def mt_pacer(backend, *, rpm=0):
+    identity = (backend.provider, backend.base_url, backend.key_fingerprint, backend.model)
     with _MT_PACERS_LOCK:
-        return _MT_PACERS.setdefault(identity, RequestPacer())
+        pacer = _MT_PACERS.get(identity)
+        if pacer is None:
+            compatible = backend.provider == "openai_compatible"
+            pacer = RequestPacer(requests_per_window=rpm if compatible else MT_WINDOW_REQUESTS,
+                                 window_seconds=60.0 if compatible else MT_WINDOW_SECONDS)
+            _MT_PACERS[identity] = pacer
+        elif backend.provider == "openai_compatible":
+            pacer.configure_quota(rpm)
+        return pacer
 
 
 class Http:
     """No automatic retries of ASR POST. No response bodies or URLs in logs."""
-    def __init__(self, cancel: threading.Event, count=lambda name: None, attempts=4, progress=lambda *args: None, pacer=None):
+    def __init__(self, cancel: threading.Event, count=lambda name: None, attempts=4, progress=lambda *args: None, pacer=None,
+                 *, safe_errors=False):
         self.cancel, self.count, self.attempts = cancel, count, attempts
         self.progress = progress
         self.pacer = pacer or RequestPacer()
+        self.safe_errors = safe_errors
 
     def request(self, method, url, *, name="http", headers=None, retry=True, **kwargs):
         for attempt in range(self.attempts if retry else 1):
@@ -187,6 +203,12 @@ class Http:
                         self.pause(attempt, retry_after)
                     continue
             if not 200 <= response.status_code < 300:
+                if self.safe_errors:
+                    status = response.status_code
+                    response.close()
+                    hint = {401: "翻译 Key 无效", 403: "翻译账户或模型授权被拒绝", 429: "翻译请求限流",
+                            400: "翻译请求参数被拒绝", 404: "翻译服务或模型不存在"}.get(status, "翻译服务请求失败")
+                    raise ToolError(f"{hint}（HTTP {status}）。", f"mt_http_{status}")
                 try:
                     body = response.json()
                 except (ValueError, requests.RequestException):
@@ -233,12 +255,68 @@ class Http:
             if kwargs.get("retry") is False:
                 raise SubmissionUnknown()
             raise ToolError("服务返回结构不符合文档。", "response_schema")
-        if body.get("code") and str(body["code"]) not in {"200", "Success", "SUCCESS"}:
+        if self.safe_errors and (body.get("error") or
+                body.get("code") and str(body["code"]) not in {"200", "Success", "SUCCESS"}):
+            raise ToolError("翻译服务返回业务错误；进度已保存。", "mt_service_error")
+        if not self.safe_errors and body.get("code") and str(body["code"]) not in {"200", "Success", "SUCCESS"}:
             raise ToolError(f"百炼业务错误：{body['code']}。", body["code"], body.get("request_id", ""))
         return body
 
 
-class Bailian:
+class BatchTranslator:
+    def translate_batch(self, fragments, source_lang="auto", *, context=(), on_attempt=lambda indices: None,
+                        on_event=lambda event: None):
+        validate_batch_input(fragments, source_lang, context, request_options=self.mt_options)
+        recovered = False
+
+        def run(start, end, depth):
+            nonlocal recovered
+            check_cancel(self.http.cancel)
+            targets = fragments[start:end]
+            background = context if start == 0 and end == len(fragments) else recovery_context(
+                fragments, start, end, source_lang, context, request_options=self.mt_options)
+            for repair in [False, True]:
+                check_cancel(self.http.cancel)
+                on_attempt(tuple(range(start, end)))
+                try:
+                    body = self.http.json("POST", self.mt_url,
+                                          name="mt", headers=self.headers,
+                                          json=batch_payload(targets, source_lang, background, repair=repair, **self.mt_options))
+                except ToolError as error:
+                    if error.code != 'response_schema':
+                        raise
+                    invalid = BatchValidationError('response_structure')
+                    request_id = '' if self.http.safe_errors else safe_request_id(error.request_id)
+                else:
+                    request_id = '' if self.http.safe_errors else safe_request_id(body.get('id'))
+                    try:
+                        translated = parse_batch_response(body, targets)
+                    except BatchValidationError as error:
+                        invalid = error
+                    else:
+                        return {str(start + int(key)): self.cc.convert(text) for key, text in translated.items()}
+                on_event({'kind': 'invalid_response', 'category': invalid.category,
+                          'expected_count': len(targets), 'actual_count': invalid.actual_count,
+                          'fragment_start': start, 'fragment_end': end, 'repair': repair,
+                          'depth': depth, 'request_id': request_id})
+            check_cancel(self.http.cancel)
+            if len(targets) == 1:
+                actual = invalid.actual_count if invalid.actual_count is not None else '未知'
+                raise ToolError(f"批量译文校验失败：{invalid}；预期 {len(targets)} 项，实际 {actual} 项，"
+                                f"原组片段 [{start},{end})；整组保留待恢复。", 'mt_batch_invalid', request_id)
+            recovered = True
+            on_event({'kind': 'split', 'fragment_start': start, 'fragment_end': end,
+                      'expected_count': len(targets), 'depth': depth})
+            middle = (start + end) // 2
+            left = run(start, middle, depth + 1)
+            right = run(middle, end, depth + 1)
+            return {**left, **right}
+
+        translated = run(0, len(fragments), 0)
+        return BatchTranslation(translated, recovered)
+
+
+class Bailian(BatchTranslator):
     def __init__(self, key: str, region: str, cancel: threading.Event,
                  count=lambda name: None, progress=lambda *args: None,
                  *, workspace_id="", access_mode="legacy_public"):
@@ -247,7 +325,10 @@ class Bailian:
                      if access_mode == "workspace" else API_ROOTS["beijing"])
         self.upload_base = API_ROOTS["beijing"]
         self.headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-        self.http = Http(cancel, count, progress=progress, pacer=mt_pacer(key, region))
+        backend = MTBackend("bailian", bailian_mt_url(identity), MT_MODEL, key_fingerprint(key))
+        self.mt_url = backend.base_url + "/chat/completions"
+        self.mt_options = backend.request_options()
+        self.http = Http(cancel, count, progress=progress, pacer=mt_pacer(backend))
         self.progress = progress
         self.cc = OpenCC("t2s")
 
@@ -345,57 +426,6 @@ class Bailian:
         # Never attach the API Authorization header to result storage.
         return self.http.json("GET", url, name="result_download")
 
-    def translate_batch(self, fragments, source_lang="auto", *, context=(), on_attempt=lambda indices: None,
-                        on_event=lambda event: None):
-        validate_batch_input(fragments, source_lang, context)
-        recovered = False
-
-        def run(start, end, depth):
-            nonlocal recovered
-            check_cancel(self.http.cancel)
-            targets = fragments[start:end]
-            background = context if start == 0 and end == len(fragments) else recovery_context(
-                fragments, start, end, source_lang, context)
-            for repair in [False, True]:
-                check_cancel(self.http.cancel)
-                on_attempt(tuple(range(start, end)))
-                try:
-                    body = self.http.json("POST", self.base + "/compatible-mode/v1/chat/completions",
-                                          name="mt", headers=self.headers,
-                                          json=batch_payload(targets, source_lang, background, repair=repair))
-                except ToolError as error:
-                    if error.code != 'response_schema':
-                        raise
-                    invalid = BatchValidationError('response_structure')
-                    request_id = safe_request_id(error.request_id)
-                else:
-                    request_id = safe_request_id(body.get('id')) if isinstance(body, dict) else ''
-                    try:
-                        translated = parse_batch_response(body, targets)
-                    except BatchValidationError as error:
-                        invalid = error
-                    else:
-                        return {str(start + int(key)): self.cc.convert(text) for key, text in translated.items()}
-                on_event({'kind': 'invalid_response', 'category': invalid.category,
-                          'expected_count': len(targets), 'actual_count': invalid.actual_count,
-                          'fragment_start': start, 'fragment_end': end, 'repair': repair,
-                          'depth': depth, 'request_id': request_id})
-            check_cancel(self.http.cancel)
-            if len(targets) == 1:
-                actual = invalid.actual_count if invalid.actual_count is not None else '未知'
-                raise ToolError(f"批量译文校验失败：{invalid}；预期 {len(targets)} 项，实际 {actual} 项，"
-                                f"原组片段 [{start},{end})；整组保留待恢复。", 'mt_batch_invalid', request_id)
-            recovered = True
-            on_event({'kind': 'split', 'fragment_start': start, 'fragment_end': end,
-                      'expected_count': len(targets), 'depth': depth})
-            middle = (start + end) // 2
-            left = run(start, middle, depth + 1)
-            right = run(middle, end, depth + 1)
-            return {**left, **right}
-
-        translated = run(0, len(fragments), 0)
-        return BatchTranslation(translated, recovered)
-
     def translate(self, text: str, source_lang="auto", *, tm_list=None) -> tuple[str, str]:
         options = {"source_lang": source_lang, "target_lang": "Chinese"}
         if tm_list is not None:
@@ -407,7 +437,7 @@ class Bailian:
             validate_mt_input(text, source_lang, tm_list)
             if tm_list:
                 options["tm_list"] = tm_list
-        body = self.http.json("POST", self.base + "/compatible-mode/v1/chat/completions",
+        body = self.http.json("POST", self.mt_url,
                               name="mt", headers=self.headers,
                               json={"model": MT_MODEL, "messages": [{"role": "user", "content": text}],
                                     "stream": False, "translation_options": options})
@@ -424,3 +454,13 @@ class Bailian:
         except (KeyError, IndexError, TypeError, ValueError) as e:
             raise ToolError("译文为空、截断或格式异常；该条保留待重试。", "mt_invalid", body.get("id", "")) from e
         return self.cc.convert(translated), body.get("id", "")
+
+
+class OpenAICompatible(BatchTranslator):
+    def __init__(self, key, backend, cancel, count=lambda name: None, progress=lambda *args: None, *, rpm=0):
+        self.mt_url = backend.base_url + "/chat/completions"
+        self.mt_options = backend.request_options()
+        self.headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+        self.http = Http(cancel, count, progress=progress, pacer=mt_pacer(backend, rpm=rpm),
+                         safe_errors=True)
+        self.cc = OpenCC("t2s")

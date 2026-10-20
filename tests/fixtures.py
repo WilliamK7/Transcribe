@@ -119,6 +119,8 @@ class TemporaryTest(unittest.TestCase):
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
         os.environ.pop("DASHSCOPE_API_KEY", None)
+        for name in ["OPENAI_API_KEY", "MT_PROVIDER", "MT_BASE_URL", "MT_MODEL", "MT_RPM"]:
+            os.environ.pop(name, None)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP)
         self.path = Path(self.temp.name)
 

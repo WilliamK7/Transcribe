@@ -116,9 +116,10 @@ class BatchRecoveryTests(TemporaryTest):
                      {'choices': [{'message': []}]}, {'choices': [{'message': {'content': 123}}]}]:
             with self.subTest(body=body):
                 events = []
-                with mock.patch.object(self.cloud.http, 'json', return_value=body):
+                with mock.patch('requests.request', side_effect=lambda *a, **k: response(body)) as request:
                     with self.assertRaises(ToolError) as error:
                         self.cloud.translate_batch(['private source'], on_event=events.append)
+                self.assertEqual(request.call_count, 2)
                 self.assertEqual(error.exception.code, 'mt_batch_invalid')
                 self.assertEqual([e['category'] for e in events], ['response_structure'] * 2)
                 self.assertNotIn('private source', str(error.exception))

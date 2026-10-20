@@ -12,6 +12,7 @@ from .common import (PROCESSING_VERSION, SUBTITLE_VERSION, TRANSLATION_STRATEGY_
 from .config import Settings
 from .review import ReviewDecision, decision_origin
 from .policy import current_execution_snapshot
+from .mt_backend import saved_mt
 
 TERMINAL = {"completed", "skipped", "cancelled"}
 STATES = {
@@ -67,7 +68,7 @@ class Store:
         self.db.commit()
 
     def enqueue(self, source: Path, region: str = "beijing", overwrite=False, output_dir: Path | None = None,
-                *, workspace_id="", account="", settings=None):
+                *, workspace_id="", account="", settings=None, mt_snapshot=None):
         if region != "beijing":
             raise ToolError("新任务只支持北京工作空间。", "config")
         workspace_id = validate_workspace_id(workspace_id)
@@ -89,6 +90,8 @@ class Store:
                     previous = json.loads(row["manifest"])
                     if (previous.get("access_mode"), previous.get("workspace_id"), previous.get("account", "")) != ("workspace", workspace_id, account):
                         raise ToolError("该文件已有其他账号或接入方式的任务，请用 --resume 原任务 ID；不能自动迁移工作空间。", "cache_mismatch")
+                    if mt_snapshot is not None and saved_mt(previous).snapshot() != mt_snapshot:
+                        raise ToolError("该文件已有不同翻译配置的未完成任务；请用 --resume 沿原后端恢复，或用 --reflow 显式切换。", "mt_config_changed")
                     if reusable is None:
                         reusable = row
             if reusable is not None:
@@ -102,6 +105,9 @@ class Store:
             manifest = {"region": region, "workspace_id": workspace_id, "access_mode": "workspace",
                         "processing_version": PROCESSING_VERSION, "account": account,
                         "overwrite": bool(overwrite), "segments": [], "warnings": []}
+            if mt_snapshot is not None:
+                manifest["mt_snapshot"] = mt_snapshot
+                saved_mt({**manifest, "translation_strategy_version": TRANSLATION_STRATEGY_VERSION})
             settings = settings or Settings()
             manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
                             execution_snapshot=current_execution_snapshot(),
