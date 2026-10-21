@@ -12,12 +12,12 @@ import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 
 from .api import Bailian, OpenAICompatible, upload_limit
-from .common import (NORMALIZER_VERSION, SUBTITLE_VERSION,
+from .common import (DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION,
                      TRANSLATION_STRATEGY_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
                      SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key)
 from .config import Config, decrypt_legacy
@@ -31,7 +31,7 @@ from .policy import asr_contract, current_execution_snapshot, load_policy
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
                             validate_normalized, validate_segments)
 from .publication import file_hash, inspect_intent, prepare_intent, write_srt
-from .subtitles import (layout_warnings, make_fragment, mt_cache_key, normalize, plan_fragments,
+from .subtitles import (layout_warnings, make_fragment, mt_cache_key, normalize, plan_display_timing, plan_fragments,
                         plan_reference_units, reference_sources, render_srt, translation_context,
                         plan_translation_batches, source_context, split_mt_units, validate_unit_coverage,
                         validate_fragment, validate_mt_input, wrap)
@@ -173,7 +173,7 @@ class Engine:
         job = self.store.job(job_id)
         manifest = job["manifest"]
         output = self.store.resolve_output(job, output_dir)
-        self.store.check_reflow_output(job_id, output, overwrite)
+        self.store.check_republish_output(job_id, output, overwrite, operation="重排")
         load_policy(manifest, verify_execution=False).settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
         self.config.settings.validate()
@@ -210,10 +210,12 @@ class Engine:
         snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
         self.store.snapshot(job_id, snapshot)
         for name in ["references_planned", "layout_planned", "layout_round", "layout_complete",
-                     "expected_srt_sha256", "publication_intent", "backup", "cue_count", "output_settings", "no_speech"]:
+                     "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
+                     "backup", "cue_count", "output_settings", "no_speech"]:
             manifest.pop(name, None)
         normalized_file = f"subtitle-sources-v{SUBTITLE_VERSION}-reflow-{token}.json"
         manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+                        display_timing_version=DISPLAY_TIMING_VERSION,
                         mt_snapshot=mt_backend.snapshot(),
                         execution_snapshot=current_execution_snapshot(),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
@@ -225,6 +227,63 @@ class Engine:
         atomic_json(cache / normalized_file, sources)
         check_cancel(self.cancel)
         self.store.commit_reflow(job_id, sources, [make_fragment(s) for s in sources], manifest, output)
+
+    def retime(self, job_id, *, overwrite=False, output_dir=None):
+        """Prepare a local display-only publication from finalized saved subtitles."""
+        job = self.store.job(job_id)
+        manifest = job["manifest"]
+        if unknown_submission(manifest, job["state"]):
+            raise ToolError("提交结果未知，不能准备显示校时；请先恢复原任务。", "submission_unknown")
+        output = self.store.resolve_output(job, output_dir)
+        self.store.check_republish_output(job_id, output, overwrite, operation="校时")
+        policy = load_policy(manifest, verify_execution=False)
+        settings = self.retime_settings(manifest, policy.settings(self.config.settings))
+        self.identity(job_id, manifest, persist=False)
+        saved_mt(manifest).credential(self.config)
+        cache = self.config.data / "cache" / job_id
+        self.validate_saved_subtitles(job_id, manifest, cache)
+        cues = self.store.cues(job_id)
+        self.validate_retime_ready(manifest, cues)
+        self.verify_source_output(job_id, manifest, output)
+        candidate = copy.deepcopy(manifest)
+        candidate["display_timing_version"] = DISPLAY_TIMING_VERSION
+        content, adjustments = self.render_subtitles(cues, settings, candidate)
+        intent = prepare_intent(output, content, overwrite)
+        check_cancel(self.cancel)
+        snapshot = self.config.root / ".build" / "retime" / job_id / (str(time.time_ns()) + ".json")
+        self.store.snapshot(job_id, snapshot)
+        candidate.pop("reflow", None)
+        candidate.pop("backup", None)
+        candidate.update(display_timing_adjustments=adjustments, publication_intent=intent,
+                         expected_srt_sha256=intent["expected_srt_sha256"], overwrite=bool(overwrite),
+                         cue_count=len(cues), output_settings=asdict(settings),
+                         retime={"snapshot": str(snapshot.relative_to(self.config.root)),
+                                 "prepared_at": time.time(),
+                                 "from_display_timing_version": policy.display_timing_version})
+        check_cancel(self.cancel)
+        inspect_intent(output, intent)
+        self.store.commit_retime(job_id, candidate, output)
+
+    @staticmethod
+    def retime_settings(manifest, settings):
+        if manifest.get("subtitle_version"):
+            return settings
+        # Pre-layout-snapshot tasks need the settings of the last rendering.
+        saved = manifest.get("output_settings")
+        keys = ["zh_line_width", "other_line_width", "chinese_first"]
+        if not isinstance(saved, dict) or any(k not in saved for k in keys):
+            raise ToolError("旧任务缺少已保存的输出排版设置，不能仅校时；请用 --reflow。", "retime_incomplete")
+        settings = replace(settings, **{k: saved[k] for k in keys})
+        settings.validate()
+        return settings
+
+    @staticmethod
+    def validate_retime_ready(manifest, cues):
+        if (not cues or manifest.get("subtitle_version") and
+                not (manifest.get("layout_complete") and manifest.get("layout_planned")) or
+                any(c["decision"] not in {"original", "translate"} or
+                    c["decision"] == "translate" and not c.get("translated") for c in cues)):
+            raise ToolError("仅校时需要完整的最终字幕、译文和排版；请先恢复原任务。", "retime_incomplete")
 
     @staticmethod
     def preserve_review_decisions(sources, previous_sources, previous_cues):
@@ -432,15 +491,19 @@ class Engine:
                 published = True
             if published:
                 stage("completed")
-                if not manifest.get("reflow"):
+                if not (manifest.get("reflow") or manifest.get("retime")):
                     self.cleanup_completed_audio(job_id, manifest, cache)
                 return "completed"
             if output.exists() and not manifest["overwrite"]:
                 stage("skipped")
                 return "skipped"
             cache.mkdir(parents=True, exist_ok=True)
-            execution_policy = load_policy(manifest)
+            execution_policy = load_policy(manifest, verify_execution=not manifest.get("retime"))
             settings = execution_policy.settings(self.config.settings)
+            if manifest.get("retime"):
+                settings = self.retime_settings(manifest, settings)
+                if not manifest.get("normalized") or execution_policy.display_timing_version != DISPLAY_TIMING_VERSION:
+                    raise mismatch()
             if manifest.get("reflow"):
                 if subtitle_version != SUBTITLE_VERSION or not manifest.get("normalized"):
                     raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
@@ -454,7 +517,7 @@ class Engine:
             key, scope = self.identity(job_id, manifest)
             mt_backend = saved_mt(manifest)
             mt_key = mt_backend.credential(self.config)
-            if mt_backend.provider == "openai_compatible":
+            if mt_backend.provider == "openai_compatible" and not manifest.get("retime"):
                 self.config.mt_rpm()
             mt_scope = {**scope, **mt_backend.cache_scope()}
             if manifest.get("normalized"):
@@ -694,10 +757,12 @@ class Engine:
     def finish_subtitles(self, job_id, manifest, settings, scope, client, stage, output, cache, *, context_version):
         self.validate_saved_subtitles(job_id, manifest, cache)
         cues = self.store.cues(job_id)
+        if manifest.get("retime"):
+            self.validate_retime_ready(manifest, cues)
         if not cues:
             manifest["no_speech"] = True
             stage("completed")
-            if not manifest.get("reflow"):
+            if not (manifest.get("reflow") or manifest.get("retime")):
                 self.cleanup_completed_audio(job_id, manifest, cache)
             return "completed"
         if any(c["decision"] == "uncertain" for c in cues):
@@ -708,28 +773,41 @@ class Engine:
                 candidate.pop("expected_srt_sha256")
                 self.commit_local(job_id, manifest, candidate,
                                   lambda jid, value: self.store.update(jid, manifest=value))
-            if manifest.get("subtitle_version"):
-                self.process_subtitles(job_id, manifest, settings, scope, client, stage, context_version=context_version)
-            else:
-                stage("translating")
-                self.translate(job_id, cues, scope, client)
+            if not manifest.get("retime"):
+                if manifest.get("subtitle_version"):
+                    self.process_subtitles(job_id, manifest, settings, scope, client, stage, context_version=context_version)
+                else:
+                    stage("translating")
+                    self.translate(job_id, cues, scope, client)
         cues = self.store.cues(job_id)
         check_cancel(self.cancel)
         stage("writing")
-        content = render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", 0))
+        content, adjustments = self.render_subtitles(cues, settings, manifest)
         if "publication_intent" not in manifest:
             candidate = copy.deepcopy(manifest)
             intent = prepare_intent(output, content, manifest["overwrite"])
             candidate.update(publication_intent=intent, expected_srt_sha256=intent["expected_srt_sha256"],
                              cue_count=len(cues), output_settings=asdict(settings))
+            if manifest.get("display_timing_version", 0):
+                candidate["display_timing_adjustments"] = adjustments
             self.commit_local(job_id, manifest, candidate,
                               lambda jid, value: self.store.update(jid, manifest=value))
+        elif manifest.get("display_timing_version", 0) and manifest.get("display_timing_adjustments") != adjustments:
+            raise mismatch()
         self.verify_source_output(job_id, manifest, output)
         manifest["backup"] = write_srt(output, content, manifest["overwrite"], intent=manifest["publication_intent"])
         stage("completed")
-        if not manifest.get("reflow"):
+        if not (manifest.get("reflow") or manifest.get("retime")):
             self.cleanup_completed_audio(job_id, manifest, cache)
         return "completed"
+
+    @staticmethod
+    def render_subtitles(cues, settings, manifest):
+        intervals, adjustments = None, []
+        if manifest.get("display_timing_version", 0):
+            intervals, adjustments = plan_display_timing(cues)
+        return render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", 0),
+                          display_intervals=intervals), adjustments
 
     def process_subtitles(self, job_id, manifest, settings, scope, client, stage, *, context_version):
         joint = manifest['translation_strategy_version'] == 3

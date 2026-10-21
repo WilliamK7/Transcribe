@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .common import (PROCESSING_VERSION, SUBTITLE_VERSION, TRANSLATION_STRATEGY_VERSION,
+from .common import (DISPLAY_TIMING_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION, TRANSLATION_STRATEGY_VERSION,
                      ToolError, atomic_json, output_key, validate_workspace_id)
 from .config import Settings
 from .review import ReviewDecision, decision_origin
@@ -110,6 +110,7 @@ class Store:
                 saved_mt({**manifest, "translation_strategy_version": TRANSLATION_STRATEGY_VERSION})
             settings = settings or Settings()
             manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+                            display_timing_version=DISPLAY_TIMING_VERSION,
                             execution_snapshot=current_execution_snapshot(),
                             subtitle_settings={k: getattr(settings, k) for k in
                                                ["zh_line_width", "other_line_width", "chinese_first"]})
@@ -143,10 +144,11 @@ class Store:
 
     def _clear_publication(self, job_id, manifest=None):
         if manifest is not None:
-            for name in ["publication_intent", "expected_srt_sha256"]:
+            for name in ["publication_intent", "expected_srt_sha256", "display_timing_adjustments"]:
                 manifest.pop(name, None)
         else:
-            self.db.execute("UPDATE jobs SET manifest=json_remove(manifest,'$.publication_intent','$.expected_srt_sha256') WHERE id=?",
+            self.db.execute("UPDATE jobs SET manifest=json_remove(manifest,'$.publication_intent','$.expected_srt_sha256',"
+                            "'$.display_timing_adjustments') WHERE id=?",
                             (job_id,))
 
     @staticmethod
@@ -222,13 +224,13 @@ class Store:
         self._replace_records("cues", job_id, cues)
         self.db.execute("UPDATE jobs SET manifest=? WHERE id=?", (json.dumps(manifest, ensure_ascii=False), job_id))
 
-    def check_reflow_output(self, job_id, output, overwrite):
+    def check_republish_output(self, job_id, output, overwrite, *, operation):
         with self.lock:
             job = self.job(job_id)
             output = Path(output).resolve()
             self._check_output_conflicts(job, output)
             if output.exists() and not overwrite:
-                raise ToolError("重排目标 SRT 已存在，必须明确搭配 --overwrite；原文件已保留。", "overwrite_required")
+                raise ToolError(operation + "目标 SRT 已存在，必须明确搭配 --overwrite；原文件已保留。", "overwrite_required")
 
     def snapshot(self, job_id, path):
         """Private local task snapshot, including text; never use as an ordinary report."""
@@ -241,10 +243,18 @@ class Store:
         """Atomically replace local subtitle inputs and the explicit resume marker."""
         with self.lock, self.db:
             output = Path(output).resolve()
-            self.check_reflow_output(job_id, output, manifest["overwrite"])
+            self.check_republish_output(job_id, output, manifest["overwrite"], operation="重排")
             self._initialize_subtitles(job_id, sources, cues, manifest)
             self.db.execute("UPDATE jobs SET output=?,output_key=?,state='queued',error='',error_code='',"
                             "request_id='',updated=? WHERE id=?", (str(output), output_key(output), time.time(), job_id))
+
+    def commit_retime(self, job_id, manifest, output):
+        """Commit display policy, adjustments and publication intent without replacing evidence."""
+        with self.lock, self.db:
+            output = Path(output).resolve()
+            self.check_republish_output(job_id, output, manifest["overwrite"], operation="校时")
+            self._save_output(job_id, output, manifest)
+            self.db.execute("UPDATE jobs SET state='queued',error='',error_code='',request_id='' WHERE id=?", (job_id,))
 
     def save_layout(self, job_id, cues, manifest, *, references=None):
         """Commit range changes and their resume marker in one SQLite transaction."""
@@ -308,7 +318,8 @@ class Store:
                 cue.update(decision.values(), translated="", error="")
             manifest = job["manifest"]
             for name in ["references_planned", "layout_planned", "layout_complete", "layout_round",
-                         "expected_srt_sha256", "publication_intent", "no_speech", "cue_count", "output_settings"]:
+                         "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
+                         "no_speech", "cue_count", "output_settings"]:
                 manifest.pop(name, None)
             self._replace_records("cues", job_id, cues)
             self.db.execute("UPDATE jobs SET manifest=?,updated=? WHERE id=?",

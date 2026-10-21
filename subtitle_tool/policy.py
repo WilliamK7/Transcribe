@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from . import mt
-from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
+from .common import (ASR_MODEL, DISPLAY_TIMING_VERSION, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
                      ToolError)
 from .media import EXTRACT_RECIPE_VERSION
 
@@ -39,6 +39,7 @@ class ExecutionPolicy:
     normalizer_version: int
     layout: LayoutPolicy | None
     context_version: int
+    display_timing_version: int
 
     def settings(self, runtime):
         """Saved result settings plus current concurrency and polling parameters."""
@@ -54,6 +55,7 @@ def load_policy(manifest, *, verify_execution=True):
     """Validate saved versions and resolve the settings used by the executor."""
     _version(manifest.get("processing_version", 1), {1, PROCESSING_VERSION})
     subtitle = _version(manifest.get("subtitle_version", 0), {0, 1, SUBTITLE_VERSION})
+    display_timing = _version(manifest.get("display_timing_version", 0), {0, DISPLAY_TIMING_VERSION})
     layout = None
     if subtitle:
         _version(manifest.get("translation_strategy_version"), {1, 2, 3})
@@ -83,4 +85,4 @@ def load_policy(manifest, *, verify_execution=True):
                 any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in required)):
             raise ToolError("任务的提示词／响应恢复执行版本与当前实现不匹配，请用 --reflow 显式重排。", "cache_version")
         context_version = _version(snapshot.get("context_version", 0), {0, CONTEXT_VERSION})
-    return ExecutionPolicy(normalizer, layout, context_version)
+    return ExecutionPolicy(normalizer, layout, context_version, display_timing)

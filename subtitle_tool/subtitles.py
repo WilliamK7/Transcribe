@@ -252,7 +252,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
     cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
     for previous, current in zip(cues, cues[1:]):
         if current["begin_ms"] < previous["end_ms"]:
-            warnings.append("识别时间存在重叠；保留两句真实时间，不截掉语音")
+            warnings.append("识别时间存在重叠；保留原始时间依据，最终显示区间按任务策略处理")
         if current["text"] == previous["text"]:
             warnings.append("相邻句文本相同；保留并提示复核，避免误删重复讲话")
     return cues, warnings
@@ -767,7 +767,62 @@ def layout_warnings(cues, settings):
     return warnings
 
 
-def render_srt(cues, settings, *, subtitle_version=SUBTITLE_VERSION) -> bytes:
+def _timeline_error(*cues):
+    ranges = " 与 ".join(f"{c.get('sentence_id', c['cue_id'])} / {c['cue_id']} "
+                        f"[{c.get('begin_ms')}, {c.get('end_ms')})ms" for c in cues)
+    return ToolError("字幕显示时间冲突：" + ranges + "；结果已保留，需人工确认。", "timeline")
+
+
+def validate_display_intervals(cues, intervals):
+    """Validate the whole display timeline, independently of the ASR evidence."""
+    if len(intervals) != len(cues):
+        raise ToolError("字幕显示区间数量与片段不一致。", "timeline")
+    previous, identities = None, set()
+    for cue, interval in zip(cues, intervals):
+        begin, end = interval.get("begin_ms"), interval.get("end_ms")
+        if (interval.get("cue_id") != cue["cue_id"] or cue["cue_id"] in identities or
+                type(begin) is not int or type(end) is not int or not 0 <= begin < end):
+            raise _timeline_error(cue)
+        if previous is not None and begin < previous["end_ms"]:
+            raise _timeline_error(previous, {**interval, "sentence_id": cue.get("sentence_id", cue["cue_id"])})
+        identities.add(cue["cue_id"])
+        previous = {**interval, "sentence_id": cue.get("sentence_id", cue["cue_id"])}
+
+
+def plan_display_timing(cues):
+    """Derive version 1 display intervals and adjustment records from saved cues."""
+    intervals, adjustments = [], []
+    for index, cue in enumerate(cues):
+        begin, end = cue["begin_ms"], cue["end_ms"]
+        if type(begin) is not int or type(end) is not int or not 0 <= begin < end:
+            raise _timeline_error(cue)
+        current = {"cue_id": cue["cue_id"], "begin_ms": begin, "end_ms": end}
+        if intervals:
+            previous = intervals[-1]
+            prior_cue = cues[index - 1]
+            if begin < previous["end_ms"]:
+                # Legacy cues identify the source sentence in the first two ID components.
+                source_ids = [c.get("sentence_id", ":".join(c["cue_id"].split(":")[:2]))
+                              for c in (prior_cue, cue)]
+                parts = [re.fullmatch(r"([A-Za-z0-9_-]{1,80}):(\d{8})", sid) if isinstance(sid, str) else None
+                         for sid in source_ids]
+                overlap = previous["end_ms"] - begin
+                if (not all(parts) or parts[0][1] != parts[1][1] or int(parts[0][2]) >= int(parts[1][2]) or
+                        not previous["begin_ms"] < begin < previous["end_ms"] < end or
+                        overlap > 100 or begin - previous["begin_ms"] < 1000 or end - begin < 1000):
+                    raise _timeline_error(prior_cue, cue)
+                adjustments.append({"cue_id": previous["cue_id"],
+                                    "old_begin_ms": previous["begin_ms"], "old_end_ms": previous["end_ms"],
+                                    "new_begin_ms": previous["begin_ms"], "new_end_ms": begin,
+                                    "adjustment_ms": overlap, "reason": "small_sentence_overlap"})
+                previous["end_ms"] = begin
+        intervals.append(current)
+    return intervals, adjustments
+
+
+def render_srt(cues, settings, *, subtitle_version=SUBTITLE_VERSION, display_intervals=None) -> bytes:
+    if display_intervals is not None:
+        validate_display_intervals(cues, display_intervals)
     rows, last = [], -1
     for number, cue in enumerate(cues, 1):
         if cue["begin_ms"] < last or cue["end_ms"] <= cue["begin_ms"]:
@@ -785,5 +840,6 @@ def render_srt(cues, settings, *, subtitle_version=SUBTITLE_VERSION) -> bytes:
             raise ToolError("仍有语种不确定项，需确认后生成字幕。", "language_uncertain")
         if not source or any("-->" in s for s in source):
             raise ToolError("字幕文本含异常时间箭头或为空。", "srt_invalid")
-        rows.append(str(number) + "\r\n" + timestamp(cue["begin_ms"]) + " --> " + timestamp(cue["end_ms"]) + "\r\n" + "\r\n".join(source))
+        timing = cue if display_intervals is None else display_intervals[number - 1]
+        rows.append(str(number) + "\r\n" + timestamp(timing["begin_ms"]) + " --> " + timestamp(timing["end_ms"]) + "\r\n" + "\r\n".join(source))
     return ("\r\n\r\n".join(rows) + ("\r\n\r\n" if rows else "")).encode("utf-8")

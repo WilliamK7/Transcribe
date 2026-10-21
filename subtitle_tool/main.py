@@ -26,6 +26,7 @@ def parser():
     actions = result.add_mutually_exclusive_group()
     actions.add_argument("--resume", metavar="JOB_ID", help="恢复本地任务")
     actions.add_argument("--reflow", metavar="JOB_ID", help="仅从完整本地转写重排字幕，覆盖须搭配 --overwrite")
+    actions.add_argument("--retime", metavar="JOB_ID", help="复用最终字幕和译文，仅升级显示时间；覆盖须搭配 --overwrite")
     actions.add_argument("--review", metavar="JOB_ID", help="终端确认音轨、声道或逐条语种后继续")
     actions.add_argument("--jobs", action="store_true", help="列出任务（每行 JSON）")
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
@@ -168,6 +169,8 @@ def summary(store, job_id):
             "access_mode": manifest.get("access_mode", "legacy_public"),
             "processing_version": manifest.get("processing_version", 1), "cue_count": len(store.cues(job_id)),
             "subtitle_version": manifest.get("subtitle_version", 0),
+            "display_timing_version": manifest.get("display_timing_version", 0),
+            "display_timing_adjustments": manifest.get("display_timing_adjustments", []),
             "translation_strategy_version": manifest.get("translation_strategy_version", 0),
             "layout_round": manifest.get("layout_round", 0), "warnings": manifest.get("warnings", []),
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
@@ -182,6 +185,8 @@ def summary(store, job_id):
                                           if k.startswith("stage_") and k.endswith("_ms")}}
     if manifest.get("reflow"):
         item["reflow"] = {k: manifest["reflow"][k] for k in ["prepared_at", "from_subtitle_version"]}
+    if manifest.get("retime"):
+        item["retime"] = {k: manifest["retime"][k] for k in ["prepared_at", "from_display_timing_version"]}
     if manifest.get("media_plan"):
         item["audio"] = {k: manifest["media_plan"][k] for k in ["method", "codec", "container", "audio_offset_ms"]}
         item["audio"]["segments"] = len(manifest["segments"])
@@ -207,7 +212,7 @@ def hint(store, job_id):
 def main(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    action = args.resume or args.reflow or args.review or args.jobs or args.cancel or args.configure or args.configure_key or args.self_test
+    action = args.resume or args.reflow or args.retime or args.review or args.jobs or args.cancel or args.configure or args.configure_key or args.self_test
     if not args.files and not action:
         argument_parser.print_help()
         return 0
@@ -219,8 +224,8 @@ def main(argv=None):
         raise ToolError("绑定已知 ID 与重新提交只能选择一种。", "input")
     if args.track is not None and args.track < 0:
         raise ToolError("音轨索引不能为负。", "input")
-    if args.reflow and (args.track is not None or args.channel is not None):
-        raise ToolError("重排沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
+    if (args.reflow or args.retime) and (args.track is not None or args.channel is not None):
+        raise ToolError("重排／校时沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
     config = Config()
     if args.workspace_id is not None:
         config.settings.workspace_id = validate_workspace_id(args.workspace_id)
@@ -252,7 +257,7 @@ def main(argv=None):
             return 0
         if args.report:
             report_writer = ReportWriter(config, args.report, inputs=args.files, output_dir=args.output_dir,
-                                         job_id=args.resume or args.reflow or args.review)
+                                         job_id=args.resume or args.reflow or args.retime or args.review)
             report_writer.validate()
         store = Store(config.data / "jobs.sqlite")
         progress = Progress()
@@ -289,7 +294,8 @@ def main(argv=None):
 
         if threading.current_thread() is threading.main_thread():
             previous_signal = signal.signal(signal.SIGINT, interrupt)
-        ids = [args.resume or args.review or args.reflow] if args.resume or args.review or args.reflow else []
+        selected = args.resume or args.review or args.reflow or args.retime
+        ids = [selected] if selected else []
         if ids:
             current_job = ids[0]
             job = store.job(current_job)
@@ -298,6 +304,8 @@ def main(argv=None):
                 raise ToolError("恢复沿用任务原接入方式和工作空间；--workspace-id 不能迁移旧任务。", "cache_mismatch")
             if args.reflow:
                 engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
+            elif args.retime:
+                engine.retime(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
             elif args.resume:
                 engine.resume(current_job, track=args.track, channel=args.channel, output_dir=args.output_dir,
                               overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit)

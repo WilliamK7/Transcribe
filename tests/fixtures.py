@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -50,6 +51,21 @@ def timed_raw(tokens, *, word_ms=200, language="en", pauses=None, start=0):
     return {"transcripts": [{"channel_id": 0, "sentences": [{
         "begin_time": start, "end_time": at, "text": ("" if language in {"zh", "yue", "ja"} else " ").join(tokens),
         "language": language, "words": words}]}]}
+
+
+def overlapping_raw(*, overlap=40, start=1000):
+    raw = timed_raw([f"alpha{i}" for i in range(8)], word_ms=500, start=start)
+    following = timed_raw([f"bravo{i}" for i in range(6)], word_ms=560, start=start + 4000 - overlap)
+    raw["transcripts"][0]["sentences"].extend(following["transcripts"][0]["sentences"])
+    return raw
+
+
+def srt_intervals(content):
+    def milliseconds(values):
+        h, m, s, ms = map(int, values)
+        return ((h * 60 + m) * 60 + s) * 1000 + ms
+    return [(milliseconds(row[:4]), milliseconds(row[4:])) for row in
+            re.findall(rb"(\d+):(\d+):(\d+),(\d+) --> (\d+):(\d+):(\d+),(\d+)", content)]
 
 
 class FakeService:

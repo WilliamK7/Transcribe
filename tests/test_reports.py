@@ -49,7 +49,7 @@ class ReportProtectionTests(TemporaryTest):
     def test_all_actions_reject_inputs_before_recovery_or_state_changes(self):
         self.store.update(self.job_id, "recognizing")
         for args in [["--jobs"], ["--cancel", self.job_id], ["--resume", self.job_id],
-                     ["--reflow", self.job_id], ["--review", self.job_id], [self.source], ["--self-test"]]:
+                     ["--reflow", self.job_id], ["--retime", self.job_id], ["--review", self.job_id], [self.source], ["--self-test"]]:
             with self.subTest(args=args):
                 self.assert_conflict(args, self.source)
 
@@ -58,15 +58,16 @@ class ReportProtectionTests(TemporaryTest):
         backup = output.with_name(output.name + ".20261018-000000.bak")
         cache = self.config.data / "cache" / self.job_id / "raw-0000.json"
         snapshot = self.path / ".build" / "reflow" / self.job_id / "snapshot.json"
-        for path in [output, backup, cache, snapshot]:
+        retime_snapshot = self.path / ".build" / "retime" / self.job_id / "snapshot.json"
+        for path in [output, backup, cache, snapshot, retime_snapshot]:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"private saved bytes")
         manifest = self.store.job(self.job_id)["manifest"]
         manifest["backup"] = str(backup)
         self.store.update(self.job_id, manifest=manifest)
-        for path in [output, backup, cache, snapshot, self.config.data / "key.txt",
+        for path in [output, backup, cache, snapshot, retime_snapshot, self.config.data / "key.txt",
                      self.config.data / "jobs.sqlite", self.config.data / "future.json",
-                     self.path / ".build" / "reflow" / "future.json"]:
+                     self.path / ".build" / "reflow" / "future.json", self.path / ".build" / "retime" / "future.json"]:
             with self.subTest(path=path.name):
                 self.assert_conflict(["--jobs"], path)
 
