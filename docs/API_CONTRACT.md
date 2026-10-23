@@ -35,7 +35,9 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`。`
 
 请求契约 2 先识别顶层／全部 choice 的业务错误及 `finish_reason:error`，再检查正常结束和正文。服务错误不进入格式修复或缩组；`content:null` 配合 `finish_reason:length` 归入非正常结束。内部错误仅保留本地分类、HTTP 状态和是否可重试，服务端消息与原始错误码不写入诊断或任务。只按白名单 `error.metadata.error_type` 判断业务类别，见[官方错误分类](https://openrouter.ai/docs/api_reference/errors-and-debugging)。普通 404／503 不被推断为不支持 Schema。
 
-OpenRouter 契约 2 的网络连接／读取失败、请求总时限、HTTP 408／429／5xx，以及明确的 `timeout`、`provider_unavailable`、`provider_overloaded`、`server`、`rate_limit_exceeded` 共用每份正文最多 **4 次 HTTP 尝试**的预算，HTTP 与业务错误共用这一预算。参数、凭据、权限、余额、内容政策、输入限制及未知业务错误直接停止；永久类别优先于暂时 HTTP 状态。HTTP 404 只对内置 `openrouter/free` 路由允许有限重试，固定模型直接停止。格式修复和缩组各自生成独立正文。
+OpenRouter 契约 2 的网络连接／读取失败、请求总时限、HTTP 408／429／5xx，以及明确的 `timeout`、`provider_unavailable`、`provider_overloaded`、`server`、`rate_limit_exceeded` 共用每份正文最多 **4 次 HTTP 尝试，包含首次**的预算，HTTP 与业务错误共用这一预算。参数、凭据、权限、余额、内容政策、输入限制及未知业务错误直接停止；永久类别优先于暂时 HTTP 状态。格式修复和缩组各自生成独立正文。
+
+官方 OpenRouter 根地址、请求契约 2 且模型为 `openrouter/free` 时，HTTP 404 允许有限重试；顶层或 choice 中的业务 `not_found` 在 HTTP 2xx／404／408／429／5xx 下同样可重试，保留原分类并共用上述四次预算。其他永久类型和不可重试的 HTTP 状态优先终止；`not_found` 混合未知、畸形或缺失类型的业务错误归为 `service_unknown`。固定模型（含固定 `:free`）、旧契约和其他根地址的 `not_found` 直接停止。
 
 暂时错误按原后端身份共享恢复：连续失败使用 15／30／60 秒冷却，另加 0～1 秒抖动；同轮并发失败合并。冷却结束仅放行一个翻译探测，成功后恢复并发，旧在途成功不能清除新冷却。保留 429 的自适应间隔；冷却、RPM 窗口及间隔取最晚截止时间。有效 `Retry-After` 按秒数或 HTTP 日期处理，超过 300 秒返回 `mt_retry_after`，不提前请求；截止耗尽使用 `mt_request_deadline`。启用后备时由组级调度处理这些可恢复故障，关闭时停止新调度并收尾。
 
@@ -65,7 +67,7 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 
 ## 数据与恢复
 
-OpenRouter 契约 2 支持 `--mt-fallback {none,bailian}`，仅用于新任务、`--resume` 与 `--reflow`，新建／恢复省略时默认启用。普通暂时故障每份正文最多 4 次 HTTP 尝试耗尽、格式修复／缩组最终失败或有效 Retry-After 超过 300 秒时，仅当前原组转百炼，后续组继续优先主后端，保留其冷却截止时间。部分子组成功后原组最终失败时，百炼重新翻译完整原组。可信免费额度耗尽才将本轮剩余工作转百炼；首次额度未知、永久错误、内容拒绝及未知业务错误停止。`content_filter` 与拒绝字段在格式恢复前识别。
+OpenRouter 契约 2 支持 `--mt-fallback {none,bailian}`，仅用于新任务、`--resume` 与 `--reflow`，新建／恢复省略时默认启用。普通暂时故障（含上述免费路由 `not_found`）每份正文最多 4 次 HTTP 尝试耗尽、格式修复／缩组最终失败或有效 Retry-After 超过 300 秒时，仅当前原组转百炼，后续组继续优先主后端，保留其冷却截止时间。部分子组成功后原组最终失败时，百炼重新翻译完整原组。可信免费额度耗尽才将本轮剩余工作转百炼；首次额度未知、永久错误、内容拒绝及未知业务错误停止。`content_filter` 与拒绝字段在格式恢复前识别。
 
 百炼后备使用保存账户／工作空间的 `qwen-mt-flash`，可能产生费用，按实际使用计费。按自己的请求契约重建单条 user 消息，沿用提示词、`temperature:0`、`seed:0`、`stream:false`，不带 OpenRouter Schema、路由或插件，发送前重新核对百炼输入预算，见 [Qwen-MT API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。按[官方错误分类](https://help.aliyun.com/en/model-studio/error-code)映射安全类别，临时限流／超时／服务故障有限重试，鉴权、欠费、权限和内容拒绝立即停止。只保留本地类别及次数，不保留上游代码和原始消息。
 

@@ -27,6 +27,12 @@ def quota(remaining=20):
         'used': 20 - remaining, 'limit': 20, 'remaining': remaining}}}).encode())
 
 
+def business_failure(kind='not_found', *, status=200, choice=False):
+    error = {'message': 'private provider details', 'metadata': {'error_type': kind}}
+    body = {'choices': [{'finish_reason': 'error', 'error': error}]} if choice else {'error': error}
+    return HTTPReply(status, json.dumps(body).encode())
+
+
 def reserve(ledger, control, fetch):
     while True:
         ledger.ensure(control, fetch)
@@ -494,6 +500,103 @@ class RetryTests(TemporaryTest):
 
     def mt_calls(self):
         return [call for call in self.transport.request.call_args_list if call.args[0] == 'POST']
+
+    def test_free_router_not_found_is_retryable_in_top_level_and_choice_errors(self):
+        for status in [200, 201, 404, 408, 429, 500, 503, 599]:
+            for choice in [False, True]:
+                with self.subTest(status=status, choice=choice):
+                    reply = business_failure(status=status, choice=choice)
+                    error = service_failure(status, json.loads(reply.body), free_router=True)
+                    self.assertEqual(error.category, 'not_found')
+                    self.assertTrue(error.retryable)
+                    self.assertNotIn('private provider details', str(error))
+        for kinds in [('not_found', 'timeout'), ('server', 'not_found')]:
+            body = {'error': {'metadata': {'error_type': kinds[0]}},
+                    'choices': [{'error': {'metadata': {'error_type': kinds[1]}}}]}
+            error = service_failure(503, body, free_router=True)
+            self.assertEqual(error.category, 'not_found')
+            self.assertTrue(error.retryable)
+
+    def test_free_router_not_found_then_success_uses_normal_retry_budget(self):
+        for status in [200, 404]:
+            for choice in [False, True]:
+                with self.subTest(status=status, choice=choice):
+                    self.control.begin()
+                    self.replies(business_failure(status=status, choice=choice), HTTPReply(200, b'{"ok":true}'))
+                    before = len(self.mt_calls())
+                    self.assertEqual(self.send(), {'ok': True})
+                    self.assertEqual(len(self.mt_calls()) - before, 2)
+
+    def test_not_found_timeout_and_http_errors_share_four_total_attempts(self):
+        events = []
+        self.client.on_event = events.append
+        self.replies(business_failure(), business_failure('timeout', choice=True),
+                     HTTPReply(503, b'{}'), business_failure(status=404))
+        with self.assertRaises(ToolError) as caught:
+            self.send()
+        self.assertEqual((caught.exception.category, caught.exception.attempts), ('not_found', 4))
+        self.assertEqual(len(self.mt_calls()), 4)
+        self.assertEqual(self.ledger.remaining, 16)
+        self.assertEqual([e['category'] for e in events if e['kind'] == 'runtime_request'],
+                         ['not_found', 'timeout', 'http_transient', 'not_found'])
+
+    def test_not_found_exception_requires_official_v2_free_router_identity(self):
+        for model, base, version in [('paid/fixed', self.backend.base_url, 2),
+                ('vendor/fixed:free', self.backend.base_url, 2),
+                ('openrouter/free', 'https://other.example/v1', 2),
+                ('openrouter/free', self.backend.base_url, 1)]:
+            with self.subTest(model=model, base=base, version=version):
+                backend = MTBackend('openai_compatible', base, model, self.backend.key_fingerprint, version)
+                client = BoundedMTHttp(backend, MTControl(threading.Event(), clock=self.clock), transport=self.transport,
+                    pacer=RequestPacer(clock=self.clock, requests_per_window=0),
+                    recovery=RecoveryCoordinator(clock=self.clock, jitter=lambda: 0, wait=self.clock.wait))
+                client.quota = None
+                self.transport.request.reset_mock(side_effect=True)
+                self.transport.request.return_value = business_failure()
+                with self.assertRaises(ToolError) as caught:
+                    client.json('POST', base + '/chat/completions', json={})
+                self.assertFalse(caught.exception.retryable)
+                self.assertEqual(caught.exception.category, 'not_found')
+                self.assertEqual(self.transport.request.call_count, 1)
+
+    def test_other_permanent_types_and_nonretryable_http_statuses_override_router_not_found(self):
+        for kind in ['authentication', 'permission_denied', 'payment_required', 'invalid_request',
+                     'content_policy_violation', 'refusal', 'context_length_exceeded']:
+            for status in [200, 404, 408, 429, 503]:
+                for reverse in [False, True]:
+                    kinds = [kind, 'not_found'] if reverse else ['not_found', kind]
+                    body = {'error': {'metadata': {'error_type': kinds[0]}},
+                            'choices': [{'error': {'metadata': {'error_type': kinds[1]}}}]}
+                    with self.subTest(kind=kind, status=status, reverse=reverse):
+                        error = service_failure(status, body, free_router=True)
+                        self.assertEqual(error.category, kind)
+                        self.assertFalse(error.retryable)
+        for status in [301, 400, 401, 402, 403, 405, 410, 413, 415, 422]:
+            with self.subTest(status=status):
+                error = service_failure(status, json.loads(business_failure().body), free_router=True)
+                self.assertFalse(error.retryable)
+
+    def test_router_not_found_mixed_with_unknown_malformed_or_untyped_errors_stays_unknown(self):
+        unknowns = [{'metadata': {'error_type': value}} for value in ['private-unknown', None, False, 42, [], {}]]
+        unknowns.extend([{}, None, {'metadata': []}])
+        known = {'metadata': {'error_type': 'not_found'}}
+        for status in [200, 404, 408, 429, 503]:
+            for unknown in unknowns:
+                for reverse in [False, True]:
+                    errors = [unknown, known] if reverse else [known, unknown]
+                    body = {'error': errors[0], 'choices': [{'finish_reason': 'error', 'error': errors[1]}]}
+                    with self.subTest(status=status, unknown=unknown, reverse=reverse):
+                        error = service_failure(status, body, free_router=True)
+                        self.assertEqual(error.category, 'service_unknown')
+                        self.assertFalse(error.retryable)
+
+    def test_content_filter_and_refusal_override_router_not_found(self):
+        for refusal in [{'finish_reason': 'content_filter'}, {'message': {'refusal': 'private refusal'}}]:
+            body = json.loads(business_failure().body)
+            body['choices'] = [refusal]
+            error = service_failure(200, body, free_router=True)
+            self.assertEqual(error.category, 'content_policy_violation')
+            self.assertFalse(error.retryable)
 
     def test_http_and_business_errors_share_four_attempts(self):
         busy = HTTPReply(200, b'{"choices":[{"error":{"metadata":{"error_type":"timeout"}}}]}')

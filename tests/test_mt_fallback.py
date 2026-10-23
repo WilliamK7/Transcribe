@@ -13,7 +13,7 @@ from subtitle_tool.mt_backend import MTBackend, key_fingerprint
 from subtitle_tool.mt_runtime import FreeQuota, RecoveryCoordinator
 from subtitle_tool.mt_transport import HTTPReply
 from tests.fixtures import SavedResultFixture, result
-from tests.test_mt_runtime import Clock, quota
+from tests.test_mt_runtime import Clock, business_failure, quota
 from tests.test_translation_v3 import batch_input, batch_response
 
 
@@ -101,6 +101,134 @@ class FallbackTests(SavedResultFixture):
             return HTTPReply(503, b'{}') if attempts < 4 else self.success(items)
         self.assertEqual(self.run_backend(service), 'completed')
         self.assertFalse(any(p == 'fallback' for p, _ in self.calls))
+
+    def check_not_found_recovery(self, status):
+        self.install()
+        attempts = 0
+        def service(provider, items, kwargs):
+            nonlocal attempts
+            if provider == 'quota':
+                return quota()
+            if provider == 'primary' and items[0]['text'].startswith('First'):
+                attempts += 1
+                if attempts == 1:
+                    return business_failure(status=status, choice=status == 404)
+            return self.success(items)
+        self.assertEqual(self.run_backend(service), 'completed')
+        self.assertEqual([p for p, _ in self.calls], ['primary'] * 3)
+        self.assertEqual(self.store.counts(self.job_id).get('mt_fallback_switch', 0), 0)
+        self.assertEqual(self.store.counts(self.job_id).get('mt_invalid_response', 0), 0)
+
+    def test_http_200_not_found_recovers_without_fallback(self):
+        self.check_not_found_recovery(200)
+
+    def test_http_404_not_found_recovers_without_fallback(self):
+        self.check_not_found_recovery(404)
+
+    def test_not_found_exhaustion_saves_fallback_origin_and_cache_then_next_group_uses_primary(self):
+        self.install()
+        attempts = 0
+        def service(provider, items, kwargs):
+            nonlocal attempts
+            if provider == 'quota':
+                return quota()
+            if provider == 'primary' and items[0]['text'].startswith('First'):
+                attempts += 1
+                return business_failure(choice=attempts % 2 == 0)
+            return self.success(items)
+        with mock.patch.object(self.store, 'cache_get', wraps=self.store.cache_get) as cache, \
+                mock.patch.object(self.store, 'translation_batch_update', wraps=self.store.translation_batch_update) as save:
+            self.assertEqual(self.run_backend(service), 'completed')
+        self.assertEqual([p for p, _ in self.calls], ['primary'] * 4 + ['fallback', 'primary'])
+        self.assertTrue(all(body == self.calls[0][1] for _, body in self.calls[:4]))
+        self.assertEqual([r['mt_origin'] for r in self.store.references(self.job_id)], ['fallback', 'primary'])
+        self.assertEqual([r['mt_origin'] for r in self.store.cues(self.job_id)], ['fallback', 'primary'])
+        keys = {r[0] for r in self.store.db.execute('SELECT key FROM mt_cache')}
+        fallback_keys = [c.kwargs['cache_key'] for c in save.call_args_list if c.kwargs['origin'] == 'fallback']
+        self.assertEqual(len(fallback_keys), 1)
+        self.assertIn(fallback_keys[0], keys)
+        self.assertNotIn(cache.call_args_list[0].args[0], keys)
+        counts = self.store.counts(self.job_id)
+        self.assertEqual((counts['mt_primary_request'], counts['mt_fallback_request'], counts['mt_fallback_switch']), (5, 1, 1))
+        self.assertEqual(counts.get('mt_invalid_response', 0) + counts.get('mt_split', 0), 0)
+        path = self.config.root / '.build' / 'mt-diagnostics' / (self.job_id + '.jsonl')
+        events = [json.loads(row) for row in path.read_text(encoding='utf-8').splitlines()]
+        retries = [e for e in events if e['kind'] == 'runtime_request' and e.get('category') == 'not_found']
+        self.assertEqual([e['attempt'] for e in retries], [1, 2, 3, 4])
+        self.assertTrue(all(e['retryable'] for e in retries))
+        switches = [e for e in events if e['kind'] == 'runtime_fallback']
+        self.assertEqual([(e['reason'], e['attempt']) for e in switches], [('transient_exhausted', 4)])
+        self.assertNotIn('private provider details', path.read_text(encoding='utf-8'))
+
+    def test_cancel_during_not_found_retry_does_not_start_fallback(self):
+        self.install()
+        cancel = threading.Event()
+        def service(provider, *args):
+            if provider == 'quota':
+                return quota()
+            cancel.set()
+            return business_failure()
+        self.assertEqual(self.run_backend(service, cancel=cancel), 'cancelled')
+        self.assertEqual([p for p, _ in self.calls], ['primary'])
+
+    def test_disabled_fallback_stops_after_four_not_found_attempts(self):
+        self.install()
+        Engine(self.config, self.store).resume(self.job_id, mt_fallback='none')
+        self.assertEqual(self.run_backend(lambda p, *args: quota() if p == 'quota' else business_failure()), 'failed')
+        self.assertEqual([p for p, _ in self.calls], ['primary'] * 4)
+        self.assertEqual(self.store.counts(self.job_id).get('mt_fallback_switch', 0), 0)
+
+    def test_other_group_can_commit_while_not_found_group_retries(self):
+        self.install()
+        self.config.settings.mt_workers = 2
+        committed = threading.Event()
+        admitted = threading.Barrier(2)
+        attempts = 0
+        original_save = self.store.translation_batch_update
+        def save(*args, **kwargs):
+            original_save(*args, **kwargs)
+            if kwargs.get('origin') == 'primary':
+                committed.set()
+        def service(provider, items, kwargs):
+            nonlocal attempts
+            if provider == 'quota':
+                return quota()
+            if provider == 'primary' and items[0]['text'].startswith('First'):
+                attempts += 1
+                if attempts == 1:
+                    admitted.wait(3)
+                if attempts == 2:
+                    self.assertTrue(committed.wait(3), 'Other primary group did not commit during retry')
+                return business_failure()
+            if provider == 'primary':
+                admitted.wait(3)
+            return self.success(items)
+        with mock.patch.object(self.store, 'translation_batch_update', side_effect=save):
+            self.assertEqual(self.run_backend(service), 'completed')
+        self.assertTrue(committed.is_set())
+        self.assertEqual(attempts, 4)
+        self.assertEqual(sum(p == 'fallback' for p, _ in self.calls), 1)
+        self.assertEqual([r['mt_origin'] for r in self.store.references(self.job_id)], ['fallback', 'primary'])
+
+    def test_resume_retains_saved_translation_and_only_retries_unfinished_group(self):
+        self.install()
+        def fail_second(provider, items, kwargs):
+            if provider == 'quota':
+                return quota()
+            if items[0]['text'].startswith('Second'):
+                return business_failure('permission_denied')
+            return self.success(items)
+        self.assertEqual(self.run_backend(fail_second), 'failed')
+        saved = self.store.references(self.job_id)[0]
+        self.assertTrue(saved['translated'])
+        Engine(self.config, self.store).resume(self.job_id)
+        self.resources.clear()
+        self.calls.clear()
+        self.assertEqual(self.run_backend(lambda p, items, kw: quota() if p == 'quota' else
+            business_failure() if p == 'primary' else self.success(items)), 'completed')
+        self.assertEqual(self.store.references(self.job_id)[0], saved)
+        self.assertEqual([p for p, _ in self.calls], ['primary'] * 4 + ['fallback'])
+        self.assertTrue(all(batch_input(body)[0]['text'].startswith('Second') for _, body in self.calls))
 
     def test_trusted_quota_exhaustion_routes_remaining_work_to_backup(self):
         self.install()

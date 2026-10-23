@@ -370,7 +370,7 @@ class OpenRouterRecoveryTests(SavedResultFixture):
             text = batch_input(kwargs['json'])[0]['text']
             entered.wait(timeout=5)
             return batch_response(['成功译文']) if text.startswith('First') else response({
-                'error': {'message': 'private', 'metadata': {'error_type': 'not_found'}}}, 404)
+                'error': {'message': 'private', 'metadata': {'error_type': 'permission_denied'}}}, 403)
         with mock.patch('requests.request', side_effect=handler):
             self.assertEqual(Engine(self.config, self.store).run(self.job_id), 'failed')
         self.assertEqual([bool(r['translated']) for r in self.store.references(self.job_id)], [True, False])

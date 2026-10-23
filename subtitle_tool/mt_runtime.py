@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from .api import mt_pacer, retry_after_seconds
 from .common import ToolError
-from .mt_backend import normalize_mt_url
+from .mt_backend import OPENROUTER_BASE_URL, normalize_mt_url
 from .mt_transport import HTTPReply, ProcessTransport, TransportError
 
 
@@ -88,14 +88,21 @@ def service_failure(status, body, *, free_router=False):
             malformed_type = True
         kinds.append(kind if isinstance(kind, str) else None)
     for kind in kinds:
-        if kind in PERMANENT_TYPES:
+        if kind in PERMANENT_TYPES and not (free_router and kind == 'not_found'):
             return ServiceError(kind, status)
     if status in {400, 401, 402, 403, 405, 413, 415, 422} or status == 404 and not free_router:
         return ServiceError('http_permanent', status)
     # Explicit but unknown types and untyped 2xx business failures are never guessed from messages/codes.
-    if malformed_type or any(kind is not None and kind not in TRANSIENT_TYPES for kind in kinds):
+    retryable_types = TRANSIENT_TYPES | {'not_found'} if free_router else TRANSIENT_TYPES
+    if malformed_type or any(kind is not None and kind not in retryable_types for kind in kinds):
         return ServiceError('service_unknown', status)
-    if kinds and all(kind in TRANSIENT_TYPES for kind in kinds):
+    if free_router and 'not_found' in kinds:
+        # Dynamic free routing gets a bounded retry, without masking an untyped companion error.
+        if not all(kind in retryable_types for kind in kinds):
+            return ServiceError('service_unknown', status)
+        retryable = 200 <= status < 300 or status in {404, 408, 429} or 500 <= status <= 599
+        return ServiceError('not_found', status, retryable)
+    if kinds and all(kind in retryable_types for kind in kinds):
         return ServiceError(kinds[0], status, True)
     if not 200 <= status < 300:
         retryable = status in {408, 429} or 500 <= status <= 599 or status == 404 and free_router
@@ -452,7 +459,9 @@ class BoundedMTHttp:
                     except (ValueError, RecursionError):
                         pass
                     error = (bailian_failure(status, body) if self.backend.provider == 'bailian' else
-                             service_failure(status, body, free_router=self.backend.model == 'openrouter/free'))
+                             service_failure(status, body, free_router=(
+                                 self.backend.provider == 'openai_compatible' and self.backend.base_url == OPENROUTER_BASE_URL
+                                 and self.backend.request_version == 2 and self.backend.model == 'openrouter/free')))
                 except TransportError as failure:
                     status = None
                     error = ServiceError(failure.category, retryable=failure.retryable,
