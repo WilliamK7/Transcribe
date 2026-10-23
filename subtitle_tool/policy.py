@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from . import mt
-from .common import (ASR_MODEL, DISPLAY_TIMING_VERSION, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
+from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
                      ToolError)
 from .media import EXTRACT_RECIPE_VERSION
 
@@ -25,6 +25,10 @@ def _version(value, supported):
     if type(value) is not int or value not in supported:
         raise ToolError("任务执行版本不受支持，请用 --reflow 显式重排。", "cache_version")
     return value
+
+
+def display_timing_version(manifest):
+    return _version(manifest.get('display_timing_version', 0), {0, 1, 2})
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,7 @@ def load_policy(manifest, *, verify_execution=True):
     """Validate saved versions and resolve the settings used by the executor."""
     _version(manifest.get("processing_version", 1), {1, PROCESSING_VERSION})
     subtitle = _version(manifest.get("subtitle_version", 0), {0, 1, SUBTITLE_VERSION})
-    display_timing = _version(manifest.get("display_timing_version", 0), {0, DISPLAY_TIMING_VERSION})
+    display_timing = display_timing_version(manifest)
     layout = None
     if subtitle:
         _version(manifest.get("translation_strategy_version"), {1, 2, 3})

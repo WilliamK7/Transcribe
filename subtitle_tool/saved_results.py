@@ -123,6 +123,8 @@ def _validate_record(record):
 def validate_normalized(manifest, cache, sources, cues, references):
     """Prove DB completeness before reviewing, translating or publishing saved work."""
     try:
+        from .mt_fallback import validate_origins
+        validate_origins(manifest, cues + references)
         validate_segments(manifest)
         records = sources if manifest.get("subtitle_version") else cues
         if "normalized_count" in manifest:

@@ -11,12 +11,13 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 
-from .api import Bailian, OpenAICompatible, upload_limit
+from .api import Bailian, BoundedBailianMT, OpenAICompatible, upload_limit
 from .common import (DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION,
                      TRANSLATION_STRATEGY_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
                      SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key)
@@ -24,10 +25,12 @@ from .config import Config, decrypt_legacy
 from .media import EXTRACT_RECIPE_VERSION, Media
 from .mt import batch_cache_key, batch_cache_value, batch_recovery_cache_key, parse_batch_translation
 from .mt_diagnostics import MTDiagnostics
+from .mt_control import MTControl
+from .mt_fallback import GroupFallback, fallback_policy, saved_fallback, validate_origins
 from .mt_backend import configured_mt, saved_mt
 from .store import TERMINAL, Store
 from .review import ReviewDecision, decision_origin
-from .policy import asr_contract, current_execution_snapshot, load_policy
+from .policy import asr_contract, current_execution_snapshot, display_timing_version, load_policy
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
                             validate_normalized, validate_segments)
 from .publication import file_hash, inspect_intent, prepare_intent, write_srt
@@ -56,6 +59,14 @@ class Engine:
         self.config, self.store = config, store
         self.cancel = cancel or threading.Event()
         self.progress = progress
+        self.mt_control = MTControl(self.cancel)
+        self.mt_runtime_active = False
+        self.fallback_groups = None
+        self.mt_context = threading.local()
+        self.run_id = uuid.uuid4().hex
+
+    def request_cancel(self, *, force=False):
+        self.mt_control.cancel_user(force=force)
 
     def recover_jobs(self):
         for job in self.store.jobs():
@@ -71,8 +82,14 @@ class Engine:
         self.store.change_output(job_id, directory, overwrite)
 
     def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
-               task_id=None, allow_resubmit=False):
+               task_id=None, allow_resubmit=False, mt_fallback=None):
         """Prepare an explicitly requested resume; run() remains the sole executor."""
+        self.configure_fallback(job_id, mt_fallback)
+        from .mt_fallback import supports_fallback
+        backend = saved_mt(self.store.job(job_id)['manifest'])
+        if supports_fallback(backend):
+            from .mt_runtime import reset_quota_for_resume
+            reset_quota_for_resume(backend)
         self.select_input(job_id, track, channel)
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped"}:
@@ -89,6 +106,31 @@ class Engine:
             self.store.update(job_id, "queued")
         if task_id or allow_resubmit:
             self.resolve_unknown(job_id, task_id, allow_resubmit)
+
+    def configure_fallback(self, job_id, choice=None):
+        with self.store.lock:
+            job = self.store.job(job_id)
+            previous = copy.deepcopy(job['manifest'])
+            proposed = fallback_policy(previous, choice)
+            if proposed is None:
+                return
+            self.identity(job_id, previous, persist=False)
+            if proposed['enabled']:
+                saved_mt(previous).credential(self.config)
+            validate_origins(previous, self.store.references(job_id) + self.store.cues(job_id))
+            if 'mt_fallback_policy' in previous:
+                saved_fallback(previous).credential(self.config)
+                proposed = {**previous['mt_fallback_policy'], 'enabled': proposed['enabled']}
+                if proposed == previous['mt_fallback_policy']:
+                    validate_origins(previous, self.store.references(job_id) + self.store.cues(job_id))
+                    return
+            else:
+                snapshot = self.config.root / '.build' / 'mt-fallback' / job_id / (str(time.time_ns()) + '.json')
+                self.store.snapshot(job_id, snapshot)
+                proposed['migration_snapshot'] = str(snapshot.relative_to(self.config.root))
+            candidate = copy.deepcopy(previous)
+            candidate['mt_fallback_policy'] = proposed
+            self.store.commit_fallback_policy(job_id, candidate, job['manifest'])
 
     def cancel_job(self, job_id, *, interrupted=False):
         job = self.store.job(job_id)
@@ -168,7 +210,7 @@ class Engine:
             self.store.update(job_id, manifest=manifest)
         return key, scope
 
-    def reflow(self, job_id, *, overwrite=False, output_dir=None):
+    def reflow(self, job_id, *, overwrite=False, output_dir=None, mt_fallback=None):
         """Prepare a recoverable local reflow; only run() may translate and commit SRT."""
         job = self.store.job(job_id)
         manifest = job["manifest"]
@@ -225,6 +267,10 @@ class Engine:
                         reflow={"snapshot": str(snapshot.relative_to(self.config.root)), "prepared_at": time.time(),
                                 "from_subtitle_version": previous_version})
         atomic_json(cache / normalized_file, sources)
+        manifest.pop('mt_fallback_policy', None)
+        proposed = fallback_policy(manifest, mt_fallback)
+        if proposed is not None:
+            manifest['mt_fallback_policy'] = proposed
         check_cancel(self.cancel)
         self.store.commit_reflow(job_id, sources, [make_fragment(s) for s in sources], manifest, output)
 
@@ -406,6 +452,9 @@ class Engine:
             raise ToolError("恢复提取的编码、分段或时间轴与原记录不同，不能改变已有识别输入。", "cache_mismatch")
 
     def run(self, job_id):
+        self.mt_control.begin()
+        self.run_id = uuid.uuid4().hex
+        self.fallback_groups = None
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped", "cancelled"}:
             return job["state"]
@@ -416,6 +465,8 @@ class Engine:
         cache = self.config.data / "cache" / job_id
         source = Path(job["source"])
         api, mt_api, key, scope = None, None, None, None
+        fallback_api, fallback_backend = None, None
+        fallback_client_lock = threading.Lock()
         mt_backend, mt_key = None, None
         started = time.monotonic()
         stage_started, current_stage = started, None
@@ -454,13 +505,56 @@ class Engine:
         def mt_client():
             nonlocal mt_api
             if mt_api is None:
-                options = dict(count=lambda name: self.store.count(job_id, name), progress=cloud_progress)
+                options = dict(count=backend_counter('primary'), progress=cloud_progress)
                 if mt_backend.provider == "openai_compatible":
-                    mt_api = OpenAICompatible(mt_key, mt_backend, self.cancel, **options, rpm=self.config.mt_rpm())
+                    self.mt_runtime_active = mt_backend.request_version == 2
+                    mt_api = OpenAICompatible(mt_key, mt_backend, self.cancel, **options, rpm=self.config.mt_rpm(),
+                        control=self.fallback_groups.primary_control if self.fallback_groups else self.mt_control,
+                        runtime_event=runtime_events('primary'), stop_on_failure=self.fallback_groups is None)
                 else:
                     mt_api = Bailian(mt_key, manifest["region"], self.cancel, **options,
                                      workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
             return mt_api
+
+        def backend_counter(role):
+            def count(name):
+                self.store.count(job_id, name)
+                if fallback_backend is not None:
+                    if name == 'mt':
+                        self.store.count(job_id, 'mt_' + role + '_request')
+                        group_counts = getattr(self.mt_context, 'attempts', None)
+                        if group_counts is not None:
+                            group_counts[role] = group_counts.get(role, 0) + 1
+                    elif name == 'mt_success':
+                        self.store.count(job_id, 'mt_' + role + '_http_2xx')
+            return count
+
+        def runtime_events(role):
+            diagnostics = MTDiagnostics(self.config.root, job_id)
+            def event(info):
+                info = {**info, 'run_id': self.run_id, 'backend': role,
+                        'provider': (fallback_backend if role == 'fallback' else mt_backend).diagnostic_provider,
+                        'group_key': getattr(self.mt_context, 'group_key', '')}
+                if self.fallback_groups and info.get('category') == 'success':
+                    info['category'] = 'response_received'
+                diagnostics.write_runtime(info)
+                for field, counter in [('shared_wait_ms', 'mt_shared_wait_ms'),
+                                       ('pacing_wait_ms', 'mt_pacing_wait_ms'), ('discarded', 'mt_drain_discarded')]:
+                    if info.get(field):
+                        self.store.count(job_id, counter, info[field])
+                if info.get('deadline_terminated'):
+                    self.store.count(job_id, 'mt_deadline_terminated')
+            return event
+
+        def fallback_client():
+            nonlocal fallback_api
+            with fallback_client_lock:
+                if fallback_api is None:
+                    self.mt_control.check_start()
+                    fallback_api = BoundedBailianMT(fallback_backend.credential(self.config), fallback_backend,
+                        self.mt_control, count=backend_counter('fallback'), progress=cloud_progress,
+                        runtime_event=runtime_events('fallback'))
+            return fallback_api
 
         def save_failure(state, error, code, request_id=""):
             nonlocal handling_failure
@@ -474,6 +568,9 @@ class Engine:
 
         try:
             check_cancel(self.cancel)
+            display_timing_version(manifest)
+            if 'mt_fallback_policy' in manifest:
+                validate_origins(manifest, self.store.references(job_id) + self.store.cues(job_id))
             output = self.store.ensure_output(job_id)
             subtitle_version = manifest.get("subtitle_version", 0)
             published = False
@@ -502,7 +599,7 @@ class Engine:
             settings = execution_policy.settings(self.config.settings)
             if manifest.get("retime"):
                 settings = self.retime_settings(manifest, settings)
-                if not manifest.get("normalized") or execution_policy.display_timing_version != DISPLAY_TIMING_VERSION:
+                if not manifest.get("normalized") or execution_policy.display_timing_version not in {1, 2}:
                     raise mismatch()
             if manifest.get("reflow"):
                 if subtitle_version != SUBTITLE_VERSION or not manifest.get("normalized"):
@@ -517,6 +614,12 @@ class Engine:
             key, scope = self.identity(job_id, manifest)
             mt_backend = saved_mt(manifest)
             mt_key = mt_backend.credential(self.config)
+            fallback_backend = saved_fallback(manifest)
+            if fallback_backend is not None and manifest['mt_fallback_policy']['enabled']:
+                fallback_backend.credential(self.config)
+                self.fallback_groups = GroupFallback(self.mt_control)
+            self.fallback_backend = fallback_backend
+            self.fallback_client = fallback_client
             if mt_backend.provider == "openai_compatible" and not manifest.get("retime"):
                 self.config.mt_rpm()
             mt_scope = {**scope, **mt_backend.cache_scope()}
@@ -727,6 +830,7 @@ class Engine:
                          "）。请检查磁盘空间、权限或缓存结构。", "local_io")
         finally:
             primary_failure = handling_failure or sys.exc_info()[0] is not None
+            self.mt_runtime_active = False
             try:
                 measure_stage()
                 for name, seconds in stage_times.items():
@@ -803,11 +907,14 @@ class Engine:
 
     @staticmethod
     def render_subtitles(cues, settings, manifest):
-        intervals, adjustments = None, []
-        if manifest.get("display_timing_version", 0):
-            intervals, adjustments = plan_display_timing(cues)
+        intervals, adjustments = plan_display_timing(cues, version=display_timing_version(manifest))
         return render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", 0),
                           display_intervals=intervals), adjustments
+
+    @staticmethod
+    def preflight_display_timing(cues, manifest):
+        if display_timing_version(manifest) == 2:
+            plan_display_timing(cues, version=2)
 
     def process_subtitles(self, job_id, manifest, settings, scope, client, stage, *, context_version):
         joint = manifest['translation_strategy_version'] == 3
@@ -851,6 +958,7 @@ class Engine:
             for cue in cues:
                 if cue["decision"] == "translate" and not joint:
                     validate_mt_input(cue["text"], cue["source_lang"])
+            self.preflight_display_timing(cues, manifest)
             candidate = copy.deepcopy(manifest)
             candidate.update(layout_planned=True, layout_round=0)
             self.commit_local(job_id, manifest, candidate, self.store.save_layout, cues)
@@ -858,6 +966,7 @@ class Engine:
             check_cancel(self.cancel)
             stage("subtitle_translating")
             cues = self.store.cues(job_id)
+            self.preflight_display_timing(cues, manifest)
             contexts = {}
             for cue in cues:
                 check_cancel(self.cancel)
@@ -873,7 +982,7 @@ class Engine:
                     cue, sources, position=source_positions[cue["sentence_id"]])
                 if exact and not context and (not joint or whole):
                     self.store.translation_update(job_id, [cue["cue_id"]], translated=exact["translated"],
-                                                  counts={"mt_reference_reused": 1})
+                                                  counts={"mt_reference_reused": 1}, origin=exact.get('mt_origin'))
                 else:
                     contexts[cue["cue_id"]] = context
             if joint:
@@ -911,13 +1020,17 @@ class Engine:
                 # Even unchanged ranges in an affected sentence must receive a new joint allocation.
                 revised = [{**cue, 'translated': '', 'error': ''} if cue['sentence_id'] in affected else cue
                            for cue in revised]
+            self.preflight_display_timing(revised, manifest)
             self.commit_local(job_id, manifest, candidate, self.store.save_layout, revised)
 
     def translate_batches(self, job_id, cues, sources, scope, client, *, context_version, reference_stage=False):
         cache_stage = 'reference' if reference_stage else 'subtitle'
         stage_name = cache_stage + '_translating'
         diagnostics = MTDiagnostics(self.config.root, job_id)
-        request_options = saved_mt(self.store.job(job_id)["manifest"]).request_options()
+        manifest = self.store.job(job_id)['manifest']
+        backend = saved_mt(manifest)
+        request_options = backend.request_options()
+        policy = manifest.get('mt_fallback_policy')
         by_source = {}
         source_ids = {s['sentence_id'] for s in sources}
         for cue in cues:
@@ -941,14 +1054,22 @@ class Engine:
                 recovery_key = batch_recovery_cache_key(key)
                 groups.setdefault(key, ([], context, recovery_key))[0].append(members)
 
-        def save_result(batches, key, translated, *, cached=False, recovered=False):
+        def save_result(batches, key, translated, *, cached=False, recovered=False, origin='primary'):
             values = {cue['cue_id']: translated[str(i)] for batch in batches for i, cue in enumerate(batch)}
             counts = {'mt_' + cache_stage + ('_cache_hit' if cached else '_completed'): len(values)}
             if recovered:
                 counts['mt_recovery_cache_hit' if cached else 'mt_recovery_success'] = len(values) if cached else 1
+            if policy is not None:
+                counts['mt_' + origin + ('_cache_hit' if cached else '_completed')] = len(values)
+                if not cached:
+                    counts['mt_' + origin + '_success'] = 1
             self.store.translation_batch_update(job_id, values, reference_stage=reference_stage,
                 cache_key=None if cached else key, cache_value=None if cached else batch_cache_value(translated),
-                counts=counts)
+                counts=counts, origin=origin if policy is not None else None)
+            if policy is not None and cached:
+                diagnostics.write_runtime({'kind': 'runtime_cache', 'category': 'cache_hit', 'run_id': self.run_id,
+                    'group_key': key, 'backend': origin,
+                    'provider': (self.fallback_backend if origin == 'fallback' else backend).diagnostic_provider})
 
         for key, (batches, context, recovery_key) in groups.items():
             cached = self.store.cache_get(key)
@@ -970,22 +1091,77 @@ class Engine:
         cloud = client()
 
         def translate_group(batches, key, context, recovery_key):
+            self.mt_context.group_key = key
+            self.mt_context.attempts = {}
+            role = 'primary'
             def attempt(indices):
                 cue_ids = [batch[i]['cue_id'] for batch in batches for i in indices]
                 self.store.translation_update(job_id, cue_ids, reference_stage=reference_stage, attempt=True,
                                               counts={'mt_' + cache_stage + '_request': 1})
             def event(info):
                 members = batches[0]
-                diagnostics.write({**info, 'stage': cache_stage, 'group_key': key,
+                diagnostics.write({**info, 'stage': cache_stage, 'group_key': key, 'run_id': self.run_id,
+                    'backend': role,
+                    'provider': (self.fallback_backend if role == 'fallback' else backend).diagnostic_provider,
                     'begin_ms': members[info['fragment_start']]['begin_ms'],
                     'end_ms': members[info['fragment_end'] - 1]['end_ms']})
                 self.store.count(job_id, 'mt_invalid_response' if info['kind'] == 'invalid_response' else 'mt_split')
                 if info['kind'] == 'split':
                     self.progress(job_id, 'mt_split', info['fragment_end'] - info['fragment_start'], info['depth'])
-            result = cloud.translate_batch([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
-                                           context=context, on_attempt=attempt, on_event=event)
-            # A completed HTTP request is saved even when cancellation arrived in flight.
-            save_result(batches, recovery_key if result.recovered else key, result.translations, recovered=result.recovered)
+            def invoke(service, normal_key, recovered_key):
+                try:
+                    result = service.translate_batch([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
+                                                     context=context, on_attempt=attempt, on_event=event)
+                except ToolError as error:
+                    if not hasattr(error, 'attempts'):
+                        error.attempts = self.mt_context.attempts.get(role, 0)
+                    raise
+                # Completed validated groups may commit during the shared drain window.
+                with self.mt_control.lock:
+                    if hasattr(service.http, 'ensure_result'):
+                        service.http.ensure_result()
+                    save_result(batches, recovered_key if result.recovered else normal_key,
+                                result.translations, recovered=result.recovered, origin=role)
+
+            def fallback():
+                nonlocal role
+                role = 'fallback'
+                backend = self.fallback_backend
+                fallback_scope = {k: v for k, v in scope.items() if k != 'mt_identity'}
+                fallback_scope.update(backend.cache_scope())
+                fallback_key = batch_cache_key([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
+                    **fallback_scope, context=context, stage=cache_stage, asr_language=batches[0][0]['language'].lower().strip(),
+                    request_options=backend.request_options())
+                recovery = batch_recovery_cache_key(fallback_key)
+                cached = self.store.cache_get(fallback_key)
+                recovered = cached is None
+                if recovered:
+                    cached = self.store.cache_get(recovery)
+                if cached is not None:
+                    try:
+                        translated = parse_batch_translation(cached, [c['text'] for c in batches[0]])
+                    except (ValueError, TypeError) as error:
+                        raise ToolError('百炼后备缓存结构无效，未复用。', 'cache_mismatch') from error
+                    with self.mt_control.lock:
+                        self.mt_control.check_inflight()
+                        save_result(batches, fallback_key, translated, cached=True, recovered=recovered, origin='fallback')
+                    return
+                invoke(self.fallback_client(), fallback_key, recovery)
+
+            def switched(error):
+                reason = {'mt_batch_invalid': 'format_exhausted', 'mt_quota_exhausted': 'quota_exhausted',
+                          'mt_retry_after': 'retry_after'}.get(error.code, 'transient_exhausted')
+                info = {'reason': reason, 'category': getattr(error, 'category', reason),
+                        'attempt': getattr(error, 'attempts', 0)}
+                self.store.count(job_id, 'mt_fallback_switch')
+                self.progress(job_id, 'mt_fallback', info, None)
+                diagnostics.write_runtime({'kind': 'runtime_fallback', **info, 'run_id': self.run_id,
+                                           'group_key': key, 'backend': 'fallback', 'provider': 'bailian'})
+
+            if self.fallback_groups:
+                self.fallback_groups.run(lambda: invoke(cloud, key, recovery_key), fallback, switched)
+            else:
+                invoke(cloud, key, recovery_key)
 
         tasks = [([cue for batch in batches for cue in batch], partial(translate_group, batches, key, context, recovery_key))
                  for batches, key, context, recovery_key in pending]
@@ -1042,26 +1218,39 @@ class Engine:
             remaining = iter(tasks)
             futures = {}
             def schedule():
-                while len(futures) < workers and not errors and not self.cancel.is_set():
+                while (len(futures) < workers and not errors and not self.cancel.is_set()
+                       and not (self.mt_runtime_active and self.mt_control.stopping)):
                     item = next(remaining, None)
                     if item is None:
                         break
                     members, run = item
                     futures[executor.submit(run)] = members
-            schedule()
-            while futures:
-                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    members = futures.pop(future)
-                    try:
-                        future.result()
-                        done += sum(not c['translated'] for c in members)
-                    except ToolError as e:
-                        self.store.translation_update(job_id, [c["cue_id"] for c in members],
-                                                      reference_stage=reference_stage, error=str(e))
-                        errors.append(e)
-                    self.progress(job_id, stage_name, done, total)
+            try:
                 schedule()
+                while futures:
+                    if self.mt_runtime_active:
+                        self.mt_control.stopping  # Observe external cancellation even with silent requests.
+                    completed, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        members = futures.pop(future)
+                        try:
+                            future.result()
+                            done += sum(not c['translated'] for c in members)
+                        except ToolError as e:
+                            if self.mt_runtime_active and e.code != 'cancelled':
+                                self.mt_control.stop(e)
+                            self.store.translation_update(job_id, [c["cue_id"] for c in members],
+                                                          reference_stage=reference_stage, error=str(e))
+                            errors.append(e)
+                        self.progress(job_id, stage_name, done, total)
+                    schedule()
+            except BaseException as error:
+                if self.mt_runtime_active:
+                    if isinstance(error, (KeyboardInterrupt, Cancelled)):
+                        self.request_cancel(force=True)
+                    else:
+                        self.mt_control.stop(ToolError('翻译阶段本地处理失败，进度已保存。', 'local_io'), force=True)
+                raise
         check_cancel(self.cancel)
         if errors:
             raise errors[0]

@@ -13,7 +13,7 @@ MT_MODEL = "qwen-mt-flash"
 NORMALIZER_VERSION = 3
 PROCESSING_VERSION = 2
 SUBTITLE_VERSION = 2
-DISPLAY_TIMING_VERSION = 1
+DISPLAY_TIMING_VERSION = 2
 TRANSLATION_STRATEGY_VERSION = 3
 # Qwen-MT's 8192-token input limit includes translation memory and template tokens.
 # UTF-8 bytes upper-bound byte-tokenized text; reserve additional template capacity.

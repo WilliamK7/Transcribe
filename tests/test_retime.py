@@ -52,7 +52,7 @@ class RetimeTests(SavedResultFixture):
         manifest = prepared["manifest"]
         self.assertEqual(prepared["state"], "queued")
         self.assertEqual(self.output.read_bytes(), self.old_content)
-        self.assertEqual(manifest["display_timing_version"], 1)
+        self.assertEqual(manifest["display_timing_version"], 2)
         self.assertEqual(manifest["subtitle_settings"], self.before["manifest"]["subtitle_settings"])
         self.assertEqual(manifest["execution_snapshot"], self.before["manifest"]["execution_snapshot"])
         self.assertEqual(manifest["contract"], self.before["manifest"]["contract"])
@@ -77,7 +77,7 @@ class RetimeTests(SavedResultFixture):
         self.assertNotIn(self.cues[0]["translated"], report)
 
     def test_overwrite_is_explicit_and_invalid_conflicts_do_not_change_the_task(self):
-        self.prepare_legacy(overlap=101)
+        self.prepare_legacy(overlap=501)
         for overwrite, code in [(False, "overwrite_required"), (True, "timeline")]:
             with self.subTest(overwrite=overwrite), self.assertRaises(ToolError) as caught:
                 Engine(self.config, self.store).retime(self.job_id, overwrite=overwrite)
@@ -203,7 +203,7 @@ class RetimeTests(SavedResultFixture):
             self.assertEqual(main(["--retime", self.job_id, "--output-dir", str(directory), "--non-interactive"]), 0)
             report = json.loads(stdout.getvalue())
             self.assertEqual(report["retime"]["from_display_timing_version"], 0)
-            self.assertEqual(report["display_timing_version"], 1)
+            self.assertEqual(report["display_timing_version"], 2)
         self.assertEqual(self.output.read_bytes(), self.old_content)
         self.assertTrue((directory / self.output.name).is_file())
         self.assertEqual(self.fake.calls, [])

@@ -132,6 +132,10 @@ class TemporaryTest(unittest.TestCase):
         pacer_scope = mock.patch.dict('subtitle_tool.api._MT_PACERS', clear=True)
         pacer_scope.start()
         self.addCleanup(pacer_scope.stop)
+        for registry in ['_RECOVERY', '_QUOTAS']:
+            scope = mock.patch.dict('subtitle_tool.mt_runtime.' + registry, clear=True)
+            scope.start()
+            self.addCleanup(scope.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
         os.environ.pop("DASHSCOPE_API_KEY", None)

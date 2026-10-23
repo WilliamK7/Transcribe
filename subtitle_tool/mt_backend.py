@@ -10,6 +10,9 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from .common import API_ROOTS, MT_MODEL, ToolError, connection_identity
 
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
 def key_fingerprint(key):
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
@@ -57,11 +60,17 @@ class MTBackend:
     key_fingerprint: str
     request_version: int = 1
 
+    @property
+    def diagnostic_provider(self):
+        if self.provider == 'openai_compatible' and self.base_url == OPENROUTER_BASE_URL:
+            return 'openrouter'
+        return self.provider
+
     def snapshot(self):
         return {"format_version": 1, **asdict(self)}
 
     def request_options(self):
-        return {"provider": self.provider, "model": self.model}
+        return {"provider": self.provider, "model": self.model, "request_version": self.request_version}
 
     def cache_scope(self):
         # Bailian's fixed model, endpoint and Key are already in the historical ASR scope.
@@ -88,7 +97,8 @@ def configured_mt(config, manifest, *, asr_key=None):
     if not isinstance(model, str) or not model.strip() or model != model.strip() or any(ord(c) < 32 for c in model):
         raise ToolError("启用兼容翻译后端必须填写有效的 mt_model。", "mt_config")
     config.mt_rpm()
-    return MTBackend(provider, base, model, key_fingerprint(config.get_mt_key()))
+    return MTBackend(provider, base, model, key_fingerprint(config.get_mt_key()),
+                     request_version=2 if base == OPENROUTER_BASE_URL else 1)
 
 
 def saved_mt(manifest):
@@ -99,9 +109,12 @@ def saved_mt(manifest):
     required = {"format_version", "provider", "base_url", "model", "key_fingerprint", "request_version"}
     if (not isinstance(saved, dict) or set(saved) != required or
             type(saved["format_version"]) is not int or saved["format_version"] != 1 or
-            type(saved["request_version"]) is not int or saved["request_version"] != 1):
+            type(saved["request_version"]) is not int or saved["request_version"] not in {1, 2}):
         raise ToolError("任务的翻译请求契约不受支持，请用 --reflow 显式重排。", "cache_version")
     backend = MTBackend(**{k: v for k, v in saved.items() if k != "format_version"})
+    if backend.request_version == 2 and (backend.provider != "openai_compatible" or
+                                         backend.base_url != OPENROUTER_BASE_URL):
+        raise ToolError("翻译请求契约 2 仅支持 OpenRouter 兼容端点，请用 --reflow 显式重排。", "cache_version")
     if (not isinstance(backend.key_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", backend.key_fingerprint) or
             not isinstance(backend.model, str) or not backend.model.strip() or
             backend.model != backend.model.strip() or any(ord(c) < 32 for c in backend.model)):

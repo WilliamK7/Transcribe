@@ -10,11 +10,13 @@ import threading
 import time
 from pathlib import Path
 
-from .common import ASR_MODEL, MT_MODEL, ToolError, validate_workspace_id
-from .config import Config
+from .common import ASR_MODEL, DISPLAY_TIMING_VERSION, MT_MODEL, ToolError, validate_workspace_id
+from .config import Config, Settings
 from .engine import Engine
 from .instance import ProcessLock
 from .mt_backend import configured_mt
+from .mt_fallback import fallback_policy, saved_fallback
+from .policy import display_timing_version, load_policy
 from .reports import ReportWriter
 from .store import STATES, Store
 from .review import MT_LANGUAGES, ReviewDecision
@@ -41,6 +43,8 @@ def parser():
     result.add_argument("--channel", choices=["mix", "left", "right"], help="明确混音／首声道／第二声道")
     result.add_argument("--output-dir", type=Path, help="显式选择输出目录，默认视频同目录")
     result.add_argument("--non-interactive", action="store_true", help="不询问；遇歧义持久化待复核状态并非零退出")
+    result.add_argument('--mt-fallback', choices=['none', 'bailian'],
+                        help='OpenRouter 契约 2 的百炼后备；新任务及恢复默认启用，百炼可能产生费用')
     result.add_argument("--report", type=Path, help="保存结构化结果，不包含 Key、上传链接或转写文字")
     return result
 
@@ -77,6 +81,17 @@ class Progress:
                 message = f"音频：{method}，{done['codec']}/{done['container']}，{done['segments']} 段，{done['bytes']:,} 字节；{done['reason']}"
             elif stage == "retry":
                 message = f"网络重试 {done}/{total}，有限退避"
+            elif stage == "mt_service_wait":
+                message = f"翻译服务暂不可用，共享等待 {done:.1f} 秒后先尝试一个请求"
+            elif stage == 'mt_fallback':
+                reasons = {'quota_exhausted': '免费额度耗尽，本轮剩余组转百炼',
+                           'format_exhausted': '格式修复及缩组耗尽，当前原组转百炼',
+                           'retry_after': '要求等待超过 300 秒，当前组转百炼'}
+                failure = {'deadline': '仍超时', 'timeout': '上游仍超时', 'network': '网络连接仍失败',
+                           'rate_limit_exceeded': '仍被限流', 'provider_overloaded': '上游仍过载',
+                           'provider_unavailable': '上游仍不可用'}.get(done['category'], '临时服务故障仍未恢复')
+                message = 'OpenRouter ' + reasons.get(done['reason'],
+                    f"本请求已尝试 {done['attempt']}/4 次，{failure}；当前组转百炼") + '（可能产生费用）'
             elif stage == "mt_cooldown":
                 message = f"翻译限流：共享冷却增加 {done:.2f} 秒，请求间隔 {total:.2f} 秒"
             elif stage == "mt_quota_wait":
@@ -177,10 +192,16 @@ def summary(store, job_id):
     mt = manifest.get("mt_snapshot", {})
     item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", MT_MODEL)}
     item["mt_provider"] = mt.get("provider", "bailian")
+    if 'mt_fallback_policy' in manifest:
+        saved_fallback(manifest)
+        policy = manifest['mt_fallback_policy']
+        item['mt_fallback'] = {'enabled': policy['enabled'], 'provider': 'bailian', 'model': 'qwen-mt-flash'}
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
     counts = item["counts"]
     item["timings"] = {"run_seconds": counts.get("run_ms", 0) / 1000,
                        "mt_cooldown_seconds": counts.get("mt_cooldown_ms", 0) / 1000,
+                       "mt_shared_wait_seconds": counts.get("mt_shared_wait_ms", 0) / 1000,
+                       "mt_pacing_wait_seconds": counts.get("mt_pacing_wait_ms", 0) / 1000,
                        "stages_seconds": {k[6:-3]: v / 1000 for k, v in counts.items()
                                           if k.startswith("stage_") and k.endswith("_ms")}}
     if manifest.get("reflow"):
@@ -194,6 +215,22 @@ def summary(store, job_id):
     return item
 
 
+def can_retime(store, job):
+    if job['state'] != 'failed' or job['error_code'] != 'timeline':
+        return False
+    try:
+        manifest = job['manifest']
+        if display_timing_version(manifest) >= DISPLAY_TIMING_VERSION:
+            return False
+        cues = store.cues(job['id'])
+        Engine.validate_retime_ready(manifest, cues)
+        settings = Engine.retime_settings(manifest, load_policy(manifest, verify_execution=False).settings(Settings()))
+        Engine.render_subtitles(cues, settings, {**manifest, 'display_timing_version': DISPLAY_TIMING_VERSION})
+        return True
+    except (ToolError, KeyError, ValueError, TypeError):
+        return False
+
+
 def hint(store, job_id):
     job = store.job(job_id)
     if job["error"]:
@@ -205,6 +242,8 @@ def hint(store, job_id):
     elif job["state"] == "submission_unknown":
         print(f"绑定已知 ID：{command} --bind-task-id 云端任务ID\n"
               f"明确接受可能重复计费后重发：{command} --allow-resubmit", file=sys.stderr)
+    elif can_retime(store, job):
+        print(f'译文已完成，可用 --retime 仅校时：.\\scripts\\transcribe.ps1 --retime {job_id}', file=sys.stderr)
     elif job["state"] in {"failed", "cancelled", "queued"}:
         print("恢复命令：" + command, file=sys.stderr)
 
@@ -227,6 +266,8 @@ def main(argv=None):
     if (args.reflow or args.retime) and (args.track is not None or args.channel is not None):
         raise ToolError("重排／校时沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
     config = Config()
+    if args.mt_fallback is not None and not (args.files or args.resume or args.reflow):
+        raise ToolError('--mt-fallback 仅用于新任务、--resume 或 --reflow。', 'input')
     if args.workspace_id is not None:
         config.settings.workspace_id = validate_workspace_id(args.workspace_id)
     interactive = not args.non_interactive and sys.stdin is not None and sys.stdin.isatty()
@@ -279,9 +320,14 @@ def main(argv=None):
             return 0
 
         def interrupt(signum, frame):
-            if cancel.is_set() or not processing:
+            if not processing:
                 raise KeyboardInterrupt
-            cancel.set()
+            if engine.mt_runtime_active:
+                engine.request_cancel(force=cancel.is_set())
+            elif cancel.is_set():
+                raise KeyboardInterrupt
+            else:
+                cancel.set()
             print("正在保存状态并停止本地处理；已提交的云端任务仍可能计费。", file=sys.stderr, flush=True)
 
         def run_job(job_id):
@@ -303,12 +349,13 @@ def main(argv=None):
                     job["manifest"].get("workspace_id") != config.settings.workspace_id):
                 raise ToolError("恢复沿用任务原接入方式和工作空间；--workspace-id 不能迁移旧任务。", "cache_mismatch")
             if args.reflow:
-                engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
+                engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir, mt_fallback=args.mt_fallback)
             elif args.retime:
                 engine.retime(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
             elif args.resume:
                 engine.resume(current_job, track=args.track, channel=args.channel, output_dir=args.output_dir,
-                              overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit)
+                              overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit,
+                              mt_fallback=args.mt_fallback)
             else:
                 engine.select_input(current_job, args.track, args.channel)
                 if args.overwrite or args.output_dir:
@@ -318,9 +365,13 @@ def main(argv=None):
             key = config.get_key()
             account = hashlib.sha256(key.encode()).hexdigest()
             mt = configured_mt(config, {"region": "beijing", "workspace_id": workspace, "access_mode": "workspace"}, asr_key=key)
+            policy = fallback_policy({'region': 'beijing', 'workspace_id': workspace, 'access_mode': 'workspace',
+                'account': account, 'translation_strategy_version': 3, 'mt_snapshot': mt.snapshot()}, args.mt_fallback)
             for source in args.files:
                 job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
-                                       workspace_id=workspace, account=account, settings=config.settings, mt_snapshot=mt.snapshot())
+                                       workspace_id=workspace, account=account, settings=config.settings, mt_snapshot=mt.snapshot(),
+                                       mt_fallback_policy=policy)
+                engine.configure_fallback(job_id, args.mt_fallback)
                 engine.select_input(job_id, args.track, args.channel)
                 if job_id not in ids:
                     ids.append(job_id)
@@ -334,6 +385,12 @@ def main(argv=None):
                     raise ToolError("--review 需要待复核任务；其他状态请使用 --resume。", "review")
                 state = "needs_review"
             else:
+                if store.job(job_id)['manifest'].get('retime'):
+                    print('仅校时：使用本地已保存的字幕和译文，无需调用云端。',
+                          file=sys.stderr, flush=True)
+                elif store.job(job_id)['manifest'].get('mt_fallback_policy', {}).get('enabled'):
+                    print('已启用按组百炼后备（qwen-mt-flash），可能产生费用；可用 --mt-fallback none 关闭后续后备。',
+                          file=sys.stderr, flush=True)
                 state = run_job(job_id)
             while state == "needs_review" and interactive and not cancel.is_set():
                 if not review(config, store, engine, job_id):

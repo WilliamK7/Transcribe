@@ -68,7 +68,7 @@ class Store:
         self.db.commit()
 
     def enqueue(self, source: Path, region: str = "beijing", overwrite=False, output_dir: Path | None = None,
-                *, workspace_id="", account="", settings=None, mt_snapshot=None):
+                *, workspace_id="", account="", settings=None, mt_snapshot=None, mt_fallback_policy=None):
         if region != "beijing":
             raise ToolError("新任务只支持北京工作空间。", "config")
         workspace_id = validate_workspace_id(workspace_id)
@@ -108,6 +108,8 @@ class Store:
             if mt_snapshot is not None:
                 manifest["mt_snapshot"] = mt_snapshot
                 saved_mt({**manifest, "translation_strategy_version": TRANSLATION_STRATEGY_VERSION})
+            if mt_fallback_policy is not None:
+                manifest['mt_fallback_policy'] = mt_fallback_policy
             settings = settings or Settings()
             manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
                             display_timing_version=DISPLAY_TIMING_VERSION,
@@ -206,6 +208,8 @@ class Store:
         rows = []
         for record in records:
             metadata = {k: v for k, v in record.items() if k not in columns + ["job_id", "metadata"]}
+            if not record.get('translated'):
+                metadata.pop('mt_origin', None)
             rows.append((job_id, *(record.get(k, defaults.get(k)) for k in columns), json.dumps(metadata, ensure_ascii=False)))
         self.db.execute("DELETE FROM " + table + " WHERE job_id=?", (job_id,))
         self.db.executemany("INSERT INTO " + table + "(job_id," + ",".join(columns) + ",metadata) "
@@ -326,7 +330,7 @@ class Store:
                             (json.dumps(manifest, ensure_ascii=False), time.time(), job_id))
 
     def translation_update(self, job_id, cue_ids, *, reference_stage=False, attempt=False,
-                           translated=None, error="", cache_key=None, counts=None):
+                           translated=None, error="", cache_key=None, counts=None, origin=None):
         """Persist one translation group's records, cache and counters together."""
         if cache_key is not None and translated is None:
             raise ValueError("Translation cache requires text")
@@ -342,13 +346,16 @@ class Store:
                 self._clear_publication(job_id)
             self.db.executemany("UPDATE " + table + " SET " + ",".join(assignments) + " WHERE job_id=? AND cue_id=?",
                                 [(*values, job_id, cue_id) for cue_id in cue_ids])
+            if translated is not None:
+                for cue_id in cue_ids:
+                    self._translation_origin(table, job_id, cue_id, origin if translated else None)
             if cache_key is not None:
                 self.db.execute("INSERT OR REPLACE INTO mt_cache VALUES(?,?)", (cache_key, translated))
             for name, amount in (counts or {}).items():
                 self._count(job_id, name, amount)
 
     def translation_batch_update(self, job_id, translations, *, reference_stage=False,
-                                 cache_key=None, cache_value=None, counts=None):
+                                 cache_key=None, cache_value=None, counts=None, origin=None):
         """Commit distinct cue translations, the complete batch cache and counters atomically."""
         if (not translations or any(not isinstance(text, str) or not text.strip() for text in translations.values()) or
                 (cache_key is None) != (cache_value is None)):
@@ -361,10 +368,35 @@ class Store:
                                           (text, job_id, cue_id))
                 if changed.rowcount != 1:
                     raise ToolError("批量翻译的字幕记录不完整，结果未保存。", "cache_mismatch")
+                self._translation_origin(table, job_id, cue_id, origin)
             if cache_key is not None:
                 self.db.execute("INSERT OR REPLACE INTO mt_cache VALUES(?,?)", (cache_key, cache_value))
             for name, amount in (counts or {}).items():
                 self._count(job_id, name, amount)
+
+    def _translation_origin(self, table, job_id, cue_id, origin):
+        if origin not in {None, 'primary', 'fallback'}:
+            raise ValueError('Invalid translation origin')
+        row = self.db.execute('SELECT metadata FROM ' + table + ' WHERE job_id=? AND cue_id=?', (job_id, cue_id)).fetchone()
+        if row is not None:
+            metadata = json.loads(row[0])
+            metadata.pop('mt_origin', None)
+            if origin is not None:
+                metadata['mt_origin'] = origin
+            self.db.execute('UPDATE ' + table + ' SET metadata=? WHERE job_id=? AND cue_id=?',
+                            (json.dumps(metadata, ensure_ascii=False), job_id, cue_id))
+
+    def commit_fallback_policy(self, job_id, manifest, previous):
+        """Policy upgrade, provenance and the local recovery marker commit together."""
+        with self.lock, self.db:
+            if self.job(job_id)['manifest'] != previous:
+                raise ToolError('任务在后备策略准备期间已改变，请重试恢复。', 'cache_mismatch')
+            for table in ['cues', 'mt_references']:
+                for record in self._records(table, job_id):
+                    if record['translated'] and 'mt_origin' not in record:
+                        self._translation_origin(table, job_id, record['cue_id'], 'primary')
+            self.db.execute('UPDATE jobs SET manifest=?,updated=? WHERE id=?',
+                            (json.dumps(manifest, ensure_ascii=False), time.time(), job_id))
 
     def cache_get(self, key):
         with self.lock:

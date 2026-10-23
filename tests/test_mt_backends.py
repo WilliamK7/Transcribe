@@ -264,6 +264,16 @@ class CompatibleRecoveryTests(SavedResultFixture):
         self.assertEqual((item["mt_provider"], item["models"]["mt"]), ("openai_compatible", "saved-model"))
         self.assertNotIn("opaque-mt-key", json.dumps(item))
 
+    def test_format_diagnostics_identify_the_saved_compatible_provider(self):
+        self.install_snapshot()
+        with mock.patch('requests.request', return_value=response({'choices': [
+                {'finish_reason': 'stop', 'message': {'content': 'invalid json'}}]})):
+            self.assertEqual(Engine(self.config, self.store).run(self.job_id), 'failed')
+        path = self.config.root / '.build' / 'mt-diagnostics' / (self.job_id + '.jsonl')
+        events = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+        self.assertTrue(events)
+        self.assertEqual({event['provider'] for event in events}, {'openai_compatible'})
+
     def test_changed_mt_key_blocks_cached_results_and_unpublished_intent(self):
         self.install_snapshot()
         fake = FakeService(result())

@@ -21,7 +21,11 @@ FRAGMENT_EXAMPLE = ('分段边界示例（仅示范，不要输出示例）：\n
                     '输出：{"translations":[{"id":"0","text":"她决定"},{"id":"1","text":"等到早上。"}]}\n')
 
 
-def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, provider="bailian", model=None):
+def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, provider="bailian", model=None,
+                  request_version=1):
+    if (type(request_version) is not int or request_version not in {1, 2} or
+            request_version == 2 and provider != "openai_compatible"):
+        raise ToolError("翻译请求契约无效。", "mt_config")
     if (not fragments or any(not isinstance(t, str) or not t.strip() for t in fragments) or
             not isinstance(source_lang, str) or not source_lang or
             any(not isinstance(c, dict) or set(c) != {"position", "text"} or
@@ -49,6 +53,18 @@ def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, pr
         payload.update(temperature=0, seed=0)
     elif provider != "openai_compatible":
         raise ToolError("翻译请求后端无效。", "mt_config")
+    if request_version == 2:
+        payload.update(
+            response_format={"type": "json_schema", "json_schema": {
+                "name": "subtitle_translations", "strict": True,
+                "schema": {"type": "object", "properties": {
+                    "translations": {"type": "array", "items": {
+                        "type": "object", "properties": {
+                            "id": {"type": "string", "enum": [str(i) for i in range(len(fragments))]},
+                            "text": {"type": "string"}},
+                        "required": ["id", "text"], "additionalProperties": False}}},
+                    "required": ["translations"], "additionalProperties": False}}},
+            provider={"require_parameters": True}, plugins=[{"id": "response-healing"}])
     return payload
 
 
@@ -134,24 +150,30 @@ def parse_batch_translation(content, fragments):
     return {str(i): translated[str(i)] for i in range(len(fragments))}
 
 
-def parse_batch_response(body, fragments):
+def parse_batch_response(body, fragments, *, request_version=1):
     if not isinstance(body, dict):
         raise BatchValidationError('response_structure')
+    if request_version == 2 and body.get('error') is not None:
+        raise ToolError("翻译服务返回业务错误；进度已保存。", "mt_service_error")
     choices = body.get('choices')
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise BatchValidationError('response_structure')
     choice = choices[0]
+    if request_version == 2 and (choice.get('error') is not None or choice.get('finish_reason') == 'error'):
+        raise ToolError("翻译服务返回业务错误；进度已保存。", "mt_service_error")
     message = choice.get('message')
-    if not isinstance(message, dict) or not isinstance(message.get('content'), str):
+    content = message.get('content') if isinstance(message, dict) else None
+    # Historical requests checked content first; version 2 classifies truncation even without text.
+    if request_version == 1 and not isinstance(content, str):
         raise BatchValidationError('response_structure')
     # Retain the item count for truncated but parseable replies, without accepting them.
     if choice.get('finish_reason') != 'stop':
         try:
-            count = len(parse_batch_translation(message['content'], fragments))
+            count = len(parse_batch_translation(content, fragments))
         except BatchValidationError as error:
             count = error.actual_count
         raise BatchValidationError('unfinished', count)
-    return parse_batch_translation(message['content'], fragments)
+    return parse_batch_translation(content, fragments)
 
 
 def recovery_context(fragments, start, end, source_lang='auto', context=(), *, request_options=None):

@@ -767,10 +767,11 @@ def layout_warnings(cues, settings):
     return warnings
 
 
-def _timeline_error(*cues):
+def _timeline_error(*cues, detail=None):
     ranges = " 与 ".join(f"{c.get('sentence_id', c['cue_id'])} / {c['cue_id']} "
                         f"[{c.get('begin_ms')}, {c.get('end_ms')})ms" for c in cues)
-    return ToolError("字幕显示时间冲突：" + ranges + "；结果已保留，需人工确认。", "timeline")
+    explanation = ('；' + detail) if detail else ''
+    return ToolError("字幕显示时间冲突：" + ranges + explanation + "；结果已保留，需人工确认。", "timeline")
 
 
 def validate_display_intervals(cues, intervals):
@@ -789,13 +790,17 @@ def validate_display_intervals(cues, intervals):
         previous = {**interval, "sentence_id": cue.get("sentence_id", cue["cue_id"])}
 
 
-def plan_display_timing(cues):
-    """Derive version 1 display intervals and adjustment records from saved cues."""
+def plan_display_timing(cues, *, version):
+    """Derive saved-version display intervals; version 0 keeps the legacy renderer."""
+    from .policy import display_timing_version
+    version = display_timing_version({'display_timing_version': version})
+    if version == 0:
+        return None, []
     intervals, adjustments = [], []
     for index, cue in enumerate(cues):
         begin, end = cue["begin_ms"], cue["end_ms"]
         if type(begin) is not int or type(end) is not int or not 0 <= begin < end:
-            raise _timeline_error(cue)
+            raise _timeline_error(cue, detail='区间结构冲突：时间须为非负整数且起点小于终点' if version == 2 else None)
         current = {"cue_id": cue["cue_id"], "begin_ms": begin, "end_ms": end}
         if intervals:
             previous = intervals[-1]
@@ -807,16 +812,34 @@ def plan_display_timing(cues):
                 parts = [re.fullmatch(r"([A-Za-z0-9_-]{1,80}):(\d{8})", sid) if isinstance(sid, str) else None
                          for sid in source_ids]
                 overlap = previous["end_ms"] - begin
-                if (not all(parts) or parts[0][1] != parts[1][1] or int(parts[0][2]) >= int(parts[1][2]) or
-                        not previous["begin_ms"] < begin < previous["end_ms"] < end or
-                        overlap > 100 or begin - previous["begin_ms"] < 1000 or end - begin < 1000):
+                structure_ok = (all(parts) and parts[0][1] == parts[1][1] and int(parts[0][2]) < int(parts[1][2]) and
+                                previous['begin_ms'] < begin < previous['end_ms'] < end)
+                if version == 1 and (not structure_ok or overlap > 100 or
+                        begin - previous['begin_ms'] < 1000 or end - begin < 1000):
                     raise _timeline_error(prior_cue, cue)
+                if version == 2:
+                    detail = None
+                    duration = prior_cue['end_ms'] - prior_cue['begin_ms']
+                    if not structure_ok:
+                        detail = '区间结构冲突：须同分段、来源递增且前起点 < 后起点 < 前终点 < 后终点'
+                    elif overlap > 500:
+                        detail = f'重叠超限：{overlap}ms，最多允许 500ms'
+                    elif overlap * 10 > duration:
+                        detail = f'缩短比例超限：{overlap}ms / {duration}ms，最多允许原显示时长的 10%'
+                    elif begin - previous['begin_ms'] < 1000 or end - begin < 1000:
+                        detail = (f"时长不足：前条修整后 {begin - previous['begin_ms']}ms、后条原时长 {end - begin}ms，"
+                                  '均须至少 1000ms')
+                    if detail:
+                        raise _timeline_error(prior_cue, cue, detail=detail)
                 adjustments.append({"cue_id": previous["cue_id"],
                                     "old_begin_ms": previous["begin_ms"], "old_end_ms": previous["end_ms"],
                                     "new_begin_ms": previous["begin_ms"], "new_end_ms": begin,
-                                    "adjustment_ms": overlap, "reason": "small_sentence_overlap"})
+                                    "adjustment_ms": overlap, "reason": ("small_sentence_overlap" if version == 1
+                                                                           else "bounded_sentence_overlap")})
                 previous["end_ms"] = begin
         intervals.append(current)
+    if version == 2:
+        validate_display_intervals(cues, intervals)
     return intervals, adjustments
 
 
