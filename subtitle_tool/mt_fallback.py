@@ -5,24 +5,25 @@ import threading
 import re
 
 from .common import MT_MODEL, Cancelled, ToolError
-from .mt_backend import MTBackend, OPENROUTER_BASE_URL, bailian_mt_url, saved_mt
+from .mt_backend import MTBackend, STRUCTURED_BAILIAN_MODEL, bailian_mt_url, saved_mt
 
 
 def supports_fallback(backend):
-    return (backend.provider == 'openai_compatible' and backend.base_url == OPENROUTER_BASE_URL
-            and backend.request_version == 2)
+    return backend.is_openrouter and backend.contract.bounded_runtime
 
 
 def fallback_policy(manifest, choice=None):
     primary = saved_mt(manifest)
     if not supports_fallback(primary):
         if choice == 'bailian':
-            raise ToolError('百炼后备仅支持 OpenRouter 请求契约 2。', 'mt_fallback_unsupported')
+            raise ToolError('百炼后备仅支持 OpenRouter 请求契约 2／3。', 'mt_fallback_unsupported')
         return None
     account = manifest.get('account')
     if not isinstance(account, str) or not re.fullmatch(r'[0-9a-f]{64}', account):
         raise ToolError('后备翻译缺少原百炼账户身份。', 'cache_mismatch')
-    backend = MTBackend('bailian', bailian_mt_url(manifest), MT_MODEL, account)
+    backend = MTBackend('bailian', bailian_mt_url(manifest),
+                        STRUCTURED_BAILIAN_MODEL if primary.contract.structured_mapping else MT_MODEL, account,
+                        3 if primary.contract.structured_mapping else 1)
     return {'format_version': 1, 'enabled': choice != 'none', 'backend': backend.snapshot()}
 
 
@@ -35,7 +36,8 @@ def saved_fallback(manifest):
             type(policy.get('enabled')) is not bool or not supports_fallback(saved_mt(manifest))):
         raise ToolError('翻译后备策略无效或版本不受支持。', 'cache_mismatch')
     backend = saved_mt({**manifest, 'mt_snapshot': policy.get('backend')})
-    if backend.provider != 'bailian' or backend.request_version != 1:
+    primary = saved_mt(manifest)
+    if backend.provider != 'bailian' or backend.request_version != (3 if primary.contract.structured_mapping else 1):
         raise ToolError('后备翻译快照必须对应原百炼账户及工作空间。', 'cache_mismatch')
     return backend
 
@@ -57,12 +59,13 @@ class PrimaryControl:
     def __init__(self, control, exhausted):
         self.control, self.exhausted = control, exhausted
         self.cancel, self.created = control.cancel, control.created
+        self.quota_source = 'local_ledger'
 
     def check_start(self):
         self.control.check_start()
         if self.exhausted.is_set():
             from .mt_runtime import ServiceError
-            raise ServiceError('quota_exhausted', code='mt_quota_exhausted')
+            raise ServiceError('quota_exhausted', code='mt_quota_exhausted', quota_source=self.quota_source)
 
     def check_inflight(self, **kwargs):
         return self.control.check_inflight(**kwargs)
@@ -98,6 +101,7 @@ class GroupFallback:
                 raise
             self.control.check_start()
             if error.code == 'mt_quota_exhausted':
+                self.primary_control.quota_source = getattr(error, 'quota_source', 'local_ledger')
                 self.exhausted.set()
             switched(error)
             self.control.check_start()

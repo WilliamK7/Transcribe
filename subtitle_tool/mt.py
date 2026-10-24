@@ -1,15 +1,25 @@
-"""Version 3 MT wire contract; independent of persisted cue identities."""
+"""Versioned MT wire contracts; independent of persisted cue identities."""
 from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from dataclasses import dataclass
 
 from .common import MT_INPUT_BUDGET, MT_MODEL, MT_TEMPLATE_RESERVE, ToolError
+from .mt_backend import request_contract
 
 
 PROMPT_VERSION = 9
 RECOVERY_VERSION = 1
+STRUCTURED_PROMPT_VERSION = 10
+STRUCTURED_RECOVERY_VERSION = 2
+STRUCTURED_PROMPT = (
+    '把 targets 的字幕片段译成简体中文，用 context 消歧但不翻译 context。'
+    '同一 sentence 内的片段连贯理解；每个编号仅翻译该片段已有的内容，'
+    '允许短语不完整，不补全、不跨片重复，保留真实重复。'
+    '必须返回 {"translations":{"0":"第0片译文","1":"第1片译文"}} 形式的 JSON，'
+    '包含所有实际输入编号，译文非空。')
 PROMPT = ("请把下面 JSON 中每个 text 字段的原文翻译成简体中文，保持 JSON 结构和 id 完全不变。"
           "所有 text 是同一句话的连续字幕片段，联合理解，但每条只翻译自己的文字，"
           "允许中文短语不完整、跨片段连读。不要补全、合并或重复邻片内容，保留原文真实重复。"
@@ -23,15 +33,33 @@ FRAGMENT_EXAMPLE = ('分段边界示例（仅示范，不要输出示例）：\n
 
 def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, provider="bailian", model=None,
                   request_version=1):
-    if (type(request_version) is not int or request_version not in {1, 2} or
-            request_version == 2 and provider != "openai_compatible"):
-        raise ToolError("翻译请求契约无效。", "mt_config")
+    contract = request_contract(provider, request_version)
     if (not fragments or any(not isinstance(t, str) or not t.strip() for t in fragments) or
             not isinstance(source_lang, str) or not source_lang or
             any(not isinstance(c, dict) or set(c) != {"position", "text"} or
                 c['position'] not in {'before', 'after', 'same_sentence_before', 'same_sentence_after'} or
                 not isinstance(c['text'], str) or not c['text'].strip() for c in context)):
         raise ToolError("批量翻译输入或原文上下文无效。", "mt_context")
+    if contract.structured_mapping:
+        data = {'context': list(context),
+                'targets': {str(i): {'sentence': 0, 'text': text} for i, text in enumerate(fragments)}}
+        if source_lang != 'auto':
+            data['source_language'] = source_lang
+        mapping = {'type': 'object', 'properties': {str(i): {'type': 'string', 'minLength': 1}
+                                                   for i in range(len(fragments))},
+                   'required': [str(i) for i in range(len(fragments))], 'additionalProperties': False}
+        payload = {'model': MT_MODEL if model is None else model, 'stream': False,
+                   'messages': [{'role': 'system', 'content': STRUCTURED_PROMPT},
+                                {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}],
+                   'response_format': {'type': 'json_schema', 'json_schema': {
+                       'name': 'subtitle_translations', 'strict': True,
+                       'schema': {'type': 'object', 'properties': {'translations': mapping},
+                                  'required': ['translations'], 'additionalProperties': False}}}}
+        if contract.openrouter_controls:
+            payload.update(provider={'require_parameters': True}, plugins=[{'id': 'response-healing'}])
+        else:
+            payload.update(enable_thinking=False, temperature=0, seed=0)
+        return payload
     # Put background before the task, and keep id/text objects exclusive to targets.
     # Context following instructions can be mistaken for the translation target.
     background = '\n'.join(item['position'] + ': ' + item['text'] for item in context)
@@ -51,9 +79,7 @@ def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, pr
                "messages": [{"role": "user", "content": content}], "stream": False}
     if provider == "bailian":
         payload.update(temperature=0, seed=0)
-    elif provider != "openai_compatible":
-        raise ToolError("翻译请求后端无效。", "mt_config")
-    if request_version == 2:
+    if contract.openrouter_controls:
         payload.update(
             response_format={"type": "json_schema", "json_schema": {
                 "name": "subtitle_translations", "strict": True,
@@ -69,7 +95,7 @@ def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, pr
 
 
 def batch_input_size(fragments, source_lang="auto", context=(), *, request_options=None):
-    # Include the repair instruction so a second attempt always fits the same budget.
+    # Reserve the legacy repair prompt; structured requests use one unchanged payload.
     return len(json.dumps(batch_payload(fragments, source_lang, context, repair=True, **(request_options or {})),
                           ensure_ascii=False).encode('utf-8')) + MT_TEMPLATE_RESERVE
 
@@ -112,7 +138,7 @@ def _unique_object(pairs):
     return value
 
 
-def parse_batch_translation(content, fragments):
+def parse_batch_translation(content, fragments, *, request_version=1):
     """Validate shape only. This cannot establish semantic translation quality."""
     if not isinstance(content, str):
         raise BatchValidationError('response_structure')
@@ -122,12 +148,15 @@ def parse_batch_translation(content, fragments):
         raise BatchValidationError('json_duplicate_key') from None
     except (ValueError, RecursionError):
         raise BatchValidationError('json_invalid') from None
-    if not isinstance(value, dict) or set(value) != {'translations'} or not isinstance(value['translations'], list):
+    mapped = request_contract('openai_compatible', request_version).structured_mapping
+    if (not isinstance(value, dict) or set(value) != {'translations'} or
+            not isinstance(value['translations'], dict if mapped else list)):
         raise BatchValidationError('response_structure')
     actual = len(value['translations'])
     expected = {str(i) for i in range(len(fragments))}
     translated = {}
-    for item in value['translations']:
+    items = ([{'id': key, 'text': text} for key, text in value['translations'].items()] if mapped else value['translations'])
+    for item in items:
         if not isinstance(item, dict):
             raise BatchValidationError('response_structure', actual)
         if 'id' not in item:
@@ -140,7 +169,8 @@ def parse_batch_translation(content, fragments):
         if identity in translated:
             raise BatchValidationError('id_duplicate', actual)
         if (not isinstance(text, str) or not text.strip() or any(c in text for c in ['-->', '```', '\x00']) or
-                len(text) > max(500, len(fragments[int(identity)]) * 12)):
+                len(text) > max(500, len(fragments[int(identity)]) * 12) or
+                mapped and any(unicodedata.category(c) in {'Cc', 'Cs'} and c not in '\n\t\r' for c in text)):
             raise BatchValidationError('translation_invalid', actual)
         if any(c.isalnum() for c in fragments[int(identity)]) and not any(c.isalnum() for c in text):
             raise BatchValidationError('translation_invalid', actual)
@@ -151,15 +181,16 @@ def parse_batch_translation(content, fragments):
 
 
 def parse_batch_response(body, fragments, *, request_version=1):
+    contract = request_contract('openai_compatible', request_version)
     if not isinstance(body, dict):
         raise BatchValidationError('response_structure')
-    if request_version == 2 and body.get('error') is not None:
+    if contract.bounded_runtime and body.get('error') is not None:
         raise ToolError("翻译服务返回业务错误；进度已保存。", "mt_service_error")
     choices = body.get('choices')
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise BatchValidationError('response_structure')
     choice = choices[0]
-    if request_version == 2 and (choice.get('error') is not None or choice.get('finish_reason') == 'error'):
+    if contract.bounded_runtime and (choice.get('error') is not None or choice.get('finish_reason') == 'error'):
         raise ToolError("翻译服务返回业务错误；进度已保存。", "mt_service_error")
     message = choice.get('message')
     content = message.get('content') if isinstance(message, dict) else None
@@ -169,11 +200,11 @@ def parse_batch_response(body, fragments, *, request_version=1):
     # Retain the item count for truncated but parseable replies, without accepting them.
     if choice.get('finish_reason') != 'stop':
         try:
-            count = len(parse_batch_translation(content, fragments))
+            count = len(parse_batch_translation(content, fragments, request_version=request_version))
         except BatchValidationError as error:
             count = error.actual_count
         raise BatchValidationError('unfinished', count)
-    return parse_batch_translation(content, fragments)
+    return parse_batch_translation(content, fragments, request_version=request_version)
 
 
 def recovery_context(fragments, start, end, source_lang='auto', context=(), *, request_options=None):
@@ -200,8 +231,11 @@ def batch_cache_value(translated):
 
 
 def batch_cache_key(fragments, source_lang="auto", *, context=(), stage="subtitle", asr_language="", request_options=None, **scope):
-    value = {"cache_version": 4, "strategy_version": 3, "prompt_version": PROMPT_VERSION,
-             "request": batch_payload(fragments, source_lang, context, **(request_options or {})), "stage": stage,
+    options = request_options or {}
+    structured = request_contract(options.get('provider', 'bailian'), options.get('request_version', 1)).structured_mapping
+    value = {"cache_version": 4, "strategy_version": 4 if structured else 3,
+             "prompt_version": STRUCTURED_PROMPT_VERSION if structured else PROMPT_VERSION,
+             "request": batch_payload(fragments, source_lang, context, **options), "stage": stage,
              "asr_language": asr_language, "scope": scope, "simplification": "opencc-t2s-0.1.7"}
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 

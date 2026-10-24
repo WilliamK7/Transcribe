@@ -57,6 +57,13 @@ def safe_request_id(value):
     return ''
 
 
+def safe_model_id(value):
+    if (isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}', value)
+            and '://' not in value and not value.lower().startswith(('sk-', 'bearer'))):
+        return value
+    return ''
+
+
 class MTDiagnostics:
     def __init__(self, root, job_id):
         if not re.fullmatch(r'[0-9a-f]{32}', job_id):
@@ -75,18 +82,18 @@ class MTDiagnostics:
         from .mt_runtime import RUNTIME_CATEGORIES
         try:
             if event.get('kind') not in {'runtime_request', 'runtime_wait', 'runtime_quota', 'runtime_drain',
-                                       'runtime_fallback', 'runtime_cache'}:
+                                       'runtime_fallback', 'runtime_commit'}:
                 return False
             record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
             if isinstance(event.get('category'), str) and event['category'] in RUNTIME_CATEGORIES:
                 record['category'] = event['category']
             self._routing(record, event)
             for field in ['attempt', 'status', 'duration_ms', 'shared_wait_ms', 'pacing_wait_ms',
-                          'discarded', 'used', 'limit', 'remaining', 'local_remaining']:
+                          'discarded', 'used', 'limit', 'remaining', 'local_remaining', 'committed_count']:
                 value = event.get(field)
                 if type(value) is int and 0 <= value <= 2**63 - 1:
                     record[field] = value
-            for field in ['retryable', 'deadline_terminated']:
+            for field in ['retryable', 'deadline_terminated', 'cached']:
                 if type(event.get(field)) is bool:
                     record[field] = event[field]
             observed = event.get('observed_at')
@@ -105,8 +112,6 @@ class MTDiagnostics:
             self._routing(record, event)
             if event.get('category') in VALIDATION_CATEGORIES:
                 record['category'] = event['category']
-            if event.get('stage') in {'reference', 'subtitle'}:
-                record['stage'] = event['stage']
             for key in ['fragment_start', 'fragment_end', 'depth', 'expected_count', 'actual_count',
                         'begin_ms', 'end_ms', 'content_length']:
                 value = event.get(key)
@@ -129,12 +134,22 @@ class MTDiagnostics:
 
     @staticmethod
     def _routing(record, event):
+        for field in ['model', 'actual_model']:
+            model = safe_model_id(event.get(field))
+            if model:
+                record[field] = model
+        if type(event.get('request_version')) is int and event['request_version'] in {1, 2, 3}:
+            record['request_version'] = event['request_version']
+        if event.get('stage') in {'reference', 'subtitle'}:
+            record['stage'] = event['stage']
+        if event.get('quota_source') in {'local_ledger', 'server_observation'}:
+            record['quota_source'] = event['quota_source']
         for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}')]:
             value = event.get(field)
             if isinstance(value, str) and re.fullmatch(pattern, value):
                 record[field] = value
         for field, allowed in [('backend', {'primary', 'fallback'}), ('provider', {'openrouter', 'bailian', 'openai_compatible'}),
-                ('reason', {'quota_exhausted', 'format_exhausted', 'retry_after', 'transient_exhausted'})]:
+                ('reason', {'quota_exhausted', 'quota_local_empty', 'format_exhausted', 'retry_after', 'transient_exhausted'})]:
             value = event.get(field)
             if isinstance(value, str) and value in allowed:
                 record[field] = value

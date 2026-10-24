@@ -23,6 +23,9 @@ def batch_response(texts, *, finish='stop'):
 
 
 def batch_input(body):
+    if len(body['messages']) == 2:
+        targets = json.loads(body['messages'][1]['content'])['targets']
+        return [{'id': key, 'text': item['text']} for key, item in targets.items()]
     content = body['messages'][0]['content']
     return json.loads(content.split('INPUT_JSON:\n', 1)[1])['translations']
 

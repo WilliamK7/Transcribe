@@ -31,17 +31,23 @@ class RuntimeEngineTests(SavedResultFixture):
         atomic_bytes(self.config.data / 'mt-key.txt', b'offline-mt-key')
         self.config.save()
 
-    def install(self, raw=None):
+    def install(self, raw=None, *, request_version=2):
         self.save_result(raw)
         manifest = self.store.job(self.job_id)['manifest']
         Engine(self.config, self.store).identity(self.job_id, manifest)
         manifest['mt_snapshot'] = MTBackend('openai_compatible', 'https://openrouter.ai/api/v1',
-            'openrouter/free', key_fingerprint('offline-mt-key'), 2).snapshot()
+            'openrouter/free', key_fingerprint('offline-mt-key'), request_version).snapshot()
+        if request_version == 3:
+            from subtitle_tool.policy import current_execution_snapshot
+            manifest.update(translation_strategy_version=4, execution_snapshot=current_execution_snapshot(4))
         self.store.update(self.job_id, manifest=manifest)
 
     @staticmethod
     def translated(kwargs):
         items = batch_input(kwargs['json'])
+        if len(kwargs['json']['messages']) == 2:
+            from tests.test_translation_v4 import mapped_response
+            return HTTPReply(200, mapped_response(['完成译文'] * len(items)).content)
         return HTTPReply(200, batch_response(['完成译文'] * len(items)).content)
 
     def test_cli_sigint_ends_within_six_seconds_and_next_process_gets_lock(self):
@@ -78,6 +84,21 @@ class RuntimeEngineTests(SavedResultFixture):
         if os.name == 'nt':
             self.assertEqual(report['console_signals_delivered'], [True, True])
 
+    def test_structured_primary_and_bailian_use_real_bounded_cli_cancellation(self):
+        for mode, role in [('once', 'primary'), ('bailian_once', 'fallback')]:
+            with self.subTest(role=role):
+                self.install(request_version=3)
+                run = self.run_cancel_cli(mode)
+                self.assertEqual(run.returncode, 0, run.stderr.decode(errors='replace'))
+                report = json.loads(run.stdout)
+                self.assertEqual(report['exit_code'], 130)
+                self.assertGreaterEqual(report['drain_seconds'], 4.9)
+                self.assertLess(report['drain_seconds'], 6)
+                self.assertEqual(report['active_children'], 0)
+                self.assertTrue(report['lock_reacquired'])
+                self.assertEqual(report['backend_calls'][role], 1)
+                self.assertEqual(self.store.job(self.job_id)['state'], 'cancelled')
+                self.assertEqual(self.store.db.execute('SELECT count(*) FROM mt_cache').fetchone()[0], 0)
     def run_cancel_cli(self, mode):
         options = {}
         if os.name == 'nt':
@@ -131,6 +152,8 @@ class RuntimeEngineTests(SavedResultFixture):
 
     def test_cache_only_recovery_and_republication_never_construct_network_transport(self):
         self.install()
+        # Populate the current contract; reflow from an old contract intentionally misses old caches.
+        Engine(self.config, self.store).reflow(self.job_id)
         transport = mock.Mock()
         transport.request.side_effect = lambda method, *args, **kwargs: quota() if method == 'GET' else self.translated(kwargs)
         with mock.patch('subtitle_tool.mt_runtime.ProcessTransport', return_value=transport):

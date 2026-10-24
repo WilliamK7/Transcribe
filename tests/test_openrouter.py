@@ -256,8 +256,8 @@ class OpenRouterRecoveryTests(SavedResultFixture):
         self.store.update(self.job_id, manifest=manifest)
         return backend
 
-    def test_current_configuration_selects_two_only_for_exact_normalized_openrouter(self):
-        for url, version in [('https://OPENROUTER.ai:443/api/v1///', 2), (OPENROUTER, 2),
+    def test_current_configuration_selects_three_only_for_exact_normalized_openrouter(self):
+        for url, version in [('https://OPENROUTER.ai:443/api/v1///', 3), (OPENROUTER, 3),
                              ('https://openrouter.ai/api/v1/extra', 1), ('https://openrouter.ai/API/v1', 1),
                              ('https://openrouter.ai:444/api/v1', 1), ('https://sub.openrouter.ai/api/v1', 1),
                              ('https://other.test/api/v1', 1)]:
@@ -304,7 +304,7 @@ class OpenRouterRecoveryTests(SavedResultFixture):
         self.assertEqual(saved_mt(self.store.job(self.job_id)['manifest']).request_version, 1)
         self.assertEqual(fake.uploads, [])
 
-    def test_reflow_snapshots_old_results_and_retranslates_locally_with_version_two(self):
+    def test_reflow_snapshots_old_results_and_retranslates_locally_with_version_three(self):
         self.install()
         fake = FakeService(result())
         self.assertEqual(self.run_fake(fake), 'completed')
@@ -312,13 +312,15 @@ class OpenRouterRecoveryTests(SavedResultFixture):
         old_references = self.store.references(self.job_id)
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         prepared = self.store.job(self.job_id)['manifest']
-        self.assertEqual(saved_mt(prepared).request_version, 2)
+        self.assertEqual(saved_mt(prepared).request_version, 3)
         snapshot = json.loads((self.config.root / prepared['reflow']['snapshot']).read_text(encoding='utf-8'))
         self.assertEqual(snapshot['job']['manifest']['mt_snapshot']['request_version'], 1)
         self.assertEqual(snapshot['references'], old_references)
         self.assertEqual(self.store.references(self.job_id), [])
-        for name in ['segments', 'fingerprint', 'cache_identity', 'execution_snapshot']:
+        for name in ['segments', 'fingerprint', 'cache_identity']:
             self.assertEqual(prepared[name], before['manifest'][name])
+        from subtitle_tool.policy import current_execution_snapshot
+        self.assertEqual(prepared['execution_snapshot'], current_execution_snapshot(4))
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
         self.assertTrue(fake.calls)

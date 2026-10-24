@@ -8,8 +8,9 @@
 | 查询 | GET 同一工作空间 `/api/v1/tasks/{task_id}` | 同上 |
 | 默认 MT（百炼） | POST 同一工作空间 `/compatible-mode/v1/chat/completions` | [Qwen-MT](https://help.aliyun.com/zh/model-studio/qwen-mt-api) |
 | 兼容 MT | POST 配置根地址 + `/chat/completions` | [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) |
-| OpenRouter MT（请求契约 2） | POST `https://openrouter.ai/api/v1/chat/completions` | [结构化输出](https://openrouter.ai/docs/guides/features/structured-outputs)、[Response Healing](https://openrouter.ai/docs/guides/features/plugins/response-healing) |
-| OpenRouter 免费额度（仅请求契约 2 的免费模型） | GET `https://openrouter.ai/api/v1/key` | [免费额度与 UTC 日计数](https://openrouter.ai/docs/api_reference/limits) |
+| OpenRouter MT（请求契约 2／3） | POST `https://openrouter.ai/api/v1/chat/completions` | [结构化输出](https://openrouter.ai/docs/guides/features/structured-outputs)、[Response Healing](https://openrouter.ai/docs/guides/features/plugins/response-healing) |
+| OpenRouter 免费额度（请求契约 2／3 的免费模型） | GET `https://openrouter.ai/api/v1/key` | [免费额度与 UTC 日计数](https://openrouter.ai/docs/api_reference/limits) |
+| 结构化百炼后备（请求契约 3） | POST 原工作空间 `/compatible-mode/v1/chat/completions` | [百炼结构化输出](https://help.aliyun.com/zh/model-studio/qwen-structured-output)、[Chat Completions 参数](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions) |
 | 上传策略 | GET `https://dashscope.aliyuncs.com/api/v1/uploads`，`action=getPolicy`，`model=qwen3-asr-flash-filetrans` | [临时上传](https://help.aliyun.com/zh/model-studio/get-temporary-file-url) |
 | 文件上传 | 返回的 `upload_host`，流式整文件 multipart，`file` 字段最后，使用上传策略鉴权 | 同上 |
 
@@ -23,7 +24,13 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`。`
 
 兼容根地址规范化主机名、默认端口和末尾斜杠，保留路径前缀，再追加 `/chat/completions`。根地址使用无凭据、查询参数、片段及路径回退的 HTTPS URL；localhost 或回环 IP 支持 HTTP。请求使用独立 Bearer Key；请求契约 1 的字段为 `model`、`messages`、`stream:false`。
 
-新任务和显式重排在规范化根地址恰为 `https://openrouter.ai/api/v1` 时使用请求契约 2；后端仍为 `openai_compatible`，其他兼容地址与百炼使用版本 1。版本 2 在上述基础字段之外发送：
+新任务和显式重排在规范化根地址恰为 `https://openrouter.ai/api/v1` 时使用请求契约 3、翻译策略 4；其他兼容地址与专用百炼 MT 使用请求契约 1、策略 3。普通恢复显式分派保存的旧／新版本，不升级旧请求或提示词。
+
+契约 3 输入为 system 翻译要求与 user JSON：可选 `source_language`（人工指定时）、仅供消歧的 `context`、固定编号原文 `targets:{"0":{"sentence":0,"text":"片段"},"1":{"sentence":0,"text":"片段"}}`。输出为 `{"translations":{"0":"译文","1":"译文"}}`。严格 Schema 的两层对象均禁止额外属性，所有编号均列为 required，译文为 `minLength:1` 的字符串。程序持有编号到 cue 的映射，本地继续拒绝重复 JSON 键、缺号／额外编号、空白／仅标点、异常长度、字幕控制字符、非法 Unicode 及非 `finish_reason:stop` 的结果。结构校验不能证明语义质量。
+
+OpenRouter 契约 3 使用 `provider:{"require_parameters":true}`、`plugins:[{"id":"response-healing"}]` 和独立 MT Key；百炼后备使用原 ASR 账户／工作空间、模型 `qwen3.8-flash`、顶层 `enable_thinking:false`、`temperature:0`、`seed:0`。两端均发送严格 `response_format.type:json_schema`。首次结构／覆盖校验失败直接转当前完整组后备，后备仍失败则停止并保留进度。
+
+请求契约 2 使用数组协议，在基础字段之外发送：
 
 - `response_format: {"type":"json_schema","json_schema":{"name":"subtitle_translations","strict":true,"schema":…}}`。Schema 为必需的 `translations` 数组，成员为必需的字符串 `id`、`text`；两层对象均设置 `additionalProperties:false`，`id.enum` 仅含本次从 `"0"` 开始的字符串编号。条数、编号唯一性、非空译文及字幕控制内容继续由本地校验。
 - `provider: {"require_parameters":true}`，仅路由至支持请求参数的端点。
@@ -31,25 +38,25 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`。`
 
 普通、修复和递归子组共用请求构造，子组重新生成自己的编号集合；完整 Schema、端点设置及插件字段均计入输入预算。`openrouter/free` 按请求能力筛选免费模型，见[免费路由](https://openrouter.ai/docs/guides/routing/routers/free-router)。暂时无可用端点时有限重试，耗尽后按后备策略处理；明确的参数拒绝直接停止。
 
-两个后端共用策略 3 的提示词、上下文、编号 JSON 校验、繁转简和缩组恢复；请求构造与预算使用同一后端和模型参数。兼容服务的非 2xx 错误映射为 `mt_http_{HTTP状态}`，2xx 中的业务错误映射为 `mt_service_error`；诊断仅记录本地分类和计数，服务端消息、错误码、请求 ID 及响应原文保持私有。
+普通兼容服务、专用百炼 MT 及旧请求共用策略 3 的提示词、上下文、编号 JSON 校验、繁转简和缩组恢复。请求构造与预算使用同一后端和模型参数。兼容服务的非 2xx 错误映射为 `mt_http_{HTTP状态}`，2xx 中的业务错误映射为 `mt_service_error`；诊断仅记录安全分类和计数，服务端消息、错误码、请求 ID 及响应原文保持私有。
 
-请求契约 2 先识别顶层／全部 choice 的业务错误及 `finish_reason:error`，再检查正常结束和正文。服务错误不进入格式修复或缩组；`content:null` 配合 `finish_reason:length` 归入非正常结束。内部错误仅保留本地分类、HTTP 状态和是否可重试，服务端消息与原始错误码不写入诊断或任务。只按白名单 `error.metadata.error_type` 判断业务类别，见[官方错误分类](https://openrouter.ai/docs/api_reference/errors-and-debugging)。普通 404／503 不被推断为不支持 Schema。
+请求契约 2／3 先识别顶层／全部 choice 的业务错误及 `finish_reason:error`，再检查正常结束和正文。服务错误不进入格式修复或缩组；`content:null` 配合 `finish_reason:length` 归入非正常结束。内部错误仅保留本地分类、HTTP 状态和是否可重试，服务端消息与原始错误码不写入诊断或任务。只按白名单 `error.metadata.error_type` 判断业务类别，见[官方错误分类](https://openrouter.ai/docs/api_reference/errors-and-debugging)。普通 404／503 不被推断为不支持 Schema。
 
-OpenRouter 契约 2 的网络连接／读取失败、请求总时限、HTTP 408／429／5xx，以及明确的 `timeout`、`provider_unavailable`、`provider_overloaded`、`server`、`rate_limit_exceeded` 共用每份正文最多 **4 次 HTTP 尝试，包含首次**的预算，HTTP 与业务错误共用这一预算。参数、凭据、权限、余额、内容政策、输入限制及未知业务错误直接停止；永久类别优先于暂时 HTTP 状态。格式修复和缩组各自生成独立正文。
+OpenRouter 契约 2／3 的网络连接／读取失败、请求总时限、HTTP 408／429／5xx，以及明确的 `timeout`、`provider_unavailable`、`provider_overloaded`、`server`、`rate_limit_exceeded` 共用每份正文最多 **4 次 HTTP 尝试，包含首次**的预算，HTTP 与业务错误共用这一预算。参数、凭据、权限、余额、内容政策、输入限制及未知业务错误直接停止；永久类别优先于暂时 HTTP 状态。格式修复和缩组各自生成独立正文。
 
-官方 OpenRouter 根地址、请求契约 2 且模型为 `openrouter/free` 时，HTTP 404 允许有限重试；顶层或 choice 中的业务 `not_found` 在 HTTP 2xx／404／408／429／5xx 下同样可重试，保留原分类并共用上述四次预算。其他永久类型和不可重试的 HTTP 状态优先终止；`not_found` 混合未知、畸形或缺失类型的业务错误归为 `service_unknown`。固定模型（含固定 `:free`）、旧契约和其他根地址的 `not_found` 直接停止。
+官方 OpenRouter 根地址、请求契约 2／3 且模型为 `openrouter/free` 时，HTTP 404 允许有限重试；顶层或 choice 中的业务 `not_found` 在 HTTP 2xx／404／408／429／5xx 下同样可重试，保留原分类并共用上述四次预算。其他永久类型和不可重试的 HTTP 状态优先终止；`not_found` 混合未知、畸形或缺失类型的业务错误归为 `service_unknown`。固定模型（含固定 `:free`）、旧契约和其他根地址的 `not_found` 直接停止。
 
 暂时错误按原后端身份共享恢复：连续失败使用 15／30／60 秒冷却，另加 0～1 秒抖动；同轮并发失败合并。冷却结束仅放行一个翻译探测，成功后恢复并发，旧在途成功不能清除新冷却。保留 429 的自适应间隔；冷却、RPM 窗口及间隔取最晚截止时间。有效 `Retry-After` 按秒数或 HTTP 日期处理，超过 300 秒返回 `mt_retry_after`，不提前请求；截止耗尽使用 `mt_request_deadline`。启用后备时由组级调度处理这些可恢复故障，关闭时停止新调度并收尾。
 
-OpenRouter 契约 2 及百炼后备使用隐藏子进程执行非流式请求，凭据经私有管道传递。翻译联网和完整读取响应合计限时 120 秒，额度查询限时 15 秒，响应上限 4 MiB；排队和限速等待另计。主进程负责重试、持久化、取消及到期终止回收，子进程仅负责联网。
+OpenRouter 契约 2／3 及百炼后备使用隐藏子进程执行非流式请求，凭据经私有管道传递。翻译联网和完整读取响应合计限时 120 秒，额度查询限时 15 秒，响应上限 4 MiB；排队和限速等待另计。主进程负责重试、持久化、取消及到期终止回收，子进程仅负责联网。
 
 免费额度仅适用于 `openrouter/free` 和以 `:free` 结尾的模型。首次确需免费 MT 时查询 `/key`，不为纯缓存恢复或结果重发创建网络客户端。仅读取 `data.free_model_daily_requests` 的非负整数 `used`、`limit`、`remaining`；共享范围为规范化根地址与 Key 指纹，不按模型拆分。并发查询合并，查询开始间隔至少 30 秒，429 重试前优先复核到期观察；等待 RPM 后再次核对。额度查询期间如有新冷却，发送前重新等待，最终放行时才登记 RPM 时间并原子预占额度。查询覆盖 UTC 日边界时不信任该观察，跨日必须查询新额度，不推定每日 1000 份。
 
-每次 MT HTTP 尝试发送前原子预占一份本地余量，含所有重试；已登记的预占保守保留，已发送失败不退还。刷新扣除查询开始时的在途预占及查询期间新增预占，同一 UTC 日只向下校准可用余量。本轮已有同日可信观察时，查询失败／字段缺失可继续本地余量；首次未知或跨日无法确认时以 `failed/mt_quota_unknown` 停止，不能因此后备。可信额度不足返回 `mt_quota_exhausted`，启用后备时转百炼，关闭时以 failed 结束。由用户 `--resume` 继续，不自动等到次日或续跑。实际限制仍受账号其他调用和上游容量影响，见[官方限额说明](https://openrouter.ai/docs/api_reference/limits)。
+每次 MT HTTP 尝试发送前原子预占一份本地余量，含所有重试；已登记的预占保守保留，已发送失败不退还。刷新扣除查询开始时的在途预占及查询期间新增预占，同一 UTC 日只向下校准可用余量。本轮已有同日可信观察时，查询失败／字段缺失可继续本地余量；首次未知或跨日无法确认时以 `failed/mt_quota_unknown` 停止，不能因此后备。可信观察下本地可用余量不足返回 `mt_quota_exhausted`；诊断的 `quota_source:local_ledger` 表示保守预占后归零，`server_observation` 表示最近服务端观察明确不足，不能将两者混称服务端耗尽，启用后备时转百炼，关闭时以 failed 结束。由用户 `--resume` 继续，不自动等到次日或续跑。实际限制仍受账号其他调用和上游容量影响，见[官方限额说明](https://openrouter.ai/docs/api_reference/limits)。
 
 翻译策略 3 的 user 消息依次包含原文上下文、翻译要求和同一来源句的有序片段；提示词指定源语言 `auto`（或人工确认的 MT 语言名）及简体中文目标。多片段请求包含固定边界示例，单片请求省略示例。百炼使用[自定义提示词模式](https://help.aliyun.com/zh/model-studio/machine-translation)，省略 `translation_options`，设置 `temperature:0`、`seed:0`；采样参数含义见[官方 API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。
 
-内部批量接口接收上下文和有序片段，请求内编号从字符串 `"0"` 开始；输入、输出均为 `{"translations":[{"id":"0","text":"文字"}]}`，输出 `text` 为对应片段的译文。本地校验 JSON、编号完整且唯一、无多余项、译文非空且无字幕控制内容，以及 `finish_reason:stop`；原文包含文字或数字时，译文须包含文字或数字。校验异常使用同组输入和修复提示再尝试一次。
+策略 3 的内部批量接口接收上下文和有序片段，请求内编号从字符串 `"0"` 开始；输入、输出均为 `{"translations":[{"id":"0","text":"文字"}]}`，输出 `text` 为对应片段的译文。本地校验 JSON、编号完整且唯一、无多余项、译文非空且无字幕控制内容，以及 `finish_reason:stop`；原文包含文字或数字时，译文须包含文字或数字。校验异常使用同组输入和修复提示再尝试一次。
 
 两次校验均失败时，按片段数中点拆成连续左右子组，在现有工作线程内先左后右执行；每组仍最多正常及修复各一次，递归至单片。子组编号从 `"0"` 开始，结果映射回原组编号及稳定 `cue_id`，沿用原字幕范围和时间。单片仍失败返回 `mt_batch_invalid`，原组保留待恢复。含 n 片的原组最多 `4n−2` 次逻辑请求；HTTP 错误、重试及取消按原规则处理。译文经 OpenCC t2s 后保存。结构校验不代表语义质量验收。
 
@@ -59,27 +66,29 @@ OpenRouter 契约 2 及百炼后备使用隐藏子进程执行非流式请求，
 
 旧策略 1／2 保留单片翻译请求，顶层 `translation_options` 指定源语种及目标语种 `Chinese`，有上下文时增加 `tm_list:[{"source":"参考原文","target":"参考译文"}]`；旧单阶段任务保留原请求形式。响应须正常结束且译文合法、非空。
 
-MT 按后端／规范化根地址／Key SHA-256／模型在进程内共享调度，并发可设为 1～4，默认 4。北京 `qwen-mt-flash` 额度为 60 RPM／35,000 TPM；本地在 61 秒滚动窗口内最多发送 60 次 HTTP 尝试，包含重试和失败，额外 1 秒用于网络到达时间余量。兼容后端按当前 `mt_rpm` 在 60 秒滚动窗口限制尝试次数，0 不主动限流；RPM 调整不改变共享调度身份。额度未满时无固定逐条间隔，用尽后逐条等待请求过期；窗口等待、共享冷却和自适应间隔取较晚期限，等待可取消。进度区分配额等待与服务端限流，配额等待不计入 `mt_cooldown_ms`。窗口不跨进程保存，账号其他调用及 TPM 限流由 429 退避处理。
+MT 按后端／规范化根地址／Key SHA-256／模型在进程内共享调度，并发可设为 1～4，默认 4。北京 `qwen-mt-flash` 额度为 60 RPM／35,000 TPM；百炼（含结构化后备）保守使用同一请求窗口，本地在 61 秒滚动窗口内最多发送 60 次 HTTP 尝试，包含重试和失败，额外 1 秒用于网络到达时间余量。兼容后端按当前 `mt_rpm` 在 60 秒滚动窗口限制尝试次数，0 不主动限流；RPM 调整不改变共享调度身份。额度未满时无固定逐条间隔，用尽后逐条等待请求过期；窗口等待、共享冷却和自适应间隔取较晚期限，等待可取消。进度区分配额等待与服务端限流，配额等待不计入 `mt_cooldown_ms`。窗口不跨进程保存，账号其他调用及 TPM 限流由 429 退避处理。
 
 每次发送记录调度代次；当前代次首次收到 429 时推进代次，将间隔升至至少 1.05 秒，后续代次再次限流时翻倍，最高 8 秒。同代次其余 429 只更新冷却、计数及重试。当前代次连续成功 4 次后间隔降低 30%，不足 0.1 秒时归零；任何 429 或当前代次其他失败重置成功窗口。旧代次成功不参与恢复，成功以 HTTP 2xx 计，译文仍须校验后才保存。间隔下降立即用于后续调度，并显示提速日志。
 
 HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有限或负数值使用 15／30／60 秒退避。共享冷却截止时间取较晚值，等待可取消。每条请求最多尝试四次，最后一次 429 仍更新调度。失败停止安排后续请求，已发出的成功结果继续持久化。实际额度及账号共享规则见[官方限流说明](https://help.aliyun.com/zh/model-studio/rate-limit)。
 
+策略 4 的流水线为来源／人工决定验证 → 原文及可靠词时间切分 → 同一完整句内联合翻译 → 真实译文排版检查 → 最多两轮重排重译 → 发布。字幕分段与显示规则见[时间轴与字幕](#时间轴与字幕)，分组与上下文裁剪见[上下文与输入预算](#上下文与输入预算)。
+
 ## 数据与恢复
 
-OpenRouter 契约 2 支持 `--mt-fallback {none,bailian}`，仅用于新任务、`--resume` 与 `--reflow`，新建／恢复省略时默认启用。普通暂时故障（含上述免费路由 `not_found`）每份正文最多 4 次 HTTP 尝试耗尽、格式修复／缩组最终失败或有效 Retry-After 超过 300 秒时，仅当前原组转百炼，后续组继续优先主后端，保留其冷却截止时间。部分子组成功后原组最终失败时，百炼重新翻译完整原组。可信免费额度耗尽才将本轮剩余工作转百炼；首次额度未知、永久错误、内容拒绝及未知业务错误停止。`content_filter` 与拒绝字段在格式恢复前识别。
+OpenRouter 契约 2／3 支持 `--mt-fallback {none,bailian}`，仅用于新任务、`--resume` 与 `--reflow`，新建／恢复省略时默认启用。普通暂时故障（含上述免费路由 `not_found`）每份正文最多 4 次 HTTP 尝试耗尽、结构／覆盖失败（契约 3 为首次失败，契约 2 为格式修复／缩组最终失败）或有效 Retry-After 超过 300 秒时，仅当前原组转百炼，后续组继续优先主后端，保留其冷却截止时间。部分子组成功后原组最终失败时，百炼重新翻译完整原组。可信观察下本地可用余量归零才将本轮剩余工作转百炼；首次额度未知、永久错误、内容拒绝及未知业务错误停止。`content_filter` 与拒绝字段在格式恢复前识别。
 
-百炼后备使用保存账户／工作空间的 `qwen-mt-flash`，可能产生费用，按实际使用计费。按自己的请求契约重建单条 user 消息，沿用提示词、`temperature:0`、`seed:0`、`stream:false`，不带 OpenRouter Schema、路由或插件，发送前重新核对百炼输入预算，见 [Qwen-MT API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。按[官方错误分类](https://help.aliyun.com/en/model-studio/error-code)映射安全类别，临时限流／超时／服务故障有限重试，鉴权、欠费、权限和内容拒绝立即停止。只保留本地类别及次数，不保留上游代码和原始消息。
+旧契约 2 的百炼后备使用保存账户／工作空间的 `qwen-mt-flash`，契约 3 后备使用 `qwen3.8-flash`；均可能产生费用，按实际使用计费。以下原生 Qwen-MT 字段仅适用于旧后备。按自己的请求契约重建单条 user 消息，沿用提示词、`temperature:0`、`seed:0`、`stream:false`，不带 OpenRouter Schema、路由或插件，发送前重新核对百炼输入预算，见 [Qwen-MT API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。按[官方错误分类](https://help.aliyun.com/en/model-studio/error-code)映射安全类别，临时限流／超时／服务故障有限重试，鉴权、欠费、权限和内容拒绝立即停止。只保留本地类别及次数，不保留上游代码和原始消息。
 
 两个后端分别使用共享限速器和冷却协调器，在同一工作线程内顺序执行，总并发保持配置值。百炼不等待主后端冷却，每个原组最多接管一次，不循环切回主后端。百炼后备使用同一隐藏子进程传输层，保持 120 秒总时限、4 MiB 响应上限、每份正文最多 4 次 HTTP 尝试及两端共享的 5 秒取消窗口；取消后不能启动后备。单后端失败交给组级调度，无法后备或两端均失败才启动全局收尾；两端失败使用 `mt_fallback_failed`，分别提示安全类别与尝试数。
 
 `mt_fallback_policy` 是独立策略对象：`format_version:1`、`enabled:bool`、`backend`（百炼完整后端快照），旧任务首次初始化策略（含显式关闭）另含 `migration_snapshot`（`.build/mt-fallback/{job_id}/{时间}.json` 相对路径）。主 MT／执行快照、请求正文、提示词、分组及主缓存键不变。启用先校验原账号及当前两端凭据；首次初始化先保存包含任务、来源、字幕、参考和计数的本机恢复快照，再事务性写入策略并标记已有成功译文为主后端。重复设置相同策略幂等；关闭保留后备快照和已有来源，只影响后续请求；重排按新任务重新解析该选项。
 
-译文 metadata 用 `mt_origin:primary|fallback` 分别引用主快照或后备快照。译文、来源、实际后端的普通／恢复缓存及成功计数同事务提交；百炼沿原百炼账户／工作空间范围，允许完全匹配的旧缓存，不写入 OpenRouter 键。未触发后备只查主缓存，触发后备才查百炼缓存。参考复用复制来源，复核或切分清空译文时一并清除来源；恢复与发布验证来源能对应保存的后端。每次显式 resume 重新获取所需额度，未完成原组重新优先主后端；已成功结果保留，运行中的尝试预算不跨进程累计。
+译文 metadata 用 `mt_origin:primary|fallback` 分别引用主快照或后备快照。译文、来源、实际后端的普通／恢复缓存及成功计数同事务提交；百炼沿原账户／工作空间范围；结构化后备另含模型、地址、Key 指纹和请求版本身份，不复用旧 Qwen-MT 缓存；旧后备允许完全匹配的旧缓存，不写入 OpenRouter 键。未触发后备只查主缓存，触发后备才查百炼缓存。参考复用复制来源，复核或切分清空译文时一并清除来源；恢复与发布验证来源能对应保存的后端。每次显式 resume 重新获取所需额度，未完成原组重新优先主后端；已成功结果保留，运行中的尝试预算不跨进程累计。
 
 任务库使用进程独占锁。任务绑定账号 Key 的 SHA-256 身份、地域、工作空间、接入方式、完整源文件指纹、模型参数、音轨／声道和媒体方案；缓存命中仍校验身份。已提交输入及分段方案保持固定。Ctrl+C 保存状态；取消任务由用户显式恢复。
 
-OpenRouter 契约 2 及其百炼后备首次 Ctrl+C 立即停止新请求、重试、额度查询及后备切换，所有在途翻译共享 5 秒收尾窗口；窗口内完整合法的原组仍保存一次，到期终止其余请求，再次 Ctrl+C 跳过剩余窗口。无法继续的错误使用同一有界收尾。网络子进程、管道和工作线程结束后，才提交最终任务状态、关闭数据库并释放锁；迟到或不完整原组不写缓存。用户取消保存 `cancelled`，额度未知或关闭后备后的额度停止保持 `failed`。本地终止不能保证云端停止生成或计费，见 [OpenRouter 取消说明](https://openrouter.ai/docs/api_reference/streaming)。普通百炼、ASR 和旧请求使用原 HTTP 传输，取消等待请求返回或超时。
+OpenRouter 契约 2／3 及其百炼后备首次 Ctrl+C 立即停止新请求、重试、额度查询及后备切换，所有在途翻译共享 5 秒收尾窗口；窗口内完整合法的原组仍保存一次，到期终止其余请求，再次 Ctrl+C 跳过剩余窗口。无法继续的错误使用同一有界收尾。网络子进程、管道和工作线程结束后，才提交最终任务状态、关闭数据库并释放锁；迟到或不完整原组不写缓存。用户取消保存 `cancelled`，额度未知或关闭后备后的额度停止保持 `failed`。本地终止不能保证云端停止生成或计费，见 [OpenRouter 取消说明](https://openrouter.ai/docs/api_reference/streaming)。普通百炼、ASR 和旧请求使用原 HTTP 传输，取消等待请求返回或超时。
 
 任务提交 `completed` 后清理音频缓存；清理失败保留文件并记录警告，完成状态保持有效。
 
@@ -103,15 +112,15 @@ OpenRouter 契约 2 及其百炼后备首次 Ctrl+C 立即停止新请求、重�
 | `workspace_id` | 1～63 位合法域名标签 |
 | `processing_version` | `2` |
 | `contract.normalizer` | `3` |
-| `subtitle_version` / `translation_strategy_version` | `2` / `3` |
+| `subtitle_version` / `translation_strategy_version` | `2` / `4`（OpenRouter）；其他后端策略 `3` |
 | `display_timing_version` | `2`；独立的最终显示时间策略 |
 | `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
-| `execution_snapshot` | `format_version: 1`、`prompt_version: 9`、`recovery_version: 1`、`context_version: 1` |
-| `mt_snapshot` | `format_version: 1`、`provider`、`base_url`、`model`、`key_fingerprint`（SHA-256）、`request_version: 1` 或 `2` |
+| `execution_snapshot` | `format_version: 1`、`prompt_version:10/recovery_version:2`（策略 4）或 `prompt_version:9/recovery_version:1`（策略 3），均有 `context_version:1` |
+| `mt_snapshot` | `format_version: 1`、`provider`、`base_url`、`model`、`key_fingerprint`（SHA-256）、`request_version:1/2/3` |
 
-`contract` 保存 ASR 模型、规范化版本与参数，读取兼容历史含 `mt:qwen-mt-flash` 的混合契约。MT 快照独立于 `cache_identity`（ASR 账户范围）；凭据仅存指纹，并发数和 RPM 使用运行设置。快照格式 1 读取请求契约 1、2；版本 2 仅允许 `openai_compatible` 配合精确的 `https://openrouter.ai/api/v1` 根地址。未知版本或非法版本 2 组合返回 `cache_version`。
+`contract` 保存 ASR 模型、规范化版本与参数，读取兼容历史含 `mt:qwen-mt-flash` 的混合契约。MT 快照独立于 `cache_identity`（ASR 账户范围）；凭据仅存指纹，并发数和 RPM 使用运行设置。快照格式 1 读取请求契约 1、2、3；兼容后端版本 2／3 仅允许 `openai_compatible` 配合精确的 `https://openrouter.ai/api/v1` 根地址。百炼版本 3 仅允许原账户的 `qwen3.8-flash` 结构化身份。未知版本或非法版本组合返回 `cache_version`。
 
-普通恢复固定使用 `mt_snapshot` 中的后端、地址、模型和请求契约，不受当前 MT 选择影响；版本 1 的 OpenRouter 任务不会自动升级。在复用现有译文、缓存或重新发布 SRT 前验证对应的当前凭据指纹。不同 MT Key 返回 `mt_account_changed`。没有 MT 快照的旧任务按保存的百炼账户及工作空间处理，不增加快照、不升级翻译策略。已按保存发布意图写入的结果只补记完成时，仍按原规则校验 ASR 账户及工作空间，不要求旧 MT Key。
+普通恢复固定使用 `mt_snapshot` 中的后端、地址、模型和请求契约，不受当前 MT 选择影响；版本 1／2 的 OpenRouter 任务不会自动升级。在复用现有译文、缓存或重新发布 SRT 前验证对应的当前凭据指纹。不同 MT Key 返回 `mt_account_changed`。没有 MT 快照的旧任务按保存的百炼账户及工作空间处理，不增加快照、不升级翻译策略。已按保存发布意图写入的结果只补记完成时，仍按原规则校验 ASR 账户及工作空间，不要求旧 MT Key。
 
 原始 ASR JSON 与规范化结果分别保存。完整句保存于 `subtitle-sources-v2.json` 和 SQLite `subtitle_sources`，参考译文存于 `mt_references`，最终片段及译文存于 `cues`。`normalized`、`normalized_count`、`references_planned`、`layout_planned`、`layout_round` 与对应记录同事务提交，恢复以数据库已提交状态为准。恢复校验来源及文字／词范围，复用成功结果，补齐必要阶段后提交 SRT。
 
@@ -121,19 +130,19 @@ OpenRouter 契约 2 及其百炼后备首次 Ctrl+C 立即停止新请求、重�
 
 输出位于原媒体目录且源文件仍存在时，首次继续处理和实际发布前均校验完整指纹；原路径媒体变化返回 `source_changed`，须另选目录的 `--output-dir`。源文件已移走或目标在其他目录时不读取源媒体内容。恢复不修改保存的源路径、指纹、音轨或分段身份。
 
-恢复沿用 manifest 中的翻译策略 1、2 或 3，以及成功译文、参考、排版范围、轮次、设置及人工决定，仅补缺失项。未知版本返回 `cache_version`。显式 `--reflow` 使用当前策略 3 重建。
+恢复沿用 manifest 中的翻译策略 1、2、3 或 4，以及成功译文、参考、排版范围、轮次、设置及人工决定，仅补缺失项。未知版本返回 `cache_version`。显式 `--reflow` 按当前后端重建：OpenRouter 使用策略 4，其他后端使用策略 3。
 
 `display_timing_version` 为独立的显示策略整数版本，显式支持 `0`、`1`、`2`：缺失或 `0` 沿用旧渲染，新任务、`--reflow` 及 `--retime` 使用 `2`；未知版本返回 `cache_version`。普通 `--resume` 沿保存版本执行，v0／v1 算法及发布字节保持不变。最终排版完成后，从原始片段生成独立显示区间，保留来源、词时间和缓存身份。非零版本的 `display_timing_adjustments` 与发布意图、预期 SHA 同事务保存，待发布恢复时按已保存版本重新计算并核对摘要及字节，已准备的 v1 校时也可恢复；已匹配保存意图的目标直接补记完成。
 
-新任务及成功准备的 `--reflow` 保存 `execution_snapshot`。带快照的未完成任务在复用翻译缓存、云端请求及重新发布前核对提示词、响应恢复和上下文版本，不受支持时返回 `cache_version`，需要显式 `--reflow`。`context_version` 支持 `0` 与 `1`，窗口规则见下文；缺少此字段或完全无快照时按版本 `0` 恢复，保留原快照形态。无快照的旧任务沿用原翻译策略。已按保存发布意图写入的结果可补记完成；重排准备失败保留原快照。线程数和轮询等待使用当前运行设置。
+新任务及成功准备的 `--reflow` 保存 `execution_snapshot`。带快照的未完成任务在复用翻译缓存、云端请求及重新发布前核对提示词、响应恢复和上下文版本，不受支持时返回 `cache_version`，需要显式 `--reflow`。`context_version` 支持 `0` 与 `1`，窗口规则见下文；缺少此字段或完全无快照时按版本 `0` 恢复，保留原快照形态。无快照的旧任务沿用原翻译策略；策略 4 必须有后端及执行快照。已按保存发布意图写入的结果可补记完成；重排准备失败保留原快照。线程数和轮询等待使用当前运行设置。
 
 MT 缓存键包含账号、地域、工作空间、接入方式、媒体版本、模型、文字与 MT 源语言。任务策略 1／2 使用版本 3 缓存，另含阶段、请求兼容策略标识、ASR 语种及完整实际 `tm_list` 的摘要；两者共享策略标识 1，各字段一致时可跨字幕版本 1／2 复用。
 
-任务策略 3 使用独立的版本 4 批量缓存，键包含策略、提示词版本、完整请求（含模型、实际发送的采样参数、语种、实际上下文和有序片段）、上述 ASR 账户范围、阶段及 ASR 语种，值保存完整编号到译文的映射。兼容后端另含完整 MT 身份快照（后端、地址、模型、Key 指纹及请求契约版本），不跨身份共享缓存。百炼固定模型／地址／Key 已受原 ASR 范围约束，保留旧缓存键算法，缺少 MT 快照的历史任务也保持原算法。并发和 RPM 不参与缓存身份。窗口版本变化后按实际请求匹配缓存，相同请求仍可复用。拆组恢复结果使用普通键摘要加恢复策略版本（当前为 1）的独立键，按普通缓存、恢复缓存的顺序查询，缓存内容为完整原组映射。请求内编号独立于来源句及稳定 `cue_id`。
+任务策略 3／4 使用独立的版本 4 批量缓存，键包含策略、提示词版本、完整请求（含模型、实际发送的采样参数、语种、实际上下文和有序片段）、上述 ASR 账户范围、阶段及 ASR 语种，值保存完整编号到译文的映射。兼容后端另含完整 MT 身份快照（后端、地址、模型、Key 指纹及请求契约版本），不跨身份共享缓存。结构化百炼后备也包含完整 MT 身份；旧百炼固定模型／地址／Key 已受原 ASR 范围约束，保留旧缓存键算法，缺少 MT 快照的历史任务也保持原算法。并发和 RPM 不参与缓存身份。窗口版本变化后按实际请求匹配缓存，相同请求仍可复用。策略 3 的拆组恢复结果使用普通键摘要加恢复策略版本 1 的独立键，按普通缓存、恢复缓存的顺序查询，缓存内容为完整原组映射；策略 4 只使用普通缓存。请求内编号独立于来源句及稳定 `cue_id`。
 
-各翻译阶段按完整缓存键合并同批请求。记录的 `attempts` 随实际参与的逻辑请求增加一次，包含策略 3 的修复及子组请求；HTTP 传输重试计入 `mt`。原组全部子组完成后，译文、完整缓存、完成及恢复成功计数同事务保存。失败写回全部组员并停止调度新组，其他在途成功组继续保存。取消时已完整返回的原组仍保存，部分返回的原组保留待恢复。策略 3 同组部分译文缺失时，按完整组缓存或重新请求恢复一致的分配。
+各翻译阶段按完整缓存键合并同批请求。记录的 `attempts` 随实际参与的逻辑请求增加一次，包含策略 3 的修复及子组请求；HTTP 传输重试计入 `mt`。原组全部子组完成后，译文、完整缓存、完成及恢复成功计数同事务保存。失败写回全部组员并停止调度新组，其他在途成功组继续保存。取消时已完整返回的原组仍保存，部分返回的原组保留待恢复。策略 3／4 同组部分译文缺失时，按完整组缓存或重新请求恢复一致的分配。
 
-`--reflow JOB_ID` 读取全部本地 `raw-{segment_id}.json`，沿用识别输入、偏移和 ASR 账户范围，按当前 MT 后端、模型、请求契约及排版设置重建来源，仅在需要翻译时联网。准备阶段校验当前 MT 配置及新凭据，不要求旧 MT Key；MT 身份变化后使用新身份的译文缓存或重新翻译，不重复 ASR。OpenRouter 从版本 1 重排至版本 2 时，两版完整请求及身份参与缓存键，原参考译文与字幕译文均不复用版本 1 缓存。源媒体可已移走；转写缺失或无效时保留原任务并报错。人工语种决定按完整来源对应，冲突或无法对应时返回 `reflow_review`。
+`--reflow JOB_ID` 读取全部本地 `raw-{segment_id}.json`，沿用识别输入、偏移和 ASR 账户范围，按当前 MT 后端、模型、请求契约及排版设置重建来源，仅在需要翻译时联网。准备阶段校验当前 MT 配置及新凭据，不要求旧 MT Key；MT 身份变化后使用新身份的译文缓存或重新翻译，不重复 ASR。OpenRouter 从版本 1／2 重排至版本 3 时，完整请求、策略／提示词和后端身份参与缓存键，不复用旧版本缓存。源媒体可已移走；转写缺失或无效时保留原任务并报错。人工语种决定按完整来源对应，冲突或无法对应时返回 `reflow_review`。
 
 重排先保存 `.build/reflow/{job_id}/{时间标识}.json` 本机任务快照，含原 manifest、来源、字幕、参考译文及计数。新来源另存 `subtitle-sources-v2-reflow-{时间标识}.json`；来源、片段、参考阶段重置、新 MT 快照、恢复标记和输出位置在同一 SQLite 事务提交。目标已存在时使用本次 `--overwrite` 参数。准备失败保留原任务；翻译失败保存可恢复进度，`--resume` 沿新 MT 快照继续。SRT 在翻译完成后备份并原子替换。快照和转写均属于本机私有数据。
 
@@ -183,19 +192,19 @@ v2 在生成布局后、每轮字幕翻译前及布局重分片提交前执行�
 
 ## 上下文与输入预算
 
-先为完整 ASR 句生成排版参考。参考和字幕均校验源句、词／文字范围、时间与语种；整句字幕复用对应的单条参考译文，复用结果与 `mt_reference_reused` 计数同事务保存。所有译文参与最终排版检查。
+策略 1／2／3 先为完整 ASR 句生成排版参考。参考和字幕均校验源句、词／文字范围、时间与语种；整句字幕复用对应的单条参考译文，复用结果与 `mt_reference_reused` 计数同事务保存。策略 4 直接切分原文并联合翻译，不创建参考。所有最终译文参与排版检查。
 
 邻句须具有一致 ASR 语种、翻译决定、MT 源语言及人工确认状态；遇到不兼容项立即停止该方向扩展。未知语种且未人工指定 MT 语言时不扩展邻句。
 
-策略 3 的 `context_version: 1` 从目标完整句向前、向后各扩展最多 12 句，候选句与目标句最近边界的时间距离最多 30000ms，扩展路径上的相邻句间隔最多 15000ms，阈值均包含等号。候选句按时间距离、句子距离、来源位置排序。`context_version: 0` 及策略 1／2 使用前后各最多两句、路径间隔不超过 5000ms 的窗口。
+策略 3／4 的 `context_version: 1` 从目标完整句向前、向后各扩展最多 12 句，候选句与目标句最近边界的时间距离最多 30000ms，扩展路径上的相邻句间隔最多 15000ms，阈值均包含等号。候选句按时间距离、句子距离、来源位置排序。`context_version: 0` 及策略 1／2 使用前后各最多两句、路径间隔不超过 5000ms 的窗口。
 
-策略 3 的参考与片段翻译均使用原文上下文。同一来源句的片段联合翻译，超预算时按连续片段分组，同句剩余片段优先于邻句作为上下文。排版追加拆分时，在同一事务清除受影响来源句全部片段译文，重新联合翻译。
+策略 3 的参考与片段翻译、策略 4 的片段翻译均使用原文上下文。同一来源句的片段联合翻译，超预算时按连续片段分组，同句剩余片段优先于邻句作为上下文。排版追加拆分时，在同一事务清除受影响来源句全部片段译文，重新联合翻译。
 
-失败子组优先以原组内未参与本次请求的片段作为上下文，按片段距离排列，再追加原有上下文；相同位置与文字的条目去重。超预算从末尾低优先级条目起整条裁剪，每次发送前均检查包含修复提示的完整 6000 输入预算。
+策略 3 的失败子组优先以原组内未参与本次请求的片段作为上下文，按片段距离排列，再追加原有上下文；相同位置与文字的条目去重。超预算从末尾低优先级条目起整条裁剪，每次发送前均检查包含修复提示的完整 6000 输入预算。策略 4 不创建失败子组。
 
 策略 1／2 的片段使用固定参考译文构建 `tm_list`，优先所属整句，再取邻句；上下文为空且片段与参考单元范围完全匹配时也可复用参考。
 
-本地输入预算为 6000：策略 3 按完整请求 JSON 的 UTF-8 字节数加 512 模板余量估算，包含修复提示；策略 1／2 按 `messages` 与实际 `translation_options` 加同等余量估算。上下文按完整条目裁剪，策略 3 优先保留连续片段组。单片超限只按可靠词时间及完整词边界拆分，无法安全拆分则保存 `mt_input_budget` 错误及恢复进度。
+本地输入预算为 6000：策略 3／4 按完整请求 JSON 的 UTF-8 字节数加 512 模板余量估算，策略 3 另包含修复提示；策略 1／2 按 `messages` 与实际 `translation_options` 加同等余量估算。上下文按完整条目裁剪，策略 3／4 优先保留连续片段组。单片超限只按可靠词时间及完整词边界拆分，无法安全拆分则保存 `mt_input_budget` 错误及恢复进度。
 
 ## 报告字段
 
@@ -230,4 +239,4 @@ HTTP、MT 和上传在发送前检查取消；已登记尝试及占用额度保�
 
 OpenRouter 运行诊断通过独立回调追加至同一 `.build/mt-diagnostics/{job_id}.jsonl`，`kind` 为 `runtime_request`、`runtime_wait`、`runtime_quota` 或 `runtime_drain`；不计入 `mt_invalid_response`／`mt_split`。仅记录安全分类、尝试序号、HTTP 状态、请求耗时、共享／限速等待、是否截止终止及收尾丢弃数；额度事件仅含上述整数、本地可用余量及 UTC 观察时间。不保留账号其他字段、上游消息、原始错误码或正文。报告通过状态和静态错误码区分额度停止与用户取消，`timings` 另含 `mt_shared_wait_seconds` 和 `mt_pacing_wait_seconds`。
 
-后备诊断另有 `runtime_fallback`／`runtime_cache`，附本地 32 位十六进制 `run_id`、64 位原组标识、实际 `backend:primary|fallback`、`provider:openrouter|bailian|openai_compatible` 及白名单切换原因。格式事件也附运行和后端归属；HTTP 接收成功与完整译文提交分开计数。普通报告的 `mt_fallback` 仅含启用状态、后备提供者与模型，不输出后备地址、指纹或私有快照路径。
+后备诊断另有 `runtime_fallback`／`runtime_commit`，附本地 32 位十六进制 `run_id`、64 位原组标识、实际 `backend:primary|fallback`、`provider:openrouter|bailian|openai_compatible` 及白名单切换原因。格式和运行事件另含安全模型标识、请求版本与阶段；实际路由 `actual_model` 仅保留格式受限且不含 URL／凭据形式的标识。`runtime_commit` 在完整组事务提交后记录组员数，`cached` 表示是否来自缓存；HTTP 接收成功与完整译文提交分开计数。普通报告的 `mt_fallback` 仅含启用状态、后备提供者与模型，不输出后备地址、指纹或私有快照路径。

@@ -19,7 +19,7 @@ from .common import (API_ROOTS, ASR_MODEL, MAX_UPLOAD_BYTES, MT_MODEL, Submissio
 from .mt import (BatchTranslation, BatchValidationError, batch_payload, parse_batch_response,
                  recovery_context, validate_batch_input)
 from .mt_diagnostics import batch_response_metadata, safe_request_id
-from .mt_backend import MTBackend, bailian_mt_url, key_fingerprint
+from .mt_backend import MTBackend, bailian_mt_url, key_fingerprint, request_contract
 
 
 # Beijing qwen-mt-flash: 60 RPM. One extra second allows for network arrival jitter.
@@ -195,12 +195,11 @@ def mt_pacer(backend, *, rpm=0):
 class Http:
     """No automatic retries of ASR POST. No response bodies or URLs in logs."""
     def __init__(self, cancel: threading.Event, count=lambda name: None, attempts=4, progress=lambda *args: None, pacer=None,
-                 *, safe_errors=False, request_version=1):
+                 *, safe_errors=False):
         self.cancel, self.count, self.attempts = cancel, count, attempts
         self.progress = progress
         self.pacer = pacer or RequestPacer()
         self.safe_errors = safe_errors
-        self.request_version = request_version
 
     def request(self, method, url, *, name="http", headers=None, retry=True, **kwargs):
         for attempt in range(self.attempts if retry else 1):
@@ -310,6 +309,8 @@ class BatchTranslator:
                         on_event=lambda event: None):
         validate_batch_input(fragments, source_lang, context, request_options=self.mt_options)
         recovered = False
+        structured = request_contract(self.mt_options.get('provider', 'bailian'),
+                                      self.mt_options.get('request_version', 1)).structured_mapping
 
         def run(start, end, depth):
             nonlocal recovered
@@ -317,7 +318,7 @@ class BatchTranslator:
             targets = fragments[start:end]
             background = context if start == 0 and end == len(fragments) else recovery_context(
                 fragments, start, end, source_lang, context, request_options=self.mt_options)
-            for repair in [False, True]:
+            for repair in ([False] if structured else [False, True]):
                 check_cancel(self.http.cancel)
                 on_attempt(tuple(range(start, end)))
                 metadata = {}
@@ -345,7 +346,7 @@ class BatchTranslator:
                           'fragment_start': start, 'fragment_end': end, 'repair': repair,
                           'depth': depth, 'request_id': request_id, **metadata})
             check_cancel(self.http.cancel)
-            if len(targets) == 1:
+            if structured or len(targets) == 1:
                 actual = invalid.actual_count if invalid.actual_count is not None else '未知'
                 raise ToolError(f"批量译文校验失败：{invalid}；预期 {len(targets)} 项，实际 {actual} 项，"
                                 f"原组片段 [{start},{end})；整组保留待恢复。", 'mt_batch_invalid', request_id)
@@ -507,7 +508,7 @@ class OpenAICompatible(BatchTranslator):
         self.mt_url = backend.base_url + "/chat/completions"
         self.mt_options = backend.request_options()
         self.headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-        if backend.request_version == 2:
+        if backend.contract.bounded_runtime:
             from .mt_control import MTControl
             from .mt_runtime import BoundedMTHttp
             self.http = BoundedMTHttp(backend, control if control is not None else MTControl(cancel), count,
@@ -515,7 +516,7 @@ class OpenAICompatible(BatchTranslator):
                                       stop_on_failure=stop_on_failure)
         else:
             self.http = Http(cancel, count, progress=progress, pacer=mt_pacer(backend, rpm=rpm),
-                             safe_errors=True, request_version=backend.request_version)
+                             safe_errors=True)
         self.cc = OpenCC("t2s")
 
 

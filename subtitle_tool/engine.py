@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .api import Bailian, BoundedBailianMT, OpenAICompatible, upload_limit
 from .common import (DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION,
-                     TRANSLATION_STRATEGY_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
+                     MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
                      SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key)
 from .config import Config, decrypt_legacy
 from .media import EXTRACT_RECIPE_VERSION, Media
@@ -256,10 +256,11 @@ class Engine:
                      "backup", "cue_count", "output_settings", "no_speech"]:
             manifest.pop(name, None)
         normalized_file = f"subtitle-sources-v{SUBTITLE_VERSION}-reflow-{token}.json"
-        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+        strategy = mt_backend.translation_strategy_version
+        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=strategy,
                         display_timing_version=DISPLAY_TIMING_VERSION,
                         mt_snapshot=mt_backend.snapshot(),
-                        execution_snapshot=current_execution_snapshot(),
+                        execution_snapshot=current_execution_snapshot(strategy),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
                                            ["zh_line_width", "other_line_width", "chinese_first"]},
                         normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION, normalized_file=normalized_file,
@@ -507,7 +508,7 @@ class Engine:
             if mt_api is None:
                 options = dict(count=backend_counter('primary'), progress=cloud_progress)
                 if mt_backend.provider == "openai_compatible":
-                    self.mt_runtime_active = mt_backend.request_version == 2
+                    self.mt_runtime_active = mt_backend.contract.bounded_runtime
                     mt_api = OpenAICompatible(mt_key, mt_backend, self.cancel, **options, rpm=self.config.mt_rpm(),
                         control=self.fallback_groups.primary_control if self.fallback_groups else self.mt_control,
                         runtime_event=runtime_events('primary'), stop_on_failure=self.fallback_groups is None)
@@ -534,9 +535,10 @@ class Engine:
             def event(info):
                 info = {**info, 'run_id': self.run_id, 'backend': role,
                         'provider': (fallback_backend if role == 'fallback' else mt_backend).diagnostic_provider,
+                        'model': (fallback_backend if role == 'fallback' else mt_backend).model,
+                        'request_version': (fallback_backend if role == 'fallback' else mt_backend).request_version,
+                        'stage': getattr(self.mt_context, 'stage', ''),
                         'group_key': getattr(self.mt_context, 'group_key', '')}
-                if self.fallback_groups and info.get('category') == 'success':
-                    info['category'] = 'response_received'
                 diagnostics.write_runtime(info)
                 for field, counter in [('shared_wait_ms', 'mt_shared_wait_ms'),
                                        ('pacing_wait_ms', 'mt_pacing_wait_ms'), ('discarded', 'mt_drain_discarded')]:
@@ -917,41 +919,44 @@ class Engine:
             plan_display_timing(cues, version=2)
 
     def process_subtitles(self, job_id, manifest, settings, scope, client, stage, *, context_version):
-        joint = manifest['translation_strategy_version'] == 3
+        joint = manifest['translation_strategy_version'] in {3, 4}
+        direct = manifest['translation_strategy_version'] == 4
         request_options = saved_mt(manifest).request_options()
         sources = self.store.sources(job_id)
         if not sources:
             raise ToolError("新任务缺少完整句来源记录，不能改用旧断句规则恢复。", "cache_mismatch")
-        if not manifest.get("references_planned"):
-            references = plan_reference_units(sources, strategy_version=manifest['translation_strategy_version'],
-                                              request_options=request_options)
-            candidate = copy.deepcopy(manifest)
-            candidate["references_planned"] = True
-            self.commit_local(job_id, manifest, candidate, self.store.save_layout,
-                              self.store.cues(job_id), references=references)
-        stage("reference_translating")
-        references = self.store.references(job_id)
         source_ids = {s["sentence_id"]: s for s in sources}
-        for reference in references:
-            if reference.get("sentence_id") not in source_ids:
-                raise ToolError("参考翻译缺少对应完整句来源。", "cache_mismatch")
-            validate_fragment(source_ids[reference["sentence_id"]], reference, reference_stage=True)
-        if joint:
-            self.translate_batches(job_id, references, sources, scope, client,
-                                   context_version=context_version, reference_stage=True)
-        else:
-            self.translate(job_id, references, scope, client, stage_name="reference_translating",
-                           reference_stage=True, strategy_version=manifest["translation_strategy_version"])
-        references = self.store.references(job_id)
-        sources = reference_sources(sources, references)
-        source_positions = {source["sentence_id"]: i for i, source in enumerate(sources)}
+        references = []
+        if not direct:
+            if not manifest.get("references_planned"):
+                references = plan_reference_units(sources, strategy_version=manifest['translation_strategy_version'],
+                                                  request_options=request_options)
+                candidate = copy.deepcopy(manifest)
+                candidate["references_planned"] = True
+                self.commit_local(job_id, manifest, candidate, self.store.save_layout,
+                                  self.store.cues(job_id), references=references)
+            stage("reference_translating")
+            references = self.store.references(job_id)
+            for reference in references:
+                if reference.get("sentence_id") not in source_ids:
+                    raise ToolError("参考翻译缺少对应完整句来源。", "cache_mismatch")
+                validate_fragment(source_ids[reference["sentence_id"]], reference, reference_stage=True)
+            if joint:
+                self.translate_batches(job_id, references, sources, scope, client,
+                                       context_version=context_version, reference_stage=True)
+            else:
+                self.translate(job_id, references, scope, client, stage_name="reference_translating",
+                               reference_stage=True, strategy_version=manifest["translation_strategy_version"])
+            references = self.store.references(job_id)
+            sources = reference_sources(sources, references)
+        source_positions = {} if joint else {source["sentence_id"]: i for i, source in enumerate(sources)}
         # Both references and cues are validated against the same source and word ranges.
         by_range = {(r["sentence_id"], r["word_start"], r["word_end"]): r for r in references}
         if not manifest.get("layout_planned"):
             stage("layout_adjusting", 0, MAX_LAYOUT_ROUNDS)
             cues = []
             for source in sources:
-                parts = plan_fragments(source, settings, reference=source["reference"])
+                parts = plan_fragments(source, settings, reference=source.get("reference", ""))
                 if joint and source['decision'] == 'translate':
                     parts = split_mt_units(source, parts, request_options=request_options)
                 cues.extend(parts)
@@ -973,7 +978,7 @@ class Engine:
                 if cue.get("sentence_id") not in source_ids:
                     raise ToolError("字幕片段缺少对应完整句来源。", "cache_mismatch")
                 validate_fragment(source_ids[cue["sentence_id"]], cue)
-                if cue["decision"] != "translate" or cue["translated"]:
+                if cue["decision"] != "translate" or cue["translated"] or direct:
                     continue
                 source = source_ids[cue["sentence_id"]]
                 exact = by_range.get((cue["sentence_id"], cue["word_start"], cue["word_end"]))
@@ -983,7 +988,7 @@ class Engine:
                 if exact and not context and (not joint or whole):
                     self.store.translation_update(job_id, [cue["cue_id"]], translated=exact["translated"],
                                                   counts={"mt_reference_reused": 1}, origin=exact.get('mt_origin'))
-                else:
+                elif not joint:
                     contexts[cue["cue_id"]] = context
             if joint:
                 self.translate_batches(job_id, self.store.cues(job_id), sources, scope, client,
@@ -1051,8 +1056,19 @@ class Engine:
                 key = batch_cache_key([c['text'] for c in members], members[0]['source_lang'], **scope,
                                       context=context, stage=cache_stage, asr_language=members[0]['language'].lower().strip(),
                                       request_options=request_options)
-                recovery_key = batch_recovery_cache_key(key)
-                groups.setdefault(key, ([], context, recovery_key))[0].append(members)
+                groups.setdefault(key, ([], context))[0].append(members)
+
+        def cached_result(key, batches, actual_backend):
+            cached = self.store.cache_get(key)
+            recovered = cached is None and not actual_backend.contract.structured_mapping
+            if recovered:
+                cached = self.store.cache_get(batch_recovery_cache_key(key))
+            if cached is None:
+                return None, False
+            try:
+                return parse_batch_translation(cached, [c['text'] for c in batches[0]]), recovered
+            except (ValueError, TypeError) as error:
+                raise ToolError("批量翻译缓存结构无效，未复用。", "cache_mismatch") from error
 
         def save_result(batches, key, translated, *, cached=False, recovered=False, origin='primary'):
             values = {cue['cue_id']: translated[str(i)] for batch in batches for i, cue in enumerate(batch)}
@@ -1066,32 +1082,27 @@ class Engine:
             self.store.translation_batch_update(job_id, values, reference_stage=reference_stage,
                 cache_key=None if cached else key, cache_value=None if cached else batch_cache_value(translated),
                 counts=counts, origin=origin if policy is not None else None)
-            if policy is not None and cached:
-                diagnostics.write_runtime({'kind': 'runtime_cache', 'category': 'cache_hit', 'run_id': self.run_id,
-                    'group_key': key, 'backend': origin,
-                    'provider': (self.fallback_backend if origin == 'fallback' else backend).diagnostic_provider})
+            actual_backend = self.fallback_backend if origin == 'fallback' else backend
+            diagnostics.write_runtime({'kind': 'runtime_commit', 'category': 'group_committed', 'run_id': self.run_id,
+                'group_key': key, 'backend': origin, 'provider': actual_backend.diagnostic_provider,
+                'model': actual_backend.model, 'request_version': actual_backend.request_version,
+                'stage': cache_stage, 'committed_count': len(values), 'cached': cached})
 
-        for key, (batches, context, recovery_key) in groups.items():
-            cached = self.store.cache_get(key)
-            recovered = cached is None
-            if recovered:
-                cached = self.store.cache_get(recovery_key)
-            if cached is not None:
-                try:
-                    translated = parse_batch_translation(cached, [c['text'] for c in batches[0]])
-                except (ValueError, TypeError) as error:
-                    raise ToolError("批量翻译缓存结构无效，未复用。", "cache_mismatch") from error
+        for key, (batches, context) in groups.items():
+            translated, recovered = cached_result(key, batches, backend)
+            if translated is not None:
                 save_result(batches, key, translated, cached=True, recovered=recovered)
                 done += sum(not c['translated'] for batch in batches for c in batch)
             else:
-                pending.append((batches, key, context, recovery_key))
+                pending.append((batches, key, context))
         self.progress(job_id, stage_name, done, len(cues))
         if not pending:
             return
         cloud = client()
 
-        def translate_group(batches, key, context, recovery_key):
+        def translate_group(batches, key, context):
             self.mt_context.group_key = key
+            self.mt_context.stage = cache_stage
             self.mt_context.attempts = {}
             role = 'primary'
             def attempt(indices):
@@ -1103,12 +1114,14 @@ class Engine:
                 diagnostics.write({**info, 'stage': cache_stage, 'group_key': key, 'run_id': self.run_id,
                     'backend': role,
                     'provider': (self.fallback_backend if role == 'fallback' else backend).diagnostic_provider,
+                    'model': (self.fallback_backend if role == 'fallback' else backend).model,
+                    'request_version': (self.fallback_backend if role == 'fallback' else backend).request_version,
                     'begin_ms': members[info['fragment_start']]['begin_ms'],
                     'end_ms': members[info['fragment_end'] - 1]['end_ms']})
                 self.store.count(job_id, 'mt_invalid_response' if info['kind'] == 'invalid_response' else 'mt_split')
                 if info['kind'] == 'split':
                     self.progress(job_id, 'mt_split', info['fragment_end'] - info['fragment_start'], info['depth'])
-            def invoke(service, normal_key, recovered_key):
+            def invoke(service, key):
                 try:
                     result = service.translate_batch([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
                                                      context=context, on_attempt=attempt, on_event=event)
@@ -1120,7 +1133,7 @@ class Engine:
                 with self.mt_control.lock:
                     if hasattr(service.http, 'ensure_result'):
                         service.http.ensure_result()
-                    save_result(batches, recovered_key if result.recovered else normal_key,
+                    save_result(batches, batch_recovery_cache_key(key) if result.recovered else key,
                                 result.translations, recovered=result.recovered, origin=role)
 
             def fallback():
@@ -1132,39 +1145,33 @@ class Engine:
                 fallback_key = batch_cache_key([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
                     **fallback_scope, context=context, stage=cache_stage, asr_language=batches[0][0]['language'].lower().strip(),
                     request_options=backend.request_options())
-                recovery = batch_recovery_cache_key(fallback_key)
-                cached = self.store.cache_get(fallback_key)
-                recovered = cached is None
-                if recovered:
-                    cached = self.store.cache_get(recovery)
-                if cached is not None:
-                    try:
-                        translated = parse_batch_translation(cached, [c['text'] for c in batches[0]])
-                    except (ValueError, TypeError) as error:
-                        raise ToolError('百炼后备缓存结构无效，未复用。', 'cache_mismatch') from error
+                translated, recovered = cached_result(fallback_key, batches, backend)
+                if translated is not None:
                     with self.mt_control.lock:
                         self.mt_control.check_inflight()
                         save_result(batches, fallback_key, translated, cached=True, recovered=recovered, origin='fallback')
                     return
-                invoke(self.fallback_client(), fallback_key, recovery)
+                invoke(self.fallback_client(), fallback_key)
 
             def switched(error):
                 reason = {'mt_batch_invalid': 'format_exhausted', 'mt_quota_exhausted': 'quota_exhausted',
                           'mt_retry_after': 'retry_after'}.get(error.code, 'transient_exhausted')
                 info = {'reason': reason, 'category': getattr(error, 'category', reason),
-                        'attempt': getattr(error, 'attempts', 0)}
+                        'attempt': getattr(error, 'attempts', 0), 'quota_source': getattr(error, 'quota_source', '')}
+                if reason == 'quota_exhausted' and info['quota_source'] == 'local_ledger':
+                    info['reason'] = 'quota_local_empty'
                 self.store.count(job_id, 'mt_fallback_switch')
                 self.progress(job_id, 'mt_fallback', info, None)
                 diagnostics.write_runtime({'kind': 'runtime_fallback', **info, 'run_id': self.run_id,
                                            'group_key': key, 'backend': 'fallback', 'provider': 'bailian'})
 
             if self.fallback_groups:
-                self.fallback_groups.run(lambda: invoke(cloud, key, recovery_key), fallback, switched)
+                self.fallback_groups.run(lambda: invoke(cloud, key), fallback, switched)
             else:
-                invoke(cloud, key, recovery_key)
+                invoke(cloud, key)
 
-        tasks = [([cue for batch in batches for cue in batch], partial(translate_group, batches, key, context, recovery_key))
-                 for batches, key, context, recovery_key in pending]
+        tasks = [([cue for batch in batches for cue in batch], partial(translate_group, batches, key, context))
+                 for batches, key, context in pending]
         self._translate_pending(job_id, tasks, stage_name=stage_name, reference_stage=reference_stage,
                                 done=done, total=len(cues))
 

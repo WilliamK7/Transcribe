@@ -44,7 +44,7 @@ def parser():
     result.add_argument("--output-dir", type=Path, help="显式选择输出目录，默认视频同目录")
     result.add_argument("--non-interactive", action="store_true", help="不询问；遇歧义持久化待复核状态并非零退出")
     result.add_argument('--mt-fallback', choices=['none', 'bailian'],
-                        help='OpenRouter 契约 2 的百炼后备；新任务及恢复默认启用，百炼可能产生费用')
+                        help='OpenRouter 的百炼后备；新任务及恢复默认启用，百炼可能产生费用')
     result.add_argument("--report", type=Path, help="保存结构化结果，不包含 Key、上传链接或转写文字")
     return result
 
@@ -84,8 +84,9 @@ class Progress:
             elif stage == "mt_service_wait":
                 message = f"翻译服务暂不可用，共享等待 {done:.1f} 秒后先尝试一个请求"
             elif stage == 'mt_fallback':
-                reasons = {'quota_exhausted': '免费额度耗尽，本轮剩余组转百炼',
-                           'format_exhausted': '格式修复及缩组耗尽，当前原组转百炼',
+                reasons = {'quota_exhausted': '服务端观测免费额度不足，本轮剩余组转百炼',
+                           'quota_local_empty': '本地免费可用余量归零，本轮剩余组转百炼',
+                           'format_exhausted': '译文结构或覆盖校验失败，当前原组转百炼',
                            'retry_after': '要求等待超过 300 秒，当前组转百炼'}
                 failure = {'deadline': '仍超时', 'timeout': '上游仍超时', 'network': '网络连接仍失败',
                            'rate_limit_exceeded': '仍被限流', 'provider_overloaded': '上游仍过载',
@@ -366,7 +367,8 @@ def main(argv=None):
             account = hashlib.sha256(key.encode()).hexdigest()
             mt = configured_mt(config, {"region": "beijing", "workspace_id": workspace, "access_mode": "workspace"}, asr_key=key)
             policy = fallback_policy({'region': 'beijing', 'workspace_id': workspace, 'access_mode': 'workspace',
-                'account': account, 'translation_strategy_version': 3, 'mt_snapshot': mt.snapshot()}, args.mt_fallback)
+                'account': account, 'translation_strategy_version': mt.translation_strategy_version,
+                'mt_snapshot': mt.snapshot()}, args.mt_fallback)
             for source in args.files:
                 job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
                                        workspace_id=workspace, account=account, settings=config.settings, mt_snapshot=mt.snapshot(),

@@ -172,8 +172,10 @@ def validate_normalized(manifest, cache, sources, cues, references):
             if manifest.get("references_planned") and source["decision"] == "translate":
                 validate_unit_coverage(source, sorted(ref_groups.get(source["sentence_id"], []), key=lambda c: c["char_start"]),
                                        reference_stage=True)
-        if (references and not manifest.get("references_planned") or
-                manifest.get("layout_planned") and not manifest.get("references_planned")):
+        direct = manifest.get('translation_strategy_version') == 4
+        if (direct and (references or manifest.get('references_planned')) or
+                references and not manifest.get("references_planned") or
+                not direct and manifest.get("layout_planned") and not manifest.get("references_planned")):
             raise mismatch()
     except (KeyError, ValueError, TypeError, IndexError) as error:
         raise mismatch() from error

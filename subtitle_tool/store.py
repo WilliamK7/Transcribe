@@ -107,13 +107,16 @@ class Store:
                         "overwrite": bool(overwrite), "segments": [], "warnings": []}
             if mt_snapshot is not None:
                 manifest["mt_snapshot"] = mt_snapshot
-                saved_mt({**manifest, "translation_strategy_version": TRANSLATION_STRATEGY_VERSION})
+            strategy = (4 if mt_snapshot is not None and mt_snapshot.get('request_version') == 3
+                        else TRANSLATION_STRATEGY_VERSION)
+            if mt_snapshot is not None:
+                saved_mt({**manifest, "translation_strategy_version": strategy})
             if mt_fallback_policy is not None:
                 manifest['mt_fallback_policy'] = mt_fallback_policy
             settings = settings or Settings()
-            manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=TRANSLATION_STRATEGY_VERSION,
+            manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=strategy,
                             display_timing_version=DISPLAY_TIMING_VERSION,
-                            execution_snapshot=current_execution_snapshot(),
+                            execution_snapshot=current_execution_snapshot(strategy),
                             subtitle_settings={k: getattr(settings, k) for k in
                                                ["zh_line_width", "other_line_width", "chinese_first"]})
             self.db.execute("INSERT INTO jobs(id,source,output,output_key,state,manifest,created,updated) "

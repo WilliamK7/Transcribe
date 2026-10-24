@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from .api import mt_pacer, retry_after_seconds
 from .common import ToolError
-from .mt_backend import OPENROUTER_BASE_URL, normalize_mt_url
+from .mt_backend import normalize_mt_url
 from .mt_transport import HTTPReply, ProcessTransport, TransportError
 
 
@@ -25,22 +25,25 @@ PERMANENT_TYPES = {
 }
 RUNTIME_CATEGORIES = TRANSIENT_TYPES | PERMANENT_TYPES | {
     'network', 'deadline', 'transport', 'response_too_large', 'http_transient', 'http_permanent',
-    'service_unknown', 'success', 'response_structure', 'shared_wait', 'quota_observed',
+    'service_unknown', 'response_structure', 'shared_wait', 'quota_observed',
     'quota_refresh_failed', 'quota_unknown', 'quota_exhausted', 'drain_discard', 'retry_after',
-    'cancelled', 'drain_stopped', 'format_exhausted', 'transient_exhausted', 'response_received', 'cache_hit',
+    'cancelled', 'drain_stopped', 'format_exhausted', 'transient_exhausted', 'response_received', 'group_committed',
 }
 
 
 class ServiceError(ToolError):
-    def __init__(self, category, status=None, retryable=False, *, code=None, provider='openrouter'):
+    def __init__(self, category, status=None, retryable=False, *, code=None, provider='openrouter', quota_source=None):
         self.category, self.status, self.retryable = category, status, retryable
+        self.quota_source = quota_source
         hint = {
             'deadline': 'OpenRouter 请求总时限耗尽，进度已保存；可显式恢复。',
             'network': 'OpenRouter 网络连接或读取失败，进度已保存。',
             'transport': 'OpenRouter 网络子进程异常，进度已保存。',
             'response_too_large': 'OpenRouter 响应超过 4 MiB 上限，进度已保存。',
             'retry_after': 'OpenRouter 要求等待超过 300 秒，已结束本轮并保存进度。',
-            'quota_exhausted': 'OpenRouter 免费额度不足，已保存进度；请稍后显式 --resume。',
+            'quota_exhausted': ('OpenRouter 本地免费可用余量归零，已保存进度；请稍后显式 --resume。'
+                                if quota_source == 'local_ledger' else
+                                'OpenRouter 服务端观测免费额度不足，已保存进度；请稍后显式 --resume。'),
             'quota_unknown': '无法确认 OpenRouter 免费额度，已保存进度；请稍后显式 --resume。',
             'authentication': 'OpenRouter 翻译凭据被拒绝，进度已保存。',
             'permission_denied': 'OpenRouter 翻译权限被拒绝，进度已保存。',
@@ -299,7 +302,7 @@ class FreeQuota:
                     self.trusted.add(control)
                 trusted = self.day == day and control in self.trusted
                 if trusted and self.remaining <= 0:
-                    raise ServiceError('quota_exhausted', code='mt_quota_exhausted')
+                    raise self.exhaustion()
                 if self.refreshing:
                     if trusted:
                         return
@@ -348,7 +351,14 @@ class FreeQuota:
             if self.day != self.utcnow().date() or control not in self.trusted:
                 raise ServiceError('quota_unknown', code='mt_quota_unknown')
             if self.remaining <= 0:
-                raise ServiceError('quota_exhausted', code='mt_quota_exhausted')
+                raise self.exhaustion()
+
+    def exhaustion(self):
+        observed = self.observation or {}
+        remote_empty = (observed.get('remaining') == 0 or
+                        'limit' in observed and observed['used'] >= observed['limit'])
+        return ServiceError('quota_exhausted', code='mt_quota_exhausted',
+                            quota_source='server_observation' if remote_empty else 'local_ledger')
 
     def try_reserve(self, control):
         """No I/O or waits: combine quota admission with the shared RPM gate."""
@@ -358,7 +368,7 @@ class FreeQuota:
                     not self.refreshing and (self.last_attempt is None or self.clock() - self.last_attempt >= 30)):
                 return False
             if self.remaining <= 0:
-                raise ServiceError('quota_exhausted', code='mt_quota_exhausted')
+                raise self.exhaustion()
             self.remaining -= 1
             self.inflight += 1
             self.reservations += 1
@@ -407,8 +417,7 @@ class BoundedMTHttp:
         self.transport = transport if transport is not None else ProcessTransport()
         self.pacer = pacer if pacer is not None else mt_pacer(backend, rpm=rpm)
         self.recovery = recovery if recovery is not None else shared_recovery
-        self.quota = (quota if quota is not None else shared_quota) if (
-            backend.model == 'openrouter/free' or backend.model.endswith(':free')) else None
+        self.quota = (quota if quota is not None else shared_quota) if backend.free_quota else None
         self.stop_on_failure = stop_on_failure
 
     def ensure_result(self):
@@ -459,9 +468,7 @@ class BoundedMTHttp:
                     except (ValueError, RecursionError):
                         pass
                     error = (bailian_failure(status, body) if self.backend.provider == 'bailian' else
-                             service_failure(status, body, free_router=(
-                                 self.backend.provider == 'openai_compatible' and self.backend.base_url == OPENROUTER_BASE_URL
-                                 and self.backend.request_version == 2 and self.backend.model == 'openrouter/free')))
+                             service_failure(status, body, free_router=self.backend.free_router))
                 except TransportError as failure:
                     status = None
                     error = ServiceError(failure.category, retryable=failure.retryable,
@@ -473,8 +480,9 @@ class BoundedMTHttp:
                         'attempt': attempt, 'duration_ms': round((time.monotonic() - started) * 1000),
                         'retryable': False, 'deadline_terminated': False})
                     raise
-                self.on_event({'kind': 'runtime_request', 'category': error.category if error else 'success',
+                self.on_event({'kind': 'runtime_request', 'category': error.category if error else 'response_received',
                     'attempt': attempt, 'status': status, 'duration_ms': round((time.monotonic() - started) * 1000),
+                    'actual_model': body.get('model') if isinstance(body, dict) else None,
                     'retryable': bool(error and error.retryable), 'deadline_terminated': bool(error and error.category == 'deadline')})
                 if error is None:
                     self.recovery.success(ticket)
@@ -503,7 +511,8 @@ class BoundedMTHttp:
                 if self.stop_on_failure and error.code not in {'response_schema', 'cancelled'}:
                     self.control.stop(error)
                 if isinstance(error, ServiceError) and error.category in {'quota_unknown', 'quota_exhausted'}:
-                    self.on_event({'kind': 'runtime_quota', 'category': error.category})
+                    self.on_event({'kind': 'runtime_quota', 'category': error.category,
+                                   'quota_source': error.quota_source})
                 raise
             finally:
                 if ticket is not None:

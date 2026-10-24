@@ -457,8 +457,7 @@ class FallbackTests(SavedResultFixture):
         self.assertEqual(self.run_backend(lambda p, items, kw: quota(0) if p == 'quota' else self.success(items)), 'completed')
         fallback_keys = {row[0] for row in self.store.db.execute('SELECT key FROM mt_cache')}
         self.assertTrue(fallback_keys)
-        # Reflow creates fresh records using the same primary wire contract and cache scope.
-        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
+        self.reset_for_legacy_cache_recovery()
         self.resources.clear()
         self.calls.clear()
         get = self.store.cache_get
@@ -470,12 +469,20 @@ class FallbackTests(SavedResultFixture):
     def test_primary_failure_reuses_existing_backup_cache_without_http(self):
         self.install()
         self.assertEqual(self.run_backend(lambda p, items, kw: quota(0) if p == 'quota' else self.success(items)), 'completed')
-        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
+        self.reset_for_legacy_cache_recovery()
         self.resources.clear()
         self.calls.clear()
         self.assertEqual(self.run_backend(lambda p, items, kw: quota(0) if p == 'quota' else self.success(items)), 'completed')
         self.assertEqual(self.calls, [])
         self.assertTrue(self.store.counts(self.job_id)['mt_fallback_cache_hit'])
+
+    def reset_for_legacy_cache_recovery(self):
+        # An old resume keeps its contract. Explicit reflow now upgrades to a distinct cache identity.
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['overwrite'] = True
+        self.store.save_layout(self.job_id, [{**c, 'translated': ''} for c in self.store.cues(self.job_id)], manifest,
+                               references=[{**r, 'translated': ''} for r in self.store.references(self.job_id)])
+        self.store.update(self.job_id, 'queued')
 
     def test_disabling_fallback_restores_stop_on_primary_exhaustion(self):
         self.install()

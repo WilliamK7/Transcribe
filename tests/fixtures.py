@@ -98,6 +98,12 @@ class FakeService:
                 raise requests.ConnectionError()
             return response(self.raw)
         if url.endswith("/chat/completions"):
+            if len(kwargs['json']['messages']) == 2:
+                targets = json.loads(kwargs['json']['messages'][1]['content'])['targets']
+                if any(item['text'] in self.mt_failure for item in targets.values()):
+                    return response({'error': {'code': 'InvalidApiKey'}}, 401)
+                return response({'model': kwargs['json']['model'], 'choices': [{'finish_reason': 'stop', 'message': {
+                    'content': json.dumps({'translations': {key: '繁體譯文：' + item['text'] for key, item in targets.items()}})}}]})
             source = kwargs["json"]["messages"][0]["content"]
             if source.startswith('以下是仅供理解的原文上下文'):
                 data = json.loads(source.split('INPUT_JSON:\n', 1)[1])

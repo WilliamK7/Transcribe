@@ -11,8 +11,10 @@ from .media import EXTRACT_RECIPE_VERSION
 CONTEXT_VERSION = 1
 
 
-def current_execution_snapshot():
-    return dict(format_version=1, prompt_version=mt.PROMPT_VERSION, recovery_version=mt.RECOVERY_VERSION,
+def current_execution_snapshot(strategy_version=3):
+    return dict(format_version=1,
+                prompt_version=mt.STRUCTURED_PROMPT_VERSION if strategy_version == 4 else mt.PROMPT_VERSION,
+                recovery_version=mt.STRUCTURED_RECOVERY_VERSION if strategy_version == 4 else mt.RECOVERY_VERSION,
                 context_version=CONTEXT_VERSION)
 
 
@@ -62,7 +64,7 @@ def load_policy(manifest, *, verify_execution=True):
     display_timing = display_timing_version(manifest)
     layout = None
     if subtitle:
-        _version(manifest.get("translation_strategy_version"), {1, 2, 3})
+        _version(manifest.get("translation_strategy_version"), {1, 2, 3, 4})
         saved_layout = manifest.get("subtitle_settings", {})
         if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:
             raise ToolError("任务的排版快照不受支持，请用 --reflow 显式重排。", "cache_version")
@@ -81,9 +83,11 @@ def load_policy(manifest, *, verify_execution=True):
     _version(plan.get("extract_recipe_version", 1) if plan else EXTRACT_RECIPE_VERSION,
              {1, EXTRACT_RECIPE_VERSION})
     context_version = 0
+    if verify_execution and manifest.get('translation_strategy_version') == 4 and 'execution_snapshot' not in manifest:
+        raise ToolError('结构化翻译缺少执行版本，请用 --reflow。', 'cache_version')
     if verify_execution and "execution_snapshot" in manifest:
         snapshot = manifest["execution_snapshot"]
-        current = current_execution_snapshot()
+        current = current_execution_snapshot(manifest.get('translation_strategy_version', 0))
         required = set(current) - {"context_version"}
         if (not isinstance(snapshot, dict) or set(snapshot) not in (required, set(current)) or
                 any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in required)):
