@@ -74,6 +74,8 @@ class FallbackTests(SavedResultFixture):
         return HTTPReply(200, batch_response(['完整译文'] * len(items)).content)
 
     def test_four_failures_fall_back_only_this_group_and_next_group_prefers_primary(self):
+        from subtitle_tool.main import summary
+
         self.install()
         def service(provider, items, kwargs):
             if provider == 'quota':
@@ -89,6 +91,8 @@ class FallbackTests(SavedResultFixture):
         self.assertEqual(set(backup_body), {'model', 'messages', 'stream', 'temperature', 'seed'})
         self.assertEqual((backup_body['model'], backup_body['temperature'], backup_body['seed']), ('qwen-mt-flash', 0, 0))
         self.assertFalse(backup_body['stream'])
+        self.assertEqual(summary(self.store, self.job_id)['mt_fallback'],
+                         {'enabled': True, 'provider': 'bailian', 'model': 'qwen-mt-flash'})
 
     def test_fourth_primary_attempt_success_does_not_invoke_backup(self):
         self.install()
@@ -567,9 +571,17 @@ class FallbackTests(SavedResultFixture):
             def run(engine, job_id):
                 engine.store.update(job_id, 'failed', code='mocked_run')
                 return 'failed'
+            stdout, stderr = io.StringIO(), io.StringIO()
             with mock.patch.object(cli, 'Config', return_value=self.config), mock.patch.object(Engine, 'run', new=run), \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 self.assertEqual(cli.main(args), 2)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report['mt_fallback'],
+                             {'enabled': choice is None, 'provider': 'bailian', 'model': 'qwen3.8-flash'})
+            if choice is None:
+                self.assertIn('百炼后备（qwen3.8-flash）', stderr.getvalue())
+            else:
+                self.assertNotIn('已启用按组百炼后备', stderr.getvalue())
             matches = [j for j in self.store.jobs() if Path(j['source']).name == source.name]
             self.assertTrue(matches)
             job = matches[0]

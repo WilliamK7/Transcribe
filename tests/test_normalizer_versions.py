@@ -5,6 +5,7 @@ from unittest import mock
 
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
+from subtitle_tool.policy import asr_contract
 from subtitle_tool.subtitles import normalize
 from tests.fixtures import FakeService, PipelineFixture, TemporaryTest, point_sentence, result
 
@@ -33,7 +34,7 @@ class NormalizerBoundaryTests(TemporaryTest):
         for raw in [result(), {"transcripts": [{"text": "", "sentences": []}]}, result(("完整字幕。", "zh"))]:
             normalize(raw, 0, "s", duration_ms=1000)
 
-    def test_old_versions_keep_their_validation_and_v3_rejects_unknown_versions(self):
+    def test_old_versions_keep_their_validation_and_reject_unknown_versions(self):
         raw = result(("完整字幕。", "zh"))
         raw["transcripts"][0]["sentences"][0].update(begin_time=5000, end_time=6000)
         for version in [1, 2]:
@@ -44,28 +45,33 @@ class NormalizerBoundaryTests(TemporaryTest):
             normalize(raw, 0, "s", normalizer_version=99)
         self.assertEqual(caught.exception.code, "cache_version")
 
-    def test_v3_keeps_negative_global_offset_and_point_repair(self):
+    def test_saved_versions_keep_negative_global_offset_and_short_point_repair(self):
         raw = result(("完整字幕。", "zh"))
-        cues, warnings = normalize(raw, -100, "s", duration_ms=1000)
+        cues, warnings = normalize(raw, -100, "s", duration_ms=1000, normalizer_version=3)
         self.assertEqual((cues[0]["begin_ms"], cues[0]["end_ms"]), (0, 800))
         self.assertTrue(warnings)
         raw = result()
         raw["transcripts"][0]["sentences"].append(point_sentence(900))
-        cues, _ = normalize(raw, 500, "s", duration_ms=1000)
+        expected = normalize(raw, 500, "s", duration_ms=1000, normalizer_version=3)
+        cues, _ = expected
         self.assertEqual((cues[0]["begin_ms"], cues[0]["end_ms"]), (1400, 1500))
+        for version in [2, 4]:
+            with self.subTest(version=version):
+                self.assertEqual(normalize(raw, 500, "s", duration_ms=1000, normalizer_version=version), expected)
 
 
 class NormalizerVersionPipelineTests(PipelineFixture):
-    def test_new_task_uses_v3_and_preserves_invalid_raw_without_resubmitting(self):
+    def test_new_task_uses_v4_and_preserves_invalid_raw_without_resubmitting(self):
         fake = FakeService(result(("完整字幕。", "zh")))
         fake.raw["transcripts"][0]["sentences"][0].update(begin_time=100000, end_time=101000)
         self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(self.store.job(self.job_id)["error_code"], "timeline")
+        self.assertEqual(self.store.job(self.job_id)["manifest"]["contract"]["normalizer"], 4)
         self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
         self.assertTrue((self.config.data / "cache" / self.job_id / "raw-0000.json").is_file())
 
-    def test_old_v2_raw_uses_saved_version_but_explicit_reflow_uses_v3(self):
+    def test_old_v2_raw_uses_saved_version_but_explicit_reflow_uses_v4(self):
         fake = FakeService(result(("完整字幕。", "zh")))
         fake.raw["transcripts"][0]["sentences"][0].update(begin_time=100000, end_time=101000)
         def interrupt(job_id, stage, *args):
@@ -84,3 +90,23 @@ class NormalizerVersionPipelineTests(PipelineFixture):
         self.assertEqual(caught.exception.code, "timeline")
         self.assertEqual(self.store.job(self.job_id), before)
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
+
+    def test_old_v3_raw_and_normalized_results_keep_the_saved_version_until_explicit_reflow(self):
+        fake = FakeService(result(("完整字幕。", "zh")))
+        manifest = self.store.job(self.job_id)["manifest"]
+        manifest["contract"] = asr_contract(3)
+        self.store.update(self.job_id, manifest=manifest)
+        self.assertEqual(self.run_fake(fake), "completed")
+        self.assertEqual(self.store.job(self.job_id)["manifest"]["normalized_version"], 3)
+        before = self.store.sources(self.job_id)
+        self.source.unlink()
+        fake.calls.clear()
+        self.assertEqual(self.run_fake(fake), "completed")
+        self.assertEqual(self.store.sources(self.job_id), before)
+        self.assertEqual(self.store.job(self.job_id)["manifest"]["normalized_version"], 3)
+        self.assertEqual(fake.calls, [])
+        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
+        self.assertEqual(self.store.job(self.job_id)["manifest"]["normalized_version"], 4)
+        self.assertEqual(self.store.job(self.job_id)["manifest"]["contract"]["normalizer"], 4)
+        self.assertEqual(self.run_fake(fake), "completed")
+        self.assertEqual(fake.calls, [])

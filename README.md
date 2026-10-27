@@ -102,7 +102,6 @@ OpenRouter 默认启用**百炼后备，可能产生费用**。暂时故障重�
 .\scripts\transcribe.ps1 --review 本地任务ID
 .\scripts\transcribe.ps1 --resume 本地任务ID
 .\scripts\transcribe.ps1 --resume 本地任务ID --mt-fallback none
-.\scripts\transcribe.ps1 --resume 本地任务ID --mt-fallback bailian
 .\scripts\transcribe.ps1 --reflow 本地任务ID --overwrite
 .\scripts\transcribe.ps1 --retime 本地任务ID --overwrite
 .\scripts\transcribe.ps1 --resume 本地任务ID --track 音轨索引 --channel right
@@ -116,11 +115,17 @@ OpenRouter 默认启用**百炼后备，可能产生费用**。暂时故障重�
 
 任务库由单个进程独占。Ctrl+C 保存进度并停止本地处理；OpenRouter 契约 2／3 及其百炼后备最多用 5 秒保存已在途的完整结果，再次 Ctrl+C 立即终止等待。普通百炼、ASR 及旧请求等待网络结束或超时。已提交云端任务仍可能计费。`--cancel` 停止已保存任务，之后用 `--resume` 恢复。
 
-`--resume` 沿用保存的 ASR 账号、MT 后端／地址／模型及请求契约、识别输入、翻译策略、上下文窗口、排版设置、显示时间策略及人工决定，校验原 Key 后保留成功译文并补齐缺失项。历史任务沿用百炼翻译；需要更新显示时间时使用 `--retime`。并发与 RPM 使用当前运行设置。
+| 操作 | 用途 | 本地条件 |
+| --- | --- | --- |
+| `--resume` | 沿用保存的身份、处理策略、排版和人工决定，补齐未完成部分 | 原账户及 MT 凭据；并发与 RPM 使用当前设置 |
+| `--reflow` | 用当前翻译配置与处理策略，从转写重建字幕；保留原 ASR 身份和人工决定 | 完整本地转写、原 ASR 与当前 MT 凭据 |
+| `--retime` | 仅更新显示时间，复用完整字幕、译文和原排版；零云端调用 | 完整最终字幕及原账户、MT 凭据 |
+
+重排或校时的目标已存在时，使用 `--overwrite` 备份后替换，或用 `--output-dir` 另存。两者均保存旧任务快照，准备失败保留原任务；准备后中断用 `--resume` 继续。原媒体可已移走，校时也不需要原始转写。详细规则见[接口与恢复契约](docs/API_CONTRACT.md#数据与恢复)。
 
 已有完整规范化结果、完整本地转写，或缺失转写均有云端任务 ID 时，源媒体移走后仍可 `--resume`；需要新提交识别时须恢复原媒体。原路径换成其他媒体后，必须用 `--output-dir` 写到其他目录。Key 校验与账户隔离仍适用于纯本地恢复。
 
-程序升级后若提示 `cache_version`，用 `--reflow JOB_ID` 更新任务处理策略；需要完整本地转写，目标已存在时搭配 `--overwrite` 或另选 `--output-dir`。
+更换翻译后端、模型或 Key，以及升级后提示 `cache_version` 时，使用 `--reflow`。旧显示版本因 `timeline` 失败且译文完整、当前规则可修整时，程序会推荐 `--retime`。
 
 翻译诊断保存在 `.build/mt-diagnostics/{job_id}.jsonl`，记录运行／请求组、实际后端、格式或服务错误分类、尝试次数、等待和额度等信息，省略字幕正文与凭据。两端均失败时提示各自原因和尝试次数，使用 `mt_fallback_failed`。计数及诊断字段见[报告字段](docs/API_CONTRACT.md#报告字段)。
 
@@ -129,10 +134,6 @@ OpenRouter 默认启用**百炼后备，可能产生费用**。暂时故障重�
 旧任务若提示 `output_path_required`，用 `--output-dir` 指定目标目录后恢复。
 
 写入字幕时中断，可用 `--resume` 继续，已写入的相同字幕和备份会复用。若目标或备份被外部修改，返回 `output_conflict` 并保留文件，可另选 `--output-dir`。
-
-`--reflow` 使用当前翻译配置、字幕策略和排版设置，从完整本地转写重建字幕，保留原 ASR 身份及人工决定，源媒体可已移走。更换 MT 后端、地址、模型或 Key 后，使用新身份的缓存或重新翻译，无需旧 MT Key。目标已存在时搭配 `--overwrite` 备份后替换，或用 `--output-dir` 写到其他目录；准备失败保留原任务，中断后用 `--resume` 沿新配置继续。详见[接口与恢复契约](docs/API_CONTRACT.md#数据与恢复)。
-
-`--retime` 按当前显示规则仅调整时间，复用完整字幕、译文及原排版设置，云端调用数为零。需要原账户与 MT 凭据，源媒体和 raw 可已移走；目标已存在时搭配 `--overwrite` 备份后替换，或用 `--output-dir` 另存。中断后用 `--resume` 沿准备时的版本继续。原任务快照保存在 `.build/retime`。旧显示版本因 `timeline` 失败且当前规则可修整时，程序会推荐此命令。
 
 提交超时或响应缺少 ID 时，任务保存为 `submission_unknown`。可绑定已有 ID，或明确接受可能重复计费后重发：
 

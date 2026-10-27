@@ -30,11 +30,7 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`。`
 
 OpenRouter 契约 3 使用 `provider:{"require_parameters":true}`、`plugins:[{"id":"response-healing"}]` 和独立 MT Key；百炼后备使用原 ASR 账户／工作空间、模型 `qwen3.8-flash`、顶层 `enable_thinking:false`、`temperature:0`、`seed:0`。两端均发送严格 `response_format.type:json_schema`。首次结构／覆盖校验失败直接转当前完整组后备，后备仍失败则停止并保留进度。
 
-请求契约 2 使用数组协议，在基础字段之外发送：
-
-- `response_format: {"type":"json_schema","json_schema":{"name":"subtitle_translations","strict":true,"schema":…}}`。Schema 为必需的 `translations` 数组，成员为必需的字符串 `id`、`text`；两层对象均设置 `additionalProperties:false`，`id.enum` 仅含本次从 `"0"` 开始的字符串编号。条数、编号唯一性、非空译文及字幕控制内容继续由本地校验。
-- `provider: {"require_parameters":true}`，仅路由至支持请求参数的端点。
-- `plugins: [{"id":"response-healing"}]`，启用非流式格式修复；插件不能保证修复所有响应，仍须本地校验。
+请求契约 2 沿用相同的 OpenRouter 路由与插件设置，Schema 使用 `translations` 数组，成员为必需的字符串 `id`、`text`；两层对象均设置 `additionalProperties:false`，`id.enum` 为本次从 `"0"` 开始的编号。条数、编号唯一性和译文内容由本地校验。
 
 普通、修复和递归子组共用请求构造，子组重新生成自己的编号集合；完整 Schema、端点设置及插件字段均计入输入预算。`openrouter/free` 按请求能力筛选免费模型，见[免费路由](https://openrouter.ai/docs/guides/routing/routers/free-router)。暂时无可用端点时有限重试，耗尽后按后备策略处理；明确的参数拒绝直接停止。
 
@@ -58,7 +54,7 @@ OpenRouter 契约 2／3 及百炼后备使用隐藏子进程执行非流式请�
 
 策略 3 的内部批量接口接收上下文和有序片段，请求内编号从字符串 `"0"` 开始；输入、输出均为 `{"translations":[{"id":"0","text":"文字"}]}`，输出 `text` 为对应片段的译文。本地校验 JSON、编号完整且唯一、无多余项、译文非空且无字幕控制内容，以及 `finish_reason:stop`；原文包含文字或数字时，译文须包含文字或数字。校验异常使用同组输入和修复提示再尝试一次。
 
-两次校验均失败时，按片段数中点拆成连续左右子组，在现有工作线程内先左后右执行；每组仍最多正常及修复各一次，递归至单片。子组编号从 `"0"` 开始，结果映射回原组编号及稳定 `cue_id`，沿用原字幕范围和时间。单片仍失败返回 `mt_batch_invalid`，原组保留待恢复。含 n 片的原组最多 `4n−2` 次逻辑请求；HTTP 错误、重试及取消按原规则处理。译文经 OpenCC t2s 后保存。结构校验不代表语义质量验收。
+两次校验均失败时，按片段数中点拆成连续左右子组，在现有工作线程内先左后右执行；每组仍最多正常及修复各一次，递归至单片。子组编号从 `"0"` 开始，结果映射回原组编号及稳定 `cue_id`，沿用原字幕范围和时间。单片仍失败返回 `mt_batch_invalid`，原组保留待恢复。含 n 片的原组最多 `4n−2` 次逻辑请求；HTTP 错误、重试及取消按原规则处理。译文经 OpenCC t2s 后保存。
 
 校验分类为响应外层结构异常、JSON 无效／重复键、编号缺失／重复／越界、译文无效、非正常结束。终止错误包含分类、预期／实际条数和原组片段范围（从 0 开始、右端不含）。校验失败和拆组事件追加到 `.build/mt-diagnostics/{job_id}.jsonl`，包含分类、数量、阶段、原组请求摘要及片段索引／时间范围；实际条数未知时为 null。
 
@@ -111,7 +107,7 @@ OpenRouter 契约 2／3 及其百炼后备首次 Ctrl+C 立即停止新请求、
 | `region` / `access_mode` | `beijing` / `workspace` |
 | `workspace_id` | 1～63 位合法域名标签 |
 | `processing_version` | `2` |
-| `contract.normalizer` | `3` |
+| `contract.normalizer` | `4` |
 | `subtitle_version` / `translation_strategy_version` | `2` / `4`（OpenRouter）；其他后端策略 `3` |
 | `display_timing_version` | `2`；独立的最终显示时间策略 |
 | `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
@@ -159,7 +155,7 @@ ASR 提交 POST 由持久化 `submitting` 标记覆盖中断窗口。超时、5x
 - 缺少接入与媒体版本字段的任务按 `legacy_public`、媒体版本 1 读取，北京任务沿用公共端点和 WAV 方案。新加坡任务保留数据，恢复时在联网和缓存复用前返回 `legacy_region`。
 - 缺少 `subtitle_version` 的任务沿用原断句、单阶段翻译、版本 2 MT 缓存和排版。已有有效规范化字幕及成功译文继续使用。
 - 字幕版本 1 的任务普通恢复仍使用严格正时长词校验和原排版快照，包括尚未规范化的本地转写；仅 `--reflow` 明确升级为 2。
-- 规范化版本 1 的任务在模型与参数相同时，可从尚未规范化的本地原始结果升级至 2；已有有效 v1 结果保持原样。版本 2 的任务沿保存版本恢复，只有新任务及显式 `--reflow` 使用规范化版本 3。
+- 规范化版本 1 的任务在模型与参数相同时，可从尚未规范化的本地原始结果升级至 2；已有有效 v1 结果保持原样。版本 2、3 的任务沿保存版本恢复，只有新任务及显式 `--reflow` 使用规范化版本 4。
 - `key.dpapi` 解密并成功写入新文件后移除。旧 `oss_protected` 仍可解密读取；解密失败时，仅尚未提交的分段可重新上传，已知 ID 或提交未知标记优先用于恢复。
 
 来源记录及字幕／参考的 JSON metadata 使用 `decision_origin: automatic | manual` 表示决定来源，`reason` 只用于展示。新规范化结果为 automatic，终端确认同事务更新所属来源与全部片段为 manual，并清除失效译文与阶段标记；每条确认立即保存。没有来源记录的旧任务保留逐片复核。缺失字段仅以旧确认文案兼容恢复，显式未知值返回 `cache_mismatch`。
@@ -174,7 +170,9 @@ PCM 中间文件使用 RIFF WAV，数据容量上限为 `UINT32_MAX - 4096` 字�
 
 规范化保留原文、源句索引和原始时间依据。零时长短句仅在句级与完整词级文字、标点和时间点一致，且语种支持、文字不超过 12 字时修复：补最多 1000ms 显示区间，受下一句和音频结尾限制；可用区间不足 400ms 时，可合并距离不超过 400ms 的同语种有效邻句。修复保存来源与警告，词时间不用于继续细分；其他无效时间返回错误。
 
-规范化版本 3 在叠加全局偏移前校验句时间：起点位于段内，终点允许最多 1ms 取整误差，更大越界返回 `timeline`。可选的 `transcripts[].text` 非空而句子文字全空时返回 `response_schema`。原始结果保留供排查。
+规范化版本 4 在补短句显示窗口前处理含长句的连续同点组。每句须非空、同一受支持语种，全部词为该整数时间点且文字和标点完整覆盖句子。组前后时间顺序正常时，依次尝试精确相接、间隔不超过 400ms 的同分段、同语种、非空原始正时长邻句，每级前句优先。距离始终按原始正时长区间计算，显示区间取邻句与 ASR 点的并集；近邻合并记录原邻句区间及距离。保留全部文字、顺序、句索引和原始时间，词时间置空。证据或边界不满足条件时返回 `timeline`，原始响应保持不变。
+
+规范化版本 3、4 在叠加全局偏移前校验句时间：起点位于段内，终点允许最多 1ms 取整误差，更大越界返回 `timeline`。可选的 `transcripts[].text` 非空而句子文字全空时返回 `response_schema`。原始结果保留供排查。
 
 完整句的词时间须覆盖清理后的全部文字及标点，为整数、单调不重叠且位于句内。连续零时长词合并到下一个正时长词，句尾合并到前一词组；文字范围和首末时间端点均取自原记录，每组保持正时长。全句零时长、倒序、重叠、越界或文字不匹配时使用句级边界，句级修复或负时间裁剪后同样如此。片段 ID 由源句和词组范围稳定生成；无可靠词时间时使用完整文字范围。
 

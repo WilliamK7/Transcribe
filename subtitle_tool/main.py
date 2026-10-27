@@ -194,9 +194,9 @@ def summary(store, job_id):
     item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", MT_MODEL)}
     item["mt_provider"] = mt.get("provider", "bailian")
     if 'mt_fallback_policy' in manifest:
-        saved_fallback(manifest)
-        policy = manifest['mt_fallback_policy']
-        item['mt_fallback'] = {'enabled': policy['enabled'], 'provider': 'bailian', 'model': 'qwen-mt-flash'}
+        fallback = saved_fallback(manifest)
+        item['mt_fallback'] = {'enabled': manifest['mt_fallback_policy']['enabled'],
+                               'provider': fallback.provider, 'model': fallback.model}
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
     counts = item["counts"]
     item["timings"] = {"run_seconds": counts.get("run_ms", 0) / 1000,
@@ -382,16 +382,17 @@ def main(argv=None):
             current_job = job_id
             if cancel.is_set():
                 break
+            manifest = store.job(job_id)['manifest']
             if args.review:
                 if store.job(job_id)["state"] != "needs_review":
                     raise ToolError("--review 需要待复核任务；其他状态请使用 --resume。", "review")
                 state = "needs_review"
             else:
-                if store.job(job_id)['manifest'].get('retime'):
+                if manifest.get('retime'):
                     print('仅校时：使用本地已保存的字幕和译文，无需调用云端。',
                           file=sys.stderr, flush=True)
-                elif store.job(job_id)['manifest'].get('mt_fallback_policy', {}).get('enabled'):
-                    print('已启用按组百炼后备（qwen-mt-flash），可能产生费用；可用 --mt-fallback none 关闭后续后备。',
+                elif manifest.get('mt_fallback_policy', {}).get('enabled'):
+                    print(f'已启用按组百炼后备（{saved_fallback(manifest).model}），可能产生费用；可用 --mt-fallback none 关闭后续后备。',
                           file=sys.stderr, flush=True)
                 state = run_job(job_id)
             while state == "needs_review" and interactive and not cancel.is_set():

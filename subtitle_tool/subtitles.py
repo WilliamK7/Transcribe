@@ -96,7 +96,101 @@ def split_sentence(sentence: dict) -> list[tuple[int, int, str]]:
     return result
 
 
-def prepare_sentence_timings(sentences, duration_ms, segment_id):
+def _corroborated_point(sentence, text):
+    words = sentence.get("words")
+    anchor = sentence["begin_time"]
+    if (not text or sentence.get("language") not in WORD_LANGS or
+            not isinstance(words, list) or not words or any(
+                not isinstance(word, dict) or type(word.get("begin_time")) is not int or
+                type(word.get("end_time")) is not int or word["begin_time"] != anchor or
+                word["end_time"] != anchor or not isinstance(word.get("text"), str) or
+                not isinstance(word.get("punctuation", ""), str) for word in words)):
+        return False
+    return (re.sub(r"\s", "", "".join(w["text"] + w.get("punctuation", "") for w in words)) ==
+            re.sub(r"\s", "", text))
+
+
+def _merge_boundary_point_groups(records, segment_id):
+    """Resolve long point groups before any short point receives display timing."""
+    warnings, at = [], 0
+    original_intervals = {sentence["_indices"][0]: (sentence["begin_time"], sentence["end_time"])
+                          for sentence in records if sentence["begin_time"] < sentence["end_time"]}
+    while at < len(records):
+        anchor = records[at]["begin_time"]
+        if records[at]["end_time"] != anchor:
+            at += 1
+            continue
+        stop = at + 1
+        while (stop < len(records) and
+               records[stop]["begin_time"] == records[stop]["end_time"] == anchor):
+            stop += 1
+        group = records[at:stop]
+        if not any(len(clean_text(sentence.get("text"))) > 12 for sentence in group):
+            at = stop
+            continue
+        language = group[0].get("language")
+        for sentence in group:
+            if sentence.get("language") != language or not _corroborated_point(sentence, clean_text(sentence.get("text"))):
+                index = sentence["_indices"][0]
+                raise ToolError(f"第 {index + 1} 句同点组缺少一致的句词证据；原始结果已保留。", "timeline")
+        previous = records[at - 1] if at else None
+        following = records[stop] if stop < len(records) else None
+        ordered = ((previous is None or previous["end_time"] <= anchor) and
+                   (following is None or following["begin_time"] >= anchor))
+        candidates = []
+        if ordered:
+            for candidate, side in [(previous, "previous"), (following, "next")]:
+                if (candidate and candidate.get("language") == language and clean_text(candidate.get("text")) and
+                        candidate["begin_time"] < candidate["end_time"]):
+                    interval = next((original_intervals[i] for i in candidate["_indices"]
+                                     if i in original_intervals), None)
+                    if interval is not None:
+                        distance = max(interval[0] - anchor, anchor - interval[1], 0)
+                        candidates.append((candidate, side, interval, distance))
+        neighbor, direction, original_interval, distance = None, None, None, 0
+        # Try both exact boundaries before the existing short-point 400ms fallback.
+        # Always measure from raw positive timing, never an endpoint widened by an earlier group.
+        for limit in (0, 400):
+            for candidate in candidates:
+                if candidate[3] <= limit:
+                    neighbor, direction, original_interval, distance = candidate
+                    break
+            if neighbor is not None:
+                break
+        if neighbor is None:
+            index = group[0]["_indices"][0]
+            raise ToolError(f"第 {index + 1} 句同点组没有距离 400ms 内的同语种原始正时长邻句；原始结果已保留。", "timeline")
+        for sentence in group:
+            adjustment = {
+                "asr_sentence_index": sentence["_indices"][0], "anchor_ms": anchor,
+                "original_begin_ms": anchor, "original_end_ms": anchor,
+                "kind": "merged_asr_boundary_point", "direction": direction}
+            if distance:
+                adjustment.update(kind="merged_asr_nearby_point", distance_ms=distance,
+                                  original_neighbor_begin_ms=original_interval[0],
+                                  original_neighbor_end_ms=original_interval[1])
+            sentence["_adjustments"].append(adjustment)
+        ordered_group = [neighbor, *group] if direction == "previous" else [*group, neighbor]
+        joiner = "" if language in {"zh", "yue", "ja"} else " "
+        merged = {**neighbor, "begin_time": min(anchor, neighbor["begin_time"]),
+                  "end_time": max(anchor, neighbor["end_time"]),
+                  "text": joiner.join(clean_text(sentence["text"]) for sentence in ordered_group),
+                  "words": None, "_indices": [i for sentence in ordered_group for i in sentence["_indices"]],
+                  "_adjustments": [a for sentence in ordered_group for a in sentence["_adjustments"]]}
+        if direction == "previous":
+            records[at - 1:stop] = [merged]
+        else:
+            records[at:stop + 1] = [merged]
+        detail = (f"合并距原始正时长区间 {distance}ms 的同语种邻句；显示区间覆盖邻句和 ASR 点，"
+                  "保留全部文字和原始句级时间，未构造词级时间" if distance else
+                  "合并边界相接的同语种原始正时长邻句；保留全部文字和已有句级边界，未构造词级时间")
+        warnings.append(f"分段 {segment_id} 第 {group[0]['_indices'][0] + 1}～{group[-1]['_indices'][-1] + 1} 句零时长，" + detail)
+        if direction == "next":
+            at += 1
+    return records, warnings
+
+
+def prepare_sentence_timings(sentences, duration_ms, segment_id, *, normalizer_version=NORMALIZER_VERSION):
     """Zero-length ASR points get display timing, never invented word alignment."""
     records, warnings = [], []
     for index, sentence in enumerate(sentences):
@@ -106,6 +200,8 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
         if type(b) is not int or type(e) is not int or b < 0 or e < b:
             raise ToolError(f"第 {index + 1} 句时间戳异常；原始结果已保留，需修复后恢复。", "timeline")
         records.append({**sentence, "_indices": [index], "_adjustments": []})
+    if normalizer_version >= 4:
+        records, warnings = _merge_boundary_point_groups(records, segment_id)
     at = 0
     while at < len(records):
         sentence = records[at]
@@ -115,16 +211,7 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
             continue
         index = sentence["_indices"][0]
         text = clean_text(sentence.get("text"))
-        words = sentence.get("words")
-        compact = lambda value: re.sub(r"\s", "", value)
-        corroborated = (0 < len(text) <= 12 and sentence.get("language") in WORD_LANGS and
-                        isinstance(words, list) and bool(words) and all(isinstance(w, dict) and
-                        type(w.get("begin_time")) is int and type(w.get("end_time")) is int and
-                        w["begin_time"] == b and w["end_time"] == b and isinstance(w.get("text"), str) and
-                        isinstance(w.get("punctuation", ""), str) for w in words))
-        if corroborated:
-            corroborated = compact("".join(w["text"] + w.get("punctuation", "") for w in words)) == compact(text)
-        if not corroborated:
+        if len(text) > 12 or not _corroborated_point(sentence, text):
             raise ToolError(f"第 {index + 1} 句零时长且缺少一致的短句时间点；原始结果已保留。", "timeline")
         previous = records[at - 1] if at else None
         following = records[at + 1] if at + 1 < len(records) else None
@@ -178,7 +265,7 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
 def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
               preserve_sentences=False, subtitle_version=SUBTITLE_VERSION,
               normalizer_version=NORMALIZER_VERSION) -> tuple[list[dict], list[str]]:
-    if type(normalizer_version) is not int or normalizer_version not in {1, 2, NORMALIZER_VERSION}:
+    if type(normalizer_version) is not int or normalizer_version not in {1, 2, 3, NORMALIZER_VERSION}:
         raise ToolError("规范化版本不受支持。", "cache_version")
     if not isinstance(raw, dict) or not isinstance(raw.get("transcripts"), list):
         raise ToolError("Qwen3 结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
@@ -210,7 +297,8 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
     if normalizer_version == 1 and any(isinstance(s, dict) and s.get("begin_time") == s.get("end_time")
                                       for s in sentences):
         raise ToolError("旧版规范化不接受零时长句子。", "timeline")
-    records, timing_warnings = prepare_sentence_timings(sentences, duration_ms, segment_id)
+    records, timing_warnings = prepare_sentence_timings(sentences, duration_ms, segment_id,
+                                                       normalizer_version=normalizer_version)
     warnings.extend(timing_warnings)
     languages = [s.get("language", "") for s in sentences]
     for sentence in records:

@@ -74,11 +74,11 @@ def load_policy(manifest, *, verify_execution=True):
     if saved:
         if not isinstance(saved, dict):
             raise ToolError("任务的识别模型契约不受支持，请用 --reflow 显式重排。", "cache_version")
-        normalizer = _version(saved.get("normalizer"), {1, 2, NORMALIZER_VERSION})
+        normalizer = _version(saved.get("normalizer"), {1, 2, 3, NORMALIZER_VERSION})
         if saved not in (asr_contract(normalizer), {**asr_contract(normalizer), "mt": MT_MODEL}):
             raise ToolError("任务的识别模型／参数契约不受支持，请检查保存记录。", "cache_version")
     if "normalized_version" in manifest:
-        _version(manifest["normalized_version"], {1, 2, NORMALIZER_VERSION})
+        _version(manifest["normalized_version"], {1, 2, 3, NORMALIZER_VERSION})
     plan = manifest.get("media_plan")
     _version(plan.get("extract_recipe_version", 1) if plan else EXTRACT_RECIPE_VERSION,
              {1, EXTRACT_RECIPE_VERSION})
