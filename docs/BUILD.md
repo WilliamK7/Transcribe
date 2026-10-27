@@ -34,3 +34,11 @@ uv pip sync requirements.lock --require-hashes --python .venv\Scripts\python.exe
 测试用模拟 HTTP、真实 SQLite、合成媒体和 Windows 子进程验证行为；诊断使用隔离目录及假 Key，零云端调用。实际结果以命令退出码和输出为准。
 
 `scripts/transcribe.ps1` 保留调用者当前目录，相对媒体与报告路径按调用位置解释。运行数据位于项目 `data`，成功任务清理音频中间文件，保留任务库、转写和规范化字幕供恢复使用。
+
+## 清理本机记录
+
+`.build` 同时包含运行依赖、恢复资料和临时开发记录，按用途清理：
+
+- 保留 `.venv/pyvenv.cfg` 指向的 Python、真实任务的 `reflow`／`retime`／`mt-fallback` 快照，以及仍需排查的 `mt-diagnostics`。用户数据、字幕、媒体和备份独立保留。
+- 工作完成后，可删除阶段计划、逐轮测试输出、重复自检报告、代码清理副本、临时测试目录及不再用于排查的实验输出；通常保留最近一次验证结果及简短摘要即可。
+- 混合目录先核对文件用途及任务引用；删除目录链接时只处理链接本身。避免直接递归删除整个 `.build`。
