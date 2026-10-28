@@ -32,9 +32,11 @@ RUNTIME_CATEGORIES = TRANSIENT_TYPES | PERMANENT_TYPES | {
 
 
 class ServiceError(ToolError):
-    def __init__(self, category, status=None, retryable=False, *, code=None, provider='openrouter', quota_source=None):
+    def __init__(self, category, status=None, retryable=False, *, code=None, provider='openrouter', quota_source=None,
+                 error_shape=None):
         self.category, self.status, self.retryable = category, status, retryable
         self.quota_source = quota_source
+        self.error_shape = error_shape or {}
         hint = {
             'deadline': 'OpenRouter 请求总时限耗尽，进度已保存；可显式恢复。',
             'network': 'OpenRouter 网络连接或读取失败，进度已保存。',
@@ -66,52 +68,76 @@ class ServiceError(ToolError):
                                       else 'mt_service_error'))
 
 
-def service_failure(status, body, *, free_router=False):
+def _service_errors(body):
+    """Extract independent errors and content-free shape counts from one envelope."""
     errors = []
-    business = False
+    shape = {'top_level_error': False, 'choice_error_count': 0, 'detail_free_error_finish_count': 0,
+             'error_type_known_count': 0, 'error_type_missing_count': 0,
+             'error_type_unknown_count': 0, 'error_type_malformed_count': 0}
+    content_refused = False
     if isinstance(body, dict):
         if 'error' in body:
-            business = True
+            shape['top_level_error'] = True
             errors.append(body['error'])
         choices = body.get('choices')
         if isinstance(choices, list):
             for choice in choices:
-                if isinstance(choice, dict) and (choice.get('finish_reason') == 'content_filter' or
+                if not isinstance(choice, dict):
+                    continue
+                if (choice.get('finish_reason') == 'content_filter' or
                         isinstance(choice.get('message'), dict) and choice['message'].get('refusal')):
-                    return ServiceError('content_policy_violation', status, code='mt_content_refused')
-                if isinstance(choice, dict) and ('error' in choice or choice.get('finish_reason') == 'error'):
-                    business = True
-                    errors.append(choice.get('error'))
+                    content_refused = True
+                if 'error' in choice:
+                    shape['choice_error_count'] += 1
+                    errors.append(choice['error'])
+                elif choice.get('finish_reason') == 'error':
+                    shape['detail_free_error_finish_count'] += 1
     kinds = []
-    malformed_type = False
     for error in errors:
         metadata = error.get('metadata') if isinstance(error, dict) else None
         kind = metadata.get('error_type') if isinstance(metadata, dict) else None
-        if isinstance(metadata, dict) and 'error_type' in metadata and not isinstance(kind, str):
-            malformed_type = True
+        if not isinstance(metadata, dict) or 'error_type' not in metadata:
+            shape['error_type_missing_count'] += 1
+        elif not isinstance(kind, str):
+            shape['error_type_malformed_count'] += 1
+        elif kind in TRANSIENT_TYPES or kind in PERMANENT_TYPES:
+            shape['error_type_known_count'] += 1
+        else:
+            shape['error_type_unknown_count'] += 1
         kinds.append(kind if isinstance(kind, str) else None)
+    if not shape['top_level_error']:
+        # A top-level error explains its finish markers, but never an explicit choice.error.
+        kinds.extend([None] * shape['detail_free_error_finish_count'])
+    return kinds, shape, content_refused
+
+
+def service_failure(status, body, *, free_router=False):
+    kinds, shape, content_refused = _service_errors(body)
+    def failure(category, retryable=False, *, code=None):
+        return ServiceError(category, status, retryable, code=code, error_shape=shape)
+    if content_refused:
+        return failure('content_policy_violation', code='mt_content_refused')
     for kind in kinds:
         if kind in PERMANENT_TYPES and not (free_router and kind == 'not_found'):
-            return ServiceError(kind, status)
+            return failure(kind)
     if status in {400, 401, 402, 403, 405, 413, 415, 422} or status == 404 and not free_router:
-        return ServiceError('http_permanent', status)
-    # Explicit but unknown types and untyped 2xx business failures are never guessed from messages/codes.
+        return failure('http_permanent')
     retryable_types = TRANSIENT_TYPES | {'not_found'} if free_router else TRANSIENT_TYPES
-    if malformed_type or any(kind is not None and kind not in retryable_types for kind in kinds):
-        return ServiceError('service_unknown', status)
+    untyped_choice = any(kind is None for kind in kinds) and (
+        shape['choice_error_count'] or shape['detail_free_error_finish_count'] and not shape['top_level_error'])
+    if (shape['error_type_malformed_count'] or untyped_choice or
+            any(kind is not None and kind not in retryable_types for kind in kinds)):
+        return failure('service_unknown')
     if free_router and 'not_found' in kinds:
-        # Dynamic free routing gets a bounded retry, without masking an untyped companion error.
-        if not all(kind in retryable_types for kind in kinds):
-            return ServiceError('service_unknown', status)
         retryable = 200 <= status < 300 or status in {404, 408, 429} or 500 <= status <= 599
-        return ServiceError('not_found', status, retryable)
+        return failure('not_found', retryable)
     if kinds and all(kind in retryable_types for kind in kinds):
-        return ServiceError(kinds[0], status, True)
+        return failure(kinds[0], True)
     if not 200 <= status < 300:
         retryable = status in {408, 429} or 500 <= status <= 599 or status == 404 and free_router
-        return ServiceError('http_transient' if retryable else 'http_permanent', status, retryable)
-    if business:
-        return ServiceError('service_unknown', status)
+        return failure('http_transient' if retryable else 'http_permanent', retryable)
+    if kinds:
+        return failure('service_unknown')
     return None
 
 
@@ -483,7 +509,8 @@ class BoundedMTHttp:
                 self.on_event({'kind': 'runtime_request', 'category': error.category if error else 'response_received',
                     'attempt': attempt, 'status': status, 'duration_ms': round((time.monotonic() - started) * 1000),
                     'actual_model': body.get('model') if isinstance(body, dict) else None,
-                    'retryable': bool(error and error.retryable), 'deadline_terminated': bool(error and error.category == 'deadline')})
+                    'retryable': bool(error and error.retryable), 'deadline_terminated': bool(error and error.category == 'deadline'),
+                    **(error.error_shape if error else {})})
                 if error is None:
                     self.recovery.success(ticket)
                     changed = self.pacer.success(ticket.pacer_generation)

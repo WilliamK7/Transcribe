@@ -89,11 +89,13 @@ class MTDiagnostics:
                 record['category'] = event['category']
             self._routing(record, event)
             for field in ['attempt', 'status', 'duration_ms', 'shared_wait_ms', 'pacing_wait_ms',
-                          'discarded', 'used', 'limit', 'remaining', 'local_remaining', 'committed_count']:
+                          'discarded', 'used', 'limit', 'remaining', 'local_remaining', 'committed_count',
+                          'choice_error_count', 'detail_free_error_finish_count', 'error_type_known_count',
+                          'error_type_missing_count', 'error_type_unknown_count', 'error_type_malformed_count']:
                 value = event.get(field)
                 if type(value) is int and 0 <= value <= 2**63 - 1:
                     record[field] = value
-            for field in ['retryable', 'deadline_terminated', 'cached']:
+            for field in ['retryable', 'deadline_terminated', 'cached', 'top_level_error']:
                 if type(event.get(field)) is bool:
                     record[field] = event[field]
             observed = event.get('observed_at')

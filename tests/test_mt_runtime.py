@@ -19,6 +19,7 @@ from subtitle_tool.mt_runtime import FreeQuota, BoundedMTHttp, RecoveryCoordinat
 from subtitle_tool.mt_runtime import runtime_resources, service_failure
 from subtitle_tool.api import RequestPacer
 from subtitle_tool.mt_backend import MTBackend, key_fingerprint
+from subtitle_tool.mt_diagnostics import MTDiagnostics
 from tests.fixtures import TemporaryTest
 
 
@@ -27,9 +28,11 @@ def quota(remaining=20):
         'used': 20 - remaining, 'limit': 20, 'remaining': remaining}}}).encode())
 
 
-def business_failure(kind='not_found', *, status=200, choice=False):
+def business_failure(kind='not_found', *, status=200, choice=False, finish_marker=False):
     error = {'message': 'private provider details', 'metadata': {'error_type': kind}}
     body = {'choices': [{'finish_reason': 'error', 'error': error}]} if choice else {'error': error}
+    if finish_marker:
+        body.setdefault('choices', []).append({'index': 0, 'finish_reason': 'error'})
     return HTTPReply(status, json.dumps(body).encode())
 
 
@@ -501,6 +504,125 @@ class RetryTests(TemporaryTest):
     def mt_calls(self):
         return [call for call in self.transport.request.call_args_list if call.args[0] == 'POST']
 
+    def test_typed_top_error_explains_detail_free_error_finish(self):
+        for kind in ['timeout', 'provider_unavailable', 'provider_overloaded', 'server', 'rate_limit_exceeded', 'not_found']:
+            for status in [200, 503]:
+                with self.subTest(kind=kind, status=status):
+                    body = json.loads(business_failure(kind, status=status, finish_marker=True).body)
+                    body['choices'].append({'index': 1, 'finish_reason': 'error'})
+                    error = service_failure(status, body, free_router=True)
+                    self.assertEqual(error.category, kind)
+                    self.assertTrue(error.retryable)
+
+    def test_typed_top_error_with_marker_recovers_on_fourth_attempt(self):
+        self.replies(*[business_failure('provider_unavailable', finish_marker=True)] * 3,
+                     HTTPReply(200, b'{"ok":true}'))
+        self.assertEqual(self.send(), {'ok': True})
+        self.assertEqual(len(self.mt_calls()), 4)
+        self.assertEqual(self.ledger.remaining, 16)
+
+    def test_typed_top_error_with_marker_exhausts_after_four_attempts(self):
+        events = []
+        self.client.on_event = events.append
+        self.replies(*[business_failure('provider_unavailable', finish_marker=True)] * 4)
+        with self.assertRaises(ToolError) as caught:
+            self.send()
+        self.assertEqual((caught.exception.category, caught.exception.attempts), ('provider_unavailable', 4))
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(len(self.mt_calls()), 4)
+        self.assertEqual(self.ledger.remaining, 16)
+        requests = [event for event in events if event['kind'] == 'runtime_request']
+        self.assertEqual([event['attempt'] for event in requests], [1, 2, 3, 4])
+        self.assertTrue(all(event['retryable'] for event in requests))
+        self.assertTrue(all(event['top_level_error'] and event['detail_free_error_finish_count'] == 1
+                            and event['error_type_known_count'] == 1 and event['error_type_missing_count'] == 0
+                            for event in requests))
+
+    def test_error_finish_without_top_error_remains_an_independent_unknown(self):
+        for choices in [[{'finish_reason': 'error'}],
+                        [{'error': {'metadata': {'error_type': 'timeout'}}}, {'finish_reason': 'error'}]]:
+            for status in [200, 503]:
+                with self.subTest(choices=choices, status=status):
+                    error = service_failure(status, {'choices': choices}, free_router=True)
+                    self.assertEqual(error.category, 'service_unknown')
+                    self.assertFalse(error.retryable)
+
+    def test_untyped_top_error_keeps_http_status_policy_with_or_without_finish_marker(self):
+        for error in [None, {}, {'message': 'private'}, {'code': 503}]:
+            for marker in [False, True]:
+                with self.subTest(error=error, marker=marker):
+                    body = {'error': error}
+                    if marker:
+                        body['choices'] = [{'finish_reason': 'error'}]
+                    failure = service_failure(503, body, free_router=True)
+                    self.assertEqual(failure.category, 'http_transient')
+                    self.assertTrue(failure.retryable)
+
+    def test_top_error_marker_keeps_permanent_refusal_and_fixed_404_precedence(self):
+        for kind in ['authentication', 'permission_denied', 'payment_required', 'invalid_request',
+                     'content_policy_violation', 'refusal']:
+            for companion in [None, {}, {'metadata': {'error_type': None}}, {'metadata': {'error_type': 'private'}}]:
+                with self.subTest(kind=kind, companion=companion):
+                    body = json.loads(business_failure(kind, finish_marker=True).body)
+                    body['choices'].append({'error': companion})
+                    error = service_failure(503, body, free_router=True)
+                    self.assertEqual(error.category, kind)
+                    self.assertFalse(error.retryable)
+        body = json.loads(business_failure('provider_unavailable', finish_marker=True).body)
+        self.assertFalse(service_failure(404, body, free_router=False).retryable)
+        for refusal in [{'finish_reason': 'content_filter'}, {'message': {'refusal': 'private refusal'}}]:
+            body['choices'] = [{'error': None}, {'error': {'metadata': {'error_type': 'payment_required'}}}, refusal]
+            error = service_failure(200, body, free_router=True)
+            self.assertEqual(error.category, 'content_policy_violation')
+            self.assertFalse(error.retryable)
+            self.assertEqual(error.code, 'mt_content_refused')
+
+    def test_runtime_diagnostics_capture_only_error_shape_and_keep_refusal_priority(self):
+        private = 'private-Key-Bearer-URL-request-id-and-subtitle'
+        body = {'error': {'code': private, 'message': private, 'metadata': {'error_type': 'provider_unavailable'}},
+                'request_id': private, 'id': private, 'model': 'https://private.invalid/model', 'choices': [
+                    {'finish_reason': 'error'},
+                    {'error': {'metadata': {'error_type': 'timeout'}}},
+                    {'error': None}, {'error': {}}, {'error': {'metadata': []}},
+                    {'error': {'metadata': {'error_type': private}}},
+                    {'error': {'metadata': {'error_type': None}}},
+                    {'error': {'metadata': {'error_type': []}}},
+                    {'message': {'refusal': private, 'content': private}}]}
+        events = []
+        self.client.on_event = events.append
+        self.replies(HTTPReply(200, json.dumps(body).encode()))
+        with self.assertRaises(ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.code, 'mt_content_refused')
+        self.assertEqual(len(self.mt_calls()), 1)
+        requests = [event for event in events if event['kind'] == 'runtime_request']
+        self.assertEqual(len(requests), 1)
+        writer = MTDiagnostics(self.path, 'a' * 32)
+        self.assertTrue(writer.write_runtime({**requests[0], 'body': body, 'message': private,
+                                             'code': private, 'request_id': private, 'url': private}))
+        raw = writer.path.read_text(encoding='utf-8')
+        record = json.loads(raw)
+        expected = {'top_level_error': True, 'choice_error_count': 7, 'detail_free_error_finish_count': 1,
+                    'error_type_known_count': 2, 'error_type_missing_count': 3,
+                    'error_type_unknown_count': 1, 'error_type_malformed_count': 2}
+        self.assertEqual({key: record[key] for key in expected}, expected)
+        self.assertNotIn(private, raw)
+        self.assertNotIn('https://', raw)
+        for field in ['body', 'message', 'code', 'request_id', 'url', 'actual_model']:
+            self.assertNotIn(field, record)
+
+    def test_runtime_error_shape_diagnostics_reject_untrusted_field_values(self):
+        writer = MTDiagnostics(self.path, 'a' * 32)
+        injected = {'top_level_error': 'private', 'choice_error_count': True,
+                    'detail_free_error_finish_count': -1, 'error_type_known_count': 1.0,
+                    'error_type_missing_count': 2**63, 'error_type_unknown_count': {'private': 1},
+                    'error_type_malformed_count': ['private']}
+        self.assertTrue(writer.write_runtime({'kind': 'runtime_request', **injected}))
+        raw = writer.path.read_text(encoding='utf-8')
+        record = json.loads(raw)
+        self.assertEqual(set(record), {'time', 'kind'})
+        self.assertNotIn('private', raw)
+
     def test_free_router_not_found_is_retryable_in_top_level_and_choice_errors(self):
         for status in [200, 201, 404, 408, 429, 500, 503, 599]:
             for choice in [False, True]:
@@ -576,19 +698,22 @@ class RetryTests(TemporaryTest):
                 error = service_failure(status, json.loads(business_failure().body), free_router=True)
                 self.assertFalse(error.retryable)
 
-    def test_router_not_found_mixed_with_unknown_malformed_or_untyped_errors_stays_unknown(self):
+    def test_mixed_typed_and_unknown_errors_stop_with_or_without_finish_marker(self):
         unknowns = [{'metadata': {'error_type': value}} for value in ['private-unknown', None, False, 42, [], {}]]
-        unknowns.extend([{}, None, {'metadata': []}])
-        known = {'metadata': {'error_type': 'not_found'}}
-        for status in [200, 404, 408, 429, 503]:
-            for unknown in unknowns:
-                for reverse in [False, True]:
-                    errors = [unknown, known] if reverse else [known, unknown]
-                    body = {'error': errors[0], 'choices': [{'finish_reason': 'error', 'error': errors[1]}]}
-                    with self.subTest(status=status, unknown=unknown, reverse=reverse):
-                        error = service_failure(status, body, free_router=True)
-                        self.assertEqual(error.category, 'service_unknown')
-                        self.assertFalse(error.retryable)
+        unknowns.extend([{}, None, [], False, {'metadata': []}])
+        for kind in ['not_found', 'provider_unavailable']:
+            known = {'metadata': {'error_type': kind}}
+            for status in [200, 404, 408, 429, 503]:
+                for unknown in unknowns:
+                    for reverse, marker in [(False, False), (True, False), (False, True), (True, True)]:
+                        errors = [unknown, known] if reverse else [known, unknown]
+                        choices = [{'finish_reason': 'error', 'error': errors[1]}]
+                        if marker:
+                            choices.append({'finish_reason': 'error'})
+                        with self.subTest(kind=kind, status=status, unknown=unknown, reverse=reverse, marker=marker):
+                            error = service_failure(status, {'error': errors[0], 'choices': choices}, free_router=True)
+                            self.assertEqual(error.category, 'service_unknown')
+                            self.assertFalse(error.retryable)
 
     def test_content_filter_and_refusal_override_router_not_found(self):
         for refusal in [{'finish_reason': 'content_filter'}, {'message': {'refusal': 'private refusal'}}]:

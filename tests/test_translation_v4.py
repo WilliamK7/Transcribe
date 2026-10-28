@@ -20,7 +20,7 @@ from subtitle_tool.mt_transport import HTTPReply, TransportError
 from subtitle_tool.policy import current_execution_snapshot, load_policy
 from subtitle_tool.subtitles import validate_unit_coverage
 from tests.fixtures import SavedResultFixture, TemporaryTest, response, result, timed_raw
-from tests.test_mt_runtime import Clock, quota
+from tests.test_mt_runtime import Clock, business_failure, quota
 from tests.test_openrouter import InlineTransport
 
 
@@ -219,6 +219,58 @@ class StructuredPipelineTests(SavedResultFixture):
 
     def test_502_uses_shared_four_attempt_budget_before_fallback(self):
         self.check_transient(HTTPReply(502, b'{}'))
+
+    def test_typed_error_with_finish_marker_retries_then_commits_structured_fallback(self):
+        self.install(result(('Only sentence.', 'en')))
+        def handler(role, targets, kwargs):
+            if role == 'quota':
+                return quota()
+            if role == 'primary':
+                return business_failure('provider_unavailable', finish_marker=True)
+            return self.success(targets)
+        with mock.patch.object(self.store, 'cache_get', wraps=self.store.cache_get) as cache, \
+                mock.patch.object(self.store, 'translation_batch_update', wraps=self.store.translation_batch_update) as save:
+            self.assertEqual(self.run_backend(handler), 'completed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'] * 4 + ['fallback'])
+        self.assertTrue(all(body == self.calls[0][1] for _, body in self.calls[:4]))
+        backup = self.calls[-1][1]
+        self.assertEqual(backup['model'], 'qwen3.8-flash')
+        self.assertTrue(backup['response_format']['json_schema']['strict'])
+        self.assertIs(backup['enable_thinking'], False)
+        self.assertEqual(self.store.references(self.job_id), [])
+        cues = self.store.cues(self.job_id)
+        self.assertTrue(cues)
+        self.assertTrue(all(cue['mt_origin'] == 'fallback' and cue['translated'] for cue in cues))
+        keys = {row[0] for row in self.store.db.execute('SELECT key FROM mt_cache')}
+        fallback_keys = [call.kwargs['cache_key'] for call in save.call_args_list if call.kwargs['origin'] == 'fallback']
+        self.assertEqual(len(fallback_keys), 1)
+        self.assertIn(fallback_keys[0], keys)
+        self.assertNotIn(cache.call_args_list[0].args[0], keys)
+        counts = self.store.counts(self.job_id)
+        self.assertEqual((counts['mt_primary_request'], counts['mt_fallback_request'], counts['mt_fallback_switch']), (4, 1, 1))
+        self.assertEqual(counts.get('mt_invalid_response', 0) + counts.get('mt_split', 0), 0)
+        events = self.events()
+        retries = [event for event in events if event['kind'] == 'runtime_request' and event['backend'] == 'primary']
+        self.assertEqual([event['category'] for event in retries], ['provider_unavailable'] * 4)
+        self.assertTrue(all(event['retryable'] for event in retries))
+        switches = [event for event in events if event['kind'] == 'runtime_fallback']
+        self.assertEqual([(event['reason'], event['attempt']) for event in switches], [('transient_exhausted', 4)])
+        commits = [event for event in events if event['kind'] == 'runtime_commit']
+        self.assertEqual([(event['backend'], event['committed_count']) for event in commits], [('fallback', len(cues))])
+        self.assertFalse(any(event['kind'] in {'invalid_response', 'split'} for event in events))
+
+    def test_explicit_untyped_choice_error_stops_without_format_repair_or_fallback(self):
+        self.install(result(('Only sentence.', 'en')))
+        body = json.loads(business_failure('provider_unavailable', finish_marker=True).body)
+        body['choices'].append({'finish_reason': 'error', 'error': None})
+        failure = HTTPReply(200, json.dumps(body).encode())
+        self.assertEqual(self.run_backend(lambda role, targets, kwargs:
+            quota() if role == 'quota' else failure), 'failed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'])
+        self.assertEqual(self.store.job(self.job_id)['error_code'], 'mt_service_error')
+        self.assertFalse(any(cue['translated'] for cue in self.store.cues(self.job_id)))
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM mt_cache').fetchone()[0], 0)
+        self.assertFalse(any(event['kind'] in {'runtime_fallback', 'invalid_response', 'split'} for event in self.events()))
 
     def test_deadline_uses_shared_four_attempt_budget_before_fallback(self):
         self.check_transient(TransportError('deadline'))

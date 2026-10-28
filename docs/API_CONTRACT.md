@@ -36,9 +36,11 @@ OpenRouter 契约 3 使用 `provider:{"require_parameters":true}`、`plugins:[{"
 
 普通兼容服务、专用百炼 MT 及旧请求共用策略 3 的提示词、上下文、编号 JSON 校验、繁转简和缩组恢复。请求构造与预算使用同一后端和模型参数。兼容服务的非 2xx 错误映射为 `mt_http_{HTTP状态}`，2xx 中的业务错误映射为 `mt_service_error`；诊断仅记录安全分类和计数，服务端消息、错误码、请求 ID 及响应原文保持私有。
 
-请求契约 2／3 先识别顶层／全部 choice 的业务错误及 `finish_reason:error`，再检查正常结束和正文。服务错误不进入格式修复或缩组；`content:null` 配合 `finish_reason:length` 归入非正常结束。内部错误仅保留本地分类、HTTP 状态和是否可重试，服务端消息与原始错误码不写入诊断或任务。只按白名单 `error.metadata.error_type` 判断业务类别，见[官方错误分类](https://openrouter.ai/docs/api_reference/errors-and-debugging)。普通 404／503 不被推断为不支持 Schema。
+请求契约 2／3 先检查顶层及全部 choice 的业务错误，按白名单 `error.metadata.error_type` 分类，见[官方错误分类](https://openrouter.ai/docs/api/reference/errors-and-debugging)。顶层 `error` 解释没有独立 `error` 字段的 `finish_reason:error`；显式 `choice.error`（含 null／空对象）独立审查。无顶层错误的孤立错误结束标记、未知或畸形 choice 错误停止，永久类别和内容拒绝优先。服务错误进入运行重试流程；正常响应再进入格式校验，`content:null` 配合 `finish_reason:length` 归入非正常结束。
 
 OpenRouter 契约 2／3 的网络连接／读取失败、请求总时限、HTTP 408／429／5xx，以及明确的 `timeout`、`provider_unavailable`、`provider_overloaded`、`server`、`rate_limit_exceeded` 共用每份正文最多 **4 次 HTTP 尝试，包含首次**的预算，HTTP 与业务错误共用这一预算。参数、凭据、权限、余额、内容政策、输入限制及未知业务错误直接停止；永久类别优先于暂时 HTTP 状态。格式修复和缩组各自生成独立正文。
+
+非 2xx 只有无类型顶层错误时（可伴随无独立错误详情的结束标记），按 HTTP 状态处理。
 
 官方 OpenRouter 根地址、请求契约 2／3 且模型为 `openrouter/free` 时，HTTP 404 允许有限重试；顶层或 choice 中的业务 `not_found` 在 HTTP 2xx／404／408／429／5xx 下同样可重试，保留原分类并共用上述四次预算。其他永久类型和不可重试的 HTTP 状态优先终止；`not_found` 混合未知、畸形或缺失类型的业务错误归为 `service_unknown`。固定模型（含固定 `:free`）、旧契约和其他根地址的 `not_found` 直接停止。
 
@@ -236,5 +238,7 @@ HTTP、MT 和上传在发送前检查取消；已登记尝试及占用额度保�
 `timings` 将耗时换算为秒；计数及耗时跨恢复累计。报告的 `mt_provider` 和 `models.mt` 读取任务实际 MT 快照，历史任务为 `bailian`／`qwen-mt-flash`；不使用当前模型选择，也不输出 MT 地址或指纹。报告另含任务状态、版本、排版轮次、超限警告、`display_timing_version` 与上述调整摘要；仅校时另含 `retime.prepared_at/from_display_timing_version`，省略私有路径、凭据、上传链接和字幕文字。
 
 OpenRouter 运行诊断通过独立回调追加至同一 `.build/mt-diagnostics/{job_id}.jsonl`，`kind` 为 `runtime_request`、`runtime_wait`、`runtime_quota` 或 `runtime_drain`；不计入 `mt_invalid_response`／`mt_split`。仅记录安全分类、尝试序号、HTTP 状态、请求耗时、共享／限速等待、是否截止终止及收尾丢弃数；额度事件仅含上述整数、本地可用余量及 UTC 观察时间。不保留账号其他字段、上游消息、原始错误码或正文。报告通过状态和静态错误码区分额度停止与用户取消，`timings` 另含 `mt_shared_wait_seconds` 和 `mt_pacing_wait_seconds`。
+
+业务错误的 `runtime_request` 另含 `top_level_error` 布尔值，以及 `choice_error_count`、`detail_free_error_finish_count` 和 `error_type_known_count`／`error_type_missing_count`／`error_type_unknown_count`／`error_type_malformed_count` 非负整数。缺失指显式错误对象没有可读取的 `metadata.error_type`；畸形指字段存在但不是字符串；未知指字符串不在类型白名单。无详情结束标记单独计数。写入器按字段和类型白名单过滤。
 
 后备诊断另有 `runtime_fallback`／`runtime_commit`，附本地 32 位十六进制 `run_id`、64 位原组标识、实际 `backend:primary|fallback`、`provider:openrouter|bailian|openai_compatible` 及白名单切换原因。格式和运行事件另含安全模型标识、请求版本与阶段；实际路由 `actual_model` 仅保留格式受限且不含 URL／凭据形式的标识。`runtime_commit` 在完整组事务提交后记录组员数，`cached` 表示是否来自缓存；HTTP 接收成功与完整译文提交分开计数。普通报告的 `mt_fallback` 仅含启用状态、后备提供者与模型，不输出后备地址、指纹或私有快照路径。
