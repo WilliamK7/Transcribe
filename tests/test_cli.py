@@ -137,6 +137,15 @@ class CliTests(TemporaryTest):
         self.assertEqual(output.getvalue().strip(),
                          '[offline-job] 翻译配额等待：约 40.50 秒，滚动窗口最多 60 次请求')
 
+    def test_content_refusal_fallback_is_not_reported_as_exhausted_retries(self):
+        progress = Progress()
+        with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
+            progress('offline-job', 'mt_fallback',
+                     {'reason': 'content_refused', 'category': 'content_policy_violation', 'attempt': 1}, None)
+        self.assertIn('明确拒绝生成，当前完整组直接转百炼', output.getvalue())
+        self.assertNotIn('1/4', output.getvalue())
+        self.assertNotIn('临时服务故障', output.getvalue())
+
     def test_no_arguments_displays_help_without_creating_store(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(main([]), 0)

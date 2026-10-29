@@ -249,12 +249,72 @@ class FallbackTests(SavedResultFixture):
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'mt_quota_unknown')
         self.assertEqual(self.calls, [])
 
-    def test_content_filter_and_permanent_errors_do_not_trigger_repair_or_backup(self):
+    def test_disabled_fallback_content_filter_stops_without_repair_or_backup(self):
         self.install()
+        Engine(self.config, self.store).resume(self.job_id, mt_fallback='none')
         denied = HTTPReply(200, b'{"choices":[{"finish_reason":"content_filter","message":{"content":null}}]}')
         self.assertEqual(self.run_backend(lambda p, *args: quota() if p == 'quota' else denied), 'failed')
         self.assertEqual([p for p, _ in self.calls], ['primary'])
         self.assertEqual(self.store.counts(self.job_id).get('mt_invalid_response', 0), 0)
+
+    def test_message_refusal_falls_back_once_and_next_group_keeps_primary_for_v2(self):
+        self.install()
+        denied = HTTPReply(200, b'{"choices":[{"finish_reason":"stop","message":{"content":null,"refusal":"synthetic refusal"}}]}')
+        def service(provider, items, kwargs):
+            if provider == 'quota':
+                return quota()
+            if provider == 'primary' and items[0]['text'].startswith('First'):
+                return denied
+            return self.success(items)
+        self.assertEqual(self.run_backend(service), 'completed')
+        self.assertEqual([provider for provider, _ in self.calls], ['primary', 'fallback', 'primary'])
+        self.assertEqual([row['mt_origin'] for row in self.store.references(self.job_id)], ['fallback', 'primary'])
+        self.assertEqual([row['mt_origin'] for row in self.store.cues(self.job_id)], ['fallback', 'primary'])
+        path = self.config.root / '.build' / 'mt-diagnostics' / (self.job_id + '.jsonl')
+        raw = path.read_text(encoding='utf-8')
+        events = [json.loads(line) for line in raw.splitlines()]
+        switches = [event for event in events if event['kind'] == 'runtime_fallback']
+        self.assertEqual([(event['reason'], event['attempt']) for event in switches], [('content_refused', 1)])
+        self.assertEqual(self.store.counts(self.job_id).get('mt_invalid_response', 0), 0)
+        self.assertNotIn('synthetic refusal', raw)
+
+    def test_content_refusal_group_eligibility_covers_code_and_categories_only(self):
+        from subtitle_tool.mt_control import MTControl
+        from subtitle_tool.mt_fallback import GroupFallback
+        from subtitle_tool.mt_runtime import ServiceError
+        for error in [ToolError('safe refusal', 'mt_content_refused'),
+                      ServiceError('content_policy_violation'), ServiceError('refusal', 403)]:
+            with self.subTest(code=error.code, category=getattr(error, 'category', None)):
+                router = GroupFallback(MTControl(threading.Event()))
+                backup, switched = mock.Mock(return_value='completed'), mock.Mock()
+                def denied():
+                    raise error
+                self.assertEqual(router.run(denied, backup, switched), 'completed')
+                backup.assert_called_once_with()
+                switched.assert_called_once_with(error)
+                self.assertFalse(getattr(error, 'retryable', False))
+                self.assertFalse(router.exhausted.is_set())
+                self.assertIsNone(router.control.error)
+        for category in ['http_permanent', 'authentication', 'permission_denied', 'payment_required',
+                         'invalid_request', 'service_unknown']:
+            with self.subTest(category=category):
+                router = GroupFallback(MTControl(threading.Event()))
+                error = ServiceError(category, 403)
+                backup, switched = mock.Mock(), mock.Mock()
+                def denied():
+                    raise error
+                with self.assertRaises(ToolError) as caught:
+                    router.run(denied, backup, switched)
+                self.assertIs(caught.exception, error)
+                backup.assert_not_called()
+                switched.assert_not_called()
+
+    def test_unclassified_http_403_stops_without_backup(self):
+        self.install()
+        self.assertEqual(self.run_backend(lambda provider, *args:
+            quota() if provider == 'quota' else HTTPReply(403, b'{}')), 'failed')
+        self.assertEqual([provider for provider, _ in self.calls], ['primary'])
+        self.assertEqual(self.store.job(self.job_id)['error_code'], 'mt_http_403')
 
     def test_format_failure_falls_back_with_the_whole_original_group(self):
         self.install()
@@ -598,12 +658,10 @@ class FallbackTests(SavedResultFixture):
         from tests.test_mt_runtime_engine import RuntimeEngineTests
         self.install(result(('Only this sentence.', 'en')))
         self.config.save()
-        reports = []
         for mode in ['bailian_once', 'bailian_twice']:
             run = RuntimeEngineTests.run_cancel_cli(self, mode)
             self.assertEqual(run.returncode, 0, run.stderr.decode(errors='replace'))
             report = json.loads(run.stdout)
-            reports.append(report)
             self.assertEqual(report['exit_code'], 130)
             self.assertEqual(report['backend_calls'], {'primary': 0, 'fallback': 1})
             self.assertEqual(report['active_children'], 0)
@@ -611,8 +669,6 @@ class FallbackTests(SavedResultFixture):
             self.assertLess(report['drain_seconds'], 6 if mode.endswith('once') else 1.5)
             self.assertEqual(self.store.job(self.job_id)['state'], 'cancelled')
             self.assertEqual(self.store.db.execute('SELECT count(*) FROM mt_cache').fetchone()[0], 0)
-        # Available to the optional local acceptance recorder without retaining fixture text or paths.
-        self.cancel_measurements = reports
 
     def test_native_errors_are_classified_without_recording_native_codes(self):
         from subtitle_tool.mt_runtime import bailian_failure

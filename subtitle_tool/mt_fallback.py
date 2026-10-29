@@ -12,6 +12,11 @@ def supports_fallback(backend):
     return backend.is_openrouter and backend.contract.bounded_runtime
 
 
+def is_content_refusal(error):
+    return (error.code == 'mt_content_refused' or
+            getattr(error, 'category', None) in {'content_policy_violation', 'refusal'})
+
+
 def fallback_policy(manifest, choice=None):
     primary = saved_mt(manifest)
     if not supports_fallback(primary):
@@ -95,7 +100,8 @@ class GroupFallback:
             raise
         except ToolError as error:
             eligible = (getattr(error, 'retryable', False) or
-                        error.code in {'mt_batch_invalid', 'mt_quota_exhausted', 'mt_retry_after'})
+                        error.code in {'mt_batch_invalid', 'mt_quota_exhausted', 'mt_retry_after'} or
+                        is_content_refusal(error))
             if not eligible:
                 self.control.stop(error)
                 raise
@@ -112,7 +118,8 @@ class GroupFallback:
             except ToolError as backup:
                 self.control.check_start()
                 def summary(failure):
-                    category = getattr(failure, 'category', 'format_exhausted' if failure.code == 'mt_batch_invalid' else 'local_error')
+                    category = getattr(failure, 'category', 'content_policy_violation' if is_content_refusal(failure) else
+                        'format_exhausted' if failure.code == 'mt_batch_invalid' else 'local_error')
                     attempts = getattr(failure, 'attempts', 0)
                     count = f'累计 {attempts} 次' if failure.code == 'mt_batch_invalid' else f'{attempts}/4 次'
                     return f'{category}，{count} HTTP 尝试'

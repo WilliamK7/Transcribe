@@ -26,7 +26,7 @@ from .media import EXTRACT_RECIPE_VERSION, Media
 from .mt import batch_cache_key, batch_cache_value, batch_recovery_cache_key, parse_batch_translation
 from .mt_diagnostics import MTDiagnostics
 from .mt_control import MTControl
-from .mt_fallback import GroupFallback, fallback_policy, saved_fallback, validate_origins
+from .mt_fallback import GroupFallback, fallback_policy, is_content_refusal, saved_fallback, validate_origins
 from .mt_backend import configured_mt, saved_mt
 from .store import TERMINAL, Store
 from .review import ReviewDecision, decision_origin
@@ -1156,7 +1156,10 @@ class Engine:
             def switched(error):
                 reason = {'mt_batch_invalid': 'format_exhausted', 'mt_quota_exhausted': 'quota_exhausted',
                           'mt_retry_after': 'retry_after'}.get(error.code, 'transient_exhausted')
-                info = {'reason': reason, 'category': getattr(error, 'category', reason),
+                if is_content_refusal(error):
+                    reason = 'content_refused'
+                info = {'reason': reason, 'category': getattr(error, 'category',
+                        'content_policy_violation' if reason == 'content_refused' else reason),
                         'attempt': getattr(error, 'attempts', 0), 'quota_source': getattr(error, 'quota_source', '')}
                 if reason == 'quota_exhausted' and info['quota_source'] == 'local_ledger':
                     info['reason'] = 'quota_local_empty'

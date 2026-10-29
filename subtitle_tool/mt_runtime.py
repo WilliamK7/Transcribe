@@ -25,7 +25,7 @@ PERMANENT_TYPES = {
 }
 RUNTIME_CATEGORIES = TRANSIENT_TYPES | PERMANENT_TYPES | {
     'network', 'deadline', 'transport', 'response_too_large', 'http_transient', 'http_permanent',
-    'service_unknown', 'response_structure', 'shared_wait', 'quota_observed',
+    'service_unknown', 'generation_error', 'response_structure', 'shared_wait', 'quota_observed',
     'quota_refresh_failed', 'quota_unknown', 'quota_exhausted', 'drain_discard', 'retry_after',
     'cancelled', 'drain_stopped', 'format_exhausted', 'transient_exhausted', 'response_received', 'group_committed',
 }
@@ -55,6 +55,7 @@ class ServiceError(ToolError):
             'invalid_prompt': 'OpenRouter 翻译输入被拒绝，进度已保存。',
             'content_policy_violation': 'OpenRouter 内容政策拒绝了翻译请求，进度已保存。',
             'refusal': 'OpenRouter 翻译请求被模型拒绝，进度已保存。',
+            'generation_error': 'OpenRouter 生成失败且未提供错误详情，进度已保存。',
         }.get(category)
         if hint is None:
             hint = {400: 'OpenRouter 请求参数被拒绝', 401: 'OpenRouter 翻译凭据被拒绝',
@@ -72,9 +73,9 @@ def _service_errors(body):
     """Extract independent errors and content-free shape counts from one envelope."""
     errors = []
     shape = {'top_level_error': False, 'choice_error_count': 0, 'detail_free_error_finish_count': 0,
+             'content_filter_count': 0, 'message_refusal_count': 0,
              'error_type_known_count': 0, 'error_type_missing_count': 0,
              'error_type_unknown_count': 0, 'error_type_malformed_count': 0}
-    content_refused = False
     if isinstance(body, dict):
         if 'error' in body:
             shape['top_level_error'] = True
@@ -84,9 +85,10 @@ def _service_errors(body):
             for choice in choices:
                 if not isinstance(choice, dict):
                     continue
-                if (choice.get('finish_reason') == 'content_filter' or
-                        isinstance(choice.get('message'), dict) and choice['message'].get('refusal')):
-                    content_refused = True
+                if choice.get('finish_reason') == 'content_filter':
+                    shape['content_filter_count'] += 1
+                if isinstance(choice.get('message'), dict) and choice['message'].get('refusal'):
+                    shape['message_refusal_count'] += 1
                 if 'error' in choice:
                     shape['choice_error_count'] += 1
                     errors.append(choice['error'])
@@ -108,7 +110,7 @@ def _service_errors(body):
     if not shape['top_level_error']:
         # A top-level error explains its finish markers, but never an explicit choice.error.
         kinds.extend([None] * shape['detail_free_error_finish_count'])
-    return kinds, shape, content_refused
+    return kinds, shape, bool(shape['content_filter_count'] or shape['message_refusal_count'])
 
 
 def service_failure(status, body, *, free_router=False):
@@ -122,6 +124,11 @@ def service_failure(status, body, *, free_router=False):
             return failure(kind)
     if status in {400, 401, 402, 403, 405, 413, 415, 422} or status == 404 and not free_router:
         return failure('http_permanent')
+    if (shape['detail_free_error_finish_count'] and not shape['top_level_error'] and
+            not shape['choice_error_count']):
+        retryable = (200 <= status < 300 or status in {408, 429} or 500 <= status <= 599 or
+                     status == 404 and free_router)
+        return failure('generation_error', retryable)
     retryable_types = TRANSIENT_TYPES | {'not_found'} if free_router else TRANSIENT_TYPES
     untyped_choice = any(kind is None for kind in kinds) and (
         shape['choice_error_count'] or shape['detail_free_error_finish_count'] and not shape['top_level_error'])
@@ -144,7 +151,8 @@ def service_failure(status, body, *, free_router=False):
 def bailian_failure(status, body):
     content = service_failure(200, body)
     if content is not None and content.category == 'content_policy_violation':
-        return ServiceError('content_policy_violation', status, code='mt_content_refused', provider='bailian')
+        return ServiceError('content_policy_violation', status, code='mt_content_refused', provider='bailian',
+                            error_shape=content.error_shape)
     error = body.get('error') if isinstance(body, dict) else None
     code = (error.get('code', error.get('type')) if isinstance(error, dict) else None)
     if code is None and isinstance(body, dict):

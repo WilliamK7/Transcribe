@@ -47,7 +47,7 @@ $env:MT_MODEL = '服务商提供的模型名称'
 
 OpenRouter 根地址使用 `https://openrouter.ai/api/v1`。免费模型可设置 `mt_model: "openrouter/free"`、`mt_rpm: 20`；实际容量与每日额度以[服务端限制](https://openrouter.ai/docs/api_reference/limits)为准。
 
-OpenRouter 默认启用**百炼后备，可能产生费用**。暂时故障重试耗尽、等待过长或译文校验失败时，当前组转交原百炼账户及工作空间的 `qwen3.8-flash`；可信免费额度的本地可用余量归零时，本轮剩余组转百炼。额度未知、凭据、权限及内容拒绝等错误会保存进度并停止。两端均失败时可恢复任务，重试及切换规则见[接口契约](docs/API_CONTRACT.md#数据与恢复)。
+OpenRouter 默认启用**百炼后备，可能产生费用**。暂时故障重试耗尽、等待过长或译文校验失败时，当前组转交原百炼账户及工作空间的 `qwen3.8-flash`；OpenRouter 明确内容拒绝时，当前完整组直接转后备，后续组仍优先 OpenRouter。可信免费额度的本地可用余量归零时，本轮剩余组转百炼。额度未知、凭据、权限及未知错误等仍会保存进度并停止；关闭后备时内容拒绝也会停止。后备同样拒绝或失败时保留进度，重试及切换规则见[接口契约](docs/API_CONTRACT.md#数据与恢复)。
 
 新任务、`--resume` 和 `--reflow` 省略 `--mt-fallback` 时启用后备；每次需要关闭时指定 `--mt-fallback none`，之后恢复也需保留该选项。成功译文保持原样，未完成组在恢复时重新优先 OpenRouter。旧任务恢复沿用保存的请求与后备模型，使用 `--reflow` 升级。
 

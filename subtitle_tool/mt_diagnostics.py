@@ -91,6 +91,7 @@ class MTDiagnostics:
             for field in ['attempt', 'status', 'duration_ms', 'shared_wait_ms', 'pacing_wait_ms',
                           'discarded', 'used', 'limit', 'remaining', 'local_remaining', 'committed_count',
                           'choice_error_count', 'detail_free_error_finish_count', 'error_type_known_count',
+                          'content_filter_count', 'message_refusal_count',
                           'error_type_missing_count', 'error_type_unknown_count', 'error_type_malformed_count']:
                 value = event.get(field)
                 if type(value) is int and 0 <= value <= 2**63 - 1:
@@ -151,7 +152,8 @@ class MTDiagnostics:
             if isinstance(value, str) and re.fullmatch(pattern, value):
                 record[field] = value
         for field, allowed in [('backend', {'primary', 'fallback'}), ('provider', {'openrouter', 'bailian', 'openai_compatible'}),
-                ('reason', {'quota_exhausted', 'quota_local_empty', 'format_exhausted', 'retry_after', 'transient_exhausted'})]:
+                ('reason', {'quota_exhausted', 'quota_local_empty', 'format_exhausted', 'retry_after',
+                            'transient_exhausted', 'content_refused'})]:
             value = event.get(field)
             if isinstance(value, str) and value in allowed:
                 record[field] = value

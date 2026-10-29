@@ -20,7 +20,7 @@ from subtitle_tool.mt_transport import HTTPReply, TransportError
 from subtitle_tool.policy import current_execution_snapshot, load_policy
 from subtitle_tool.subtitles import validate_unit_coverage
 from tests.fixtures import SavedResultFixture, TemporaryTest, response, result, timed_raw
-from tests.test_mt_runtime import Clock, business_failure, quota
+from tests.test_mt_runtime import Clock, business_failure, generation_failure, quota
 from tests.test_openrouter import InlineTransport
 
 
@@ -219,6 +219,176 @@ class StructuredPipelineTests(SavedResultFixture):
 
     def test_502_uses_shared_four_attempt_budget_before_fallback(self):
         self.check_transient(HTTPReply(502, b'{}'))
+
+    def test_generation_error_fourth_attempt_succeeds_without_fallback(self):
+        self.install(result(('Only sentence.', 'en')))
+        attempts = 0
+        def handler(role, targets, kwargs):
+            nonlocal attempts
+            if role == 'quota':
+                return quota()
+            attempts += 1
+            return generation_failure() if attempts < 4 else self.success(targets)
+        self.assertEqual(self.run_backend(handler), 'completed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'] * 4)
+        self.assertTrue(all(body == self.calls[0][1] for _, body in self.calls))
+        self.assertTrue(all(cue['mt_origin'] == 'primary' and cue['translated'] for cue in self.store.cues(self.job_id)))
+        self.assertFalse(any(event['kind'] in {'runtime_fallback', 'invalid_response', 'split'} for event in self.events()))
+
+    def test_generation_error_exhaustion_falls_back_current_group_and_reuses_persisted_cache(self):
+        manifest = self.install(result(('First sentence.', 'en'), ('Second sentence.', 'en')))
+        def handler(role, targets, kwargs):
+            if role == 'quota':
+                return quota()
+            if role == 'primary' and targets['0']['text'].startswith('First'):
+                return generation_failure()
+            return self.success(targets)
+        with mock.patch.object(self.store, 'cache_get', wraps=self.store.cache_get) as cache, \
+                mock.patch.object(self.store, 'translation_batch_update', wraps=self.store.translation_batch_update) as save:
+            self.assertEqual(self.run_backend(handler), 'completed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'] * 4 + ['fallback', 'primary'])
+        self.assertTrue(all(body == self.calls[0][1] for _, body in self.calls[:4]))
+        cues = self.store.cues(self.job_id)
+        self.assertEqual([cue['mt_origin'] for cue in cues], ['fallback', 'primary'])
+        self.assertTrue(all(cue['translated'] for cue in cues))
+        keys = {row[0] for row in self.store.db.execute('SELECT key FROM mt_cache')}
+        fallback_keys = [call.kwargs['cache_key'] for call in save.call_args_list if call.kwargs['origin'] == 'fallback']
+        self.assertEqual(len(fallback_keys), 1)
+        self.assertIn(fallback_keys[0], keys)
+        self.assertNotIn(cache.call_args_list[0].args[0], keys)
+        self.assertEqual(self.store.job(self.job_id)['manifest']['mt_snapshot'], manifest['mt_snapshot'])
+        events = self.events()
+        requests = [event for event in events if event['kind'] == 'runtime_request' and
+                    event['category'] == 'generation_error']
+        self.assertEqual([event['attempt'] for event in requests], [1, 2, 3, 4])
+        self.assertTrue(all(event['retryable'] for event in requests))
+        switches = [event for event in events if event['kind'] == 'runtime_fallback']
+        self.assertEqual([(event['reason'], event['attempt']) for event in switches], [('transient_exhausted', 4)])
+        self.assertFalse(any(event['kind'] in {'invalid_response', 'split'} for event in events))
+        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
+        self.calls.clear()
+        self.assertEqual(self.run_backend(handler), 'completed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'] * 4)
+        self.assertEqual([cue['mt_origin'] for cue in self.store.cues(self.job_id)], ['fallback', 'primary'])
+        self.assertTrue(any(event['kind'] == 'runtime_commit' and event['backend'] == 'fallback' and
+                            event['cached'] for event in self.events()))
+
+    def test_disabled_fallback_saves_other_group_and_generation_error_resume_only_retries_unfinished(self):
+        self.install(result(('First sentence.', 'en'), ('Second sentence.', 'en')))
+        Engine(self.config, self.store).resume(self.job_id, mt_fallback='none')
+        def handler(role, targets, kwargs):
+            if role == 'quota':
+                return quota()
+            return generation_failure() if targets['0']['text'].startswith('Second') else self.success(targets)
+        self.assertEqual(self.run_backend(handler), 'failed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'] * 5)
+        saved, pending = self.store.cues(self.job_id)
+        self.assertTrue(saved['translated'])
+        self.assertFalse(pending['translated'])
+        self.assertEqual(self.store.job(self.job_id)['error_code'], 'mt_service_error')
+        self.assertFalse(any(event['kind'] == 'runtime_fallback' for event in self.events()))
+        Engine(self.config, self.store).resume(self.job_id, mt_fallback='none')
+        self.calls.clear()
+        self.assertEqual(self.run_backend(lambda role, targets, kwargs:
+            quota() if role == 'quota' else self.success(targets)), 'completed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'])
+        self.assertTrue(json.loads(self.calls[0][1]['messages'][1]['content'])['targets']['0']['text'].startswith('Second'))
+        self.assertEqual(self.store.cues(self.job_id)[0], saved)
+
+    def test_cancel_during_generation_error_retry_never_starts_fallback(self):
+        self.install(result(('Only sentence.', 'en')))
+        cancel = threading.Event()
+        def handler(role, targets, kwargs):
+            if role == 'quota':
+                return quota()
+            cancel.set()
+            return generation_failure()
+        self.assertEqual(self.run_backend(handler, cancel=cancel), 'cancelled')
+        self.assertEqual([role for role, _ in self.calls], ['primary'])
+        self.assertFalse(any(event['kind'] == 'runtime_fallback' for event in self.events()))
+
+    def check_primary_refusal_fallback(self, denied):
+        raw = timed_raw(['First', 'sentence', 'has', 'many', 'words', 'today.'], word_ms=1400)
+        raw['transcripts'][0]['sentences'].append({'begin_time': 9000, 'end_time': 9900,
+            'text': 'Second sentence.', 'language': 'en'})
+        manifest = self.install(raw)
+        def handler(role, targets, kwargs):
+            if role == 'quota':
+                return quota()
+            if role == 'primary' and targets['0']['text'].startswith('First'):
+                return denied
+            return self.success(targets)
+        self.assertEqual(self.run_backend(handler), 'completed')
+        self.assertEqual([role for role, _ in self.calls], ['primary', 'fallback', 'primary'])
+        targets = [json.loads(body['messages'][1]['content'])['targets'] for _, body in self.calls]
+        self.assertGreater(len(targets[0]), 1)
+        self.assertEqual(targets[0], targets[1])
+        self.assertEqual([cue['mt_origin'] for cue in self.store.cues(self.job_id)],
+                         ['fallback'] * len(targets[0]) + ['primary'])
+        self.assertEqual(self.store.job(self.job_id)['manifest']['mt_snapshot'], manifest['mt_snapshot'])
+        events = self.events()
+        primary = [event for event in events if event['kind'] == 'runtime_request' and event['backend'] == 'primary']
+        self.assertEqual(primary[0]['attempt'], 1)
+        self.assertFalse(primary[0]['retryable'])
+        self.assertIn(primary[0]['category'], {'content_policy_violation', 'refusal'})
+        switches = [event for event in events if event['kind'] == 'runtime_fallback']
+        self.assertEqual([(event['reason'], event['attempt']) for event in switches], [('content_refused', 1)])
+        self.assertFalse(any(event['kind'] in {'invalid_response', 'split'} for event in events))
+
+    def test_primary_content_filter_falls_back_once_and_next_group_uses_primary(self):
+        self.check_primary_refusal_fallback(HTTPReply(200,
+            b'{"choices":[{"finish_reason":"content_filter","message":{"content":null}}]}'))
+        event = next(event for event in self.events() if event['kind'] == 'runtime_request')
+        self.assertEqual((event['content_filter_count'], event['message_refusal_count']), (1, 0))
+
+    def test_primary_typed_refusal_with_http_code_falls_back_without_retry(self):
+        self.check_primary_refusal_fallback(business_failure('refusal', status=403, choice=True))
+
+    def test_both_backends_refuse_preserve_other_group_and_resume_only_unfinished(self):
+        self.install(result(('First sentence.', 'en'), ('Second sentence.', 'en')))
+        private = 'synthetic-refusal-and-subtitle-text'
+        refused = HTTPReply(200, json.dumps({'choices': [{'finish_reason': 'stop',
+            'message': {'content': None, 'refusal': private}}]}).encode())
+        def handler(role, targets, kwargs):
+            if role == 'quota':
+                return quota()
+            if targets['0']['text'].startswith('First'):
+                return self.success(targets)
+            return business_failure('content_policy_violation') if role == 'primary' else refused
+        self.assertEqual(self.run_backend(handler), 'failed')
+        self.assertEqual([role for role, _ in self.calls], ['primary', 'primary', 'fallback'])
+        saved, pending = self.store.cues(self.job_id)
+        self.assertTrue(saved['translated'])
+        self.assertFalse(pending['translated'])
+        self.assertNotIn('mt_origin', pending)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM mt_cache').fetchone()[0], 1)
+        job = self.store.job(self.job_id)
+        self.assertEqual(job['error_code'], 'mt_fallback_failed')
+        self.assertIn('OpenRouter：content_policy_violation', job['error'])
+        self.assertIn('百炼：content_policy_violation', job['error'])
+        backup = next(event for event in self.events()
+                      if event['kind'] == 'runtime_request' and event['backend'] == 'fallback')
+        self.assertEqual((backup['content_filter_count'], backup['message_refusal_count']), (0, 1))
+        self.assertNotIn(private, job['error'] + json.dumps(self.events()))
+        self.assertFalse(any(event['kind'] in {'invalid_response', 'split'} for event in self.events()))
+        Engine(self.config, self.store).resume(self.job_id)
+        self.calls.clear()
+        self.assertEqual(self.run_backend(lambda role, targets, kwargs:
+            quota() if role == 'quota' else self.success(targets)), 'completed')
+        self.assertEqual([role for role, _ in self.calls], ['primary'])
+        self.assertEqual(self.store.cues(self.job_id)[0], saved)
+
+    def test_cancel_after_primary_content_refusal_never_starts_fallback(self):
+        self.install(result(('Only sentence.', 'en')))
+        cancel = threading.Event()
+        def handler(role, targets, kwargs):
+            if role == 'quota':
+                return quota()
+            cancel.set()
+            return business_failure('refusal')
+        self.assertEqual(self.run_backend(handler, cancel=cancel), 'cancelled')
+        self.assertEqual([role for role, _ in self.calls], ['primary'])
+        self.assertFalse(any(event['kind'] == 'runtime_fallback' for event in self.events()))
 
     def test_typed_error_with_finish_marker_retries_then_commits_structured_fallback(self):
         self.install(result(('Only sentence.', 'en')))

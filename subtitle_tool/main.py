@@ -87,6 +87,7 @@ class Progress:
                 reasons = {'quota_exhausted': '服务端观测免费额度不足，本轮剩余组转百炼',
                            'quota_local_empty': '本地免费可用余量归零，本轮剩余组转百炼',
                            'format_exhausted': '译文结构或覆盖校验失败，当前原组转百炼',
+                           'content_refused': '主后端明确拒绝生成，当前完整组直接转百炼',
                            'retry_after': '要求等待超过 300 秒，当前组转百炼'}
                 failure = {'deadline': '仍超时', 'timeout': '上游仍超时', 'network': '网络连接仍失败',
                            'rate_limit_exceeded': '仍被限流', 'provider_overloaded': '上游仍过载',

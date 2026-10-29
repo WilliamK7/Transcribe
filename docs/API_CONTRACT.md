@@ -36,9 +36,11 @@ OpenRouter 契约 3 使用 `provider:{"require_parameters":true}`、`plugins:[{"
 
 普通兼容服务、专用百炼 MT 及旧请求共用策略 3 的提示词、上下文、编号 JSON 校验、繁转简和缩组恢复。请求构造与预算使用同一后端和模型参数。兼容服务的非 2xx 错误映射为 `mt_http_{HTTP状态}`，2xx 中的业务错误映射为 `mt_service_error`；诊断仅记录安全分类和计数，服务端消息、错误码、请求 ID 及响应原文保持私有。
 
-请求契约 2／3 先检查顶层及全部 choice 的业务错误，按白名单 `error.metadata.error_type` 分类，见[官方错误分类](https://openrouter.ai/docs/api/reference/errors-and-debugging)。顶层 `error` 解释没有独立 `error` 字段的 `finish_reason:error`；显式 `choice.error`（含 null／空对象）独立审查。无顶层错误的孤立错误结束标记、未知或畸形 choice 错误停止，永久类别和内容拒绝优先。服务错误进入运行重试流程；正常响应再进入格式校验，`content:null` 配合 `finish_reason:length` 归入非正常结束。
+请求契约 2／3 先检查顶层及全部 choice 的业务错误，按白名单 `error.metadata.error_type` 分类，见[官方错误分类](https://openrouter.ai/docs/api/reference/errors-and-debugging)。顶层 `error` 解释没有独立 `error` 字段的 `finish_reason:error`；显式 `choice.error`（含 null／空对象）独立审查。未知或畸形 choice 错误停止，永久类别和内容拒绝优先。服务错误进入运行重试流程；正常响应再进入格式校验，`content:null` 配合 `finish_reason:length` 归入非正常结束。
 
-OpenRouter 契约 2／3 的网络连接／读取失败、请求总时限、HTTP 408／429／5xx，以及明确的 `timeout`、`provider_unavailable`、`provider_overloaded`、`server`、`rate_limit_exceeded` 共用每份正文最多 **4 次 HTTP 尝试，包含首次**的预算，HTTP 与业务错误共用这一预算。参数、凭据、权限、余额、内容政策、输入限制及未知业务错误直接停止；永久类别优先于暂时 HTTP 状态。格式修复和缩组各自生成独立正文。
+OpenRouter 契约 2／3 的网络连接／读取失败、请求总时限、HTTP 408／429／5xx，以及明确的 `timeout`、`provider_unavailable`、`provider_overloaded`、`server`、`rate_limit_exceeded` 共用每份正文最多 **4 次 HTTP 尝试，包含首次**的预算，HTTP 与业务错误共用这一预算。参数、凭据、权限、余额、输入限制及未知业务错误直接停止；明确内容拒绝不在主后端重试，交给下述组级后备策略处理。永久类别优先于暂时 HTTP 状态。格式修复和缩组各自生成独立正文。
+
+出现 `finish_reason:error` 且没有顶层或 choice 的显式 `error` 时，归为本地 `generation_error`，共用上述四次预算；失败响应不要求具备完整的消息、编号或译文结构。HTTP 2xx／408／429／5xx 可重试，404 仅限下述 `openrouter/free`。内容拒绝、永久状态及显式业务错误仍优先按各自规则处理；耗尽后进入组级后备。`generation_error` 不是服务端 `error_type`。
 
 非 2xx 只有无类型顶层错误时（可伴随无独立错误详情的结束标记），按 HTTP 状态处理。
 
@@ -74,7 +76,7 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 
 ## 数据与恢复
 
-OpenRouter 契约 2／3 支持 `--mt-fallback {none,bailian}`，仅用于新任务、`--resume` 与 `--reflow`，新建／恢复省略时默认启用。普通暂时故障（含上述免费路由 `not_found`）每份正文最多 4 次 HTTP 尝试耗尽、结构／覆盖失败（契约 3 为首次失败，契约 2 为格式修复／缩组最终失败）或有效 Retry-After 超过 300 秒时，仅当前原组转百炼，后续组继续优先主后端，保留其冷却截止时间。部分子组成功后原组最终失败时，百炼重新翻译完整原组。可信观察下本地可用余量归零才将本轮剩余工作转百炼；首次额度未知、永久错误、内容拒绝及未知业务错误停止。`content_filter` 与拒绝字段在格式恢复前识别。
+OpenRouter 契约 2／3 支持 `--mt-fallback {none,bailian}`，仅用于新任务、`--resume` 与 `--reflow`，新建／恢复省略时默认启用。普通暂时故障（含上述免费路由 `not_found`）每份正文最多 4 次 HTTP 尝试耗尽、结构／覆盖失败（契约 3 为首次失败，契约 2 为格式修复／缩组最终失败）或有效 Retry-After 超过 300 秒时，仅当前原组转百炼，后续组继续优先主后端，保留其冷却截止时间。明确内容拒绝（`content_filter`、非空 `message.refusal`、业务类型 `content_policy_violation`／`refusal`）在格式恢复前识别，直接将当前完整原组交给后备，不在主端重试或缩组；关闭后备时保存进度并停止。部分子组成功后原组最终失败时，百炼重新翻译完整原组。可信观察下本地可用余量归零才将本轮剩余工作转百炼；首次额度未知、其他永久错误及未知业务错误停止，未分类的 HTTP 403 不推定为内容拒绝。
 
 旧契约 2 的百炼后备使用保存账户／工作空间的 `qwen-mt-flash`，契约 3 后备使用 `qwen3.8-flash`；均可能产生费用，按实际使用计费。以下原生 Qwen-MT 字段仅适用于旧后备。按自己的请求契约重建单条 user 消息，沿用提示词、`temperature:0`、`seed:0`、`stream:false`，不带 OpenRouter Schema、路由或插件，发送前重新核对百炼输入预算，见 [Qwen-MT API](https://help.aliyun.com/zh/model-studio/qwen-mt-api)。按[官方错误分类](https://help.aliyun.com/en/model-studio/error-code)映射安全类别，临时限流／超时／服务故障有限重试，鉴权、欠费、权限和内容拒绝立即停止。只保留本地类别及次数，不保留上游代码和原始消息。
 
@@ -239,6 +241,6 @@ HTTP、MT 和上传在发送前检查取消；已登记尝试及占用额度保�
 
 OpenRouter 运行诊断通过独立回调追加至同一 `.build/mt-diagnostics/{job_id}.jsonl`，`kind` 为 `runtime_request`、`runtime_wait`、`runtime_quota` 或 `runtime_drain`；不计入 `mt_invalid_response`／`mt_split`。仅记录安全分类、尝试序号、HTTP 状态、请求耗时、共享／限速等待、是否截止终止及收尾丢弃数；额度事件仅含上述整数、本地可用余量及 UTC 观察时间。不保留账号其他字段、上游消息、原始错误码或正文。报告通过状态和静态错误码区分额度停止与用户取消，`timings` 另含 `mt_shared_wait_seconds` 和 `mt_pacing_wait_seconds`。
 
-业务错误的 `runtime_request` 另含 `top_level_error` 布尔值，以及 `choice_error_count`、`detail_free_error_finish_count` 和 `error_type_known_count`／`error_type_missing_count`／`error_type_unknown_count`／`error_type_malformed_count` 非负整数。缺失指显式错误对象没有可读取的 `metadata.error_type`；畸形指字段存在但不是字符串；未知指字符串不在类型白名单。无详情结束标记单独计数。写入器按字段和类型白名单过滤。
+业务错误的 `runtime_request` 另含 `top_level_error` 布尔值，以及 `choice_error_count`、`detail_free_error_finish_count` 和 `error_type_known_count`／`error_type_missing_count`／`error_type_unknown_count`／`error_type_malformed_count` 非负整数。缺失指显式错误对象没有可读取的 `metadata.error_type`；畸形指字段存在但不是字符串；未知指字符串不在类型白名单。无详情结束标记单独计数。`content_filter_count` 与 `message_refusal_count` 分别记录内容过滤结束标记和非空拒绝字段的数量，不保存拒绝正文；内容拒绝切换后备的原因是 `content_refused`。写入器按字段和类型白名单过滤。
 
 后备诊断另有 `runtime_fallback`／`runtime_commit`，附本地 32 位十六进制 `run_id`、64 位原组标识、实际 `backend:primary|fallback`、`provider:openrouter|bailian|openai_compatible` 及白名单切换原因。格式和运行事件另含安全模型标识、请求版本与阶段；实际路由 `actual_model` 仅保留格式受限且不含 URL／凭据形式的标识。`runtime_commit` 在完整组事务提交后记录组员数，`cached` 表示是否来自缓存；HTTP 接收成功与完整译文提交分开计数。普通报告的 `mt_fallback` 仅含启用状态、后备提供者与模型，不输出后备地址、指纹或私有快照路径。

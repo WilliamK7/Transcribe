@@ -164,16 +164,19 @@ class OpenRouterProtocolTests(TemporaryTest):
 
     def test_business_errors_and_error_finish_never_trigger_format_repair(self):
         secret = 'private-mt-key-and-input'
-        for body in [{'error': {'message': secret}},
-                     {'choices': [{'error': {'message': secret}, 'finish_reason': 'length', 'message': {'content': None}}]},
-                     {'choices': [{'finish_reason': 'error', 'message': {'content': secret}}]}]:
+        for body, attempts in [({'error': {'message': secret}}, 1),
+                ({'choices': [{'error': {'message': secret}, 'finish_reason': 'length', 'message': {'content': None}}]}, 1),
+                ({'choices': [{'finish_reason': 'error', 'message': {'content': secret}}]}, 4)]:
             with self.subTest(body=body):
                 self.cloud.http.control.begin()
+                clock = Clock()
+                self.cloud.http.recovery = RecoveryCoordinator(clock=clock, jitter=lambda: 0, wait=clock.wait)
+                self.cloud.http.pacer = RequestPacer(clock=clock, requests_per_window=0)
                 events = []
                 with mock.patch('requests.request', return_value=response(body)) as request, self.assertRaises(ToolError) as error:
                     self.cloud.translate_batch(['alpha', 'bravo'], on_event=events.append)
                 self.assertEqual(error.exception.code, 'mt_service_error')
-                self.assertEqual(request.call_count, 1)
+                self.assertEqual(request.call_count, attempts)
                 self.assertEqual(events, [])
                 self.assertNotIn(secret, str(error.exception) + error.exception.request_id)
 
