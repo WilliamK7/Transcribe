@@ -14,6 +14,7 @@ PROMPT_VERSION = 9
 RECOVERY_VERSION = 1
 STRUCTURED_PROMPT_VERSION = 10
 STRUCTURED_RECOVERY_VERSION = 2
+QINIU_INPUT_BUDGET = 32 * 1024
 STRUCTURED_PROMPT = (
     '把 targets 的字幕片段译成简体中文，用 context 消歧但不翻译 context。'
     '同一 sentence 内的片段连贯理解；每个编号仅翻译该片段已有的内容，'
@@ -55,10 +56,15 @@ def batch_payload(fragments, source_lang="auto", context=(), *, repair=False, pr
                        'name': 'subtitle_translations', 'strict': True,
                        'schema': {'type': 'object', 'properties': {'translations': mapping},
                                   'required': ['translations'], 'additionalProperties': False}}}}
-        if contract.openrouter_controls:
+        if request_version in {4, 5} and provider == 'qiniu':
+            payload['response_format'] = {'type': 'json_object'}
+            payload['max_tokens'] = 4096
+        elif contract.openrouter_controls:
             payload.update(provider={'require_parameters': True}, plugins=[{'id': 'response-healing'}])
         else:
             payload.update(enable_thinking=False, temperature=0, seed=0)
+        if request_version == 5:
+            payload['max_tokens'] = 4096
         return payload
     # Put background before the task, and keep id/text objects exclusive to targets.
     # Context following instructions can be mistaken for the translation target.
@@ -100,8 +106,12 @@ def batch_input_size(fragments, source_lang="auto", context=(), *, request_optio
                           ensure_ascii=False).encode('utf-8')) + MT_TEMPLATE_RESERVE
 
 
+def batch_input_budget(request_options=None):
+    return QINIU_INPUT_BUDGET if (request_options or {}).get('request_version') in {4, 5} else MT_INPUT_BUDGET
+
+
 def validate_batch_input(fragments, source_lang="auto", context=(), *, request_options=None):
-    if batch_input_size(fragments, source_lang, context, request_options=request_options) > MT_INPUT_BUDGET:
+    if batch_input_size(fragments, source_lang, context, request_options=request_options) > batch_input_budget(request_options):
         raise ToolError("待翻译文本超过保守输入预算，且无法在可靠词时间边界安全拆分；进度已保存，可恢复。", "mt_input_budget")
 
 
@@ -219,7 +229,7 @@ def recovery_context(fragments, start, end, source_lang='auto', context=(), *, r
             kept.append(item)
             seen.add(identity)
     targets = fragments[start:end]
-    while kept and batch_input_size(targets, source_lang, kept, request_options=request_options) > MT_INPUT_BUDGET:
+    while kept and batch_input_size(targets, source_lang, kept, request_options=request_options) > batch_input_budget(request_options):
         kept.pop()
     validate_batch_input(targets, source_lang, kept, request_options=request_options)
     return kept

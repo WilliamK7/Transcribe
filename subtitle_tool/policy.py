@@ -6,6 +6,7 @@ from . import mt
 from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
                      ToolError)
 from .media import EXTRACT_RECIPE_VERSION
+from .mt_quality import QUALITY_PROMPT_VERSION
 
 
 CONTEXT_VERSION = 1
@@ -13,8 +14,8 @@ CONTEXT_VERSION = 1
 
 def current_execution_snapshot(strategy_version=3):
     return dict(format_version=1,
-                prompt_version=mt.STRUCTURED_PROMPT_VERSION if strategy_version == 4 else mt.PROMPT_VERSION,
-                recovery_version=mt.STRUCTURED_RECOVERY_VERSION if strategy_version == 4 else mt.RECOVERY_VERSION,
+                prompt_version=QUALITY_PROMPT_VERSION if strategy_version == 5 else mt.STRUCTURED_PROMPT_VERSION if strategy_version == 4 else mt.PROMPT_VERSION,
+                recovery_version=3 if strategy_version == 5 else mt.STRUCTURED_RECOVERY_VERSION if strategy_version == 4 else mt.RECOVERY_VERSION,
                 context_version=CONTEXT_VERSION)
 
 
@@ -64,7 +65,7 @@ def load_policy(manifest, *, verify_execution=True):
     display_timing = display_timing_version(manifest)
     layout = None
     if subtitle:
-        _version(manifest.get("translation_strategy_version"), {1, 2, 3, 4})
+        _version(manifest.get("translation_strategy_version"), {1, 2, 3, 4, 5})
         saved_layout = manifest.get("subtitle_settings", {})
         if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:
             raise ToolError("任务的排版快照不受支持，请用 --reflow 显式重排。", "cache_version")
@@ -83,7 +84,7 @@ def load_policy(manifest, *, verify_execution=True):
     _version(plan.get("extract_recipe_version", 1) if plan else EXTRACT_RECIPE_VERSION,
              {1, EXTRACT_RECIPE_VERSION})
     context_version = 0
-    if verify_execution and manifest.get('translation_strategy_version') == 4 and 'execution_snapshot' not in manifest:
+    if verify_execution and manifest.get('translation_strategy_version') in {4, 5} and 'execution_snapshot' not in manifest:
         raise ToolError('结构化翻译缺少执行版本，请用 --reflow。', 'cache_version')
     if verify_execution and "execution_snapshot" in manifest:
         snapshot = manifest["execution_snapshot"]

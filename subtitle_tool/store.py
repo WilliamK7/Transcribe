@@ -49,6 +49,9 @@ class Store:
                 attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(job_id, cue_id));
             CREATE TABLE IF NOT EXISTS mt_cache (key TEXT PRIMARY KEY, text TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS mt_stages (
+                job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, stage_key TEXT NOT NULL,
+                stage TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(job_id,stage_key));
             CREATE TABLE IF NOT EXISTS subtitle_sources (
                 job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, sentence_id TEXT NOT NULL,
                 record TEXT NOT NULL, PRIMARY KEY(job_id,sentence_id));
@@ -68,7 +71,8 @@ class Store:
         self.db.commit()
 
     def enqueue(self, source: Path, region: str = "beijing", overwrite=False, output_dir: Path | None = None,
-                *, workspace_id="", account="", settings=None, mt_snapshot=None, mt_fallback_policy=None):
+                *, workspace_id="", account="", settings=None, mt_snapshot=None, mt_fallback_policy=None,
+                mt_route_snapshot=None):
         if region != "beijing":
             raise ToolError("新任务只支持北京工作空间。", "config")
         workspace_id = validate_workspace_id(workspace_id)
@@ -92,6 +96,8 @@ class Store:
                         raise ToolError("该文件已有其他账号或接入方式的任务，请用 --resume 原任务 ID；不能自动迁移工作空间。", "cache_mismatch")
                     if mt_snapshot is not None and saved_mt(previous).snapshot() != mt_snapshot:
                         raise ToolError("该文件已有不同翻译配置的未完成任务；请用 --resume 沿原后端恢复，或用 --reflow 显式切换。", "mt_config_changed")
+                    if previous.get('mt_route_snapshot') != mt_route_snapshot:
+                        raise ToolError('该文件已有不同翻译池配置的未完成任务；请用 --resume 或 --reflow。', 'mt_config_changed')
                     if reusable is None:
                         reusable = row
             if reusable is not None:
@@ -107,10 +113,16 @@ class Store:
                         "overwrite": bool(overwrite), "segments": [], "warnings": []}
             if mt_snapshot is not None:
                 manifest["mt_snapshot"] = mt_snapshot
-            strategy = (4 if mt_snapshot is not None and mt_snapshot.get('request_version') == 3
+            if mt_route_snapshot is not None:
+                manifest['mt_route_snapshot'] = mt_route_snapshot
+            strategy = (5 if mt_route_snapshot is not None else
+                        4 if mt_snapshot is not None and mt_snapshot.get('request_version') in {3, 4}
                         else TRANSLATION_STRATEGY_VERSION)
             if mt_snapshot is not None:
                 saved_mt({**manifest, "translation_strategy_version": strategy})
+            if mt_route_snapshot is not None:
+                from .mt_pool import saved_route
+                saved_route({**manifest, 'translation_strategy_version': strategy})
             if mt_fallback_policy is not None:
                 manifest['mt_fallback_policy'] = mt_fallback_policy
             settings = settings or Settings()
@@ -213,6 +225,7 @@ class Store:
             metadata = {k: v for k, v in record.items() if k not in columns + ["job_id", "metadata"]}
             if not record.get('translated'):
                 metadata.pop('mt_origin', None)
+                metadata.pop('mt_stage_key', None)
             rows.append((job_id, *(record.get(k, defaults.get(k)) for k in columns), json.dumps(metadata, ensure_ascii=False)))
         self.db.execute("DELETE FROM " + table + " WHERE job_id=?", (job_id,))
         self.db.executemany("INSERT INTO " + table + "(job_id," + ",".join(columns) + ",metadata) "
@@ -244,13 +257,14 @@ class Store:
         with self.lock:
             atomic_json(path, {"job": self.job(job_id), "sources": self.sources(job_id),
                                "cues": self.cues(job_id), "references": self.references(job_id),
-                               "counts": self.counts(job_id)})
+                               "counts": self.counts(job_id), "mt_stages": self.mt_stages(job_id)})
 
     def commit_reflow(self, job_id, sources, cues, manifest, output):
         """Atomically replace local subtitle inputs and the explicit resume marker."""
         with self.lock, self.db:
             output = Path(output).resolve()
             self.check_republish_output(job_id, output, manifest["overwrite"], operation="重排")
+            self.db.execute('DELETE FROM mt_stages WHERE job_id=?', (job_id,))
             self._initialize_subtitles(job_id, sources, cues, manifest)
             self.db.execute("UPDATE jobs SET output=?,output_key=?,state='queued',error='',error_code='',"
                             "request_id='',updated=? WHERE id=?", (str(output), output_key(output), time.time(), job_id))
@@ -320,6 +334,7 @@ class Store:
                     # Neighbor context can change as well as the reviewed sentence.
                     item.update(translated="", error="")
                 self.db.execute("DELETE FROM mt_references WHERE job_id=?", (job_id,))
+                self.db.execute('DELETE FROM mt_stages WHERE job_id=?', (job_id,))
             else:
                 # Old tasks without sources retain their per-cue review behavior.
                 cue.update(decision.values(), translated="", error="")
@@ -377,17 +392,60 @@ class Store:
             for name, amount in (counts or {}).items():
                 self._count(job_id, name, amount)
 
-    def _translation_origin(self, table, job_id, cue_id, origin):
+    def _translation_origin(self, table, job_id, cue_id, origin, *, stage_key=None):
         if origin not in {None, 'primary', 'fallback'}:
-            raise ValueError('Invalid translation origin')
+            manifest = self.job(job_id)['manifest']
+            route = manifest.get('mt_route_snapshot', {})
+            entries = route.get('entries', []) if isinstance(route, dict) else []
+            if not isinstance(origin, str) or not any(isinstance(entry, dict) and entry.get('id') == origin for entry in entries):
+                raise ValueError('Invalid translation origin')
         row = self.db.execute('SELECT metadata FROM ' + table + ' WHERE job_id=? AND cue_id=?', (job_id, cue_id)).fetchone()
         if row is not None:
             metadata = json.loads(row[0])
             metadata.pop('mt_origin', None)
+            metadata.pop('mt_stage_key', None)
             if origin is not None:
                 metadata['mt_origin'] = origin
+            if stage_key is not None:
+                metadata['mt_stage_key'] = stage_key
             self.db.execute('UPDATE ' + table + ' SET metadata=? WHERE job_id=? AND cue_id=?',
                             (json.dumps(metadata, ensure_ascii=False), job_id, cue_id))
+
+    def mt_stages(self, job_id):
+        with self.lock:
+            return [{'key': row['stage_key'], 'stage': row['stage'], 'record': json.loads(row['record'])}
+                    for row in self.db.execute('SELECT stage_key,stage,record FROM mt_stages WHERE job_id=? ORDER BY stage_key',
+                                               (job_id,))]
+
+    def mt_stage_entry(self, job_id, key):
+        with self.lock:
+            row = self.db.execute('SELECT stage,record FROM mt_stages WHERE job_id=? AND stage_key=?', (job_id, key)).fetchone()
+            return {'stage': row['stage'], 'record': json.loads(row['record'])} if row is not None else None
+
+    def commit_mt_stage(self, job_id, key, stage, record, *, translations=None, origin=None, counts=None,
+                        cache_key=None, cache_value=None):
+        """Persist a complete private stage and, when present, all cue updates in one transaction."""
+        if (not isinstance(key, str) or len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or
+                stage not in {'glossary', 'glossary_unavailable', 'draft', 'align', 'review', 'correct', 'final'} or not isinstance(record, dict) or
+                (cache_key is None) != (cache_value is None) or
+                translations is not None and (not translations or
+                    any(not isinstance(text, str) or not text.strip() for text in translations.values()))):
+            raise ValueError('Invalid MT stage')
+        with self.lock, self.db:
+            if translations is not None:
+                self._clear_publication(job_id)
+                for cue_id, text in translations.items():
+                    changed = self.db.execute("UPDATE cues SET translated=?,error='' WHERE job_id=? AND cue_id=?",
+                                              (text, job_id, cue_id))
+                    if changed.rowcount != 1:
+                        raise ToolError('批量翻译的字幕记录不完整，结果未保存。', 'cache_mismatch')
+                    self._translation_origin('cues', job_id, cue_id, origin, stage_key=key)
+            self.db.execute('INSERT OR REPLACE INTO mt_stages(job_id,stage_key,stage,record) VALUES(?,?,?,?)',
+                            (job_id, key, stage, json.dumps(record, ensure_ascii=False)))
+            if cache_key is not None:
+                self.db.execute('INSERT OR REPLACE INTO mt_cache VALUES(?,?)', (cache_key, cache_value))
+            for name, amount in (counts or {}).items():
+                self._count(job_id, name, amount)
 
     def commit_fallback_policy(self, job_id, manifest, previous):
         """Policy upgrade, provenance and the local recovery marker commit together."""

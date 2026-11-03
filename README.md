@@ -1,6 +1,6 @@
 # 百炼命令行字幕工具
 
-Windows x64 本地 CLI。使用北京工作空间的 `qwen3-asr-flash-filetrans` 自动识别语音，默认用 `qwen-mt-flash` 翻译为简体中文，也可配置 OpenAI Chat Completions 兼容翻译后端。
+Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans` 识别语音，用七牛／OpenRouter／百炼翻译池生成简体中文字幕，也支持单个翻译后端。翻译池免费优先，默认允许付费后备。
 
 ## 开始使用
 
@@ -12,148 +12,190 @@ Windows x64 本地 CLI。使用北京工作空间的 `qwen3-asr-flash-filetrans`
 .\scripts\transcribe.ps1 "D:\Videos\课程.mkv"
 ```
 
-准备环境使用 Python 3.12.10 x64、哈希锁定依赖和项目 FFmpeg。已有对应 Python 可使用 `setup.ps1 -PythonPath "C:\Python312\python.exe"`。
+环境使用 Python 3.12.10 x64、锁定依赖和项目 FFmpeg。已有解释器可传 `setup.ps1 -PythonPath "C:\Python312\python.exe"`。无参数或 `--help` 显示帮助；多个文件顺序处理。
 
-无参数或 `--help` 显示帮助。也可运行 `.\.venv\Scripts\python.exe -m subtitle_tool.main`。多个文件顺序处理。
-
-`--configure` 填写北京 Workspace ID 并隐藏输入 Key；`--configure-key` 只更新 Key。`--workspace-id ID` 可为本次新任务指定工作空间。
-
-Key **明文保存到 `data/key.txt`**，环境变量 `DASHSCOPE_API_KEY` 优先。`data` 还包含上传引用、转写和任务缓存，应留在本机。
+`--configure` 填写北京 Workspace ID 并隐藏输入 Key；`--configure-key` 只更新 Key。Key 明文保存到 `data/key.txt`，环境变量 `DASHSCOPE_API_KEY` 优先。`data` 还保存任务、转写和缓存，应留在本机。`--workspace-id ID` 可为新任务指定工作空间。
 
 ## 选择翻译后端
 
-默认 `mt_provider: "bailian"`，使用百炼 Key。通过 `data/settings.json` 或环境变量选择兼容翻译服务；ASR 使用百炼 Key 和北京 Workspace ID。
+默认 `mt_provider:"pool"`；已有设置明确选择其他后端时沿用该设置。ASR 始终使用百炼账户。翻译配置用于新任务和 `--reflow`；`--resume` 沿用任务保存的翻译身份和策略。
 
-| 配置项 | 默认值 | 环境变量 | 含义 |
+### 七牛／OpenRouter 翻译池
+
+配置七牛 Key 并检查免费模型：
+
+```powershell
+.\scripts\transcribe.ps1 --configure-mt qiniu
+.\scripts\transcribe.ps1 --check-mt qiniu
+.\scripts\transcribe.ps1 --check-mt --mt-paid deny
+.\scripts\transcribe.ps1 --mt-paid deny "D:\Videos\课程.mkv"
+```
+
+`--configure-mt qiniu` 隐藏输入 Key，明文保存到 `data/qiniu-key.txt` 并选择翻译池；`QINIU_API_KEY` 优先。`--check-mt` 检查当前配置，使用合成短句，首个候选成功后报告入口和模型。检查会联网，启用付费候选时可能产生费用。
+
+| 等级 | 入口 ID | 默认模型 | 凭据 |
 | --- | --- | --- | --- |
-| `mt_provider` | `bailian` | `MT_PROVIDER` | `bailian` 或 `openai_compatible` |
-| `mt_base_url` | `https://api.openai.com/v1` | `MT_BASE_URL` | 兼容接口根地址，保留服务商要求的路径前缀 |
-| `mt_model` | 空 | `MT_MODEL` | 兼容后端的模型名称，启用时必填 |
-| `mt_rpm` | `0` | `MT_RPM` | 兼容后端本地每分钟请求上限，非负整数；0 不主动限制 |
+| 免费 | `qiniu_free` | `qiniu/conatus-free` | `QINIU_API_KEY` 或 `data/qiniu-key.txt` |
+| 免费 | `openrouter_free` | `openrouter/free` | `OPENAI_API_KEY` 或 `data/mt-key.txt` |
+| 付费 | `qiniu_paid` | `deepseek/deepseek-v4.1-flash` | 七牛 Key |
+| 付费 | `bailian_paid` | `qwen3.8-flash` | 百炼 Key 及原工作空间 |
 
-环境变量覆盖同名文件设置，仅对当前进程及其子进程生效。例如，先配置 ASR，再在 PowerShell 设置兼容服务：
+每个等级内默认权重为 3:1。缺少凭据的入口跳过；只配置百炼 Key 时可能直接使用百炼付费候选。免费候选累计等待最多 15 秒，然后尝试允许的付费候选。每阶段最多 180 秒，每后端最多 2 次请求，单次最多 60 秒，总并发默认 4。
+
+`--mt-paid deny` 禁止付费候选的新请求，`allow` 允许；新建、恢复和重排均可指定，恢复时保存新的许可状态。已有匹配缓存仍可复用。池使用此选项管理后备；单后端使用下文的 `--mt-fallback`。
+
+七牛 Conatus 活动截至北京时间 **2026 年 11 月 30 日 23:59**，工具在活动结束后跳过该免费模型。实名认证、资格和额度见[官方活动页](https://www.qiniu.com/ai/free-models/conatus-2026)。
+
+### 使用百炼免费额度
+
+百炼免费额度按地域、模型及快照核算，用完或到期后默认转付费。为免费入口开启“免费额度用完即停”，等待生效后再使用，详见[官方额度规则](https://help.aliyun.com/zh/model-studio/new-free-quota)。
+
+使用 Windows npm 安装的官方 CLI **2.7.2**，确保 PATH 可找到 `bl.cmd` 和 Node.js，登录控制台会话：
+
+```powershell
+bl auth login --console
+.\scripts\transcribe.ps1 --inspect-bailian-quota
+```
+
+检查只读查询模型余额、到期日期及 `auto_stop`；`observation_usable` 表示额度字段有效，账户绑定和保护确认另行保存。CLI 只返回到期日期，工具从该北京日期开始跳过模型。CLI 安装和鉴权见[官方说明](https://help.aliyun.com/zh/model-studio/cli/installation)，首次登录可能创建 API Key。
+
+确认 CLI 账户与工具的北京工作空间、Key 属于同一主账号，然后添加模型并绑定：
+
+```powershell
+.\scripts\transcribe.ps1 --configure-mt-pool --bailian-free-model qwen3.8-27b --bailian-free-model qwen3.8-max-0902
+.\scripts\transcribe.ps1 --bind-bailian-account --confirm-same-account
+```
+
+在[百炼控制台](https://bailian.console.aliyun.com/)为这两个精确模型开启“免费额度用完即停”，等待生效，再记录确认：
+
+```powershell
+.\scripts\transcribe.ps1 --confirm-bailian-protection qwen3.8-27b --confirm-bailian-protection qwen3.8-max-0902 --confirm-propagation-waited
+.\scripts\transcribe.ps1 --mt-paid deny "D:\Videos\课程.mkv"
+```
+
+添加模型保留已有池条目；默认池没有百炼免费入口。命令使用已保存的北京工作空间，新入口用于新任务，旧任务通过 `--reflow` 应用。
+
+绑定及逐模型确认保存在 `data/bailian-quota-binding.json`，只记录指纹。Key、工作空间或 CLI 登录上下文改变后重新绑定并确认；重新绑定清除原模型确认。观察到云端开关关闭也会撤销该模型确认。免费请求同时检查账户绑定、模型确认、有效余额和开关状态；观察及本地估算可能延迟，实际计费保护依赖云端开关生效。
+
+控制台会话与模型 API Key 独立。遇到会话失效时，结束当前运行，重新执行 `bl auth login --console`、账户绑定和模型保护确认，再用原任务 ID `--resume`。查询失败时跳过百炼免费候选，其他允许的候选仍可使用。
+
+### 自定义翻译池
+
+在 `data/settings.json` 合并以下设置，保留 Workspace ID 等其他配置：
+
+```json
+{
+  "mt_provider": "pool",
+  "mt_backends": [
+    {"id": "qiniu_free"},
+    {"id": "openrouter_free", "rpm": 20},
+    {"id": "qiniu_paid"},
+    {"id": "bailian_paid"}
+  ],
+  "mt_routing": {"paid_enabled": false, "free_wait_seconds": 15},
+  "mt_quality": {"manual_glossary": {"idempotency": "幂等性"}}
+}
+```
+
+`mt_backends` 为 `null` 或省略时使用默认池；显式列表完整替换默认列表。默认 ID 可只写覆盖项，自定义入口须填写完整身份和能力。字段范围及示例见[池配置契约](docs/API_CONTRACT.md#翻译池配置)。
+
+### 单后端
+
+将 `mt_backends` 设为 `null`，通过文件设置或环境变量选择服务；环境变量优先。
+
+| 设置 | 环境变量 | 用途 |
+| --- | --- | --- |
+| `mt_provider` | `MT_PROVIDER` | `bailian`、`qiniu`、`openai_compatible` 或 `pool` |
+| `mt_base_url` | `MT_BASE_URL` | 兼容接口根地址，默认 `https://api.openai.com/v1` |
+| `mt_model` | `MT_MODEL` | 兼容后端必填；七牛留空使用 `qiniu/conatus-free` |
+| `mt_rpm` | `MT_RPM` | 兼容后端每分钟请求上限，0 表示不主动限流 |
+
+百炼单后端使用 `qwen-mt-flash`。兼容后端使用 `OPENAI_API_KEY` 或明文 `data/mt-key.txt`，根地址填写到 `/chat/completions` 之前，保留服务商要求的路径前缀。
 
 ```powershell
 $env:MT_PROVIDER = 'openai_compatible'
-$env:MT_BASE_URL = 'https://服务商地址/要求的路径/v1'
-$env:MT_MODEL = '服务商提供的模型名称'
-# 另行设置 OPENAI_API_KEY，或将独立 MT Key 写入本机 data/mt-key.txt
+$env:MT_BASE_URL = 'https://openrouter.ai/api/v1'
+$env:MT_MODEL = 'openrouter/free'
+$env:MT_RPM = '20'
 .\scripts\transcribe.ps1 "D:\Videos\课程.mkv"
 ```
 
-独立 MT Key 优先读取 `OPENAI_API_KEY`，其次读取明文 `data/mt-key.txt`。新任务在提交 ASR 前验证翻译配置与本机凭据是否齐全。
-
-根地址填写到 `/chat/completions` 之前的路径，使用无凭据、查询参数和片段的 HTTPS URL；回环地址也支持 HTTP。服务需支持非流式文本 Chat Completions 和编号 JSON 译文，详细请求见[接口契约](docs/API_CONTRACT.md#云端请求)。
-
-OpenRouter 根地址使用 `https://openrouter.ai/api/v1`。免费模型可设置 `mt_model: "openrouter/free"`、`mt_rpm: 20`；实际容量与每日额度以[服务端限制](https://openrouter.ai/docs/api_reference/limits)为准。
-
-OpenRouter 默认启用**百炼后备，可能产生费用**。暂时故障重试耗尽、等待过长或译文校验失败时，当前组转交原百炼账户及工作空间的 `qwen3.8-flash`；OpenRouter 明确内容拒绝时，当前完整组直接转后备，后续组仍优先 OpenRouter。可信免费额度的本地可用余量归零时，本轮剩余组转百炼。额度未知、凭据、权限及未知错误等仍会保存进度并停止；关闭后备时内容拒绝也会停止。后备同样拒绝或失败时保留进度，重试及切换规则见[接口契约](docs/API_CONTRACT.md#数据与恢复)。
-
-新任务、`--resume` 和 `--reflow` 省略 `--mt-fallback` 时启用后备；每次需要关闭时指定 `--mt-fallback none`，之后恢复也需保留该选项。成功译文保持原样，未完成组在恢复时重新优先 OpenRouter。旧任务恢复沿用保存的请求与后备模型，使用 `--reflow` 升级。
-
-更换服务或模型后，对已有任务使用 `--reflow`，详见下方恢复说明。
+OpenRouter 单后端默认启用百炼后备，可能产生费用。暂时故障、格式错误或内容拒绝时，当前组转百炼；可信免费额度耗尽时，剩余组转百炼。每次需要禁用后备时传 `--mt-fallback none`，恢复时也保留该选项。重试及旧任务恢复规则见[接口契约](docs/API_CONTRACT.md#数据与恢复)。
 
 ## 右键“发送到”
 
-`setup.ps1` 环境准备成功后，会为当前用户安装“!百炼字幕”入口。在资源管理器中选择一个或多个视频／音频文件，右键 → 发送到 → !百炼字幕；Windows 11 可先点“显示更多选项”。文件依次处理，字幕默认保存在源文件同目录，已有 SRT 默认跳过。
+环境准备成功后安装“!百炼字幕”入口。在资源管理器中选中文件，右键 → 发送到 → !百炼字幕；Windows 11 可先点“显示更多选项”。字幕默认位于源文件同目录，已有 SRT 默认跳过。
 
-窗口支持音轨、声道和语种复核。全部成功或跳过后自动关闭；失败、暂停复核或停止处理时保留提示，按回车关闭。任务恢复见下方 CLI 命令。
-
-已有环境可单独安装／更新或卸载入口：
+窗口支持音轨、声道和语种复核；全部成功或跳过后自动关闭，其余情况保留提示。项目移动后重新安装入口：
 
 ```powershell
 .\scripts\install-sendto.ps1
 .\scripts\install-sendto.ps1 -Remove
 ```
 
-项目移动后，从新位置重新运行安装脚本。
-
 ## 字幕与音频
 
-- 默认输出视频同目录的 `视频名.srt`，只替换最终扩展名。`--output-dir` 按调用位置解析，恢复时沿用保存的绝对路径。
-- 外语原文在上、简体中文译文在下；中文／粤语保留原文并跳过 MT。无语音时完成任务且不生成字幕。
-- OpenRouter 新任务按原文和可靠词时间切分，结合前后原文联合翻译同一句的片段。真实译文超出排版目标时，最多追加两轮重排重译。同批相同请求共享结果，恢复时复用匹配缓存。
-- 新任务结合前后各 30 秒内、最多各 12 句的原文理解上下文，允许最多 15 秒的句间停顿；实际范围受语种、人工决定和输入预算限制。
-- 翻译默认 4 并发，短任务无固定逐条间隔；百炼在 61 秒滚动窗口内最多发送 60 次，兼容后端按 `mt_rpm` 等待额度释放。真实限流仍共享退避并逐步提速，进度会区分配额等待与服务端限流。
-- 原文、译文各以两行为目标，短句保持一行；保留完整单词和标点，平衡英文尾行。实际显示也受播放器字体和窗口影响。
-- 文字过多或超过 7 秒时，按可靠词时间拆分，新片段至少 1 秒。零时长词与相邻词组合后参与分段。无法继续拆分时保留完整内容和已有时间，在报告中记录排版超限警告。
-- 新任务使用显示时间策略 v2：自动收短同分段、来源及起止顺序正常的相邻句重叠，须同时不超过 500ms 和前条原显示时长的 10%；修整后前条及后条原时长均至少 1 秒。其他时间冲突保存进度并返回 `timeline`；详细规则见[时间轴与字幕](docs/API_CONTRACT.md#时间轴与字幕)。
-- 已有 SRT 默认跳过；`--overwrite` 先备份再覆盖。同名不同扩展视频的目标冲突需要调整文件名或输出目录。
-- 优先复制 AAC→M4A、MP3→MP3、FLAC→FLAC、Opus／Vorbis→OGG；需要声道处理或时间轴校正时转换为 16kHz 单声道 FLAC。
-- 保留音轨偏移、静音和编码延迟；超过 12 小时或上传容量时按 PCM 样本精确分段。上传容量取 1 GB 与服务返回限额中的较小值。
-- 需要转换为 PCM 的音轨约以 37.28 小时为上限；遇到 `media_pcm_limit` 时，请先分割输入。
+- 默认输出 `视频名.srt`，外语原文在上、简体中文译文在下；中文／粤语保留原文。无语音时完成任务且不生成字幕。
+- 翻译池按组完成术语、整句翻译、片段对齐和自动复核，最多两轮纠正。完成一组即保存，每 15 秒报告活动阶段。辅助复核不可用或仍有疑点时保留完整译文并报告警告；自动复核不能保证语义质量。
+- 输入预算不足时裁剪上下文，再按可靠词时间拆分。实际译文使后续请求超预算时保存进度并返回 `mt_input_budget`；可配置更大输入能力的候选后重排，全局上限为 32768 字节。
+- 原文和译文各以两行为目标，超长字幕按可靠词时间拆分。无法继续拆分时保留完整内容并记录警告。可修整的小幅句间重叠自动收短，其他冲突返回 `timeline`；规则见[时间轴与字幕](docs/API_CONTRACT.md#时间轴与字幕)。
+- 已有 SRT 默认跳过；`--overwrite` 先备份再覆盖。同名不同扩展媒体可指定不同输出目录。
+- 优先复制 AAC、MP3、FLAC、Opus／Vorbis；需要声道或时间轴处理时转换为 16kHz 单声道 FLAC，保留偏移、静音和编码延迟。超过 12 小时或上传容量时分段；`media_pcm_limit` 表示输入需先分割。
 
-可在 `data/settings.json` 调整以下设置，新任务和 `--reflow` 使用当前设置，`--resume` 沿用任务保存的排版设置。宽度计量见[时间轴与字幕](docs/API_CONTRACT.md#时间轴与字幕)。
+在 `data/settings.json` 调整排版，新任务及 `--reflow` 使用当前设置，`--resume` 沿用已保存设置。并发使用当前值。
 
-| 设置 | 默认值 | 含义 |
+| 设置 | 默认值 | 范围或含义 |
 | --- | --- | --- |
-| `mt_workers` | `4` | 翻译并发数，1～4 |
-| `zh_line_width` | `44` | 中文每行全角字符宽度，12～72 |
-| `other_line_width` | `84` | 其他语种每行显示宽度，24～160 |
-| `chinese_first` | `false` | 译文是否排在原文上方 |
+| `mt_workers` | `4` | 1～4 |
+| `zh_line_width` | `44` | 12～72 |
+| `other_line_width` | `84` | 24～160 |
+| `chinese_first` | `false` | 译文是否位于原文上方 |
 
 ## 复核与任务管理
 
-音轨、声道或语种存在歧义时，终端会要求确认。语种复核逐条显示原文，可选择保留或翻译；手动语言只影响 MT。同一完整句的片段一起确认，每条决定立即保存，输入 `q` 暂停后可继续复核。
+音轨、声道或语种有歧义时交互确认。语种复核显示原文，可选择保留或翻译；同句片段一起确认，决定立即保存，输入 `q` 暂停。`--non-interactive` 或重定向输入时，歧义保存为 `needs_review`。
 
 ```powershell
-.\scripts\transcribe.ps1 --non-interactive --channel mix "D:\Videos\课程.mkv"
 .\scripts\transcribe.ps1 --jobs
 .\scripts\transcribe.ps1 --review 本地任务ID
 .\scripts\transcribe.ps1 --resume 本地任务ID
-.\scripts\transcribe.ps1 --resume 本地任务ID --mt-fallback none
+.\scripts\transcribe.ps1 --resume 本地任务ID --mt-paid deny
 .\scripts\transcribe.ps1 --reflow 本地任务ID --overwrite
 .\scripts\transcribe.ps1 --retime 本地任务ID --overwrite
-.\scripts\transcribe.ps1 --resume 本地任务ID --track 音轨索引 --channel right
-.\scripts\transcribe.ps1 --resume 本地任务ID --output-dir "D:\Subtitles" --overwrite
 .\scripts\transcribe.ps1 --cancel 本地任务ID
 ```
 
-`--channel left` 选择首声道，`right` 选择第二声道，`mix` 混音。`--track` 使用 FFprobe 音轨索引。恢复时可重选尚未提交任务的音轨／声道，已提交的识别输入固定。
-
-`--non-interactive` 或重定向输入时，歧义保存为 `needs_review` 并以退出码 2 结束。待复核或未完成的字幕暂不输出。
-
-任务库由单个进程独占。Ctrl+C 保存进度并停止本地处理；OpenRouter 契约 2／3 及其百炼后备最多用 5 秒保存已在途的完整结果，再次 Ctrl+C 立即终止等待。普通百炼、ASR 及旧请求等待网络结束或超时。已提交云端任务仍可能计费。`--cancel` 停止已保存任务，之后用 `--resume` 恢复。
-
-| 操作 | 用途 | 本地条件 |
+| 操作 | 用途 | 所需本地资料 |
 | --- | --- | --- |
-| `--resume` | 沿用保存的身份、处理策略、排版和人工决定，补齐未完成部分 | 原账户及 MT 凭据；并发与 RPM 使用当前设置 |
-| `--reflow` | 用当前翻译配置与处理策略，从转写重建字幕；保留原 ASR 身份和人工决定 | 完整本地转写、原 ASR 与当前 MT 凭据 |
-| `--retime` | 仅更新显示时间，复用完整字幕、译文和原排版；零云端调用 | 完整最终字幕及原账户、MT 凭据 |
+| `--resume` | 保留原身份、策略及成功结果，补齐未完成部分 | 原账户及需要使用的翻译凭据 |
+| `--reflow` | 用当前翻译配置从转写重建字幕，保留 ASR 身份和人工决定 | 完整本地转写、原 ASR 与当前 MT 凭据 |
+| `--retime` | 更新显示时间，保留完整译文和排版，零云端调用 | 完整最终字幕及对应账户凭据 |
 
-重排或校时的目标已存在时，使用 `--overwrite` 备份后替换，或用 `--output-dir` 另存。两者均保存旧任务快照，准备失败保留原任务；准备后中断用 `--resume` 继续。原媒体可已移走，校时也不需要原始转写。详细规则见[接口与恢复契约](docs/API_CONTRACT.md#数据与恢复)。
+重排或校时使用 `--overwrite` 备份后替换，或 `--output-dir "D:\Subtitles"` 另存。操作保存恢复快照，中断后用 `--resume` 继续。更换模型、Key 或提示 `cache_version` 时使用 `--reflow`。
 
-已有完整规范化结果、完整本地转写，或缺失转写均有云端任务 ID 时，源媒体移走后仍可 `--resume`；需要新提交识别时须恢复原媒体。原路径换成其他媒体后，必须用 `--output-dir` 写到其他目录。Key 校验与账户隔离仍适用于纯本地恢复。
+`--track` 使用 FFprobe 音轨索引；`--channel left|right|mix` 选择首声道、第二声道或混音。恢复时可重选尚未提交识别的输入。已有完整规范化结果、本地转写或云端任务 ID 时，原媒体移走后仍可恢复；原路径被其他媒体占用时另选输出目录。
 
-更换翻译后端、模型或 Key，以及升级后提示 `cache_version` 时，使用 `--reflow`。旧显示版本因 `timeline` 失败且译文完整、当前规则可修整时，程序会推荐 `--retime`。
+任务库由一个进程独占。Ctrl+C 保存进度；翻译池、OpenRouter 契约 2／3 及其后备最多等待 5 秒保存在途完整结果，再次 Ctrl+C 立即结束等待。其他请求等待返回或超时。云端已提交请求仍可能计费；取消的任务可用 `--resume` 恢复。
 
-翻译诊断保存在 `.build/mt-diagnostics/{job_id}.jsonl`，记录运行／请求组、实际后端、格式或服务错误分类、尝试次数、等待和额度等信息，省略字幕正文与凭据。两端均失败时提示各自原因和尝试次数，使用 `mt_fallback_failed`。计数及诊断字段见[报告字段](docs/API_CONTRACT.md#报告字段)。
-
-重复传入同一文件与同一输出目标时，翻译身份相同才复用未结束任务；配置变化时须明确使用 `--resume` 或 `--reflow`。`--overwrite` 启用覆盖，省略时沿用原设置。用 `--resume JOB_ID --output-dir 目录` 修改未完成任务的目标；已完成或已跳过任务可重新传入文件，或使用 `--reflow` 重排。
-
-旧任务若提示 `output_path_required`，用 `--output-dir` 指定目标目录后恢复。
-
-写入字幕时中断，可用 `--resume` 继续，已写入的相同字幕和备份会复用。若目标或备份被外部修改，返回 `output_conflict` 并保留文件，可另选 `--output-dir`。
-
-提交超时或响应缺少 ID 时，任务保存为 `submission_unknown`。可绑定已有 ID，或明确接受可能重复计费后重发：
+提交状态未知时，可绑定已有云端任务 ID，或接受重复计费风险后重发：
 
 ```powershell
 .\scripts\transcribe.ps1 --resume 本地任务ID --bind-task-id 云端task_id
 .\scripts\transcribe.ps1 --resume 本地任务ID --allow-resubmit
 ```
 
-进度写入 stderr；任务结果以每行 JSON 写入 stdout，`--report "结果.json"` 另存 JSON 数组。报告包含任务实际 `mt_provider`、`models.mt`、状态、调用／复用计数、限流和耗时统计及排版警告；凭据、上传链接和字幕文字保持私有。字段含义见[报告字段](docs/API_CONTRACT.md#报告字段)。
+同一文件和输出目标复用未结束任务；翻译身份改变时明确选择恢复或重排。`--output-dir` 按调用位置解析，恢复沿用已保存路径；`output_path_required` 表示需要重新指定。写字幕中断后恢复会复用已写结果和备份，文件被外部修改时返回 `output_conflict`，可另选目录。
 
-报告请另存到 `.build` 或其他独立位置；输入媒体、任务 SRT、备份及内部数据受路径冲突保护（`report_conflict`）。同名报告可覆盖；自检默认保存到 `data/self-test.json`。
+进度写入 stderr，结果以每行 JSON 写入 stdout；`--report ".build\结果.json"` 另存 JSON 数组。报告省略凭据、链接和字幕文字；输入、输出及内部数据路径受冲突保护。翻译脱敏诊断位于 `.build/mt-diagnostics/{job_id}.jsonl`，字段见[报告契约](docs/API_CONTRACT.md#报告字段)。
 
-退出码：`0` 完成／跳过或管理操作成功；`2` 待复核／任务失败；`3` 启动／本地异常；`130` Ctrl+C。
+退出码：`0` 成功／跳过；`2` 待复核／任务失败；`3` 启动／本地异常；`130` Ctrl+C。
 
 ## 本机检查
 
 ```powershell
-.\scripts\transcribe.ps1 --self-test --report "本机诊断.json"
+.\scripts\transcribe.ps1 --self-test --report ".build\self-test.json"
 ```
 
-诊断在隔离目录检查本机凭据写入、独占锁、FFmpeg 和字幕输出，使用合成音频，云端调用数为零。
+使用隔离目录及合成音频检查凭据写入、独占锁、FFmpeg 和字幕输出，云端调用数为零。
 
 [环境维护](docs/BUILD.md) · [接口与恢复契约](docs/API_CONTRACT.md) · [第三方组件](docs/THIRD_PARTY.txt) · [源码许可](LICENSE)

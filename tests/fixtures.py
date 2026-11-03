@@ -145,7 +145,7 @@ class TemporaryTest(unittest.TestCase):
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
         os.environ.pop("DASHSCOPE_API_KEY", None)
-        for name in ["OPENAI_API_KEY", "MT_PROVIDER", "MT_BASE_URL", "MT_MODEL", "MT_RPM"]:
+        for name in ["OPENAI_API_KEY", "QINIU_API_KEY", "MT_PROVIDER", "MT_BASE_URL", "MT_MODEL", "MT_RPM"]:
             os.environ.pop(name, None)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP)
         self.path = Path(self.temp.name)
@@ -165,6 +165,7 @@ class SavedResultFixture(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
+        self.config.settings.mt_provider = 'bailian'  # Existing fixtures exercise the historical single-provider contract.
         self.config.settings.workspace_id = "offline-space"
         self.config.set_key("offline-test-key-no-cloud-authorization")
         self.source = self.path / "saved.mkv"
@@ -228,6 +229,7 @@ class PipelineFixture(TemporaryTest):
         self.media_tools = mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe"))
         self.media_tools.start()
         self.config = Config(self.path)
+        self.config.settings.mt_provider = 'bailian'  # Existing fixtures exercise the historical single-provider contract.
         self.config.settings.workspace_id = "offline-space"
         self.config.set_key("offline-test-key-no-cloud-authorization")
         self.source = self.path / "中文 多点.片段 & (1).mkv"

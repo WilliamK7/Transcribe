@@ -37,14 +37,14 @@ class TransportError(ToolError):
 
 
 class ProcessTransport:
-    def request(self, method, url, *, headers, json=None, control, timeout=120.0, drain=True):
+    def request(self, method, url, *, headers, json=None, control, timeout=120.0, drain=True, on_dispatch=None):
         control.check_start()
         deadline = time.monotonic() + timeout
         payload = jsonlib.dumps({'method': method, 'url': url, 'headers': headers, 'json': json},
                                 ensure_ascii=False).encode('utf-8')
         # Do not pass account credentials via inherited environment variables either.
         environment = {k: v for k, v in os.environ.items()
-                       if k.upper() not in {'DASHSCOPE_API_KEY', 'OPENAI_API_KEY'}}
+                       if k.upper() not in {'DASHSCOPE_API_KEY', 'OPENAI_API_KEY', 'QINIU_API_KEY'}}
         process = None
         try:
             control.check_start()
@@ -59,6 +59,10 @@ class ProcessTransport:
                 if remaining <= 0:
                     raise TransportError('deadline')
                 try:
+                    if first:
+                        control.check_start()
+                        if on_dispatch is not None:
+                            on_dispatch()
                     stdout, _ = process.communicate(payload if first else None, timeout=min(.1, remaining))
                     break
                 except subprocess.TimeoutExpired:

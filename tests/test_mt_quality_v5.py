@@ -1,0 +1,136 @@
+"""Stage and quality contract tests using only fictional course material."""
+import json
+import unittest
+
+from subtitle_tool.common import ToolError
+from subtitle_tool.mt_backend import MTBackend, key_fingerprint
+from subtitle_tool.mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
+                                      stage_cache_key, validate_glossary)
+
+
+def source(index, *, language='en', decision='translate', origin='automatic', segment='0000', start=None):
+    start = index * 5000 if start is None else start
+    return {'sentence_id': f'{segment}:{index:08}', 'text': f'Cache number {index}.',
+            'language': language, 'decision': decision, 'decision_origin': origin, 'source_lang': 'English',
+            'begin_ms': start, 'end_ms': start + 1000}
+
+
+def body(value):
+    return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(value, ensure_ascii=False)}}]}
+
+
+class QualityContractTests(unittest.TestCase):
+    def setUp(self):
+        self.qiniu = MTBackend('qiniu', 'https://api.qnaigc.com/v1', 'qiniu/conatus-free', key_fingerprint('q'), 5)
+        self.router = MTBackend('openai_compatible', 'https://openrouter.ai/api/v1', 'openrouter/free', key_fingerprint('o'), 5)
+        self.qiniu_caps = {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}
+        self.router_caps = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
+        self.scope = {'account': 'synthetic'}
+
+    def test_groups_respect_sentence_count_span_segment_language_and_human_decision(self):
+        records = [source(i) for i in range(9)] + [source(9, language='fr'), source(10, origin='manual'),
+                   source(11, decision='keep'), source(12), source(13, segment='0001')]
+        groups = plan_sentence_groups(records)
+        self.assertEqual([len(group) for group in groups], [8, 1, 1, 1, 1, 1])
+        self.assertNotIn('0000:00000011', [s['sentence_id'] for g in groups for s in g])
+        groups = plan_sentence_groups([source(0, start=0), source(1, start=59001), source(2, start=60001)])
+        self.assertEqual([len(group) for group in groups], [1, 2])
+
+    def test_extracted_terms_require_source_evidence_and_manual_terms_take_priority(self):
+        records = [source(0)]
+        extracted = [{'source': 'cache', 'translation': '高速缓存', 'sentence': records[0]['sentence_id']},
+                     {'source': 'network', 'translation': '网络', 'sentence': records[0]['sentence_id']}]
+        terms = validate_glossary(extracted, records, {'cache': '缓存'})
+        self.assertEqual(terms, [{'source': 'cache', 'translation': '缓存', 'sentence': records[0]['sentence_id'],
+                                  'origin': 'manual'}])
+
+    def test_qiniu_and_openrouter_stage_wire_profiles_stay_separate(self):
+        data = {'sentences': [{'id': '0', 'text': 'A cache stores a result.'}], 'glossary': []}
+        q = make_stage_payload('draft', data, self.qiniu, capabilities=self.qiniu_caps)
+        r = make_stage_payload('draft', data, self.router, capabilities=self.router_caps)
+        self.assertEqual(q['response_format'], {'type': 'json_object'})
+        self.assertNotIn('provider', q)
+        self.assertNotIn('plugins', q)
+        self.assertNotIn('enable_thinking', q)
+        self.assertEqual(q['max_tokens'], 4096)
+        self.assertEqual(r['response_format']['type'], 'json_schema')
+        self.assertEqual(r['provider'], {'require_parameters': True})
+
+    def test_review_requires_specific_numbered_evidence_and_never_echoes_text_in_error(self):
+        valid = {'issues': [{'id': '0', 'category': 'number', 'evidence': 'The value differs.'}]}
+        self.assertEqual(parse_stage_response('review', body(valid), ids=['0']), valid)
+        invalid = {'issues': [{'id': '7', 'category': 'number', 'evidence': 'private evidence'}]}
+        with self.assertRaises(ToolError) as error:
+            parse_stage_response('review', body(invalid), ids=['0'])
+        self.assertNotIn('private evidence', str(error.exception))
+        self.assertEqual(error.exception.code, 'mt_batch_invalid')
+
+    def test_stage_cache_identity_covers_prompt_glossary_context_and_backend(self):
+        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': []}
+        original = stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope=self.scope)
+        self.assertNotEqual(original, stage_cache_key('draft', {**data, 'glossary': [{'source': 'cache'}]},
+                                                     self.qiniu, capabilities=self.qiniu_caps, scope=self.scope))
+        self.assertNotEqual(original, stage_cache_key('draft', {**data, 'context': ['different']},
+                                                     self.qiniu, capabilities=self.qiniu_caps, scope=self.scope))
+        self.assertNotEqual(original, stage_cache_key('draft', data, self.router,
+                                                     capabilities=self.qiniu_caps, scope=self.scope))
+
+    def test_review_rejects_choice_error_refusal_and_unicode_surrogates(self):
+        for extra in ({'error': {'code': 'synthetic'}}, {'message': {'content': '{"issues":[]}', 'refusal': 'denied'}}):
+            response = body({'issues': []})
+            response['choices'][0].update(extra)
+            with self.assertRaises(ToolError):
+                parse_stage_response('review', response, ids=['0'])
+        response = body({'issues': [{'id': '0', 'category': 'meaning', 'evidence': '\ud800'}]})
+        with self.assertRaises(ToolError):
+            parse_stage_response('review', response, ids=['0'])
+
+    def test_ascii_technical_terms_do_not_match_inside_unrelated_words(self):
+        records = [{'sentence_id': '0000:00000000', 'text': 'The program runs.', 'decision': 'translate'}]
+        self.assertEqual(validate_glossary([], records, {'RAM': '内存'}), [])
+
+    def test_complete_payload_budget_includes_context_and_schema(self):
+        data = {'sentences': [{'id': '0', 'text': 'Small.'}], 'context': ['x' * 33000], 'glossary': []}
+        with self.assertRaises(ToolError) as error:
+            make_stage_payload('draft', data, self.router, capabilities=self.router_caps)
+        self.assertEqual(error.exception.code, 'mt_input_budget')
+
+    def test_explicit_capability_controls_wire_format_and_size(self):
+        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'glossary': []}
+        caps = {'response_format': 'text', 'input_bytes': 2000, 'output_tokens': 512}
+        payload = make_stage_payload('draft', data, self.qiniu, capabilities=caps)
+        self.assertNotIn('response_format', payload)
+        self.assertEqual(payload['max_tokens'], 512)
+        self.assertNotEqual(stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope=self.scope),
+                            stage_cache_key('draft', data, self.qiniu, capabilities=caps, scope=self.scope))
+
+    def test_stage_texts_are_simplified_before_use_and_cache_identity_includes_scope(self):
+        translated = parse_stage_response('draft', body({'translations': {'0': '繁體翻譯'}}),
+                                          ids=['0'], originals=['Example'])
+        self.assertEqual(translated['translations']['0'], '繁体翻译')
+        terms = parse_stage_response('glossary', body({'terms': [
+            {'source': 'cache', 'translation': '緩存', 'sentence': '0000:00000000'}]}))
+        self.assertEqual(terms['terms'][0]['translation'], '缓存')
+        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
+        self.assertNotEqual(stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope={'account': 'a'}),
+                            stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope={'account': 'b'}))
+
+    def test_single_long_sentence_never_creates_a_group_over_sixty_seconds(self):
+        from subtitle_tool.config import Settings
+        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.subtitles import normalize, plan_fragments
+        from tests.fixtures import timed_raw
+        raw = timed_raw([f'word{i}' for i in range(70)], word_ms=1000)
+        source = normalize(raw, 0, '0000', duration_ms=80000, preserve_sentences=True)[0][0]
+        cues = plan_fragments(source, Settings())
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline._fit = lambda stage, data, **kwargs: data
+        groups = pipeline.plan_groups([source], cues)
+        self.assertGreater(len(groups), 1)
+        for group in groups:
+            members = [cue for unit in group for cue in unit['cues']]
+            self.assertLessEqual(members[-1]['end_ms'] - members[0]['begin_ms'], 60000)
+
+
+if __name__ == '__main__':
+    unittest.main()

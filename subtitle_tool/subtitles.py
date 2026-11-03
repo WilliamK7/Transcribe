@@ -693,12 +693,12 @@ def plan_reference_units(sources, *, strategy_version=2, request_options=None):
 
 
 def split_mt_units(source, units, *, reference_stage=False, request_options=None):
-    from .mt import batch_input_size, validate_batch_input
+    from .mt import batch_input_budget, batch_input_size, validate_batch_input
     result, break_index = [], None
     stack = list(reversed(units))
     while stack:
         unit = stack.pop()
-        if batch_input_size([unit['text']], unit['source_lang'], request_options=request_options) > MT_INPUT_BUDGET:
+        if batch_input_size([unit['text']], unit['source_lang'], request_options=request_options) > batch_input_budget(request_options):
             if break_index is None:
                 break_index = _WordBreakIndex(source)
             at = break_index.best(unit['word_start'], unit['word_end'])
@@ -749,14 +749,14 @@ def source_context(sources, position, *, context_version=0):
 
 
 def plan_translation_batches(units, neighbors, *, request_options=None):
-    from .mt import batch_input_size, validate_batch_input
+    from .mt import batch_input_budget, batch_input_size, validate_batch_input
     groups, at = [], 0
     while at < len(units):
         end = at + 1
         validate_batch_input([units[at]['text']], units[at]['source_lang'], request_options=request_options)
         # Neighbors are all removable before a sentence is divided into contiguous groups.
         while end < len(units) and batch_input_size([u['text'] for u in units[at:end + 1]],
-                                                    units[at]['source_lang'], request_options=request_options) <= MT_INPUT_BUDGET:
+                                                    units[at]['source_lang'], request_options=request_options) <= batch_input_budget(request_options):
             end += 1
         members = units[at:end]
         remaining = sorted([(at - i, i, 'same_sentence_before', unit) for i, unit in enumerate(units[:at])] +
@@ -764,7 +764,7 @@ def plan_translation_batches(units, neighbors, *, request_options=None):
         context = [{'position': side, 'text': unit['text']} for _, _, side, unit in remaining] + list(neighbors)
         texts = [u['text'] for u in members]
         # Same-sentence context has priority; remove farthest neighbors first.
-        while context and batch_input_size(texts, members[0]['source_lang'], context, request_options=request_options) > MT_INPUT_BUDGET:
+        while context and batch_input_size(texts, members[0]['source_lang'], context, request_options=request_options) > batch_input_budget(request_options):
             context.pop()
         validate_batch_input(texts, members[0]['source_lang'], context, request_options=request_options)
         groups.append((members, context))

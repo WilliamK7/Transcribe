@@ -18,10 +18,13 @@ class Settings:
     region: str = "beijing"
     workspace_id: str = ""
     mt_workers: int = 4
-    mt_provider: str = "bailian"
+    mt_provider: str = "pool"
     mt_base_url: str = "https://api.openai.com/v1"
     mt_model: str = ""
     mt_rpm: int = 0
+    mt_backends: list | None = None
+    mt_routing: dict | None = None
+    mt_quality: dict | None = None
     channel: str = "ask"
     poll_seconds: float = 4
     poll_timeout_seconds: float = 6 * 3600
@@ -115,6 +118,22 @@ class Config:
             return self.validate_key((self.data / "mt-key.txt").read_text(encoding="utf-8"))
         except (OSError, UnicodeError) as error:
             raise ToolError("兼容翻译后端需要 OPENAI_API_KEY 或本机 data/mt-key.txt；不会复用百炼 Key。", "credentials") from error
+
+    def get_qiniu_key(self) -> str:
+        env = os.environ.get('QINIU_API_KEY', '').strip()
+        if env:
+            return self.validate_key(env)
+        try:
+            return self.validate_key((self.data / 'qiniu-key.txt').read_text(encoding='utf-8'))
+        except (OSError, UnicodeError) as error:
+            raise ToolError('七牛翻译需要 QINIU_API_KEY 或本机 data/qiniu-key.txt。', 'credentials') from error
+
+    def set_qiniu_key(self, key: str):
+        key = self.validate_key(key)
+        try:
+            atomic_bytes(self.data / 'qiniu-key.txt', key.encode('utf-8'))
+        except OSError as error:
+            raise ToolError('无法写入 data/qiniu-key.txt，请检查目录权限。', 'credentials') from error
 
     def set_key(self, key: str):
         key = self.validate_key(key)

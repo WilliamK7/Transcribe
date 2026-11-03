@@ -82,14 +82,34 @@ class Engine:
         self.store.change_output(job_id, directory, overwrite)
 
     def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
-               task_id=None, allow_resubmit=False, mt_fallback=None):
+               task_id=None, allow_resubmit=False, mt_fallback=None, mt_paid=None):
         """Prepare an explicitly requested resume; run() remains the sole executor."""
-        self.configure_fallback(job_id, mt_fallback)
-        from .mt_fallback import supports_fallback
-        backend = saved_mt(self.store.job(job_id)['manifest'])
-        if supports_fallback(backend):
+        manifest = self.store.job(job_id)['manifest']
+        if manifest.get('translation_strategy_version') == 5:
+            from .mt_pool import saved_route
+            route = saved_route(manifest)
+            if mt_fallback is not None:
+                raise ToolError('翻译池请使用 --mt-paid allow|deny，不支持 --mt-fallback。', 'mt_config')
+            if mt_paid is not None:
+                route = copy.deepcopy(route)
+                route['routing']['paid_enabled'] = mt_paid == 'allow'
+                manifest['mt_route_snapshot'] = route
+                self.store.update(job_id, manifest=manifest)
             from .mt_runtime import reset_quota_for_resume
-            reset_quota_for_resume(backend)
+            for entry in route['entries']:
+                if entry['tier'] == 'free' and entry['backend'] is not None:
+                    backend = saved_mt({**manifest, 'mt_snapshot': entry['backend']})
+                    if backend.free_quota:
+                        reset_quota_for_resume(backend)
+        else:
+            if mt_paid is not None:
+                raise ToolError('--mt-paid 仅用于翻译池；旧单后端使用 --mt-fallback。', 'mt_config')
+            self.configure_fallback(job_id, mt_fallback)
+            from .mt_fallback import supports_fallback
+            backend = saved_mt(self.store.job(job_id)['manifest'])
+            if supports_fallback(backend):
+                from .mt_runtime import reset_quota_for_resume
+                reset_quota_for_resume(backend)
         self.select_input(job_id, track, channel)
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped"}:
@@ -210,7 +230,7 @@ class Engine:
             self.store.update(job_id, manifest=manifest)
         return key, scope
 
-    def reflow(self, job_id, *, overwrite=False, output_dir=None, mt_fallback=None):
+    def reflow(self, job_id, *, overwrite=False, output_dir=None, mt_fallback=None, mt_paid=None):
         """Prepare a recoverable local reflow; only run() may translate and commit SRT."""
         job = self.store.job(job_id)
         manifest = job["manifest"]
@@ -219,7 +239,19 @@ class Engine:
         load_policy(manifest, verify_execution=False).settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
         self.config.settings.validate()
-        mt_backend = configured_mt(self.config, manifest)
+        from .mt_pool import configured_route, is_pool_config
+        route = None
+        if is_pool_config(self.config):
+            if mt_fallback is not None:
+                raise ToolError('翻译池请使用 --mt-paid allow|deny，不支持 --mt-fallback。', 'mt_config')
+            route = configured_route(self.config, manifest,
+                                     paid_enabled=None if mt_paid is None else mt_paid == 'allow')
+            snapshot = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
+            mt_backend = saved_mt({**manifest, 'mt_snapshot': snapshot, 'translation_strategy_version': 5})
+        else:
+            if mt_paid is not None:
+                raise ToolError('--mt-paid 仅用于翻译池；旧单后端使用 --mt-fallback。', 'mt_config')
+            mt_backend = configured_mt(self.config, manifest)
         contract = asr_contract()
         cache = self.config.data / "cache" / job_id
         offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
@@ -252,6 +284,7 @@ class Engine:
         snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
         self.store.snapshot(job_id, snapshot)
         for name in ["references_planned", "layout_planned", "layout_round", "layout_complete",
+                     "mt_glossary_schedule",
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                      "backup", "cue_count", "output_settings", "no_speech"]:
             manifest.pop(name, None)
@@ -269,9 +302,13 @@ class Engine:
                                 "from_subtitle_version": previous_version})
         atomic_json(cache / normalized_file, sources)
         manifest.pop('mt_fallback_policy', None)
-        proposed = fallback_policy(manifest, mt_fallback)
-        if proposed is not None:
-            manifest['mt_fallback_policy'] = proposed
+        manifest.pop('mt_route_snapshot', None)
+        if route is not None:
+            manifest['mt_route_snapshot'] = route
+        else:
+            proposed = fallback_policy(manifest, mt_fallback)
+            if proposed is not None:
+                manifest['mt_fallback_policy'] = proposed
         check_cancel(self.cancel)
         self.store.commit_reflow(job_id, sources, [make_fragment(s) for s in sources], manifest, output)
 
@@ -286,7 +323,11 @@ class Engine:
         policy = load_policy(manifest, verify_execution=False)
         settings = self.retime_settings(manifest, policy.settings(self.config.settings))
         self.identity(job_id, manifest, persist=False)
-        saved_mt(manifest).credential(self.config)
+        if manifest.get('translation_strategy_version') == 5:
+            from .mt_pipeline_v5 import validate_provenance
+            validate_provenance(self, job_id, manifest)
+        else:
+            saved_mt(manifest).credential(self.config)
         cache = self.config.data / "cache" / job_id
         self.validate_saved_subtitles(job_id, manifest, cache)
         cues = self.store.cues(job_id)
@@ -507,9 +548,10 @@ class Engine:
             nonlocal mt_api
             if mt_api is None:
                 options = dict(count=backend_counter('primary'), progress=cloud_progress)
-                if mt_backend.provider == "openai_compatible":
+                if mt_backend.provider in {"openai_compatible", "qiniu"}:
                     self.mt_runtime_active = mt_backend.contract.bounded_runtime
-                    mt_api = OpenAICompatible(mt_key, mt_backend, self.cancel, **options, rpm=self.config.mt_rpm(),
+                    mt_api = OpenAICompatible(mt_key, mt_backend, self.cancel, **options,
+                        rpm=self.config.mt_rpm() if mt_backend.provider == 'openai_compatible' else 0,
                         control=self.fallback_groups.primary_control if self.fallback_groups else self.mt_control,
                         runtime_event=runtime_events('primary'), stop_on_failure=self.fallback_groups is None)
                 else:
@@ -573,6 +615,9 @@ class Engine:
             display_timing_version(manifest)
             if 'mt_fallback_policy' in manifest:
                 validate_origins(manifest, self.store.references(job_id) + self.store.cues(job_id))
+            elif manifest.get('translation_strategy_version') == 5:
+                from .mt_pipeline_v5 import validate_provenance
+                validate_provenance(self, job_id, manifest, verify_credentials=False)
             output = self.store.ensure_output(job_id)
             subtitle_version = manifest.get("subtitle_version", 0)
             published = False
@@ -615,14 +660,20 @@ class Engine:
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
             mt_backend = saved_mt(manifest)
-            mt_key = mt_backend.credential(self.config)
+            if manifest.get('translation_strategy_version') == 5:
+                from .mt_pool import saved_route
+                saved_route(manifest)
+                self.mt_runtime_active = not bool(manifest.get('retime'))
+                mt_key = None
+            else:
+                mt_key = mt_backend.credential(self.config)
             fallback_backend = saved_fallback(manifest)
             if fallback_backend is not None and manifest['mt_fallback_policy']['enabled']:
                 fallback_backend.credential(self.config)
                 self.fallback_groups = GroupFallback(self.mt_control)
             self.fallback_backend = fallback_backend
             self.fallback_client = fallback_client
-            if mt_backend.provider == "openai_compatible" and not manifest.get("retime"):
+            if mt_backend.provider == "openai_compatible" and not manifest.get("retime") and manifest.get('translation_strategy_version') != 5:
                 self.config.mt_rpm()
             mt_scope = {**scope, **mt_backend.cache_scope()}
             if manifest.get("normalized"):
@@ -849,6 +900,9 @@ class Engine:
         if not manifest.get("normalized"):
             raise mismatch()
         validate_normalized(manifest, cache, self.store.sources(job_id), self.store.cues(job_id), self.store.references(job_id))
+        if manifest.get('translation_strategy_version') == 5:
+            from .mt_pipeline_v5 import validate_provenance
+            validate_provenance(self, job_id, manifest)
 
     def verify_source_output(self, job_id, manifest, output):
         source = Path(self.store.job(job_id)["source"])
@@ -919,6 +973,10 @@ class Engine:
             plan_display_timing(cues, version=2)
 
     def process_subtitles(self, job_id, manifest, settings, scope, client, stage, *, context_version):
+        if manifest['translation_strategy_version'] == 5:
+            from .mt_pipeline_v5 import process_subtitles_v5
+            return process_subtitles_v5(self, job_id, manifest, settings, scope, stage,
+                                        context_version=context_version)
         joint = manifest['translation_strategy_version'] in {3, 4}
         direct = manifest['translation_strategy_version'] == 4
         request_options = saved_mt(manifest).request_options()

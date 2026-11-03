@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from .api import mt_pacer, retry_after_seconds
 from .common import ToolError
-from .mt_backend import normalize_mt_url
+from .mt_backend import QINIU_FREE_MODEL, normalize_mt_url, qiniu_free_active
 from .mt_transport import HTTPReply, ProcessTransport, TransportError
 
 
@@ -26,7 +26,7 @@ PERMANENT_TYPES = {
 RUNTIME_CATEGORIES = TRANSIENT_TYPES | PERMANENT_TYPES | {
     'network', 'deadline', 'transport', 'response_too_large', 'http_transient', 'http_permanent',
     'service_unknown', 'generation_error', 'response_structure', 'shared_wait', 'quota_observed',
-    'quota_refresh_failed', 'quota_unknown', 'quota_exhausted', 'drain_discard', 'retry_after',
+    'quota_refresh_failed', 'quota_console_session_invalid', 'quota_unknown', 'quota_exhausted', 'drain_discard', 'retry_after',
     'cancelled', 'drain_stopped', 'format_exhausted', 'transient_exhausted', 'response_received', 'group_committed',
 }
 
@@ -65,6 +65,10 @@ class ServiceError(ToolError):
                         status, 'OpenRouter 翻译服务返回错误') + '；进度已保存。'
         if provider == 'bailian':
             hint = hint.replace('OpenRouter', '百炼')
+            if category == 'quota_exhausted' and quota_source == 'free_tier_only':
+                hint = '百炼该模型的免费额度已用尽或不可用，进度已保存。'
+        elif provider == 'qiniu':
+            hint = hint.replace('OpenRouter', '七牛')
         super().__init__(hint, code or (f'mt_http_{status}' if status and not 200 <= status < 300
                                       else 'mt_service_error'))
 
@@ -157,6 +161,11 @@ def bailian_failure(status, body):
     code = (error.get('code', error.get('type')) if isinstance(error, dict) else None)
     if code is None and isinstance(body, dict):
         code = body.get('code')
+    # This exact status/code pair is the server's free-tier stop signal.
+    # Other 403/429 responses are not evidence that a model's quota is empty.
+    if status == 403 and code == 'AllocationQuota.FreeTierOnly':
+        return ServiceError('quota_exhausted', status, code='mt_quota_exhausted', provider='bailian',
+                            quota_source='free_tier_only')
     permanent = {'InvalidApiKey': 'authentication', 'invalid_api_key': 'authentication',
         'AccessDenied': 'permission_denied', 'access_denied': 'permission_denied',
         'Arrearage': 'payment_required', 'arrearage': 'payment_required',
@@ -462,12 +471,16 @@ class BoundedMTHttp:
             raise
 
     def json(self, method, url, *, name='mt', headers=None, json=None):
+        if self.backend.provider == 'qiniu' and self.backend.model == QINIU_FREE_MODEL and not qiniu_free_active():
+            raise ToolError('七牛 Conatus 免费活动不在有效期内，未发出请求。', 'mt_free_expired')
         def fetch():
             self.control.check_start()
             self.count('mt_quota_query')
             return self.transport.request('GET', self.backend.base_url + '/key', headers=headers or {},
                                           control=self.control, timeout=15.0, drain=False)
-        for attempt in range(1, 5):
+        max_attempts = 2 if self.backend.request_version == 4 else 4
+        timeout = 60.0 if self.backend.request_version == 4 else 120.0
+        for attempt in range(1, max_attempts + 1):
             self.control.check_start()
             ticket = None
             reserved = False
@@ -492,7 +505,7 @@ class BoundedMTHttp:
                 body = None
                 try:
                     reply = self.transport.request(method, url, headers=headers or {}, json=json,
-                                                   control=self.control, timeout=120.0)
+                                                   control=self.control, timeout=timeout)
                     status = reply.status
                     if 200 <= status < 300:
                         self.count('mt_success')
@@ -503,11 +516,14 @@ class BoundedMTHttp:
                         pass
                     error = (bailian_failure(status, body) if self.backend.provider == 'bailian' else
                              service_failure(status, body, free_router=self.backend.free_router))
+                    if error is not None and self.backend.provider == 'qiniu':
+                        error = ServiceError(error.category, status, error.retryable, code=error.code,
+                                             provider='qiniu', error_shape=error.error_shape)
                 except TransportError as failure:
                     status = None
                     error = ServiceError(failure.category, retryable=failure.retryable,
                         code='mt_request_deadline' if failure.category == 'deadline' else failure.code,
-                        provider='bailian' if self.backend.provider == 'bailian' else 'openrouter')
+                        provider=self.backend.provider if self.backend.provider in {'bailian', 'qiniu'} else 'openrouter')
                 except ToolError:
                     self.on_event({'kind': 'runtime_drain', 'category': 'drain_discard', 'discarded': 1})
                     self.on_event({'kind': 'runtime_request', 'category': 'cancelled' if self.cancel.is_set() else 'drain_stopped',
@@ -538,9 +554,9 @@ class BoundedMTHttp:
                 if retry_after is not None and retry_after > 300 and error.retryable:
                     raise ServiceError('retry_after', status, code='mt_retry_after',
                                        provider='bailian' if self.backend.provider == 'bailian' else 'openrouter')
-                if not error.retryable or attempt == 4:
+                if not error.retryable or attempt == max_attempts:
                     raise error
-                self.progress('retry', attempt, 4)
+                self.progress('retry', attempt, max_attempts)
             except ToolError as error:
                 error.attempts = attempt if ticket is not None else 0
                 if self.stop_on_failure and error.code not in {'response_schema', 'cancelled'}:

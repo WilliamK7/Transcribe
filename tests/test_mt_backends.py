@@ -27,6 +27,7 @@ class MTConfigurationTests(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
+        self.config.settings.mt_provider = 'bailian'  # Explicit historical single-backend configuration.
         self.config.set_key("separate-bailian-key")
         self.manifest = {"region": "beijing", "access_mode": "workspace", "workspace_id": "offline-space"}
 

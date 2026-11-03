@@ -77,6 +77,38 @@ class MTDiagnostics:
                 stream.write(json.dumps(record, ensure_ascii=False) + '\n')
         return True
 
+    def write_route(self, event):
+        """Write only fixed route classifications and bounded, non-content metadata."""
+        from .mt_routing import _CATEGORIES
+        try:
+            if event.get('kind') not in {'route_attempt', 'route_failure', 'route_wait', 'route_switch',
+                                         'route_complete', 'route_reply'}:
+                return False
+            record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
+            for field in ['entry', 'from', 'to', 'model', 'actual_model']:
+                value = safe_model_id(event.get(field))
+                if value:
+                    record[field] = value
+            for field, allowed in [('stage', {'glossary', 'draft', 'align', 'review', 'correct'}),
+                                   ('tier', {'free', 'paid'}),
+                                   ('scope', {'entry', 'model', 'credential', 'endpoint', 'free_quota', 'model_quota', 'paid_account'}),
+                                   ('category', _CATEGORIES)]:
+                if event.get(field) in allowed:
+                    record[field] = event[field]
+            for field in ['attempt', 'status', 'duration_ms', 'wait_ms', 'planned_wait_ms', 'switches']:
+                value = event.get(field)
+                if type(value) is int and 0 <= value <= 2**63 - 1:
+                    record[field] = value
+            if type(event.get('cached')) is bool:
+                record['cached'] = event['cached']
+            for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}')]:
+                value = event.get(field)
+                if isinstance(value, str) and re.fullmatch(pattern, value):
+                    record[field] = value
+            return self._append(record)
+        except (OSError, ValueError, TypeError, OverflowError):
+            return False
+
     def write_runtime(self, event):
         """Separate callback and whitelist; runtime events never count as format repairs."""
         from .mt_runtime import RUNTIME_CATEGORIES
@@ -141,17 +173,17 @@ class MTDiagnostics:
             model = safe_model_id(event.get(field))
             if model:
                 record[field] = model
-        if type(event.get('request_version')) is int and event['request_version'] in {1, 2, 3}:
+        if type(event.get('request_version')) is int and event['request_version'] in {1, 2, 3, 4, 5}:
             record['request_version'] = event['request_version']
-        if event.get('stage') in {'reference', 'subtitle'}:
+        if event.get('stage') in {'reference', 'subtitle', 'glossary', 'draft', 'align', 'review', 'correct'}:
             record['stage'] = event['stage']
-        if event.get('quota_source') in {'local_ledger', 'server_observation'}:
+        if event.get('quota_source') in {'local_ledger', 'server_observation', 'free_tier_only'}:
             record['quota_source'] = event['quota_source']
         for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}')]:
             value = event.get(field)
             if isinstance(value, str) and re.fullmatch(pattern, value):
                 record[field] = value
-        for field, allowed in [('backend', {'primary', 'fallback'}), ('provider', {'openrouter', 'bailian', 'openai_compatible'}),
+        for field, allowed in [('backend', {'primary', 'fallback'}), ('provider', {'openrouter', 'bailian', 'openai_compatible', 'qiniu'}),
                 ('reason', {'quota_exhausted', 'quota_local_empty', 'format_exhausted', 'retry_after',
                             'transient_exhausted', 'content_refused'})]:
             value = event.get(field)

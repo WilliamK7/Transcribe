@@ -123,8 +123,18 @@ def _validate_record(record):
 def validate_normalized(manifest, cache, sources, cues, references):
     """Prove DB completeness before reviewing, translating or publishing saved work."""
     try:
-        from .mt_fallback import validate_origins
-        validate_origins(manifest, cues + references)
+        if manifest.get('translation_strategy_version') == 5:
+            from .mt_pool import saved_route
+            route = saved_route(manifest)
+            profiles = {entry['id']: entry for entry in route['entries']}
+            for record in cues + references:
+                origin, translated = record.get('mt_origin'), record.get('translated')
+                if ((translated and (origin not in profiles or profiles[origin]['backend'] is None)) or
+                        (not translated and origin is not None)):
+                    raise mismatch()
+        else:
+            from .mt_fallback import validate_origins
+            validate_origins(manifest, cues + references)
         validate_segments(manifest)
         records = sources if manifest.get("subtitle_version") else cues
         if "normalized_count" in manifest:
@@ -172,7 +182,7 @@ def validate_normalized(manifest, cache, sources, cues, references):
             if manifest.get("references_planned") and source["decision"] == "translate":
                 validate_unit_coverage(source, sorted(ref_groups.get(source["sentence_id"], []), key=lambda c: c["char_start"]),
                                        reference_stage=True)
-        direct = manifest.get('translation_strategy_version') == 4
+        direct = manifest.get('translation_strategy_version') in {4, 5}
         if (direct and (references or manifest.get('references_planned')) or
                 references and not manifest.get("references_planned") or
                 not direct and manifest.get("layout_planned") and not manifest.get("references_planned")):
