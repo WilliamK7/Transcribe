@@ -11,7 +11,7 @@ from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main
 from subtitle_tool.store import Store
-from tests.fixtures import ROOT, TemporaryTest
+from tests.fixtures import enqueue_current, ROOT, TemporaryTest
 
 
 class ReportProtectionTests(TemporaryTest):
@@ -23,7 +23,7 @@ class ReportProtectionTests(TemporaryTest):
         self.source = self.path / "source.mkv"
         self.source.write_bytes(b"original media")
         self.store = Store(self.config.data / "jobs.sqlite")
-        self.job_id = self.store.enqueue(self.source, workspace_id="offline-space")
+        self.job_id = enqueue_current(self.store, self.config, self.source)
     def tearDown(self):
         self.store.close()
         super().tearDown()

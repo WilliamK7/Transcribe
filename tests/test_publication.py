@@ -8,7 +8,7 @@ import subtitle_tool.engine as engine_module
 from subtitle_tool.engine import Engine
 from subtitle_tool.policy import load_policy
 from subtitle_tool.subtitles import render_srt
-from tests.fixtures import FakeService, SavedResultFixture, result
+from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, result
 
 
 class PublicationTests(SavedResultFixture):
@@ -52,7 +52,7 @@ class PublicationTests(SavedResultFixture):
                 with self.subTest(boundary=boundary, fault=fault.__name__):
                     self.source = self.path / (boundary + fault.__name__ + ".mkv")
                     self.source.write_bytes(b"test source")
-                    self.job_id = self.store.enqueue(self.source, workspace_id="offline-space")
+                    self.job_id = enqueue_current(self.store, self.config, self.source)
                     self.cache = self.config.data / "cache" / self.job_id
                     self.cache.mkdir(parents=True)
                     fake = self.prepare()
@@ -160,23 +160,9 @@ class PublicationTests(SavedResultFixture):
         manifest["subtitle_version"] = 999
         self.store.update(self.job_id, manifest=manifest)
         with mock.patch.object(engine_module, "write_srt", side_effect=AssertionError("already published")):
-            self.assertEqual(self.run_fake(fake), "completed")
+            self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(fake.calls, [])
 
-    def test_legacy_hash_recovers_overwrite_without_guessing_backup_ownership(self):
-        import hashlib
-        fake = self.prepare()
-        content = b"legacy published result"
-        self.output.write_bytes(content)
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest["expected_srt_sha256"] = hashlib.sha256(content).hexdigest()
-        manifest["execution_snapshot"] = {"format_version": 999}
-        self.store.update(self.job_id, "writing", manifest)
-        Engine(self.config, self.store).resume(self.job_id, overwrite=True)
-        self.assertEqual(self.run_fake(fake), "completed")
-        self.assertNotIn("backup", self.store.job(self.job_id)["manifest"])
-        self.assertEqual(list(self.path.glob("*.bak.*")), [])
-        self.assertEqual(fake.calls, [])
 
     def test_failed_content_transaction_preserves_original_intent_and_records(self):
         self.prepare()

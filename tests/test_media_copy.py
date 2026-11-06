@@ -4,17 +4,14 @@ import array
 import json
 import os
 import threading
-import time
+
 import unittest
 import wave
 from unittest import mock
 
 from subtitle_tool.media import Media, run_process
-from subtitle_tool.common import NeedsReview, ToolError, fingerprint
-from subtitle_tool.config import Config
-from subtitle_tool.engine import Engine
-from subtitle_tool.store import Store
-from tests.fixtures import ROOT, FakeService, PipelineFixture, TemporaryTest, result
+from subtitle_tool.common import NeedsReview, fingerprint
+from tests.fixtures import enqueue_current, ROOT, FakeService, PipelineFixture, TemporaryTest, result
 
 
 @unittest.skipUnless(os.name == "nt" and (ROOT / "tools/ffmpeg.exe").exists(), "Pinned FFmpeg required")
@@ -63,66 +60,6 @@ class CompressedMediaTests(TemporaryTest):
                     repeated = self.media.prepare(source, self.path / ("repeat-" + encoder), info, track, "ask")
                     self.assertEqual((plan, segments), repeated)
 
-    def test_old_ogg_upgrade_is_atomic_and_preserves_submission_facts(self):
-        source = self.generate("libopus", ".ogg")
-        info = self.media.probe(source)
-        track, _ = self.media.select(info)
-        config = Config(self.path)
-        store = Store(config.data / "jobs.sqlite")
-        try:
-            for condition in ["unsubmitted_before", "unsubmitted_inside", "unsubmitted_after",
-                              "task_id", "submitting", "raw", "other_task", "local_raw", "normalized", "source_changed"]:
-                with self.subTest(condition=condition):
-                    job_id = store.enqueue(source, workspace_id="offline-space", output_dir=self.path / condition)
-                    cache = config.data / "cache" / job_id
-                    plan, segments = self.media.prepare(source, cache, info, track, "ask")
-                    plan.pop("extract_recipe_version", None)
-                    # Model the random serial number in an old container; all timeline facts stay valid.
-                    segments[0]["sha256"] = "0" * 64
-                    manifest = store.job(job_id)["manifest"]
-                    manifest.update(media=info, track=track, channel="ask", media_plan=plan, segments=segments,
-                                    upload_limit_bytes=plan["limit_bytes"], fingerprint=fingerprint(source, self.media.cancel))
-                    segments[0].update(oss_url="oss://offline/expired", upload_expires=0, upload_identity={"saved": True})
-                    if condition in {"task_id", "submitting", "raw"}:
-                        segments[0][condition] = "saved-fact"
-                    elif condition == "local_raw":
-                        (cache / "raw-0000.json").write_text("{}", encoding="utf-8")
-                    elif condition == "normalized":
-                        manifest["normalized"] = True
-                    elif condition == "other_task":
-                        manifest["segments"].append({"id": "0001", "task_id": "other-task"})
-                    elif condition == "source_changed":
-                        manifest["fingerprint"] = {}
-                    store.update(job_id, manifest=manifest)
-                    (cache / segments[0]["audio"]).unlink()
-                    engine = Engine(config, store)
-                    if not condition.startswith("unsubmitted"):
-                        with self.assertRaises(ToolError) as caught:
-                            engine.rebuild_audio(self.media, source, cache, manifest, job_id)
-                        self.assertEqual(caught.exception.code, "cache_mismatch")
-                        self.assertEqual(store.job(job_id)["manifest"], manifest)
-                    else:
-                        update = store.update
-                        def interrupt(*args, **kwargs):
-                            if condition == "unsubmitted_before":
-                                raise KeyboardInterrupt()
-                            if condition == "unsubmitted_inside":
-                                with store.lock, store.db:
-                                    store.db.execute("UPDATE jobs SET manifest=? WHERE id=?",
-                                                     (json.dumps(kwargs["manifest"]), job_id))
-                                    raise KeyboardInterrupt()
-                            update(*args, **kwargs)
-                            raise KeyboardInterrupt()
-                        with mock.patch.object(store, "update", side_effect=interrupt):
-                            with self.assertRaises(KeyboardInterrupt):
-                                engine.rebuild_audio(self.media, source, cache, manifest, job_id)
-                        self.assertEqual(store.job(job_id)["manifest"], manifest)
-                        engine.rebuild_audio(self.media, source, cache, manifest, job_id)
-                        self.assertEqual(manifest["media_plan"]["extract_recipe_version"], 2)
-                        self.assertNotIn("oss_url", manifest["segments"][0])
-                        self.assertEqual(manifest["segments"][0]["sha256"], self.media.audio_identity(cache / segments[0]["audio"])["sha256"])
-        finally:
-            store.close()
 
     def test_stereo_requires_choice_first_channel_copies_other_choices_convert(self):
         source = self.generate("aac", ".m4a", stereo=True)
@@ -201,27 +138,19 @@ class OggRecoveryTests(PipelineFixture):
                      "sine=frequency=440:duration=3:sample_rate=48000", "-c:a", "libopus", source], media.cancel)
         info = media.probe(source)
         track, _ = media.select(info)
-        for case in ["new_missing", "old_missing", "old_cache", "old_reference", "known_task", "unknown_version"]:
+        for case in ["new_missing", "known_task", "unknown_version"]:
             with self.subTest(case=case):
-                self.job_id = self.store.enqueue(source, workspace_id="offline-space", output_dir=self.path / case)
+                self.job_id = enqueue_current(self.store, self.config, source, output_dir=self.path / case)
                 cache = self.config.data / "cache" / self.job_id
-                recipe = 2 if case in {"new_missing", "unknown_version"} else 1
-                plan, segments = media.prepare(source, cache, info, track, "ask", extract_recipe_version=recipe)
-                if recipe == 1:
-                    plan.pop("extract_recipe_version")
+                plan, segments = media.prepare(source, cache, info, track, "ask", extract_recipe_version=2)
                 if case == "unknown_version":
                     plan["extract_recipe_version"] = 99
                 manifest = self.store.job(self.job_id)["manifest"]
                 manifest.update(media=info, track=track, channel="ask", segments=segments, media_plan=plan,
                                 fingerprint=fingerprint(source, media.cancel), upload_limit_bytes=plan["limit_bytes"])
-                if case == "old_reference":
-                    segments[0].update(oss_url="oss://offline/valid", upload_expires=time.time() + 3600)
-                if case == "old_missing":
-                    segments[0].update(oss_url="oss://offline/expired", upload_expires=0)
                 if case == "known_task":
                     segments[0]["task_id"] = "offline-known"
-                if case != "old_cache":
-                    (cache / segments[0]["audio"]).unlink()
+                (cache / segments[0]["audio"]).unlink()
                 self.store.update(self.job_id, manifest=manifest)
                 fake = FakeService(result(("中文字幕。", "zh")))
                 self.assertEqual(self.run_fake(fake), "failed" if case == "unknown_version" else "completed")
@@ -231,8 +160,7 @@ class OggRecoveryTests(PipelineFixture):
                     self.assertEqual(fake.calls, [])
                     continue
                 self.assertEqual(len(fake.named("/asr/transcription")), 0 if case == "known_task" else 1)
-                self.assertEqual(len(fake.uploads), 0 if case in {"old_reference", "known_task"} else 1)
-                expected_recipe = 2 if case in {"new_missing", "old_missing"} else 1
-                self.assertEqual(saved["manifest"]["media_plan"].get("extract_recipe_version", 1), expected_recipe)
+                self.assertEqual(len(fake.uploads), 0 if case == "known_task" else 1)
+                self.assertEqual(saved["manifest"]["media_plan"].get("extract_recipe_version"), 2)
                 self.assertTrue(saved["manifest"]["segments"][0].get("task_id"))
                 self.assertFalse(saved["manifest"]["segments"][0].get("submitting"))

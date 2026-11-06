@@ -63,6 +63,7 @@ class ProcessTransport:
                         control.check_start()
                         if on_dispatch is not None:
                             on_dispatch()
+                        control.check_start()
                     stdout, _ = process.communicate(payload if first else None, timeout=min(.1, remaining))
                     break
                 except subprocess.TimeoutExpired:

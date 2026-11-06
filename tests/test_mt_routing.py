@@ -30,7 +30,7 @@ class FakeClock:
 
 def entry(name, tier='free', weight=1, *, model=None, key='key-a', url='https://a.example/v1',
           provider='openai_compatible', rpm=0):
-    return RouteEntry(name, MTBackend(provider, url, model or name, key, 4), tier,
+    return RouteEntry(name, MTBackend(provider, url, model or name, key, 5), tier,
                       weight=weight, rpm=rpm)
 
 

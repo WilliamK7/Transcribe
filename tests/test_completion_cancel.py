@@ -7,7 +7,7 @@ from unittest import mock
 from subtitle_tool.api import Bailian, Http
 from subtitle_tool.common import Cancelled
 from subtitle_tool.engine import Engine
-from tests.fixtures import FakeService, PipelineFixture, TemporaryTest, response, result
+from tests.fixtures import enqueue_current, FakeService, PipelineFixture, TemporaryTest, response, result
 
 
 class CompletionTests(PipelineFixture):
@@ -65,7 +65,7 @@ class CompletionTests(PipelineFixture):
     def test_interrupt_or_error_after_completed_commit_cannot_downgrade(self):
         for fault in [KeyboardInterrupt, OSError]:
             with self.subTest(fault=fault.__name__):
-                self.job_id = self.store.enqueue(self.source, workspace_id="offline-space", output_dir=self.path / fault.__name__)
+                self.job_id = enqueue_current(self.store, self.config, self.source, output_dir=self.path / fault.__name__)
                 def progress(job_id, name, *args):
                     if name == "completed":
                         raise fault()
@@ -81,16 +81,16 @@ class CompletionTests(PipelineFixture):
     def test_cancel_after_mt_attempt_is_persisted_does_not_start_translation(self):
         fake = FakeService(result(("First sentence.", "en")))
         cancel = threading.Event()
-        update = self.store.translation_update
-        def persist(*args, **kwargs):
-            update(*args, **kwargs)
-            if kwargs.get("attempt"):
+        count = self.store.count
+        def persist(job_id, name, *args):
+            count(job_id, name, *args)
+            if name == 'mt':
                 cancel.set()
-        with mock.patch.object(self.store, "translation_update", side_effect=persist), \
+        with mock.patch.object(self.store, "count", side_effect=persist), \
                 mock.patch("requests.request", side_effect=fake.request), mock.patch("requests.post", side_effect=fake.upload):
             self.assertEqual(Engine(self.config, self.store, cancel).run(self.job_id), "cancelled")
         self.assertEqual(fake.named("/chat/completions"), [])
-        self.assertEqual(self.store.references(self.job_id)[0]["attempts"], 1)
+        self.assertEqual(self.store.counts(self.job_id)['mt'], 1)
 
     def test_cancel_after_registered_asr_attempt_preserves_unknown_marker(self):
         cancel = threading.Event()
@@ -142,7 +142,7 @@ class CancelBoundaryTests(TemporaryTest):
                   "x_oss_object_acl": "private", "x_oss_forbid_overwrite": "true", "max_file_size_mb": 1000}
         for boundary in ["progress", "count"]:
             cancel = threading.Event()
-            cloud = Bailian("offline-key", "beijing", cancel)
+            cloud = Bailian("offline-key", "beijing", cancel, workspace_id="offline-space")
             if boundary == "progress":
                 cloud.progress = lambda *args: cancel.set()
             else:

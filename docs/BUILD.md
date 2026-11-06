@@ -33,10 +33,11 @@ uv pip sync requirements.lock --require-hashes --python .venv\Scripts\python.exe
 
 测试用模拟 HTTP、真实 SQLite、合成媒体和 Windows 子进程验证行为；诊断使用隔离目录及假 Key，零云端调用。
 
+
 百炼免费额度的 AK/SK 续期使用项目内 `subtitle_tool/mt_bailian_bridge.mjs`，复用 Windows npm 安装的官方 CLI，不额外安装 Node 依赖。CLI 及其 `bailian-cli-core`、`bailian-cli-commands`、`bailian-cli-runtime` 均锁定为 2.7.2；这些模块的导出和响应须随版本升级重新核对。Node 桥接测试使用本地合成模块，无真实凭据或网络请求。
 
 `scripts/transcribe.ps1` 保留调用者当前目录，相对媒体与报告路径按调用位置解释。运行数据位于项目 `data`，成功任务清理音频中间文件，保留任务库、转写和规范化字幕供恢复使用。
 
 ## 清理本机记录
 
-`.build` 同时包含运行依赖、恢复资料和临时开发记录。按 [AGENTS.md 的清理规则](../AGENTS.md#本机记录清理)核对用途和任务引用，保留运行依赖及真实恢复资料，清除已完成工作的临时产物。
+`.build` 同时包含运行依赖、恢复资料和临时开发记录。按 [AGENTS.md](../AGENTS.md)核对用途和任务引用，保留运行依赖及真实恢复资料，清除已完成工作的临时产物。

@@ -9,28 +9,25 @@ from tests.fixtures import FakeService, SavedResultFixture, result
 
 
 class LifecycleTests(SavedResultFixture):
-    def unknown(self, *, legacy=False):
+    def unknown(self):
         self.save_result(normalized=False)
         manifest = self.store.job(self.job_id)["manifest"]
         manifest["segments"][0].pop("task_id")
         manifest["segments"][0].pop("raw")
-        if not legacy:
-            manifest["segments"][0]["submitting"] = True
+        manifest["segments"][0]["submitting"] = True
         self.store.update(self.job_id, "submitting", manifest)
         return Engine(self.config, self.store)
 
     def test_startup_and_explicit_resume_never_resend_unknown_submission(self):
-        for legacy in [False, True]:
-            with self.subTest(legacy=legacy):
-                engine = self.unknown(legacy=legacy)
-                engine.recover_jobs()
-                engine.resume(self.job_id)
-                fake = FakeService(result())
-                self.assertEqual(self.run_fake(fake), "submission_unknown")
-                self.assertEqual(fake.calls, [])
+        engine = self.unknown()
+        engine.recover_jobs()
+        engine.resume(self.job_id)
+        fake = FakeService(result())
+        self.assertEqual(self.run_fake(fake), 'submission_unknown')
+        self.assertEqual(fake.calls, [])
 
-    def test_cancelled_legacy_unknown_can_be_bound_only_on_explicit_resume(self):
-        engine = self.unknown(legacy=True)
+    def test_cancelled_unknown_can_be_bound_only_on_explicit_resume(self):
+        engine = self.unknown()
         engine.cancel_job(self.job_id)
         self.assertEqual(self.store.job(self.job_id)["state"], "cancelled")
         engine.recover_jobs()
@@ -42,14 +39,14 @@ class LifecycleTests(SavedResultFixture):
         self.assertEqual(manifest["segments"][0]["task_id"], "offline-bound")
         self.assertFalse(manifest["segments"][0].get("submitting"))
 
-    def test_legacy_resubmit_is_explicit_and_ambiguous_multiple_segments_stay_blocked(self):
-        engine = self.unknown(legacy=True)
+    def test_resubmit_is_explicit_and_ambiguous_multiple_segments_stay_blocked(self):
+        engine = self.unknown()
         engine.recover_jobs()
         with self.assertRaises(ToolError):
             engine.resolve_unknown(self.job_id)
         engine.resolve_unknown(self.job_id, allow_resubmit=True)
         self.assertEqual(self.store.job(self.job_id)["state"], "queued")
-        engine = self.unknown(legacy=True)
+        engine = self.unknown()
         manifest = self.store.job(self.job_id)["manifest"]
         manifest["segments"].append({**manifest["segments"][0], "id": "0001"})
         self.store.update(self.job_id, "submitting", manifest)

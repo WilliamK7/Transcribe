@@ -18,7 +18,7 @@ from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.store import Store
-from subtitle_tool.common import ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, atomic_json, fingerprint
+from subtitle_tool.common import ASR_MODEL, NORMALIZER_VERSION, atomic_json, fingerprint
 from subtitle_tool.subtitles import make_fragment, normalize
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -98,26 +98,19 @@ class FakeService:
                 raise requests.ConnectionError()
             return response(self.raw)
         if url.endswith("/chat/completions"):
-            if len(kwargs['json']['messages']) == 2:
-                targets = json.loads(kwargs['json']['messages'][1]['content'])['targets']
-                if any(item['text'] in self.mt_failure for item in targets.values()):
+            from subtitle_tool.mt_quality import PROMPTS
+            payload = kwargs['json']
+            stage = next((name for name, prompt in PROMPTS.items()
+                          if payload['messages'][0]['content'].startswith(prompt)), None)
+            if stage is not None:
+                data = json.loads(payload['messages'][1]['content'])
+                targets = data['sentences'] if stage in {'draft', 'glossary'} else data['fragments']
+                if any(item['text'] in self.mt_failure for item in targets):
                     return response({'error': {'code': 'InvalidApiKey'}}, 401)
-                return response({'model': kwargs['json']['model'], 'choices': [{'finish_reason': 'stop', 'message': {
-                    'content': json.dumps({'translations': {key: '繁體譯文：' + item['text'] for key, item in targets.items()}})}}]})
-            source = kwargs["json"]["messages"][0]["content"]
-            if source.startswith('以下是仅供理解的原文上下文'):
-                data = json.loads(source.split('INPUT_JSON:\n', 1)[1])
-                if any(item['text'] in self.mt_failure for item in data['translations']):
-                    return response({'code': 'Unauthorized', 'request_id': 'offline-denied'}, 403)
-                return response({'id': 'offline-mt', 'choices': [{'finish_reason': 'stop', 'message': {
-                    'content': json.dumps({'translations': [{'id': item['id'], 'text': '繁體譯文：' + item['text']}
-                                                           for item in data['translations']]})}}]})
-            if source in self.mt_failure:
-                return response({"code": "Unauthorized", "request_id": "offline-denied"}, 403)
-            if source.startswith("First"):
-                time.sleep(0.06)
-            return response({"id": "offline-mt", "choices": [{"finish_reason": "stop", "message": {
-                "content": "繁體譯文：" + source}}]})
+                value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
+                         {'translations': {item['id']: '繁體譯文：' + item['text'] for item in targets}})
+                return response({'model': payload['model'], 'choices': [{'finish_reason': 'stop', 'message': {
+                    'content': json.dumps(value, ensure_ascii=False)}}]})
         raise AssertionError("Unexpected request " + url)
 
     def upload(self, url, **kwargs):
@@ -135,13 +128,12 @@ class FakeService:
 class TemporaryTest(unittest.TestCase):
     def setUp(self):
         # Each test represents an independent CLI process; clients within it share quota.
-        pacer_scope = mock.patch.dict('subtitle_tool.api._MT_PACERS', clear=True)
-        pacer_scope.start()
-        self.addCleanup(pacer_scope.stop)
-        for registry in ['_RECOVERY', '_QUOTAS']:
-            scope = mock.patch.dict('subtitle_tool.mt_runtime.' + registry, clear=True)
-            scope.start()
-            self.addCleanup(scope.stop)
+        quota_scope = mock.patch.dict('subtitle_tool.mt_runtime._QUOTAS', clear=True)
+        quota_scope.start()
+        self.addCleanup(quota_scope.stop)
+        transport = mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport)
+        transport.start()
+        self.addCleanup(transport.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
         os.environ.pop("DASHSCOPE_API_KEY", None)
@@ -165,13 +157,13 @@ class SavedResultFixture(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
-        self.config.settings.mt_provider = 'bailian'  # Existing fixtures exercise the historical single-provider contract.
+        self.config.settings.mt_provider = 'bailian'  # One-model pool fixture.
         self.config.settings.workspace_id = "offline-space"
         self.config.set_key("offline-test-key-no-cloud-authorization")
         self.source = self.path / "saved.mkv"
         self.source.write_bytes(b"saved source identity only")
         self.store = Store(self.config.data / "jobs.sqlite")
-        self.job_id = self.store.enqueue(self.source, workspace_id="offline-space")
+        self.job_id = enqueue_current(self.store, self.config, self.source)
         self.cache = self.config.data / "cache" / self.job_id
         self.cache.mkdir(parents=True)
 
@@ -187,24 +179,23 @@ class SavedResultFixture(TemporaryTest):
                                                  "tracks": [{"index": 0, "channels": 1, "start_ms": 0}]},
                         segments=[{"id": "0000", "offset_ms": 0, "duration_ms": 10000,
                                    "task_id": "offline-task", "raw": "raw-0000.json"}],
-                        contract={"asr": ASR_MODEL, "mt": MT_MODEL, "normalizer": NORMALIZER_VERSION,
+                        contract={"asr": ASR_MODEL, "normalizer": NORMALIZER_VERSION,
                                   "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}})
         atomic_json(self.cache / "raw-0000.json", raw)
         sources, warnings = normalize(raw, 0, "0000", duration_ms=10000, preserve_sentences=True)
         if normalized:
             manifest.update(normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
-                            normalized_file="subtitle-sources-v2.json", warnings=warnings)
-            atomic_json(self.cache / manifest["normalized_file"], sources)
+                            warnings=warnings)
             self.store.initialize_subtitles(self.job_id, sources, [make_fragment(s) for s in sources], manifest)
         else:
-            for name in ["normalized", "normalized_count", "normalized_version", "normalized_file", "references_planned",
+            for name in ["normalized", "normalized_count", "normalized_version", "normalized_file",
                          "layout_planned", "layout_complete", "layout_round", "expected_srt_sha256", "publication_intent", "no_speech"]:
                 manifest.pop(name, None)
             self.store.initialize_subtitles(self.job_id, [], [], manifest)
         return sources
 
     def run_fake(self, service):
-        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"):
+        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"), mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport):
             return Engine(self.config, self.store).run(self.job_id)
 
 
@@ -229,13 +220,13 @@ class PipelineFixture(TemporaryTest):
         self.media_tools = mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe"))
         self.media_tools.start()
         self.config = Config(self.path)
-        self.config.settings.mt_provider = 'bailian'  # Existing fixtures exercise the historical single-provider contract.
+        self.config.settings.mt_provider = 'bailian'  # One-model pool fixture.
         self.config.settings.workspace_id = "offline-space"
         self.config.set_key("offline-test-key-no-cloud-authorization")
         self.source = self.path / "中文 多点.片段 & (1).mkv"
         shutil.copyfile(self.fixture, self.source)
         self.store = Store(self.config.data / "jobs.sqlite")
-        self.job_id = self.store.enqueue(self.source, "beijing", workspace_id="offline-space")
+        self.job_id = enqueue_current(self.store, self.config, self.source)
         if self.translation_strategy_version is not None:
             manifest = self.store.job(self.job_id)['manifest']
             manifest['translation_strategy_version'] = self.translation_strategy_version
@@ -247,5 +238,40 @@ class PipelineFixture(TemporaryTest):
         super().tearDown()
 
     def run_fake(self, service):
-        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"):
+        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"), mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport):
             return Engine(self.config, self.store).run(self.job_id)
+
+
+def enqueue_current(store, config, source, **kwargs):
+    from subtitle_tool.mt_backend import key_fingerprint
+    from subtitle_tool.mt_pool import configured_route
+    workspace = kwargs.pop('workspace_id', config.settings.workspace_id)
+    account = key_fingerprint(config.get_key())
+    identity = {'region': 'beijing', 'access_mode': 'workspace', 'workspace_id': workspace, 'account': account}
+    route = configured_route(config, identity)
+    return store.enqueue(source, workspace_id=workspace, account=account, settings=config.settings,
+                         mt_snapshot=next(e['backend'] for e in route['entries'] if e['backend'] is not None),
+                         mt_route_snapshot=route, **kwargs)
+
+
+class FakeTransport:
+    def request(self, method, url, **kwargs):
+        from subtitle_tool.mt_transport import HTTPReply
+        control = kwargs.pop('control')
+        control.check_start()
+        for name in ['timeout', 'drain']:
+            kwargs.pop(name, None)
+        dispatch = kwargs.pop('on_dispatch', None)
+        if dispatch:
+            dispatch()
+        control.check_start()
+        reply = requests.request(method, url, **kwargs)
+        return HTTPReply(reply.status_code, reply.content, reply.headers.get('Retry-After', ''))
+
+
+def configured_backend(config, identity):
+    from subtitle_tool.mt_pool import configured_route
+    from subtitle_tool.mt_backend import key_fingerprint, saved_mt
+    manifest = {**identity, 'account': key_fingerprint(config.get_key()), 'translation_strategy_version': 5}
+    route = configured_route(config, manifest)
+    return saved_mt({**manifest, 'mt_snapshot': next(e['backend'] for e in route['entries'] if e['backend'] is not None)})

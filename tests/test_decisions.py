@@ -45,26 +45,25 @@ class DecisionTests(SavedResultFixture):
         for cue in cues:
             cue["translated"] = "旧译文"
         manifest = self.store.job(self.job_id)["manifest"]
-        manifest.update(references_planned=True, layout_planned=True, layout_complete=True,
+        manifest.update(layout_planned=True, layout_complete=True,
                         expected_srt_sha256="obsolete", publication_intent={"old": True})
-        self.store.save_layout(self.job_id, cues, manifest, references=[{**make_fragment(source), "cue_id": "reference"}])
+        self.store.save_layout(self.job_id, cues, manifest)
         manifest.update(expected_srt_sha256="obsolete", publication_intent={"old": True})
         self.store.update(self.job_id, manifest=manifest)
         self.store.update(self.job_id, "needs_review", code="language_uncertain")
         apply = lambda: self.store.apply_review(self.job_id, cues[0]["cue_id"], ReviewDecision("translate", "English"))
-        before = (self.store.job(self.job_id), self.store.cues(self.job_id), self.store.references(self.job_id))
+        before = (self.store.job(self.job_id), self.store.cues(self.job_id))
         with mock.patch.object(self.store, "_replace_records", side_effect=OSError()), self.assertRaises(OSError):
             apply()
         self.assertEqual(self.store.sources(self.job_id), sources)
-        self.assertEqual((self.store.job(self.job_id), self.store.cues(self.job_id), self.store.references(self.job_id)), before)
+        self.assertEqual((self.store.job(self.job_id), self.store.cues(self.job_id)), before)
         apply()
         for record in self.store.sources(self.job_id) + self.store.cues(self.job_id):
             self.assertEqual((record["decision"], record["source_lang"], record["decision_origin"]),
                              ("translate", "English", "manual"))
             self.assertFalse(record.get("translated"))
-        self.assertEqual(self.store.references(self.job_id), [])
         saved = self.store.job(self.job_id)["manifest"]
-        self.assertFalse(any(k in saved for k in ["references_planned", "layout_complete", "expected_srt_sha256", "publication_intent"]))
+        self.assertFalse(any(k in saved for k in ["layout_complete", "expected_srt_sha256", "publication_intent"]))
 
     def test_pause_preserves_prior_confirmation_and_skips_sibling_prompts(self):
         self.save_result(result(("OK", ""), ("Hmm", "")))

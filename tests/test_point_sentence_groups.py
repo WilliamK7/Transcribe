@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 import copy
-import json
-import re
-from unittest import mock
 
 from subtitle_tool.common import ToolError
-from subtitle_tool.engine import Engine
-from subtitle_tool.policy import asr_contract
 from subtitle_tool.subtitles import normalize, plan_display_timing
-from tests.fixtures import FakeService, PipelineFixture, TemporaryTest, point_sentence, result
+from tests.fixtures import TemporaryTest, point_sentence, result
 
 
 def boundary_points():
@@ -58,7 +53,7 @@ class PointSentenceGroupTests(TemporaryTest):
         self.assertEqual(plan_display_timing(sources, version=2)[1], [])
         with self.assertRaises(ToolError) as caught:
             normalize(raw, 1250, "s", duration_ms=5000, normalizer_version=3)
-        self.assertEqual(caught.exception.code, "timeline")
+        self.assertEqual(caught.exception.code, "cache_version")
 
     def test_nearby_original_neighbors_allow_four_hundred_ms_but_reject_four_hundred_and_one(self):
         for direction in ["previous", "next"]:
@@ -170,7 +165,7 @@ class PointSentenceGroupTests(TemporaryTest):
         for version in [1, 2, 3]:
             with self.subTest(saved_version=version), self.assertRaises(ToolError) as caught:
                 normalize(raw, 1250, "s", duration_ms=5000, normalizer_version=version)
-            self.assertEqual(caught.exception.code, "timeline")
+            self.assertEqual(caught.exception.code, "cache_version")
 
     def test_group_uses_next_original_interval_when_previous_cannot_anchor_it(self):
         for previous in [None, "other_language", "gap"]:
@@ -295,47 +290,3 @@ class PointSentenceGroupTests(TemporaryTest):
                     normalize(raw, 0, "s", duration_ms=5000)
                 self.assertEqual(caught.exception.code, "timeline")
                 self.assertEqual(raw, before)
-
-class PointSentenceGroupPipelineTests(PipelineFixture):
-    def test_v3_failure_reflows_to_v4_and_resumes_saved_raw_without_resubmitting_asr(self):
-        raw = boundary_points()
-        fake = FakeService(raw)
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest["contract"] = asr_contract(3)
-        self.store.update(self.job_id, manifest=manifest)
-        for _ in range(2):
-            self.assertEqual(self.run_fake(fake), "failed")
-            self.assertEqual(self.store.job(self.job_id)["error_code"], "timeline")
-        self.assertEqual(len(fake.named("/asr/transcription")), 1)
-        cache = self.config.data / "cache" / self.job_id
-        raw_bytes = (cache / "raw-0000.json").read_bytes()
-        before = copy.deepcopy(self.store.job(self.job_id))
-        with mock.patch("requests.request") as request, mock.patch("requests.post") as upload:
-            Engine(self.config, self.store).reflow(self.job_id)
-        request.assert_not_called()
-        upload.assert_not_called()
-        prepared = self.store.job(self.job_id)
-        manifest = prepared["manifest"]
-        self.assertEqual(manifest["contract"]["normalizer"], 4)
-        self.assertEqual(manifest["normalized_version"], 4)
-        snapshot = json.loads((self.config.root / manifest["reflow"]["snapshot"]).read_text(encoding="utf-8"))
-        self.assertEqual(snapshot["job"], before)
-        sources = self.store.sources(self.job_id)
-        self.assertEqual(len(sources), 2)
-        self.assertEqual([i for source in sources for i in source["asr_sentence_indices"]], [0, 1, 2, 3])
-        self.assertEqual(re.sub(r"\s", "", "".join(s["text"] for s in sources)),
-                         re.sub(r"\s", "", "".join(s["text"] for s in raw["transcripts"][0]["sentences"])))
-        # Prove recovery can validate v4 against raw when the count/file proof is unavailable.
-        manifest.pop("normalized_count")
-        (cache / manifest.pop("normalized_file")).unlink()
-        self.store.update(self.job_id, manifest=manifest)
-        self.source.unlink()
-        fake.calls.clear()
-        fake.mt_failure.add(sources[0]["text"])
-        self.assertEqual(self.run_fake(fake), "failed")
-        fake.mt_failure.clear()
-        self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(fake.named("/asr/transcription"), [])
-        self.assertEqual(len(fake.uploads), 1)
-        self.assertEqual((cache / "raw-0000.json").read_bytes(), raw_bytes)
-        self.assertEqual(self.store.sources(self.job_id), sources)

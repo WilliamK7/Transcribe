@@ -119,26 +119,6 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(self.binding.current_proof(), proof)
         self.assertTrue(self.binding.protection(self.route, None))
 
-    def test_early_openapi_binding_normalizes_only_an_exactly_matching_profile(self):
-        self.enable_openapi()
-        self.cli_config['language'] = 'zh-CN'
-        self.write_cli()
-        self.bind()
-        self.confirm()
-        current = self.binding.current_proof()
-        record = json.loads(self.binding.path.read_text())
-        record['cli_fingerprint'] = self.source._fingerprint_context(
-            self.source._read_context(), version=2, full_profile=True)[2]
-        self.binding.path.write_text(json.dumps(record))
-        self.assertEqual(self.binding.current_proof(), current)
-        saved = json.loads(self.binding.path.read_text())
-        self.assertEqual(saved['confirmed_models'], ['qwen-test'])
-        self.assertEqual(saved['cli_fingerprint'], current.context_fingerprint)
-        # Old fingerprints cannot prove which field changed before normalization.
-        self.binding.path.write_text(json.dumps(record))
-        self.cli_config['access_key_id'] = 'different-account'
-        self.write_cli()
-        self.assertIsNone(self.binding.current_proof())
 
     def test_openapi_identity_changes_revoke_confirmation_even_if_restored(self):
         self.enable_openapi()

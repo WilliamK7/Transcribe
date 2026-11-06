@@ -17,12 +17,12 @@ from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_i
 from .mt_pool import saved_route
 from .mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
                          stage_cache_key, validate_glossary)
-from .mt_routing import CacheHit, MTRouter, RouteEntry, RouteExhausted, RouteFailure, RouteResult
+from .mt_routing import CacheHit, MTRouter, RouteEntry, RouteFailure
 from .mt_runtime import bailian_failure, service_failure
 from .mt_transport import TransportError
 from .review import decision_origin
-from .subtitles import (layout_warnings, plan_fragments, source_context, split_mt_units, validate_fragment,
-                        validate_unit_coverage, wrap)
+from .subtitles import (layout_warnings, plan_fragments, revise_layout, source_context, split_mt_units, validate_fragment,
+                        validate_unit_coverage)
 
 
 def _digest(value):
@@ -133,7 +133,11 @@ def check_pool(config, identity, route, cancel):
     from .store import Store
     from .policy import current_execution_snapshot
     primary = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
+    from dataclasses import asdict
     manifest = {**identity, 'mt_snapshot': primary, 'mt_route_snapshot': route,
+                'processing_version': 2, 'subtitle_version': 2, 'display_timing_version': 2,
+                'subtitle_settings': {k: asdict(config.settings)[k] for k in
+                                      ['zh_line_width', 'other_line_width', 'chinese_first']},
                 'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot(5)}
     scope = {**identity, 'processing_version': 2}
     store = Store(Path(':memory:'))
@@ -145,7 +149,7 @@ def check_pool(config, identity, route, cancel):
                              'VALUES(?,?,?,?,?,?,?,?)',
                              (job_id, '', '', '', 'queued', json.dumps(manifest), now, now))
         engine = SimpleNamespace(config=config, store=store, mt_control=MTControl(cancel))
-        pipeline = Pipeline(engine, job_id, manifest, scope, 1)
+        pipeline = Pipeline(engine, job_id, manifest, scope)
         sentence = 'A cache stores a previously computed result.'
         data = {'sentences': [{'id': '0', 'text': sentence, 'asr_language': 'en',
                               'source_language': 'English', 'decision_origin': 'automatic'}],
@@ -222,12 +226,11 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
 
 
 class Pipeline:
-    def __init__(self, engine, job_id, manifest, scope, context_version):
+    def __init__(self, engine, job_id, manifest, scope):
         from .policy import load_policy
-        self.engine, self.store, self.job_id, self.manifest = engine, engine.store, job_id, manifest
+        self.engine, self.store, self.job_id = engine, engine.store, job_id
         self.prompt_version = load_policy(manifest).prompt_version
-        self.scope = {key: value for key, value in scope.items() if key != 'mt_identity'}
-        self.context_version = context_version
+        self.scope = dict(scope)
         self.context = threading.local()
         self.group_progress = None
         self.diagnostics = MTDiagnostics(engine.config.root, job_id)
@@ -236,9 +239,9 @@ class Pipeline:
         from . import mt_transport
         from .mt_bailian_quota import BailianQuota
         from .mt_bailian_binding import LocalBailianBinding
-        from .mt_quota_v5 import V5Quota
+        from .mt_quota import OpenRouterQuota
         self.transport = mt_transport.ProcessTransport()
-        self.quota = V5Quota(engine.mt_control, lambda entry: entry.backend.credential(engine.config),
+        self.quota = OpenRouterQuota(engine.mt_control, lambda entry: entry.backend.credential(engine.config),
                              transport=self.transport, on_event=self._quota_event)
         # The saved, explicitly user-confirmed binding is rechecked against the
         # current credentials and CLI login context before every admission.
@@ -278,7 +281,7 @@ class Pipeline:
         if event.get('kind') == 'quota_query':
             self.store.count(self.job_id, 'mt_quota_query')
         else:
-            self.diagnostics.write_runtime(event)
+            self.diagnostics.write_quota(event)
             if event.get('category') == 'quota_console_session_invalid':
                 with self.quota_warning_lock:
                     progress = getattr(self.engine, 'progress', None)
@@ -377,9 +380,7 @@ class Pipeline:
             self.group_progress.set(group, name)
         started = time.monotonic()
         data = copy.deepcopy(data)
-        def make_work_key():
-            return self._work_key(name, data)
-        work_key = make_work_key()
+        work_key = self._work_key(name, data)
         self.context.stage, self.context.group_key = name, work_key
         def saved_stage():
             try:
@@ -507,7 +508,7 @@ class Pipeline:
                 category, actual_count = 'response_structure', None
                 if name in {'draft', 'align', 'correct'}:
                     try:
-                        parse_batch_response(body, originals, request_version=5)
+                        parse_batch_response(body, originals)
                     except BatchValidationError as error:
                         category, actual_count = error.category, error.actual_count
                     except ToolError:
@@ -527,33 +528,19 @@ class Pipeline:
 
         # Preserve the exact originally requested context and glossary for both
         # free and paid cache lookup before adapting to permitted network models.
-        def matches_preferred(entry):
-            return entry == prefer or entry.backend == prefer or entry.id == prefer
-        ordered = sorted(enumerate(self.router.entries), key=lambda item: (
-            item[1].tier != 'free', matches_preferred(item[1]), item[0]))
-        result = None
-        for _, entry in ordered:
-            self.engine.mt_control.check_start()
-            if time.monotonic() - started >= 180:
-                raise RouteExhausted(deadline=True)
-            hit = cached(entry)
-            if hit is not None:
-                self.engine.mt_control.check_inflight()
-                if time.monotonic() - started >= 180:
-                    raise RouteExhausted(deadline=True)
-                result = RouteResult(hit.value, entry, True, 0, 0.0, 0)
-                break
+        result = self.router.cached_result(cached, prefer_other_than=prefer, deadline=started + 180.0)
         if result is None:
             data = self._fit(name, data)
-            new_key = make_work_key()
-            if new_key != work_key:
+            new_key = self._work_key(name, data)
+            adapted = new_key != work_key
+            if adapted:
                 work_key = new_key
                 self.context.group_key = work_key
                 saved = saved_stage()
                 if saved is not None:
                     return saved
             remaining = max(0.0, 180.0 - (time.monotonic() - started))
-            result = self.router.run(invoke, cache=cached, prefer_other_than=prefer,
+            result = self.router.run(invoke, cache=cached if adapted else None, prefer_other_than=prefer,
                                      prepare=lambda entry, wait: self._reserve_quota(entry, wait, name, data),
                                      deadline_seconds=remaining, stage=name)
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
@@ -674,22 +661,13 @@ class Pipeline:
                                            counts={'mt_glossary_unavailable': 1})
             return []
 
-    def global_glossary(self, groups, sources):
-        """Rebuild the original full glossary for tasks with existing drafts."""
-        extracted = []
-        self.engine.progress(self.job_id, 'mt_glossary_progress', 0, len(groups))
-        for index, group in enumerate(groups):
-            extracted.extend(self.glossary(group))
-            self.engine.progress(self.job_id, 'mt_glossary_progress', index + 1, len(groups))
-        return validate_glossary(extracted, sources, self.snapshot['quality']['manual_glossary'])
-
     def group(self, group, glossary, sources):
         self.engine.mt_control.check_start()
         members = [cue for unit in group for cue in unit['cues']]
         if not members or all(cue['translated'] for cue in members):
             return
         positions = {source['sentence_id']: index for index, source in enumerate(sources)}
-        context = source_context(sources, positions[group[0]['source']['sentence_id']], context_version=self.context_version)
+        context = source_context(sources, positions[group[0]['source']['sentence_id']])
         relevant = [term for term in glossary if any(term['source'].casefold() in unit['text'].casefold() for unit in group)]
         relevant.sort(key=lambda term: term['origin'] != 'manual')
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(group)]
@@ -752,7 +730,7 @@ class Pipeline:
                                                'mt_quality_warning': int(warning)})
 
 
-def process_subtitles_v5(engine, job_id, manifest, settings, scope, stage, *, context_version):
+def process_subtitles(engine, job_id, manifest, settings, scope, stage):
     sources = engine.store.sources(job_id)
     if not sources:
         raise ToolError('任务缺少完整句来源记录。', 'cache_mismatch')
@@ -760,28 +738,15 @@ def process_subtitles_v5(engine, job_id, manifest, settings, scope, stage, *, co
         if any(cue['decision'] == 'translate' and not cue['translated'] for cue in engine.store.cues(job_id)):
             raise ToolError('已完成排版缺少完整译文。', 'cache_mismatch')
         return
-    schedule = manifest.get('mt_glossary_schedule')
-    if schedule is None:
-        # Older runs that already produced a draft used the complete glossary.
-        # Preserve their request inputs so partial drafts/alignments remain reusable.
-        produced = any(item['stage'] in {'draft', 'align', 'review', 'correct', 'final'}
-                       for item in engine.store.mt_stages(job_id))
-        schedule = 'global-v1' if produced else 'prefix-v1'
-        candidate = copy.deepcopy(manifest)
-        candidate['mt_glossary_schedule'] = schedule
-        engine.commit_local(job_id, manifest, candidate,
-                            lambda jid, value: engine.store.update(jid, manifest=value))
-    if schedule not in {'global-v1', 'prefix-v1'}:
-        raise ToolError('翻译术语调度记录无效。', 'cache_mismatch')
     source_ids = {source['sentence_id']: source for source in sources}
-    pipeline = Pipeline(engine, job_id, manifest, scope, context_version)
+    pipeline = Pipeline(engine, job_id, manifest, scope)
     if not manifest.get('layout_planned'):
         cues = []
-        primary = next(entry for entry in pipeline.router.entries)
         for source in sources:
             parts = plan_fragments(source, settings)
             if source['decision'] == 'translate':
-                parts = split_mt_units(source, parts, request_options=primary.backend.request_options())
+                parts = split_mt_units(source, parts, fits=lambda cue: pipeline._fits_group(
+                    [{'source': source, 'text': cue['text'], 'cues': [cue]}], allow_guarded_fallback=True))
             cues.extend(parts)
         engine.preflight_display_timing(cues, manifest)
         candidate = copy.deepcopy(manifest)
@@ -801,8 +766,6 @@ def process_subtitles_v5(engine, job_id, manifest, settings, scope, stage, *, co
                    if any(not cue['translated'] for unit in group for cue in unit['cues'])]
         tasks = []
         if pending:
-            global_glossary = (pipeline.global_glossary(groups, sources)
-                               if schedule == 'global-v1' else None)
             # Completed earlier groups still contribute their exact saved glossary
             # to the prefix used by later unfinished groups.
             groups = groups[:pending[-1] + 1]
@@ -813,8 +776,7 @@ def process_subtitles_v5(engine, job_id, manifest, settings, scope, stage, *, co
                 pipeline.context.group = index
                 progress.set(index, 'glossary')
                 try:
-                    glossary = (global_glossary if global_glossary is not None else
-                                prefix.for_group(index, pipeline.glossary(group)))
+                    glossary = prefix.for_group(index, pipeline.glossary(group))
                     pipeline.group(group, glossary, sources)
                 finally:
                     progress.finish(index)
@@ -825,27 +787,19 @@ def process_subtitles_v5(engine, job_id, manifest, settings, scope, stage, *, co
                             sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues), len(cues))
             progress.start()
             try:
-                engine._translate_pending(job_id, tasks, stage_name='subtitle_translating', reference_stage=False,
+                engine._translate_pending(job_id, tasks, stage_name='subtitle_translating',
                                           done=sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues),
                                           total=len(cues))
             finally:
                 progress.close()
                 pipeline.group_progress = None
         cues = engine.store.cues(job_id)
-        changed, revised, affected = False, [], set()
+        revised = None
         round_number = manifest['layout_round']
         if round_number < MAX_LAYOUT_ROUNDS:
             stage('layout_adjusting', round_number + 1, MAX_LAYOUT_ROUNDS)
-            for cue in cues:
-                parts = [cue]
-                if cue['decision'] == 'translate' and len(wrap(cue['translated'], settings.zh_line_width * 2)) > 2:
-                    parts = plan_fragments(source_ids[cue['sentence_id']], settings, cue=cue,
-                                           reference=cue['translated'], layout_round=round_number + 1, force=True)
-                if len(parts) > 1:
-                    changed = True
-                    affected.add(cue['sentence_id'])
-                revised.extend(parts)
-        if not changed:
+            revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1, joint=True)
+        if revised is None:
             warnings = layout_warnings(cues, settings)
             if any(item['record'].get('warning') for item in engine.store.mt_stages(job_id)):
                 warnings.append('部分翻译组自动复核未通过或复核服务不可用，已保留完整译文；建议人工检查。')
@@ -859,6 +813,5 @@ def process_subtitles_v5(engine, job_id, manifest, settings, scope, stage, *, co
             return
         candidate = copy.deepcopy(manifest)
         candidate['layout_round'] = round_number + 1
-        revised = [{**cue, 'translated': '', 'error': ''} if cue['sentence_id'] in affected else cue for cue in revised]
         engine.preflight_display_timing(revised, manifest)
         engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, revised)

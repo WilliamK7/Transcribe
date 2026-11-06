@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from . import mt
-from .common import (ASR_MODEL, MT_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
+from .common import (ASR_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
                      ToolError)
 from .media import EXTRACT_RECIPE_VERSION
 from .mt_quality import QUALITY_PROMPT_VERSION
@@ -12,10 +11,11 @@ from .mt_quality import QUALITY_PROMPT_VERSION
 CONTEXT_VERSION = 1
 
 
-def current_execution_snapshot(strategy_version=3):
+def current_execution_snapshot(strategy_version=5):
+    _version(strategy_version, {5})
     return dict(format_version=1,
-                prompt_version=QUALITY_PROMPT_VERSION if strategy_version == 5 else mt.STRUCTURED_PROMPT_VERSION if strategy_version == 4 else mt.PROMPT_VERSION,
-                recovery_version=3 if strategy_version == 5 else mt.STRUCTURED_RECOVERY_VERSION if strategy_version == 4 else mt.RECOVERY_VERSION,
+                prompt_version=QUALITY_PROMPT_VERSION,
+                recovery_version=3,
                 context_version=CONTEXT_VERSION)
 
 
@@ -31,7 +31,7 @@ def _version(value, supported):
 
 
 def display_timing_version(manifest):
-    return _version(manifest.get('display_timing_version', 0), {0, 1, 2})
+    return _version(manifest.get('display_timing_version'), {2})
 
 
 @dataclass(frozen=True)
@@ -44,15 +44,13 @@ class LayoutPolicy:
 @dataclass(frozen=True)
 class ExecutionPolicy:
     normalizer_version: int
-    layout: LayoutPolicy | None
+    layout: LayoutPolicy
     context_version: int
     display_timing_version: int
     prompt_version: int
 
     def settings(self, runtime):
         """Saved result settings plus current concurrency and polling parameters."""
-        if self.layout is None:
-            return runtime
         settings = replace(runtime, zh_line_width=self.layout.zh_line_width,
                            other_line_width=self.layout.other_line_width, chinese_first=self.layout.chinese_first)
         settings.validate()
@@ -61,42 +59,33 @@ class ExecutionPolicy:
 
 def load_policy(manifest, *, verify_execution=True):
     """Validate saved versions and resolve the settings used by the executor."""
-    _version(manifest.get("processing_version", 1), {1, PROCESSING_VERSION})
-    subtitle = _version(manifest.get("subtitle_version", 0), {0, 1, SUBTITLE_VERSION})
+    if manifest.get('archived'):
+        raise ToolError('旧任务已归档；可用 --export-archive 导出字幕，或 --reflow 从转写新建任务。', 'job_archived')
+    _version(manifest.get("processing_version"), {PROCESSING_VERSION})
+    _version(manifest.get("subtitle_version"), {SUBTITLE_VERSION})
     display_timing = display_timing_version(manifest)
-    layout = None
-    if subtitle:
-        _version(manifest.get("translation_strategy_version"), {1, 2, 3, 4, 5})
-        saved_layout = manifest.get("subtitle_settings", {})
-        if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:
-            raise ToolError("任务的排版快照不受支持，请用 --reflow 显式重排。", "cache_version")
-        layout = LayoutPolicy(**saved_layout)
+    _version(manifest.get("translation_strategy_version"), {5})
+    saved_layout = manifest.get("subtitle_settings", {})
+    if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:
+        raise ToolError("任务的排版快照无效，请用 --reflow 重排。", "cache_version")
+    layout = LayoutPolicy(**saved_layout)
     saved = manifest.get("contract")
     normalizer = NORMALIZER_VERSION
     if saved:
         if not isinstance(saved, dict):
             raise ToolError("任务的识别模型契约不受支持，请用 --reflow 显式重排。", "cache_version")
-        normalizer = _version(saved.get("normalizer"), {1, 2, 3, NORMALIZER_VERSION})
-        if saved not in (asr_contract(normalizer), {**asr_contract(normalizer), "mt": MT_MODEL}):
+        normalizer = _version(saved.get("normalizer"), {NORMALIZER_VERSION})
+        if saved != asr_contract(normalizer):
             raise ToolError("任务的识别模型／参数契约不受支持，请检查保存记录。", "cache_version")
     if "normalized_version" in manifest:
-        _version(manifest["normalized_version"], {1, 2, 3, NORMALIZER_VERSION})
+        _version(manifest["normalized_version"], {NORMALIZER_VERSION})
     plan = manifest.get("media_plan")
-    _version(plan.get("extract_recipe_version", 1) if plan else EXTRACT_RECIPE_VERSION,
-             {1, EXTRACT_RECIPE_VERSION})
-    context_version = 0
-    prompt_version = 1
-    if verify_execution and manifest.get('translation_strategy_version') in {4, 5} and 'execution_snapshot' not in manifest:
-        raise ToolError('结构化翻译缺少执行版本，请用 --reflow。', 'cache_version')
-    if verify_execution and "execution_snapshot" in manifest:
-        snapshot = manifest["execution_snapshot"]
-        current = current_execution_snapshot(manifest.get('translation_strategy_version', 0))
-        if manifest.get('translation_strategy_version') == 5 and isinstance(snapshot, dict):
-            current['prompt_version'] = _version(snapshot.get('prompt_version'), {1, QUALITY_PROMPT_VERSION})
-        required = set(current) - {"context_version"}
-        if (not isinstance(snapshot, dict) or set(snapshot) not in (required, set(current)) or
-                any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in required)):
-            raise ToolError("任务的提示词／响应恢复执行版本与当前实现不匹配，请用 --reflow 显式重排。", "cache_version")
-        context_version = _version(snapshot.get("context_version", 0), {0, CONTEXT_VERSION})
-        prompt_version = snapshot['prompt_version']
-    return ExecutionPolicy(normalizer, layout, context_version, display_timing, prompt_version)
+    _version(plan.get("extract_recipe_version") if plan else EXTRACT_RECIPE_VERSION, {EXTRACT_RECIPE_VERSION})
+    snapshot = manifest.get('execution_snapshot')
+    current = current_execution_snapshot()
+    if verify_execution and (not isinstance(snapshot, dict) or set(snapshot) != set(current) or
+            any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in current)):
+        raise ToolError('任务执行版本已退役；请用 --reflow 从原始转写重建当前版本任务。', 'cache_version')
+    if verify_execution and manifest.get('mt_glossary_schedule', 'prefix-v1') != 'prefix-v1':
+        raise ToolError('任务术语调度版本已退役，请从原始转写重建。', 'cache_version')
+    return ExecutionPolicy(normalizer, layout, CONTEXT_VERSION, display_timing, QUALITY_PROMPT_VERSION)

@@ -112,6 +112,8 @@ def _official_url(provider, manifest):
 
 
 def _base_url(provider, value, manifest):
+    if provider == 'openai_compatible':
+        return normalize_mt_url(value)
     expected = _official_url(provider, manifest)
     if provider == 'bailian' and value is None:
         return expected
@@ -137,7 +139,23 @@ def _configured_specs(config, manifest):
     # An explicit list defines the complete pool, in order. Existing template
     # IDs may be written as short overrides; omitted IDs are absent.
     if raw is None:
-        raw = [{'id': identity} for identity in templates]
+        selected = config.mt_settings()
+        if selected.mt_provider == 'pool':
+            raw = [{'id': identity} for identity in templates]
+        elif selected.mt_provider == 'bailian':
+            raw = [{'id': 'bailian_paid', 'model': selected.mt_model or STRUCTURED_BAILIAN_MODEL}]
+        elif selected.mt_provider == 'qiniu':
+            model = selected.mt_model or QINIU_FREE_MODEL
+            raw = [{'id': 'qiniu_free', 'model': model, 'tier': 'free' if model == QINIU_FREE_MODEL else 'paid'}]
+        elif selected.mt_provider == 'openai_compatible':
+            if not _model(selected.mt_model):
+                raise _invalid()
+            base = normalize_mt_url(selected.mt_base_url)
+            free = base == OPENROUTER_BASE_URL and (selected.mt_model == 'openrouter/free' or selected.mt_model.endswith(':free'))
+            raw = [{'id': 'openrouter_free', 'base_url': base, 'model': selected.mt_model,
+                    'tier': 'free' if free else 'paid', 'rpm': config.mt_rpm()}]
+        else:
+            raise _invalid()
     if not isinstance(raw, list):
         raise _invalid()
     result, seen_ids, seen_backends = [], set(), set()
@@ -179,10 +197,6 @@ def _configured_specs(config, manifest):
         seen_backends.add(backend_identity)
         result.append(spec)
     return result
-
-
-def is_pool_config(config):
-    return config.mt_settings().mt_provider == 'pool' or config.settings.mt_backends is not None
 
 
 def with_bailian_free_models(config, manifest, models):

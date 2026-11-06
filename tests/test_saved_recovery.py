@@ -5,7 +5,7 @@ from unittest import mock
 
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media
-from subtitle_tool.common import atomic_json
+
 from tests.fixtures import FakeService, SavedResultFixture, result, timed_raw
 
 
@@ -22,7 +22,6 @@ class SavedRecoveryTests(SavedResultFixture):
         before_sources, before_cues = self.store.sources(self.job_id), self.store.cues(self.job_id)
         self.source.unlink()
         (self.cache / "raw-0000.json").unlink()
-        (self.cache / "subtitle-sources-v2.json").unlink()
         fake = FakeService(result())
         with mock.patch.object(Media, "probe", side_effect=AssertionError("no probe")), \
                 mock.patch("subtitle_tool.engine.fingerprint", side_effect=AssertionError("no source read")):
@@ -57,7 +56,7 @@ class SavedRecoveryTests(SavedResultFixture):
         manifest = self.store.job(self.job_id)["manifest"]
         original_cues = self.store.cues(self.job_id)
         bad_cue = {**original_cues[0], "char_end": 1}
-        for kind in ["count", "missing_source", "range", "word_text", "duplicate_source", "reference"]:
+        for kind in ["count", "missing_source", "range", "word_text", "duplicate_source"]:
             with self.subTest(kind=kind):
                 candidate = copy.deepcopy(manifest)
                 records = copy.deepcopy(sources)
@@ -72,35 +71,10 @@ class SavedRecoveryTests(SavedResultFixture):
                     records[0]["words"][0]["char_end"] = 1
                 elif kind == "duplicate_source":
                     candidate["segments"].append(copy.deepcopy(candidate["segments"][0]))
-                elif kind == "reference":
-                    candidate["references_planned"] = True
                 self.store.initialize_subtitles(self.job_id, records, cues, candidate)
                 self.store.update(self.job_id, "queued")
                 self.assert_mismatch_without_requests()
 
-    def test_legacy_count_proof_uses_saved_file_or_raw_but_never_rebuilds_committed_cues(self):
-        self.save_result(result(("保留原文。", "zh")))
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest.pop("normalized_count")
-        self.store.update(self.job_id, manifest=manifest)
-        self.source.unlink()
-        self.assertEqual(self.run_fake(FakeService(result())), "completed")
-        self.source.with_suffix(".srt").unlink()
-        self.store.update(self.job_id, "queued")
-        (self.cache / manifest["normalized_file"]).unlink()
-        self.assertEqual(self.run_fake(FakeService(result())), "completed")
-        self.source.with_suffix(".srt").unlink()
-        self.store.update(self.job_id, "queued")
-        (self.cache / "raw-0000.json").unlink()
-        self.assert_mismatch_without_requests()
-
-    def test_empty_result_needs_independent_proof_and_contradictions_fail(self):
-        self.save_result(result())
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest.pop("normalized_count")
-        self.store.update(self.job_id, manifest=manifest)
-        atomic_json(self.cache / manifest["normalized_file"], [{"unexpected": "record"}])
-        self.assert_mismatch_without_requests()
 
     def test_changed_original_requires_explicit_output_directory(self):
         self.save_result(result(("原媒体字幕。", "zh")))

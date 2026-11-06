@@ -123,10 +123,6 @@ class LocalBailianBinding:
         context = self.source.binding_fingerprint(proof)
         if context is None:
             self._invalidate(record)
-        if context != record['cli_fingerprint']:
-            record['cli_fingerprint'] = context
-            atomic_json(self.path, record)
-            proof = self._proof(record)
         if not self.source.bound_to(proof):
             raise ValueError()
         return record, proof

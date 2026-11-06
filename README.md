@@ -1,6 +1,6 @@
 # 百炼命令行字幕工具
 
-Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans` 识别语音，用七牛／OpenRouter／百炼翻译池生成简体中文字幕，也支持单个翻译后端。翻译池免费优先，默认允许付费后备。
+Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans` 识别语音，用七牛／OpenRouter／百炼翻译池生成简体中文字幕，单模型同样使用翻译池执行。翻译池免费优先，默认允许付费后备。
 
 ## 开始使用
 
@@ -42,7 +42,7 @@ Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans`
 
 每个等级内默认权重为 3:1。缺少凭据的入口跳过；只配置百炼 Key 时可能直接使用百炼付费候选。免费候选累计等待最多 15 秒，然后尝试允许的付费候选。每阶段最多 180 秒，每后端最多 2 次请求，单次最多 60 秒，总并发默认 4。
 
-`--mt-paid deny` 禁止付费候选的新请求，`allow` 允许；新建、恢复和重排均可指定，恢复时保存新的许可状态。已有匹配缓存仍可复用。池使用此选项管理后备；单后端使用下文的 `--mt-fallback`。
+`--mt-paid deny` 禁止付费候选的新请求，`allow` 允许；新建、恢复和重排均可指定，恢复时保存新的许可状态。已有匹配缓存仍可复用。所有翻译配置统一使用此选项管理付费请求。
 
 七牛 Conatus 活动截至北京时间 **2026 年 11 月 30 日 23:59**，工具在活动结束后跳过该免费模型。实名认证、资格和额度见[官方活动页](https://www.qiniu.com/ai/free-models/conatus-2026)。
 
@@ -99,30 +99,22 @@ bl auth login --console
 }
 ```
 
-`mt_backends` 为 `null` 或省略时使用默认池；显式列表完整替换默认列表。默认 ID 可只写覆盖项，自定义入口须填写完整身份和能力。字段范围及示例见[池配置契约](docs/API_CONTRACT.md#翻译池配置)。
+`mt_provider:pool` 且 `mt_backends` 为 `null` 或省略时使用默认池；显式列表完整替换默认列表。默认 ID 可只写覆盖项，自定义入口须填写完整身份和能力。字段范围及示例见[池配置契约](docs/API_CONTRACT.md#翻译池配置)。
 
-### 单后端
+### 单模型
 
-将 `mt_backends` 设为 `null`，通过文件设置或环境变量选择服务；环境变量优先。
+只使用一个模型时，可配置只有一个入口的 `mt_backends` 列表。保留 `mt_backends:null` 时，`mt_provider` 仍可选择 `bailian`、`qiniu` 或 `openai_compatible`，程序将其转换为一个池入口，统一执行术语、整句翻译、对齐和复核。
 
 | 设置 | 环境变量 | 用途 |
 | --- | --- | --- |
-| `mt_provider` | `MT_PROVIDER` | `bailian`、`qiniu`、`openai_compatible` 或 `pool` |
-| `mt_base_url` | `MT_BASE_URL` | 兼容接口根地址，默认 `https://api.openai.com/v1` |
-| `mt_model` | `MT_MODEL` | 兼容后端必填；七牛留空使用 `qiniu/conatus-free` |
-| `mt_rpm` | `MT_RPM` | 兼容后端每分钟请求上限，0 表示不主动限流 |
+| `mt_provider` | `MT_PROVIDER` | `pool` 或上述单模型快捷配置 |
+| `mt_base_url` | `MT_BASE_URL` | 兼容接口根地址，保留服务商路径前缀 |
+| `mt_model` | `MT_MODEL` | 兼容服务必填；七牛默认 `qiniu/conatus-free`，百炼默认 `qwen3.8-flash` |
+| `mt_rpm` | `MT_RPM` | 兼容入口每分钟请求上限，0 表示不主动限流 |
 
-百炼单后端使用 `qwen-mt-flash`。兼容后端使用 `OPENAI_API_KEY` 或明文 `data/mt-key.txt`，根地址填写到 `/chat/completions` 之前，保留服务商要求的路径前缀。
+环境变量优先。兼容服务使用 `OPENAI_API_KEY` 或 `data/mt-key.txt`。七牛和百炼使用各自凭据；自定义兼容模型须支持所配置的结构化输出能力，可用完整池条目指定 `json_object`、`json_schema` 或 `text`。
 
-```powershell
-$env:MT_PROVIDER = 'openai_compatible'
-$env:MT_BASE_URL = 'https://openrouter.ai/api/v1'
-$env:MT_MODEL = 'openrouter/free'
-$env:MT_RPM = '20'
-.\scripts\transcribe.ps1 "D:\Videos\课程.mkv"
-```
-
-OpenRouter 单后端默认启用百炼后备，可能产生费用。暂时故障、格式错误或内容拒绝时，当前组转百炼；可信免费额度耗尽时，剩余组转百炼。每次需要禁用后备时传 `--mt-fallback none`，恢复时也保留该选项。重试及旧任务恢复规则见[接口契约](docs/API_CONTRACT.md#数据与恢复)。
+需要后备时将其他入口加入 `mt_backends`，用 `--mt-paid allow|deny` 管理付费请求。
 
 ## 右键“发送到”
 
@@ -177,7 +169,18 @@ OpenRouter 单后端默认启用百炼后备，可能产生费用。暂时故障
 
 `--track` 使用 FFprobe 音轨索引；`--channel left|right|mix` 选择首声道、第二声道或混音。恢复时可重选尚未提交识别的输入。已有完整规范化结果、本地转写或云端任务 ID 时，原媒体移走后仍可恢复；原路径被其他媒体占用时另选输出目录。
 
-任务库由一个进程独占。Ctrl+C 保存进度；翻译池、OpenRouter 契约 2／3 及其后备最多等待 5 秒保存在途完整结果，再次 Ctrl+C 立即结束等待。其他请求等待返回或超时。云端已提交请求仍可能计费；取消的任务可用 `--resume` 恢复。
+`--jobs` 中标记为 `archived` 的任务保存于 `data/archives`，包含原始转写、人工决定和校验后的 SRT：
+
+```powershell
+# 原字节导出，不需要 Key，不访问云端；文件名为任务 ID.srt
+.\scripts\transcribe.ps1 --export-archive 旧任务ID --output-dir "D:\Subtitles\Archive"
+# 从归档转写创建新任务；不重新识别，必要时按当前池配置重新翻译
+.\scripts\transcribe.ps1 --reflow 旧任务ID --output-dir "D:\Subtitles\Rebuilt"
+```
+
+归档重建返回新的任务 ID，使用当前账户和翻译配置，保留可对应的人工语种决定；对应关系不明确时停止。原归档保留。
+
+任务库由一个进程独占。Ctrl+C 保存进度；翻译最多等待 5 秒保存在途完整结果，再次 Ctrl+C 立即结束等待。其他请求等待返回或超时。云端已提交请求仍可能计费；取消的任务可用 `--resume` 恢复。
 
 提交状态未知时，可绑定已有云端任务 ID，或接受重复计费风险后重发：
 

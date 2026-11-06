@@ -1,6 +1,6 @@
-"""Bounded OpenRouter free-quota admission for one v5 translation run.
+"""Bounded OpenRouter free-quota admission for one translation run.
 
-This shares the legacy account ledger and parser but never wraps an HTTP
+This shares the account ledger and parser but never wraps an HTTP
 translation or retries it.  The router owns the time budget and invokes the
 returned reservation immediately before dispatch.
 """
@@ -12,7 +12,7 @@ from contextlib import contextmanager
 
 from .common import Cancelled, ToolError
 from .mt_routing import RouteFailure
-from .mt_runtime import ServiceError, runtime_resources
+from .mt_runtime import ServiceError, quota_for
 from .mt_transport import ProcessTransport, TransportError
 
 
@@ -65,7 +65,7 @@ class _Reservation:
             self.ledger.condition.notify_all()
 
 
-class V5Quota:
+class OpenRouterQuota:
     """Query once per shared account observation, reserving only before POST.
 
     ``credential(entry)`` returns the frozen backend's current key.  This
@@ -76,7 +76,7 @@ class V5Quota:
                  ledger_for=None, on_event=lambda event: None):
         self.control, self.credential, self.clock = control, credential, clock
         self.transport = transport if transport is not None else ProcessTransport()
-        self.ledger_for = ledger_for if ledger_for is not None else lambda backend: runtime_resources(backend)[1]
+        self.ledger_for = ledger_for if ledger_for is not None else quota_for
         self.on_event = on_event
 
     @contextmanager

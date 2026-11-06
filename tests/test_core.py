@@ -13,16 +13,16 @@ from unittest import mock
 import requests
 
 from subtitle_tool.api import Bailian, Http
-from subtitle_tool.common import ASR_MODEL, MT_MODEL, SubmissionUnknown, ToolError, redact
+from subtitle_tool.common import ASR_MODEL, SubmissionUnknown, ToolError, redact
 from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.main import main
-from subtitle_tool.subtitles import mt_cache_key, normalize, render_srt, route
+from subtitle_tool.subtitles import normalize, render_srt, route
 from subtitle_tool.publication import write_srt
 from subtitle_tool.review import ReviewDecision
 
-from tests.fixtures import ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
+from tests.fixtures import enqueue_current, ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
 
 
 class SubtitleTests(TemporaryTest):
@@ -125,7 +125,10 @@ class SubtitleTests(TemporaryTest):
         sentence.update(end_time=10000, words=[
             {"begin_time": 0, "end_time": 3200, "text": "First part", "punctuation": "."},
             {"begin_time": 3700, "end_time": 10000, "text": "Second part", "punctuation": "."}])
-        cues, _ = normalize(raw, 1234, "s")
+        sources, _ = normalize(raw, 1234, "s")
+        from subtitle_tool.subtitles import plan_fragments
+        from subtitle_tool.config import Settings
+        cues = plan_fragments(sources[0], Settings())
         self.assertEqual([(c["begin_ms"], c["end_ms"]) for c in cues], [(1234, 4434), (4934, 11234)])
         sentence["language"] = "ar"
         self.assertEqual(len(normalize(raw, 0, "s")[0]), 1)
@@ -153,14 +156,10 @@ class SubtitleTests(TemporaryTest):
         with self.assertRaises(ToolError):
             render_srt(cues, Settings())
 
-    def test_cache_includes_region_source_and_model_contract(self):
-        self.assertNotEqual(mt_cache_key("a", "auto", "beijing"), mt_cache_key("a", "English", "beijing"))
-        self.assertNotEqual(mt_cache_key("a", "auto", "beijing"), mt_cache_key("a", "auto", "singapore"))
-
 
 class HttpTests(unittest.TestCase):
     def test_submit_malformed_output_or_missing_id_is_unknown(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event())
+        cloud = Bailian("offline-key", "beijing", threading.Event(), workspace_id="offline-space")
         for body in [{}, {"output": None}, {"output": []}, {"output": {"task_id": ""}}]:
             with self.subTest(body=body), mock.patch("requests.request", return_value=response(body)) as request:
                 with self.assertRaises(SubmissionUnknown):
@@ -168,14 +167,14 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(request.call_count, 1)
 
     def test_submit_timeout_is_never_retried(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event())
+        cloud = Bailian("offline-key", "beijing", threading.Event(), workspace_id="offline-space")
         with mock.patch("requests.request", side_effect=requests.Timeout()) as request:
             with self.assertRaises(SubmissionUnknown):
                 cloud.submit("oss://test/a.wav")
             self.assertEqual(request.call_count, 1)
 
     def test_submit_5xx_is_unknown_but_403_is_explicit_rejection(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event())
+        cloud = Bailian("offline-key", "beijing", threading.Event(), workspace_id="offline-space")
         with mock.patch("requests.request", return_value=response({}, 503)) as request:
             with self.assertRaises(SubmissionUnknown):
                 cloud.submit("oss://test/a.wav")
@@ -192,12 +191,6 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(http.json("GET", "https://example.test")["ok"], True)
             self.assertEqual(request.call_count, 3)
 
-    def test_empty_truncated_or_bad_mt_response_rejected(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event())
-        for text, reason in [("", "stop"), ("译文", "length"), ("```srt", "stop")]:
-            with mock.patch("requests.request", return_value=response({"choices": [{"finish_reason": reason, "message": {"content": text}}]})):
-                with self.assertRaises(ToolError):
-                    cloud.translate("hello")
 
     def test_redaction(self):
         sanitized = redact("Bearer sk-secret-value https://oss.example/a?Signature=secret oss://private/file")
@@ -234,14 +227,6 @@ class MediaTests(TemporaryTest):
 
 
 class PipelineTests(PipelineFixture):
-    """The previous task format remains a separate recovery contract."""
-    def setUp(self):
-        super().setUp()
-        manifest = self.store.job(self.job_id)["manifest"]
-        for name in ["subtitle_version", "translation_strategy_version", "subtitle_settings"]:
-            manifest.pop(name)
-        self.store.update(self.job_id, manifest=manifest)
-
     def test_chinese_end_to_end_zero_mt_and_contract(self):
         fake = FakeService(result(("欢迎使用百炼。", "zh"), ("我们使用 Python 和 API。", "zh")))
         self.assertEqual(self.run_fake(fake), "completed")
@@ -275,21 +260,20 @@ class PipelineTests(PipelineFixture):
         self.assertTrue(output.index("First sentence.") < output.index("繁体译文"))
         for call in fake.named("/chat/completions"):
             body = call[2]["json"]
-            self.assertEqual(body["model"], MT_MODEL)
-            self.assertEqual(body["translation_options"], {"source_lang": "auto", "target_lang": "Chinese"})
-            self.assertEqual(len(body["messages"]), 1)
-            self.assertEqual(body["messages"][0]["role"], "user")
+            self.assertEqual(body["model"], 'qwen3.8-flash')
+            self.assertEqual(len(body['messages']), 2)
+            self.assertEqual(body['messages'][0]['role'], 'system')
 
     def test_partial_mt_failure_retries_only_failed_cue(self):
         fake = FakeService(result(("First sentence.", "en"), ("Second sentence.", "en")))
         fake.mt_failure.add("Second sentence.")
         self.assertEqual(self.run_fake(fake), "failed")
         self.assertFalse(self.source.with_suffix(".srt").exists())
-        self.assertTrue(self.store.cues(self.job_id)[0]["translated"])
+        self.assertFalse(any(c["translated"] for c in self.store.cues(self.job_id)))
         fake.mt_failure.clear()
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
-        self.assertEqual(len(fake.named("/chat/completions")), 3)
+        self.assertEqual(len(fake.named("/chat/completions")), 4)
 
     def test_mt_failure_stops_scheduling_beyond_concurrency(self):
         fake = FakeService(result(*[(f"Sentence number {i}.", "en") for i in range(12)]))
@@ -309,40 +293,6 @@ class PipelineTests(PipelineFixture):
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(self.store.counts(self.job_id).get("asr_query", 0), before)
 
-    def test_valid_v1_normalized_cache_keeps_cues_and_successful_translation(self):
-        fake = FakeService(result(("First sentence.", "en"), ("Second sentence.", "en")))
-        fake.mt_failure.add("Second sentence.")
-        self.assertEqual(self.run_fake(fake), "failed")
-        job = self.store.job(self.job_id)
-        manifest = job["manifest"]
-        cache = self.config.data / "cache" / self.job_id
-        saved_file = cache / manifest["normalized_file"]
-        legacy_file = cache / "normalized-v1.json"
-        saved_file.rename(legacy_file)
-        legacy_content = legacy_file.read_bytes()
-        manifest["contract"]["normalizer"] = 1
-        manifest["normalized_version"] = 1
-        manifest["normalized_file"] = legacy_file.name
-        self.store.update(self.job_id, "failed", manifest)
-        (cache / "raw-0000.json").unlink()
-        cues_before = self.store.cues(self.job_id)
-        counts_before = self.store.counts(self.job_id)
-        fake.query_failure = True
-        fake.mt_failure.clear()
-        self.assertEqual(self.run_fake(fake), "completed")
-        cues_after = self.store.cues(self.job_id)
-        self.assertEqual(cues_after[0]["translated"], cues_before[0]["translated"])
-        self.assertEqual([(c["cue_id"], c["begin_ms"], c["end_ms"], c["text"]) for c in cues_after],
-                         [(c["cue_id"], c["begin_ms"], c["end_ms"], c["text"]) for c in cues_before])
-        self.assertEqual(legacy_file.read_bytes(), legacy_content)
-        self.assertFalse((cache / "normalized-v2.json").exists())
-        restored = self.store.job(self.job_id)["manifest"]
-        self.assertEqual(restored["contract"]["normalizer"], 1)
-        self.assertEqual(restored["normalized_version"], 1)
-        counts_after = self.store.counts(self.job_id)
-        for name in ["upload_policy", "upload", "asr_submit", "asr_query", "result_download"]:
-            self.assertEqual(counts_after.get(name, 0), counts_before.get(name, 0))
-        self.assertEqual(counts_after["mt"], counts_before["mt"] + 1)
 
     def test_interrupted_durable_submit_marker_becomes_unknown(self):
         job = self.store.job(self.job_id)
@@ -463,61 +413,10 @@ class PipelineTests(PipelineFixture):
             source = self.path / f"other-{index}.mkv"
             shutil.copyfile(self.fixture, source)
             self.config.set_key(key)
-            self.job_id = self.store.enqueue(source, "beijing", workspace_id=workspace)
+            self.job_id = enqueue_current(self.store, self.config, source, workspace_id=workspace)
             self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(len(fake.named("/chat/completions")), 3)
+        self.assertEqual(len(fake.named("/chat/completions")), 12)
 
-    def make_legacy(self, region="beijing"):
-        manifest = self.store.job(self.job_id)["manifest"]
-        for key in ["access_mode", "workspace_id", "processing_version", "cache_identity"]:
-            manifest.pop(key, None)
-        manifest["region"] = region
-        self.store.update(self.job_id, manifest=manifest)
-
-    def test_legacy_beijing_known_task_stays_on_public_endpoint(self):
-        self.make_legacy()
-        fake = FakeService(result(("欢迎使用百炼。", "zh")))
-        fake.query_failure = True
-        self.assertEqual(self.run_fake(fake), "failed")
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest["segments"][0].pop("oss_url", None)
-        manifest["segments"][0]["oss_protected"] = "unreadable-old-ciphertext"
-        self.store.update(self.job_id, manifest=manifest)
-        fake.query_failure = False
-        with mock.patch("subtitle_tool.engine.decrypt_legacy", side_effect=AssertionError("known task must not decrypt")):
-            self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(len(fake.named("/asr/transcription")), 1)
-        self.assertEqual(len(fake.uploads), 1)
-        self.assertTrue(all(c[1].startswith("https://dashscope.aliyuncs.com/") for c in fake.calls if "/tasks/" in c[1]))
-
-    def test_legacy_singapore_keeps_data_without_network_calls(self):
-        self.make_legacy("singapore")
-        fake = FakeService(result(("欢迎使用百炼。", "zh")))
-        self.assertEqual(self.run_fake(fake), "failed")
-        self.assertEqual(self.store.job(self.job_id)["error_code"], "legacy_region")
-        self.assertEqual(fake.calls, [])
-        self.assertTrue(self.source.exists())
-
-    def test_unreadable_legacy_upload_can_be_reuploaded_only_before_submission(self):
-        self.make_legacy()
-        fake = FakeService(result(("欢迎使用百炼。", "zh")))
-        original = fake.request
-        def rejected(method, url, **kwargs):
-            if url.endswith("/asr/transcription"):
-                return response({"code": "Denied"}, 403)
-            return original(method, url, **kwargs)
-        fake.request = rejected
-        self.assertEqual(self.run_fake(fake), "failed")
-        manifest = self.store.job(self.job_id)["manifest"]
-        segment = manifest["segments"][0]
-        segment.pop("oss_url", None)
-        segment.pop("upload_identity", None)
-        segment["oss_protected"] = "b2xk"
-        self.store.update(self.job_id, manifest=manifest)
-        fake.request = original
-        with mock.patch("subtitle_tool.engine.decrypt_legacy", side_effect=ToolError("解密失败", "credentials")):
-            self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(len(fake.uploads), 2)
 
     def test_resume_cli_channel_option_changes_unsubmitted_input(self):
         run_process([ROOT / "tools/ffmpeg.exe", "-v", "error", "-y", "-f", "lavfi", "-i",
@@ -618,27 +517,6 @@ class PipelineTests(PipelineFixture):
         self.assertGreater(len(manifest["segments"]), 1)
         self.assertTrue(all(s["bytes"] <= 50000 for s in manifest["segments"]))
         self.assertEqual(len(fake.named("/asr/transcription")), len(manifest["segments"]))
-
-    def test_old_timeline_failure_reuses_raw_and_task_after_normalizer_upgrade(self):
-        fake = FakeService(result(("First sentence.", "en"), ("Next sentence.", "en")))
-        fake.raw["transcripts"][0]["sentences"][0]["end_time"] = 1000
-        fake.raw["transcripts"][0]["sentences"].insert(1, point_sentence(1000))
-        fake.mt_failure.add("First sentence. Yes.")
-        self.assertEqual(self.run_fake(fake), "failed")
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest["normalized"] = False
-        manifest["contract"]["normalizer"] = 1
-        manifest.pop("normalized_version", None)
-        self.store.replace_cues(self.job_id, [])
-        self.store.update(self.job_id, "failed", manifest, code="timeline")
-        fake.mt_failure.clear()
-        before = dict(self.store.counts(self.job_id))
-        self.assertEqual(self.run_fake(fake), "completed")
-        after = self.store.counts(self.job_id)
-        for name in ["asr_submit", "asr_query", "upload", "result_download"]:
-            self.assertEqual(after.get(name, 0), before.get(name, 0))
-        self.assertEqual(self.store.job(self.job_id)["manifest"]["normalized_version"], 2)
-        self.assertTrue((self.config.data / "cache" / self.job_id / "normalized-v2.json").exists())
 
 
 if __name__ == "__main__":

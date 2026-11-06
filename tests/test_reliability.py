@@ -1,27 +1,25 @@
 from __future__ import annotations
 
+import json
 import copy
 import sqlite3
 from unittest import mock
 
-from subtitle_tool.api import _MT_PACERS
 from subtitle_tool.common import ToolError
-from tests.fixtures import FakeService, SavedResultFixture, response, result, timed_raw
+from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, response, result, timed_raw
 
 
 class TransactionRecoveryTests(SavedResultFixture):
     def test_local_stage_interruptions_follow_committed_records(self):
-        for boundary in ["initialize", "references", "layout", "append"]:
+        for boundary in ["initialize", "layout", "append"]:
             for point in ["before", "inside", "after"]:
                 for fault in [KeyboardInterrupt, OSError]:
                     with self.subTest(boundary=boundary, point=point, fault=fault.__name__):
-                        _MT_PACERS.clear()
-                        self.job_id = self.store.enqueue(self.source, workspace_id="offline-space",
+                        self.job_id = enqueue_current(self.store, self.config, self.source,
                             output_dir=self.path / (boundary + point + fault.__name__))
                         self.cache = self.config.data / "cache" / self.job_id
                         self.cache.mkdir(parents=True)
                         manifest = self.store.job(self.job_id)["manifest"]
-                        manifest['translation_strategy_version'] = 2
                         manifest["subtitle_settings"].update(zh_line_width=22, other_line_width=42)
                         self.store.update(self.job_id, manifest=manifest)
                         raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)
@@ -31,9 +29,14 @@ class TransactionRecoveryTests(SavedResultFixture):
                         def request(method, url, **kwargs):
                             if url.endswith("/chat/completions"):
                                 fake.calls.append((method, url, kwargs))
-                                body = kwargs["json"]
-                                return response({"choices": [{"finish_reason": "stop", "message": {
-                                    "content": "中" * (50 if body["translation_options"].get("tm_list") else 10)}}]})
+                                from subtitle_tool.mt_quality import PROMPTS
+                                body = kwargs['json']
+                                stage = next(name for name, prompt in PROMPTS.items() if body['messages'][0]['content'].startswith(prompt))
+                                data = json.loads(body['messages'][1]['content'])
+                                value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
+                                         {'translations': {item['id']: '中' * (10 if stage == 'draft' else 50)
+                                                           for item in data['sentences' if stage == 'draft' else 'fragments']}})
+                                return response({'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(value)}}]})
                             return original_request(method, url, **kwargs)
                         fake.request = request
                         method = "initialize_subtitles" if boundary == "initialize" else "save_layout"
@@ -42,7 +45,6 @@ class TransactionRecoveryTests(SavedResultFixture):
                         def interrupt(job_id, *args, **kwargs):
                             candidate = args[-1]
                             target = (boundary == "initialize" or
-                                      boundary == "references" and kwargs.get("references") is not None or
                                       boundary == "layout" and candidate.get("layout_planned") and candidate.get("layout_round") == 0 or
                                       boundary == "append" and candidate.get("layout_round") == 1)
                             if not target or injected:
@@ -50,7 +52,7 @@ class TransactionRecoveryTests(SavedResultFixture):
                             injected.append(True)
                             def snapshot():
                                 return (copy.deepcopy(self.store.job(job_id)["manifest"]),
-                                        self.store.sources(job_id), self.store.cues(job_id), self.store.references(job_id))
+                                        self.store.sources(job_id), self.store.cues(job_id))
                             expected["saved"] = snapshot()
                             if point == "after":
                                 save(job_id, *args, **kwargs)
@@ -66,13 +68,12 @@ class TransactionRecoveryTests(SavedResultFixture):
                         with mock.patch.object(self.store, method, side_effect=interrupt):
                             self.assertEqual(self.run_fake(fake), "cancelled" if fault is KeyboardInterrupt else "failed")
                         self.assertTrue(injected)
-                        saved, sources, cues, references = expected["saved"]
+                        saved, sources, cues = expected["saved"]
                         actual = self.store.job(self.job_id)["manifest"]
-                        for flag in ["normalized", "normalized_count", "references_planned", "layout_planned", "layout_round"]:
+                        for flag in ["normalized", "normalized_count", "layout_planned", "layout_round"]:
                             self.assertEqual(actual.get(flag), saved.get(flag), flag)
                         self.assertEqual(self.store.sources(self.job_id), sources)
                         self.assertEqual(self.store.cues(self.job_id), cues)
-                        self.assertEqual(self.store.references(self.job_id), references)
                         self.store.update(self.job_id, "queued")
                         self.assertEqual(self.run_fake(fake), "completed")
                         self.assertFalse(self.store.job(self.job_id)["manifest"].get("no_speech"))
@@ -81,10 +82,9 @@ class TransactionRecoveryTests(SavedResultFixture):
                         with self.store.db:
                             self.store.db.execute("DELETE FROM mt_cache")
 
-    def test_legacy_initialization_is_atomic(self):
+    def test_initialization_is_atomic(self):
         self.save_result(result(("完整字幕。", "zh")), normalized=False)
         manifest = self.store.job(self.job_id)["manifest"]
-        manifest.pop("subtitle_version")
         self.store.update(self.job_id, manifest=manifest)
         fake = FakeService(result(("完整字幕。", "zh")))
         replace = self.store._replace_records
@@ -112,21 +112,6 @@ class TransactionRecoveryTests(SavedResultFixture):
         self.assertEqual(self.store.job(self.job_id)["error_code"], "cache_mismatch")
         self.assertEqual(len(fake.named("/asr/transcription")), 0)
 
-    def test_legacy_empty_cache_can_use_complete_raw_but_not_missing_evidence(self):
-        fake = FakeService(result())
-        self.save_result(fake.raw, normalized=False)
-        self.assertEqual(self.run_fake(fake), "completed")
-        cache = self.config.data / "cache" / self.job_id
-        manifest = self.store.job(self.job_id)["manifest"]
-        manifest.pop("normalized_count", None)
-        (cache / manifest["normalized_file"]).unlink()
-        self.store.update(self.job_id, "queued", manifest)
-        self.assertEqual(self.run_fake(fake), "completed")
-        (cache / "raw-0000.json").unlink()
-        self.store.update(self.job_id, "queued")
-        self.assertEqual(self.run_fake(fake), "failed")
-        self.assertEqual(self.store.job(self.job_id)["error_code"], "cache_mismatch")
-        self.assertEqual(len(fake.named("/asr/transcription")), 0)
 
     def test_accounting_failure_does_not_replace_primary_failure(self):
         fake = FakeService(result())

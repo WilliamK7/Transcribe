@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
@@ -13,31 +12,21 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import asdict, replace
-from functools import partial
 from pathlib import Path
 
-from .api import Bailian, BoundedBailianMT, OpenAICompatible, upload_limit
-from .common import (DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION,
-                     MAX_LAYOUT_ROUNDS, Cancelled, NeedsReview,
-                     SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key)
-from .config import Config, decrypt_legacy
-from .media import EXTRACT_RECIPE_VERSION, Media
-from .mt import batch_cache_key, batch_cache_value, batch_recovery_cache_key, parse_batch_translation
-from .mt_diagnostics import MTDiagnostics
+from .api import Bailian, upload_limit
+from .common import DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION, Cancelled, NeedsReview, SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key
+from .config import Config
+from .media import Media
 from .mt_control import MTControl
-from .mt_fallback import GroupFallback, fallback_policy, is_content_refusal, saved_fallback, validate_origins
-from .mt_backend import configured_mt, saved_mt
+from .mt_backend import saved_mt
 from .store import TERMINAL, Store
 from .review import ReviewDecision, decision_origin
 from .policy import asr_contract, current_execution_snapshot, display_timing_version, load_policy
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
                             validate_normalized, validate_segments)
 from .publication import file_hash, inspect_intent, prepare_intent, write_srt
-from .subtitles import (layout_warnings, make_fragment, mt_cache_key, normalize, plan_display_timing, plan_fragments,
-                        plan_reference_units, reference_sources, render_srt, translation_context,
-                        plan_translation_batches, source_context, split_mt_units, validate_unit_coverage,
-                        validate_fragment, validate_mt_input, wrap)
+from .subtitles import make_fragment, normalize, plan_display_timing, render_srt
 
 
 class LocalStateUnavailable(ToolError):
@@ -46,12 +35,9 @@ class LocalStateUnavailable(ToolError):
 
 
 def unknown_submission(manifest, state):
-    """Shared uncertainty rule, including pre-segment-marker task records."""
-    return not manifest.get("reflow") and (
-        manifest.get("submitting") or
-        any(s.get("submitting") and not s.get("task_id") for s in manifest.get("segments", [])) or
-        state == "submission_unknown" or
-        state == "submitting" and not any(s.get("task_id") or "submitting" in s for s in manifest.get("segments", [])))
+    return not manifest.get('reflow') and (
+        state == 'submission_unknown' or
+        any(s.get('submitting') and not s.get('task_id') for s in manifest.get('segments', [])))
 
 
 class Engine:
@@ -61,8 +47,6 @@ class Engine:
         self.progress = progress
         self.mt_control = MTControl(self.cancel)
         self.mt_runtime_active = False
-        self.fallback_groups = None
-        self.mt_context = threading.local()
         self.run_id = uuid.uuid4().hex
 
     def request_cancel(self, *, force=False):
@@ -82,34 +66,22 @@ class Engine:
         self.store.change_output(job_id, directory, overwrite)
 
     def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
-               task_id=None, allow_resubmit=False, mt_fallback=None, mt_paid=None):
+               task_id=None, allow_resubmit=False, mt_paid=None):
         """Prepare an explicitly requested resume; run() remains the sole executor."""
         manifest = self.store.job(job_id)['manifest']
-        if manifest.get('translation_strategy_version') == 5:
-            from .mt_pool import saved_route
-            route = saved_route(manifest)
-            if mt_fallback is not None:
-                raise ToolError('翻译池请使用 --mt-paid allow|deny，不支持 --mt-fallback。', 'mt_config')
-            if mt_paid is not None:
-                route = copy.deepcopy(route)
-                route['routing']['paid_enabled'] = mt_paid == 'allow'
-                manifest['mt_route_snapshot'] = route
-                self.store.update(job_id, manifest=manifest)
-            from .mt_runtime import reset_quota_for_resume
-            for entry in route['entries']:
-                if entry['tier'] == 'free' and entry['backend'] is not None:
-                    backend = saved_mt({**manifest, 'mt_snapshot': entry['backend']})
-                    if backend.free_quota:
-                        reset_quota_for_resume(backend)
-        else:
-            if mt_paid is not None:
-                raise ToolError('--mt-paid 仅用于翻译池；旧单后端使用 --mt-fallback。', 'mt_config')
-            self.configure_fallback(job_id, mt_fallback)
-            from .mt_fallback import supports_fallback
-            backend = saved_mt(self.store.job(job_id)['manifest'])
-            if supports_fallback(backend):
-                from .mt_runtime import reset_quota_for_resume
-                reset_quota_for_resume(backend)
+        load_policy(manifest)
+        from .mt_pool import saved_route
+        from .mt_runtime import reset_quota_for_resume
+        route = saved_route(manifest)
+        if mt_paid is not None:
+            route['routing']['paid_enabled'] = mt_paid == 'allow'
+            manifest['mt_route_snapshot'] = route
+            self.store.update(job_id, manifest=manifest)
+        for entry in route['entries']:
+            if entry['tier'] == 'free' and entry['backend'] is not None:
+                backend = saved_mt({**manifest, 'mt_snapshot': entry['backend']})
+                if backend.free_quota:
+                    reset_quota_for_resume(backend)
         self.select_input(job_id, track, channel)
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped"}:
@@ -127,29 +99,6 @@ class Engine:
         if task_id or allow_resubmit:
             self.resolve_unknown(job_id, task_id, allow_resubmit)
 
-    def configure_fallback(self, job_id, choice=None):
-        with self.store.lock:
-            job = self.store.job(job_id)
-            previous = copy.deepcopy(job['manifest'])
-            proposed = fallback_policy(previous, choice)
-            if proposed is None:
-                return
-            self.identity(job_id, previous, persist=False)
-            if proposed['enabled']:
-                saved_mt(previous).credential(self.config)
-            validate_origins(previous, self.store.references(job_id) + self.store.cues(job_id))
-            if 'mt_fallback_policy' in previous:
-                saved_fallback(previous).credential(self.config)
-                proposed = {**previous['mt_fallback_policy'], 'enabled': proposed['enabled']}
-                if proposed == previous['mt_fallback_policy']:
-                    return
-            else:
-                snapshot = self.config.root / '.build' / 'mt-fallback' / job_id / (str(time.time_ns()) + '.json')
-                self.store.snapshot(job_id, snapshot)
-                proposed['migration_snapshot'] = str(snapshot.relative_to(self.config.root))
-            candidate = copy.deepcopy(previous)
-            candidate['mt_fallback_policy'] = proposed
-            self.store.commit_fallback_policy(job_id, candidate, job['manifest'])
 
     def cancel_job(self, job_id, *, interrupted=False):
         job = self.store.job(job_id)
@@ -157,9 +106,6 @@ class Engine:
             return
         manifest = job["manifest"]
         ambiguous = unknown_submission(manifest, job["state"])
-        if ambiguous:
-            # Preserve old top-level uncertainty when the external state becomes cancelled.
-            manifest["submitting"] = True
         state = "submission_unknown" if interrupted and ambiguous else "cancelled"
         self.store.update(job_id, state, manifest,
                           error="用户停止本地任务；已提交的云端任务仍可能计费。",
@@ -229,28 +175,20 @@ class Engine:
             self.store.update(job_id, manifest=manifest)
         return key, scope
 
-    def reflow(self, job_id, *, overwrite=False, output_dir=None, mt_fallback=None, mt_paid=None):
+    def reflow(self, job_id, *, overwrite=False, output_dir=None, mt_paid=None):
         """Prepare a recoverable local reflow; only run() may translate and commit SRT."""
         job = self.store.job(job_id)
+        if job['state'] == 'archived':
+            return self.rebuild_archive(job_id, output_dir, overwrite=overwrite, mt_paid=mt_paid)
         manifest = job["manifest"]
         output = self.store.resolve_output(job, output_dir)
         self.store.check_republish_output(job_id, output, overwrite, operation="重排")
         load_policy(manifest, verify_execution=False).settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
         self.config.settings.validate()
-        from .mt_pool import configured_route, is_pool_config
-        route = None
-        if is_pool_config(self.config):
-            if mt_fallback is not None:
-                raise ToolError('翻译池请使用 --mt-paid allow|deny，不支持 --mt-fallback。', 'mt_config')
-            route = configured_route(self.config, manifest,
-                                     paid_enabled=None if mt_paid is None else mt_paid == 'allow')
-            snapshot = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
-            mt_backend = saved_mt({**manifest, 'mt_snapshot': snapshot, 'translation_strategy_version': 5})
-        else:
-            if mt_paid is not None:
-                raise ToolError('--mt-paid 仅用于翻译池；旧单后端使用 --mt-fallback。', 'mt_config')
-            mt_backend = configured_mt(self.config, manifest)
+        from .mt_pool import configured_route
+        route = configured_route(self.config, manifest, paid_enabled=None if mt_paid is None else mt_paid == 'allow')
+        mt_snapshot = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
         contract = asr_contract()
         cache = self.config.data / "cache" / job_id
         offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
@@ -282,34 +220,98 @@ class Engine:
         previous_version = manifest.get("subtitle_version", 0)
         snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
         self.store.snapshot(job_id, snapshot)
-        for name in ["references_planned", "layout_planned", "layout_round", "layout_complete",
+        for name in ["layout_planned", "layout_round", "layout_complete",
                      "mt_glossary_schedule",
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
-                     "backup", "cue_count", "output_settings", "no_speech"]:
+                     "backup", "cue_count", "output_settings", "normalized_file", "no_speech"]:
             manifest.pop(name, None)
-        normalized_file = f"subtitle-sources-v{SUBTITLE_VERSION}-reflow-{token}.json"
-        strategy = mt_backend.translation_strategy_version
+        strategy = 5
         manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=strategy,
+                        mt_glossary_schedule="prefix-v1",
                         display_timing_version=DISPLAY_TIMING_VERSION,
-                        mt_snapshot=mt_backend.snapshot(),
+                        mt_snapshot=mt_snapshot,
                         execution_snapshot=current_execution_snapshot(strategy),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
                                            ["zh_line_width", "other_line_width", "chinese_first"]},
-                        normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION, normalized_file=normalized_file,
+                        normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
                         warnings=warnings, overwrite=bool(overwrite), contract=contract,
                         reflow={"snapshot": str(snapshot.relative_to(self.config.root)), "prepared_at": time.time(),
                                 "from_subtitle_version": previous_version})
-        atomic_json(cache / normalized_file, sources)
-        manifest.pop('mt_fallback_policy', None)
-        manifest.pop('mt_route_snapshot', None)
-        if route is not None:
-            manifest['mt_route_snapshot'] = route
-        else:
-            proposed = fallback_policy(manifest, mt_fallback)
-            if proposed is not None:
-                manifest['mt_fallback_policy'] = proposed
+        manifest['mt_route_snapshot'] = route
         check_cancel(self.cancel)
         self.store.commit_reflow(job_id, sources, [make_fragment(s) for s in sources], manifest, output)
+        return job_id
+
+    def rebuild_archive(self, job_id, directory, *, overwrite=False, mt_paid=None):
+        from .archives import read_archive
+        from .mt_pool import configured_route
+        from .reports import ReportWriter
+        from .common import PROCESSING_VERSION, atomic_bytes, validate_workspace_id
+        if directory is None:
+            raise ToolError('旧任务重建须用 --output-dir 指定新输出目录；原归档保留。', 'output_path_required')
+        task, files = read_archive(self.config, job_id)
+        old = task['job']['manifest']
+        key = self.config.get_key()
+        manifest = {'region': 'beijing', 'access_mode': 'workspace',
+                    'workspace_id': validate_workspace_id(self.config.settings.workspace_id),
+                    'account': hashlib.sha256(key.encode()).hexdigest(), 'processing_version': PROCESSING_VERSION,
+                    'subtitle_version': SUBTITLE_VERSION, 'display_timing_version': DISPLAY_TIMING_VERSION,
+                    'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot(),
+                    'mt_glossary_schedule': 'prefix-v1', 'contract': asr_contract(),
+                    'overwrite': bool(overwrite), 'rebuilt_from_archive': job_id,
+                    'subtitle_settings': {k: getattr(self.config.settings, k) for k in
+                                         ['zh_line_width', 'other_line_width', 'chinese_first']}}
+        route = configured_route(self.config, manifest, paid_enabled=None if mt_paid is None else mt_paid == 'allow')
+        manifest.update(mt_route_snapshot=route,
+                        mt_snapshot=next(e['backend'] for e in route['entries'] if e['backend'] is not None))
+        for name in ['fingerprint', 'media', 'track', 'channel']:
+            if name in old:
+                manifest[name] = old[name]
+        manifest['audio_offset_ms'] = segment_offset(old)
+        manifest['segments'] = [{k: s[k] for k in ['id', 'offset_ms', 'duration_ms'] if k in s} for s in old['segments']]
+        validate_segments(manifest)
+        sources, warnings = [], []
+        for segment in manifest['segments']:
+            check_cancel(self.cancel)
+            raw = json.loads(files['raw-' + segment['id'] + '.json'])
+            items, notes = normalize(raw, manifest['audio_offset_ms'] + segment['offset_ms'], segment['id'],
+                                     duration_ms=segment.get('duration_ms'), preserve_sentences=True)
+            sources.extend(items)
+            warnings.extend(notes)
+        sources.sort(key=lambda s: (s['begin_ms'], s['end_ms'], s['sentence_id']))
+        self.preserve_review_decisions(sources, task['sources'], task['cues'])
+        output = Path(directory).resolve() / Path(task['job']['source']).with_suffix('.srt').name
+        ReportWriter(self.config, output).validate()
+        self.store.check_republish_output(job_id, output, overwrite, operation='归档重建')
+        new_id = uuid.uuid4().hex
+        cache = self.config.data / 'cache' / new_id
+        cache.mkdir(parents=True)
+        try:
+            for name, content in files.items():
+                if name.startswith('raw-'):
+                    atomic_bytes(cache / name, content)
+            manifest.update(normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
+                            warnings=warnings)
+            check_cancel(self.cancel)
+            with self.store.lock, self.store.db:
+                now = time.time()
+                self.store.db.execute('INSERT INTO jobs(id,source,output,output_key,state,manifest,created,updated) '
+                                      'VALUES(?,?,?,?,?,?,?,?)',
+                                      (new_id, task['job']['source'], str(output), output_key(output), 'queued',
+                                       json.dumps(manifest, ensure_ascii=False), now, now))
+                self.store._initialize_subtitles(new_id, sources, [make_fragment(s) for s in sources], manifest)
+        except BaseException:
+            # A failure may arrive after COMMIT. Keep any committed task's raw files.
+            with self.store.lock:
+                committed = self.store.db.execute('SELECT 1 FROM jobs WHERE id=?', (new_id,)).fetchone()
+            if not committed:
+                for name in files:
+                    if not name.startswith('raw-'):
+                        continue
+                    (cache / name).unlink(missing_ok=True)
+                cache.rmdir()
+            raise
+        return new_id
 
     def retime(self, job_id, *, overwrite=False, output_dir=None):
         """Prepare a local display-only publication from finalized saved subtitles."""
@@ -320,12 +322,10 @@ class Engine:
         output = self.store.resolve_output(job, output_dir)
         self.store.check_republish_output(job_id, output, overwrite, operation="校时")
         policy = load_policy(manifest, verify_execution=False)
-        settings = self.retime_settings(manifest, policy.settings(self.config.settings))
+        settings = policy.settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
-        if manifest.get('translation_strategy_version') != 5:
-            saved_mt(manifest).credential(self.config)
         cache = self.config.data / "cache" / job_id
-        self.validate_saved_subtitles(job_id, manifest, cache)
+        self.validate_saved_subtitles(job_id, manifest)
         cues = self.store.cues(job_id)
         self.validate_retime_ready(manifest, cues)
         self.verify_source_output(job_id, manifest, output)
@@ -340,7 +340,7 @@ class Engine:
         candidate.pop("backup", None)
         candidate.update(display_timing_adjustments=adjustments, publication_intent=intent,
                          expected_srt_sha256=intent["expected_srt_sha256"], overwrite=bool(overwrite),
-                         cue_count=len(cues), output_settings=asdict(settings),
+                         cue_count=len(cues),
                          retime={"snapshot": str(snapshot.relative_to(self.config.root)),
                                  "prepared_at": time.time(),
                                  "from_display_timing_version": policy.display_timing_version})
@@ -348,18 +348,6 @@ class Engine:
         inspect_intent(output, intent)
         self.store.commit_retime(job_id, candidate, output)
 
-    @staticmethod
-    def retime_settings(manifest, settings):
-        if manifest.get("subtitle_version"):
-            return settings
-        # Pre-layout-snapshot tasks need the settings of the last rendering.
-        saved = manifest.get("output_settings")
-        keys = ["zh_line_width", "other_line_width", "chinese_first"]
-        if not isinstance(saved, dict) or any(k not in saved for k in keys):
-            raise ToolError("旧任务缺少已保存的输出排版设置，不能仅校时；请用 --reflow。", "retime_incomplete")
-        settings = replace(settings, **{k: saved[k] for k in keys})
-        settings.validate()
-        return settings
 
     @staticmethod
     def validate_retime_ready(manifest, cues):
@@ -419,6 +407,7 @@ class Engine:
     def select_input(self, job_id, track=None, channel=None):
         job = self.store.job(job_id)
         manifest = job["manifest"]
+        load_policy(manifest)
         changes = {k: v for k, v in {"track": track, "channel": channel}.items()
                    if v is not None and manifest.get(k) != v}
         if not changes:
@@ -435,69 +424,37 @@ class Engine:
         self.store.replace_cues(job_id, [])
         self.store.update(job_id, manifest=manifest)
 
-    def prepare_audio(self, media, source, cache, manifest, limit, force_method=None, *, recipe=None):
-        if manifest.get("processing_version", 1) == 1:
-            full = cache / "audio.wav"
-            media.extract(source, full, manifest["track"], manifest["channel"], info=manifest["media"])
-            segments = media.split(full, cache, limit)
-            if len(segments) > 1:
-                full.unlink(missing_ok=True)
-            return None, segments
+    def prepare_audio(self, media, source, cache, manifest, limit, force_method=None):
         return media.prepare(source, cache, manifest["media"], manifest["track"], manifest["channel"],
-                             limit, force_method=force_method,
-                             extract_recipe_version=(recipe if recipe is not None else
-                                 manifest["media_plan"].get("extract_recipe_version", 1) if manifest.get("media_plan")
-                                 else EXTRACT_RECIPE_VERSION))
+                             limit, force_method=force_method)
 
-    def rebuild_audio(self, media, source, cache, manifest, job_id):
+    def rebuild_audio(self, media, source, cache, manifest):
         original = manifest.get("media_plan")
-        recipe = original.get("extract_recipe_version", 1) if original else EXTRACT_RECIPE_VERSION
-        upgrade = (original and recipe == 1 and original.get("method") == "copy" and
-                   original.get("container") == "ogg" and original.get("codec") in {"opus", "vorbis"} and
-                   not manifest.get("normalized") and
-                   not any(s.get("task_id") or s.get("submitting") or s.get("raw") for s in manifest["segments"]) and
-                   not any(cache.glob("raw-*.json")))
-        if upgrade and manifest.get("fingerprint") != fingerprint(source, self.cancel):
-            raise ToolError("旧 OGG 缺少可确认的源文件身份，不能升级提取配方。", "cache_mismatch")
         with tempfile.TemporaryDirectory(prefix=".rebuild-", dir=cache) as directory:
             prepared = Path(directory)
             plan, rebuilt = self.prepare_audio(media, source, prepared, manifest,
-                    manifest["upload_limit_bytes"], original["method"] if original else None,
-                    recipe=EXTRACT_RECIPE_VERSION if upgrade else recipe)
-            self.validate_rebuilt(original, manifest["segments"], plan, rebuilt, upgrade=upgrade)
+                    manifest["upload_limit_bytes"], original["method"] if original else None)
+            self.validate_rebuilt(original, manifest["segments"], plan, rebuilt)
             check_cancel(self.cancel)
-            if upgrade and manifest["fingerprint"] != fingerprint(source, self.cancel):
-                raise ToolError("准备期间源文件发生变化，旧 OGG 身份未升级。", "source_changed")
             for segment in rebuilt:
                 os.replace(prepared / segment["audio"], cache / segment["audio"])
-            if upgrade:
-                candidate = copy.deepcopy(manifest)
-                candidate["media_plan"] = plan
-                for old, new in zip(candidate["segments"], rebuilt):
-                    old.update(new)
-                    for name in ["oss_url", "oss_protected", "upload_expires", "upload_identity"]:
-                        old.pop(name, None)
-                self.commit_local(job_id, manifest, candidate,
-                                  lambda jid, value: self.store.update(jid, manifest=value))
 
     @staticmethod
-    def validate_rebuilt(original, segments, plan, rebuilt, *, upgrade=False):
+    def validate_rebuilt(original, segments, plan, rebuilt):
         fields = ("id", "audio", "offset_ms", "duration_ms", "start_frame", "sample_count", "sample_rate", "codec", "container", "bytes", "sha256")
-        ignored = {"bytes", "sha256"} if upgrade else set()
-        matches = all(all(old.get(k) == new.get(k) for k in fields if k in old and k not in ignored)
+        matches = all(all(old.get(k) == new.get(k) for k in fields if k in old)
                       for old, new in zip(segments, rebuilt))
-        ignored_plan = {"reason", "extract_recipe_version"} if upgrade else {"reason"}
-        expected = {**(original or {}), "extract_recipe_version": (original or {}).get("extract_recipe_version", 1)}
-        plan_matches = (not original or {k: v for k, v in plan.items() if k not in ignored_plan} ==
-                        {k: v for k, v in expected.items() if k not in ignored_plan})
+        plan_matches = (not original or {k: v for k, v in plan.items() if k != 'reason'} ==
+                        {k: v for k, v in original.items() if k != 'reason'})
         if len(rebuilt) != len(segments) or not matches or not plan_matches:
             raise ToolError("恢复提取的编码、分段或时间轴与原记录不同，不能改变已有识别输入。", "cache_mismatch")
 
     def run(self, job_id):
         self.mt_control.begin()
         self.run_id = uuid.uuid4().hex
-        self.fallback_groups = None
         job = self.store.job(job_id)
+        if job['state'] == 'archived' or job['manifest'].get('archived'):
+            raise ToolError('旧任务已归档，请导出字幕或从转写重建。', 'job_archived')
         if job["state"] in {"completed", "skipped", "cancelled"}:
             return job["state"]
         if unknown_submission(job["manifest"], job["state"]):
@@ -506,10 +463,7 @@ class Engine:
         manifest = job["manifest"]
         cache = self.config.data / "cache" / job_id
         source = Path(job["source"])
-        api, mt_api, key, scope = None, None, None, None
-        fallback_api, fallback_backend = None, None
-        fallback_client_lock = threading.Lock()
-        mt_backend, mt_key = None, None
+        api, key, scope = None, None, None
         started = time.monotonic()
         stage_started, current_stage = started, None
         stage_times = {}
@@ -544,62 +498,6 @@ class Engine:
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
             return api
 
-        def mt_client():
-            nonlocal mt_api
-            if mt_api is None:
-                options = dict(count=backend_counter('primary'), progress=cloud_progress)
-                if mt_backend.provider in {"openai_compatible", "qiniu"}:
-                    self.mt_runtime_active = mt_backend.contract.bounded_runtime
-                    mt_api = OpenAICompatible(mt_key, mt_backend, self.cancel, **options,
-                        rpm=self.config.mt_rpm() if mt_backend.provider == 'openai_compatible' else 0,
-                        control=self.fallback_groups.primary_control if self.fallback_groups else self.mt_control,
-                        runtime_event=runtime_events('primary'), stop_on_failure=self.fallback_groups is None)
-                else:
-                    mt_api = Bailian(mt_key, manifest["region"], self.cancel, **options,
-                                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
-            return mt_api
-
-        def backend_counter(role):
-            def count(name):
-                self.store.count(job_id, name)
-                if fallback_backend is not None:
-                    if name == 'mt':
-                        self.store.count(job_id, 'mt_' + role + '_request')
-                        group_counts = getattr(self.mt_context, 'attempts', None)
-                        if group_counts is not None:
-                            group_counts[role] = group_counts.get(role, 0) + 1
-                    elif name == 'mt_success':
-                        self.store.count(job_id, 'mt_' + role + '_http_2xx')
-            return count
-
-        def runtime_events(role):
-            diagnostics = MTDiagnostics(self.config.root, job_id)
-            def event(info):
-                info = {**info, 'run_id': self.run_id, 'backend': role,
-                        'provider': (fallback_backend if role == 'fallback' else mt_backend).diagnostic_provider,
-                        'model': (fallback_backend if role == 'fallback' else mt_backend).model,
-                        'request_version': (fallback_backend if role == 'fallback' else mt_backend).request_version,
-                        'stage': getattr(self.mt_context, 'stage', ''),
-                        'group_key': getattr(self.mt_context, 'group_key', '')}
-                diagnostics.write_runtime(info)
-                for field, counter in [('shared_wait_ms', 'mt_shared_wait_ms'),
-                                       ('pacing_wait_ms', 'mt_pacing_wait_ms'), ('discarded', 'mt_drain_discarded')]:
-                    if info.get(field):
-                        self.store.count(job_id, counter, info[field])
-                if info.get('deadline_terminated'):
-                    self.store.count(job_id, 'mt_deadline_terminated')
-            return event
-
-        def fallback_client():
-            nonlocal fallback_api
-            with fallback_client_lock:
-                if fallback_api is None:
-                    self.mt_control.check_start()
-                    fallback_api = BoundedBailianMT(fallback_backend.credential(self.config), fallback_backend,
-                        self.mt_control, count=backend_counter('fallback'), progress=cloud_progress,
-                        runtime_event=runtime_events('fallback'))
-            return fallback_api
-
         def save_failure(state, error, code, request_id=""):
             nonlocal handling_failure
             handling_failure = True
@@ -612,14 +510,12 @@ class Engine:
 
         try:
             check_cancel(self.cancel)
+            load_policy(manifest)
             display_timing_version(manifest)
-            if 'mt_fallback_policy' in manifest:
-                validate_origins(manifest, self.store.references(job_id) + self.store.cues(job_id))
-            elif manifest.get('translation_strategy_version') == 5:
-                from .mt_pipeline_v5 import validate_provenance
-                validate_provenance(self, job_id, manifest, verify_credentials=False)
+            from .mt_pipeline import validate_provenance
+            validate_provenance(self, job_id, manifest, verify_credentials=False)
             output = self.store.ensure_output(job_id)
-            subtitle_version = manifest.get("subtitle_version", 0)
+            subtitle_version = SUBTITLE_VERSION
             published = False
             if "publication_intent" in manifest:
                 key, scope = self.identity(job_id, manifest, persist=False)
@@ -645,44 +541,26 @@ class Engine:
             execution_policy = load_policy(manifest, verify_execution=not manifest.get("retime"))
             settings = execution_policy.settings(self.config.settings)
             if manifest.get("retime"):
-                settings = self.retime_settings(manifest, settings)
                 if not manifest.get("normalized") or execution_policy.display_timing_version not in {1, 2}:
                     raise mismatch()
             if manifest.get("reflow"):
                 if subtitle_version != SUBTITLE_VERSION or not manifest.get("normalized"):
                     raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
             contract = asr_contract(execution_policy.normalizer_version)
-            if execution_policy.normalizer_version == 1 and not manifest.get("normalized"):
-                contract["normalizer"] = 2
-                manifest["normalization_upgraded_from"] = 1
             manifest["contract"] = contract
             normalizer_version = contract["normalizer"]
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
-            mt_backend = saved_mt(manifest)
-            if manifest.get('translation_strategy_version') == 5:
-                from .mt_pool import saved_route
-                saved_route(manifest)
-                self.mt_runtime_active = not bool(manifest.get('retime'))
-                mt_key = None
-            else:
-                mt_key = mt_backend.credential(self.config)
-            fallback_backend = saved_fallback(manifest)
-            if fallback_backend is not None and manifest['mt_fallback_policy']['enabled']:
-                fallback_backend.credential(self.config)
-                self.fallback_groups = GroupFallback(self.mt_control)
-            self.fallback_backend = fallback_backend
-            self.fallback_client = fallback_client
-            if mt_backend.provider == "openai_compatible" and not manifest.get("retime") and manifest.get('translation_strategy_version') != 5:
-                self.config.mt_rpm()
-            mt_scope = {**scope, **mt_backend.cache_scope()}
+            from .mt_pool import saved_route
+            saved_route(manifest)
+            self.mt_runtime_active = not bool(manifest.get('retime'))
+            mt_scope = scope
             if manifest.get("normalized"):
                 self.verify_source_output(job_id, manifest, output)
                 self.prepare_output(output)
-                return self.finish_subtitles(job_id, manifest, settings, mt_scope, mt_client, stage, output, cache,
-                                             context_version=execution_policy.context_version)
+                return self.finish_subtitles(job_id, manifest, settings, mt_scope, stage, output, cache)
             saved_asr = False
-            if self.store.sources(job_id) or self.store.cues(job_id) or self.store.references(job_id):
+            if self.store.sources(job_id) or self.store.cues(job_id):
                 raise mismatch()
             if manifest["segments"]:
                 validate_segments(manifest)
@@ -749,22 +627,13 @@ class Engine:
                     oss_url = None
                     if segment.get("upload_expires", 0) > time.time() + 60:
                         oss_url = segment.get("oss_url")
-                        if not oss_url and segment.get("oss_protected"):
-                            try:
-                                oss_url = decrypt_legacy(base64.b64decode(segment["oss_protected"])).decode()
-                            except (ToolError, ValueError, UnicodeError):
-                                # No task or unknown marker: safe to upload again, never to repeat a POST.
-                                oss_url = None
                     if oss_url and (not isinstance(oss_url, str) or not oss_url.startswith("oss://") or any(c.isspace() for c in oss_url)):
                         raise ToolError("缓存上传引用格式无效。", "cache_mismatch")
                     if not oss_url:
                         if (not audio.exists() or (segment.get("sha256") and
                                 media.audio_identity(audio) != {"bytes": segment["bytes"], "sha256": segment["sha256"]})):
                             stage("extracting")
-                            self.rebuild_audio(media, source, cache, manifest, job_id)
-                            # A legacy recipe upgrade replaces the segment dictionaries at commit.
-                            segment = manifest["segments"][position]
-                            audio = cache / segment["audio"]
+                            self.rebuild_audio(media, source, cache, manifest)
                         stage("uploading")
                         try:
                             oss_url = client().upload(audio)
@@ -848,20 +717,16 @@ class Engine:
                 for segment in manifest["segments"]:
                     raw = json.loads((cache / ("raw-" + segment["id"] + ".json")).read_text(encoding="utf-8"))
                     items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
-                                                duration_ms=segment.get("duration_ms"), preserve_sentences=bool(subtitle_version),
+                                                duration_ms=segment.get("duration_ms"), preserve_sentences=True,
                                                 subtitle_version=subtitle_version, normalizer_version=normalizer_version)
                     cues.extend(items)
                     candidate["warnings"].extend(warnings)
                 cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
-                normalized_file = (f"subtitle-sources-v{subtitle_version}.json" if subtitle_version else
-                                   f"normalized-v{normalizer_version}.json")
-                atomic_json(cache / normalized_file, cues)
                 candidate.update(normalized=True, normalized_count=len(cues),
-                                 normalized_version=normalizer_version, normalized_file=normalized_file)
-                sources, fragments = (cues, [make_fragment(s) for s in cues]) if subtitle_version else ([], cues)
+                                 normalized_version=normalizer_version)
+                sources, fragments = cues, [make_fragment(s) for s in cues]
                 self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, sources, fragments)
-            return self.finish_subtitles(job_id, manifest, settings, mt_scope, mt_client, stage, output, cache,
-                                         context_version=execution_policy.context_version)
+            return self.finish_subtitles(job_id, manifest, settings, mt_scope, stage, output, cache)
         except LocalStateUnavailable:
             # Never let a generic handler persist an unconfirmed in-memory state.
             raise
@@ -896,13 +761,12 @@ class Engine:
         self.progress(job_id, state, None, None)
         return state
 
-    def validate_saved_subtitles(self, job_id, manifest, cache):
+    def validate_saved_subtitles(self, job_id, manifest):
         if not manifest.get("normalized"):
             raise mismatch()
-        validate_normalized(manifest, cache, self.store.sources(job_id), self.store.cues(job_id), self.store.references(job_id))
-        if manifest.get('translation_strategy_version') == 5:
-            from .mt_pipeline_v5 import validate_provenance
-            validate_provenance(self, job_id, manifest)
+        validate_normalized(manifest, self.store.sources(job_id), self.store.cues(job_id))
+        from .mt_pipeline import validate_provenance
+        validate_provenance(self, job_id, manifest)
 
     def verify_source_output(self, job_id, manifest, output):
         source = Path(self.store.job(job_id)["source"])
@@ -914,8 +778,8 @@ class Engine:
             if not manifest.get("fingerprint") or manifest["fingerprint"] != fingerprint(source, self.cancel):
                 raise ToolError("原路径媒体已变化；请使用其他目录的 --output-dir 保存原任务字幕。", "source_changed")
 
-    def finish_subtitles(self, job_id, manifest, settings, scope, client, stage, output, cache, *, context_version):
-        self.validate_saved_subtitles(job_id, manifest, cache)
+    def finish_subtitles(self, job_id, manifest, settings, scope, stage, output, cache):
+        self.validate_saved_subtitles(job_id, manifest)
         cues = self.store.cues(job_id)
         if manifest.get("retime"):
             self.validate_retime_ready(manifest, cues)
@@ -934,11 +798,8 @@ class Engine:
                 self.commit_local(job_id, manifest, candidate,
                                   lambda jid, value: self.store.update(jid, manifest=value))
             if not manifest.get("retime"):
-                if manifest.get("subtitle_version"):
-                    self.process_subtitles(job_id, manifest, settings, scope, client, stage, context_version=context_version)
-                else:
-                    stage("translating")
-                    self.translate(job_id, cues, scope, client)
+                from .mt_pipeline import process_subtitles
+                process_subtitles(self, job_id, manifest, settings, scope, stage)
         cues = self.store.cues(job_id)
         check_cancel(self.cancel)
         stage("writing")
@@ -947,7 +808,7 @@ class Engine:
             candidate = copy.deepcopy(manifest)
             intent = prepare_intent(output, content, manifest["overwrite"])
             candidate.update(publication_intent=intent, expected_srt_sha256=intent["expected_srt_sha256"],
-                             cue_count=len(cues), output_settings=asdict(settings))
+                             cue_count=len(cues))
             if manifest.get("display_timing_version", 0):
                 candidate["display_timing_adjustments"] = adjustments
             self.commit_local(job_id, manifest, candidate,
@@ -964,7 +825,7 @@ class Engine:
     @staticmethod
     def render_subtitles(cues, settings, manifest):
         intervals, adjustments = plan_display_timing(cues, version=display_timing_version(manifest))
-        return render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", 0),
+        return render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", SUBTITLE_VERSION),
                           display_intervals=intervals), adjustments
 
     @staticmethod
@@ -972,313 +833,8 @@ class Engine:
         if display_timing_version(manifest) == 2:
             plan_display_timing(cues, version=2)
 
-    def process_subtitles(self, job_id, manifest, settings, scope, client, stage, *, context_version):
-        if manifest['translation_strategy_version'] == 5:
-            from .mt_pipeline_v5 import process_subtitles_v5
-            return process_subtitles_v5(self, job_id, manifest, settings, scope, stage,
-                                        context_version=context_version)
-        joint = manifest['translation_strategy_version'] in {3, 4}
-        direct = manifest['translation_strategy_version'] == 4
-        request_options = saved_mt(manifest).request_options()
-        sources = self.store.sources(job_id)
-        if not sources:
-            raise ToolError("新任务缺少完整句来源记录，不能改用旧断句规则恢复。", "cache_mismatch")
-        source_ids = {s["sentence_id"]: s for s in sources}
-        references = []
-        if not direct:
-            if not manifest.get("references_planned"):
-                references = plan_reference_units(sources, strategy_version=manifest['translation_strategy_version'],
-                                                  request_options=request_options)
-                candidate = copy.deepcopy(manifest)
-                candidate["references_planned"] = True
-                self.commit_local(job_id, manifest, candidate, self.store.save_layout,
-                                  self.store.cues(job_id), references=references)
-            stage("reference_translating")
-            references = self.store.references(job_id)
-            for reference in references:
-                if reference.get("sentence_id") not in source_ids:
-                    raise ToolError("参考翻译缺少对应完整句来源。", "cache_mismatch")
-                validate_fragment(source_ids[reference["sentence_id"]], reference, reference_stage=True)
-            if joint:
-                self.translate_batches(job_id, references, sources, scope, client,
-                                       context_version=context_version, reference_stage=True)
-            else:
-                self.translate(job_id, references, scope, client, stage_name="reference_translating",
-                               reference_stage=True, strategy_version=manifest["translation_strategy_version"])
-            references = self.store.references(job_id)
-            sources = reference_sources(sources, references)
-        source_positions = {} if joint else {source["sentence_id"]: i for i, source in enumerate(sources)}
-        # Both references and cues are validated against the same source and word ranges.
-        by_range = {(r["sentence_id"], r["word_start"], r["word_end"]): r for r in references}
-        if not manifest.get("layout_planned"):
-            stage("layout_adjusting", 0, MAX_LAYOUT_ROUNDS)
-            cues = []
-            for source in sources:
-                parts = plan_fragments(source, settings, reference=source.get("reference", ""))
-                if joint and source['decision'] == 'translate':
-                    parts = split_mt_units(source, parts, request_options=request_options)
-                cues.extend(parts)
-            for cue in cues:
-                if cue["decision"] == "translate" and not joint:
-                    validate_mt_input(cue["text"], cue["source_lang"])
-            self.preflight_display_timing(cues, manifest)
-            candidate = copy.deepcopy(manifest)
-            candidate.update(layout_planned=True, layout_round=0)
-            self.commit_local(job_id, manifest, candidate, self.store.save_layout, cues)
-        while True:
-            check_cancel(self.cancel)
-            stage("subtitle_translating")
-            cues = self.store.cues(job_id)
-            self.preflight_display_timing(cues, manifest)
-            contexts = {}
-            for cue in cues:
-                check_cancel(self.cancel)
-                if cue.get("sentence_id") not in source_ids:
-                    raise ToolError("字幕片段缺少对应完整句来源。", "cache_mismatch")
-                validate_fragment(source_ids[cue["sentence_id"]], cue)
-                if cue["decision"] != "translate" or cue["translated"] or direct:
-                    continue
-                source = source_ids[cue["sentence_id"]]
-                exact = by_range.get((cue["sentence_id"], cue["word_start"], cue["word_end"]))
-                whole = cue["char_start"] == 0 and cue["char_end"] == len(source["text"])
-                context = [] if joint or (exact and whole) else translation_context(
-                    cue, sources, position=source_positions[cue["sentence_id"]])
-                if exact and not context and (not joint or whole):
-                    self.store.translation_update(job_id, [cue["cue_id"]], translated=exact["translated"],
-                                                  counts={"mt_reference_reused": 1}, origin=exact.get('mt_origin'))
-                elif not joint:
-                    contexts[cue["cue_id"]] = context
-            if joint:
-                self.translate_batches(job_id, self.store.cues(job_id), sources, scope, client,
-                                       context_version=context_version)
-            else:
-                self.translate(job_id, self.store.cues(job_id), scope, client, stage_name="subtitle_translating",
-                               strategy_version=manifest["translation_strategy_version"], contexts=contexts)
-            cues = self.store.cues(job_id)
-            if manifest.get("layout_complete"):
-                return
-            round_number = manifest["layout_round"]
-            changed, revised, affected = False, [], set()
-            if round_number < MAX_LAYOUT_ROUNDS:
-                stage("layout_adjusting", round_number + 1, MAX_LAYOUT_ROUNDS)
-                for cue in cues:
-                    parts = [cue]
-                    if cue["decision"] == "translate" and len(wrap(cue["translated"], settings.zh_line_width * 2)) > 2:
-                        parts = plan_fragments(source_ids[cue["sentence_id"]], settings, cue=cue,
-                                               reference=cue["translated"], layout_round=round_number + 1, force=True)
-                    changed |= len(parts) > 1
-                    if len(parts) > 1:
-                        affected.add(cue['sentence_id'])
-                    revised.extend(parts)
-            if not changed:
-                for warning in layout_warnings(cues, settings):
-                    if warning not in manifest["warnings"]:
-                        manifest["warnings"].append(warning)
-                manifest["layout_complete"] = True
-                self.store.update(job_id, manifest=manifest)
-                return
-            candidate = copy.deepcopy(manifest)
-            candidate["layout_round"] = round_number + 1
-            if joint:
-                # Even unchanged ranges in an affected sentence must receive a new joint allocation.
-                revised = [{**cue, 'translated': '', 'error': ''} if cue['sentence_id'] in affected else cue
-                           for cue in revised]
-            self.preflight_display_timing(revised, manifest)
-            self.commit_local(job_id, manifest, candidate, self.store.save_layout, revised)
 
-    def translate_batches(self, job_id, cues, sources, scope, client, *, context_version, reference_stage=False):
-        cache_stage = 'reference' if reference_stage else 'subtitle'
-        stage_name = cache_stage + '_translating'
-        diagnostics = MTDiagnostics(self.config.root, job_id)
-        manifest = self.store.job(job_id)['manifest']
-        backend = saved_mt(manifest)
-        request_options = backend.request_options()
-        policy = manifest.get('mt_fallback_policy')
-        by_source = {}
-        source_ids = {s['sentence_id'] for s in sources}
-        for cue in cues:
-            if cue.get('sentence_id') not in source_ids:
-                raise ToolError("批量翻译缺少对应完整句来源。", "cache_mismatch")
-            by_source.setdefault(cue['sentence_id'], []).append(cue)
-        groups, pending = {}, []
-        done = sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues)
-        for position, source in enumerate(sources):
-            if source['decision'] != 'translate':
-                continue
-            units = sorted(by_source.get(source['sentence_id'], []), key=lambda c: c['char_start'])
-            validate_unit_coverage(source, units, reference_stage=reference_stage)
-            for members, context in plan_translation_batches(units, source_context(
-                    sources, position, context_version=context_version), request_options=request_options):
-                if all(c['translated'] for c in members):
-                    continue
-                key = batch_cache_key([c['text'] for c in members], members[0]['source_lang'], **scope,
-                                      context=context, stage=cache_stage, asr_language=members[0]['language'].lower().strip(),
-                                      request_options=request_options)
-                groups.setdefault(key, ([], context))[0].append(members)
-
-        def cached_result(key, batches, actual_backend):
-            cached = self.store.cache_get(key)
-            recovered = cached is None and not actual_backend.contract.structured_mapping
-            if recovered:
-                cached = self.store.cache_get(batch_recovery_cache_key(key))
-            if cached is None:
-                return None, False
-            try:
-                return parse_batch_translation(cached, [c['text'] for c in batches[0]]), recovered
-            except (ValueError, TypeError) as error:
-                raise ToolError("批量翻译缓存结构无效，未复用。", "cache_mismatch") from error
-
-        def save_result(batches, key, translated, *, cached=False, recovered=False, origin='primary'):
-            values = {cue['cue_id']: translated[str(i)] for batch in batches for i, cue in enumerate(batch)}
-            counts = {'mt_' + cache_stage + ('_cache_hit' if cached else '_completed'): len(values)}
-            if recovered:
-                counts['mt_recovery_cache_hit' if cached else 'mt_recovery_success'] = len(values) if cached else 1
-            if policy is not None:
-                counts['mt_' + origin + ('_cache_hit' if cached else '_completed')] = len(values)
-                if not cached:
-                    counts['mt_' + origin + '_success'] = 1
-            self.store.translation_batch_update(job_id, values, reference_stage=reference_stage,
-                cache_key=None if cached else key, cache_value=None if cached else batch_cache_value(translated),
-                counts=counts, origin=origin if policy is not None else None)
-            actual_backend = self.fallback_backend if origin == 'fallback' else backend
-            diagnostics.write_runtime({'kind': 'runtime_commit', 'category': 'group_committed', 'run_id': self.run_id,
-                'group_key': key, 'backend': origin, 'provider': actual_backend.diagnostic_provider,
-                'model': actual_backend.model, 'request_version': actual_backend.request_version,
-                'stage': cache_stage, 'committed_count': len(values), 'cached': cached})
-
-        for key, (batches, context) in groups.items():
-            translated, recovered = cached_result(key, batches, backend)
-            if translated is not None:
-                save_result(batches, key, translated, cached=True, recovered=recovered)
-                done += sum(not c['translated'] for batch in batches for c in batch)
-            else:
-                pending.append((batches, key, context))
-        self.progress(job_id, stage_name, done, len(cues))
-        if not pending:
-            return
-        cloud = client()
-
-        def translate_group(batches, key, context):
-            self.mt_context.group_key = key
-            self.mt_context.stage = cache_stage
-            self.mt_context.attempts = {}
-            role = 'primary'
-            def attempt(indices):
-                cue_ids = [batch[i]['cue_id'] for batch in batches for i in indices]
-                self.store.translation_update(job_id, cue_ids, reference_stage=reference_stage, attempt=True,
-                                              counts={'mt_' + cache_stage + '_request': 1})
-            def event(info):
-                members = batches[0]
-                diagnostics.write({**info, 'stage': cache_stage, 'group_key': key, 'run_id': self.run_id,
-                    'backend': role,
-                    'provider': (self.fallback_backend if role == 'fallback' else backend).diagnostic_provider,
-                    'model': (self.fallback_backend if role == 'fallback' else backend).model,
-                    'request_version': (self.fallback_backend if role == 'fallback' else backend).request_version,
-                    'begin_ms': members[info['fragment_start']]['begin_ms'],
-                    'end_ms': members[info['fragment_end'] - 1]['end_ms']})
-                self.store.count(job_id, 'mt_invalid_response' if info['kind'] == 'invalid_response' else 'mt_split')
-                if info['kind'] == 'split':
-                    self.progress(job_id, 'mt_split', info['fragment_end'] - info['fragment_start'], info['depth'])
-            def invoke(service, key):
-                try:
-                    result = service.translate_batch([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
-                                                     context=context, on_attempt=attempt, on_event=event)
-                except ToolError as error:
-                    if not hasattr(error, 'attempts'):
-                        error.attempts = self.mt_context.attempts.get(role, 0)
-                    raise
-                # Completed validated groups may commit during the shared drain window.
-                with self.mt_control.lock:
-                    if hasattr(service.http, 'ensure_result'):
-                        service.http.ensure_result()
-                    save_result(batches, batch_recovery_cache_key(key) if result.recovered else key,
-                                result.translations, recovered=result.recovered, origin=role)
-
-            def fallback():
-                nonlocal role
-                role = 'fallback'
-                backend = self.fallback_backend
-                fallback_scope = {k: v for k, v in scope.items() if k != 'mt_identity'}
-                fallback_scope.update(backend.cache_scope())
-                fallback_key = batch_cache_key([c['text'] for c in batches[0]], batches[0][0]['source_lang'],
-                    **fallback_scope, context=context, stage=cache_stage, asr_language=batches[0][0]['language'].lower().strip(),
-                    request_options=backend.request_options())
-                translated, recovered = cached_result(fallback_key, batches, backend)
-                if translated is not None:
-                    with self.mt_control.lock:
-                        self.mt_control.check_inflight()
-                        save_result(batches, fallback_key, translated, cached=True, recovered=recovered, origin='fallback')
-                    return
-                invoke(self.fallback_client(), fallback_key)
-
-            def switched(error):
-                reason = {'mt_batch_invalid': 'format_exhausted', 'mt_quota_exhausted': 'quota_exhausted',
-                          'mt_retry_after': 'retry_after'}.get(error.code, 'transient_exhausted')
-                if is_content_refusal(error):
-                    reason = 'content_refused'
-                info = {'reason': reason, 'category': getattr(error, 'category',
-                        'content_policy_violation' if reason == 'content_refused' else reason),
-                        'attempt': getattr(error, 'attempts', 0), 'quota_source': getattr(error, 'quota_source', '')}
-                if reason == 'quota_exhausted' and info['quota_source'] == 'local_ledger':
-                    info['reason'] = 'quota_local_empty'
-                self.store.count(job_id, 'mt_fallback_switch')
-                self.progress(job_id, 'mt_fallback', info, None)
-                diagnostics.write_runtime({'kind': 'runtime_fallback', **info, 'run_id': self.run_id,
-                                           'group_key': key, 'backend': 'fallback', 'provider': 'bailian'})
-
-            if self.fallback_groups:
-                self.fallback_groups.run(lambda: invoke(cloud, key), fallback, switched)
-            else:
-                invoke(cloud, key)
-
-        tasks = [([cue for batch in batches for cue in batch], partial(translate_group, batches, key, context))
-                 for batches, key, context in pending]
-        self._translate_pending(job_id, tasks, stage_name=stage_name, reference_stage=reference_stage,
-                                done=done, total=len(cues))
-
-    def translate(self, job_id, cues, scope, client, *, stage_name="translating", reference_stage=False,
-                  strategy_version=0, contexts=None):
-        cache_stage = "reference" if reference_stage else "subtitle"
-        groups, pending, done = {}, [], 0
-        for cue in cues:
-            if cue["decision"] != "translate" or cue["translated"]:
-                done += 1
-                continue
-            context = (contexts or {}).get(cue["cue_id"], [])
-            key = mt_cache_key(cue["text"], cue["source_lang"], **scope, stage=cache_stage,
-                               strategy_version=strategy_version, tm_list=context, asr_language=cue["language"].lower().strip())
-            groups.setdefault(key, ([], context))[0].append(cue)
-        for key, (members, context) in groups.items():
-            cached = self.store.cache_get(key)
-            if cached:
-                self.store.translation_update(job_id, [c["cue_id"] for c in members], reference_stage=reference_stage,
-                                              translated=cached,
-                                              counts={"mt_" + cache_stage + "_cache_hit": len(members)} if strategy_version else None)
-                done += len(members)
-            else:
-                pending.append((members, key, context))
-        self.progress(job_id, stage_name, done, len(cues))
-        if not pending:
-            return
-        cloud = client()
-        def translate_group(members, key, context):
-            check_cancel(self.cancel)
-            cue_ids = [c["cue_id"] for c in members]
-            self.store.translation_update(job_id, cue_ids, reference_stage=reference_stage, attempt=True,
-                                          counts={"mt_" + cache_stage + "_request": 1} if strategy_version else None)
-            cue = members[0]
-            check_cancel(self.cancel)
-            if strategy_version:
-                text, _ = cloud.translate(cue["text"], cue["source_lang"], tm_list=context)
-            else:
-                text, _ = cloud.translate(cue["text"], cue["source_lang"])
-            self.store.translation_update(job_id, cue_ids, reference_stage=reference_stage, translated=text,
-                                          cache_key=key, counts={"mt_" + cache_stage + "_completed": len(members)})
-        tasks = [(members, partial(translate_group, members, key, context)) for members, key, context in pending]
-        self._translate_pending(job_id, tasks, stage_name=stage_name, reference_stage=reference_stage,
-                                done=done, total=len(cues))
-
-    def _translate_pending(self, job_id, tasks, *, stage_name, reference_stage, done, total):
+    def _translate_pending(self, job_id, tasks, *, stage_name, done, total):
         """Stop new work on failure or cancellation; save in-flight results before returning."""
         errors = []
         workers = self.config.settings.mt_workers
@@ -1307,8 +863,7 @@ class Engine:
                         except ToolError as e:
                             if self.mt_runtime_active and e.code != 'cancelled':
                                 self.mt_control.stop(e)
-                            self.store.translation_update(job_id, [c["cue_id"] for c in members],
-                                                          reference_stage=reference_stage, error=str(e))
+                            self.store.translation_error(job_id, [c["cue_id"] for c in members], str(e))
                             errors.append(e)
                         self.progress(job_id, stage_name, done, total)
                     schedule()
@@ -1349,12 +904,8 @@ class Engine:
         if job["state"] != "submission_unknown":
             raise ToolError("当前任务不是提交未知状态。", "job")
         candidates = [s for s in manifest["segments"] if s.get("submitting") and not s.get("task_id")]
-        if not candidates:
-            candidates = [s for s in manifest["segments"] if not s.get("task_id")]
-            if len(candidates) != 1:
-                candidates = []
-        if not candidates:
-            raise ToolError("未知提交记录缺少对应分段，不能自动重发；请检查任务记录。", "submission_unknown")
+        if len(candidates) != 1:
+            raise ToolError('未知提交必须对应唯一分段；请检查任务记录。', 'submission_unknown')
         segment = candidates[0]
         if task_id:
             if not task_id.isascii() or not all(c.isalnum() or c in "-_" for c in task_id) or len(task_id) > 200:
@@ -1363,8 +914,7 @@ class Engine:
         elif not allow_resubmit:
             raise ToolError("重新提交需要明确确认可能重复计费。", "submission_unknown")
         else:
-            for name in ["oss_url", "oss_protected", "upload_expires", "upload_identity"]:
+            for name in ["oss_url", "upload_expires", "upload_identity"]:
                 segment.pop(name, None)
         segment["submitting"] = False
-        manifest.pop("submitting", None)
         self.store.update(job_id, "submission_unknown" if unknown_submission(manifest, "queued") else "queued", manifest)

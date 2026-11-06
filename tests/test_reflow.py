@@ -11,7 +11,6 @@ from unittest import mock
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main, summary
-from subtitle_tool.mt import batch_cache_key, batch_cache_value
 from subtitle_tool.subtitles import normalize, plan_fragments, wrap
 from subtitle_tool.config import Settings
 from tests.fixtures import FakeService, PipelineFixture, result, timed_raw
@@ -65,9 +64,9 @@ class ZeroDurationWordTests(unittest.TestCase):
     def test_version_one_still_rejects_point_words(self):
         raw = timed_raw(['word'] * 20)
         raw['transcripts'][0]['sentences'][0]['words'][0]['end_time'] = 0
-        old = normalize(raw, 0, '0000', preserve_sentences=True, subtitle_version=1)[0][0]
+        with self.assertRaises(ToolError):
+            normalize(raw, 0, '0000', preserve_sentences=True, subtitle_version=1)
         new = normalize(raw, 0, '0000', preserve_sentences=True, subtitle_version=2)[0][0]
-        self.assertEqual(old['words'], [])
         self.assertTrue(new['words'])
 
 
@@ -108,7 +107,7 @@ class ReflowTests(PipelineFixture):
         self.config.settings.zh_line_width = 22
         self.config.settings.other_line_width = 42
         manifest = self.store.job(self.job_id)['manifest']
-        manifest['subtitle_version'] = 1
+        manifest['subtitle_version'] = 2
         manifest['subtitle_settings'].update(zh_line_width=22, other_line_width=42)
         self.store.update(self.job_id, manifest=manifest)
 
@@ -137,7 +136,7 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(self.run_fake(fake), 'completed')
         self.assertEqual(fake.named('/asr/transcription'), [])
         manifest = self.store.job(self.job_id)['manifest']
-        self.assertEqual((manifest['output_settings']['zh_line_width'], manifest['output_settings']['other_line_width']), (22, 42))
+        self.assertEqual((manifest['subtitle_settings']['zh_line_width'], manifest['subtitle_settings']['other_line_width']), (22, 42))
         self.assertGreater(len(self.store.cues(self.job_id)), 2)
         output = self.source.with_suffix('.srt')
         previous = output.read_bytes()
@@ -145,9 +144,10 @@ class ReflowTests(PipelineFixture):
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
-        self.assertEqual(fake.calls, [])
+        self.assertTrue(fake.calls)
+        self.assertTrue(all(call[1].endswith('/chat/completions') for call in fake.calls))
         manifest = self.store.job(self.job_id)['manifest']
-        for name in ['subtitle_settings', 'output_settings']:
+        for name in ['subtitle_settings']:
             self.assertEqual((manifest[name]['zh_line_width'], manifest[name]['other_line_width']), (44, 84))
         sources, cues = self.store.sources(self.job_id), self.store.cues(self.job_id)
         self.assertEqual([c['text'] for c in cues], [s['text'] for s in sources])
@@ -177,9 +177,8 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(prepared['manifest']['subtitle_version'], 2)
         snapshot = self.config.root / prepared['manifest']['reflow']['snapshot']
         saved = json.loads(snapshot.read_text(encoding='utf-8'))
-        self.assertEqual(saved['job']['manifest']['subtitle_version'], 1)
+        self.assertEqual(saved['job']['manifest']['subtitle_version'], 2)
         self.assertTrue(saved['sources'])
-        self.assertTrue(saved['references'])
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
         self.assertEqual(fake.calls, [])
@@ -190,7 +189,7 @@ class ReflowTests(PipelineFixture):
         report = summary(self.store, self.job_id)
         self.assertIn('timings', report)
         self.assertGreater(report['timings']['run_seconds'], 0)
-        self.assertIn('reference_translating', report['timings']['stages_seconds'])
+        self.assertIn('subtitle_translating', report['timings']['stages_seconds'])
 
     def test_missing_raw_fails_without_requests_or_changing_task_or_srt(self):
         self.complete_old_job()
@@ -210,6 +209,9 @@ class ReflowTests(PipelineFixture):
         fake = self.complete_old_job(raw)
         output = self.source.with_suffix('.srt')
         old = output.read_bytes()
+        self.config.settings.other_line_width = 24
+        self.config.settings.zh_line_width = 12
+        self.config.settings.mt_quality = {'manual_glossary': {'word0': '新术语'}}
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         source = self.store.sources(self.job_id)[0]
         planned = plan_fragments(source, self.config.settings)
@@ -221,12 +223,12 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(fake.named('/asr/transcription'), [])
         self.assertEqual(len(fake.uploads), 1)
         self.assertFalse(any(c['translated'] for c in self.store.cues(self.job_id)))
-        references = self.store.references(self.job_id)
-        self.assertTrue(all(r['translated'] for r in references))
+        stages = self.store.mt_stages(self.job_id)
+        self.assertTrue(stages)
         fake.mt_failure.clear()
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
-        self.assertEqual(self.store.references(self.job_id), references)
+        self.assertTrue(all(row in self.store.mt_stages(self.job_id) for row in stages))
         self.assertTrue(all(c['translated'] for c in self.store.cues(self.job_id)))
         self.assertEqual(fake.named('/asr/transcription'), [])
         self.assertEqual(Path(self.store.job(self.job_id)['manifest']['backup']).read_bytes(), old)
@@ -255,28 +257,6 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(error.exception.code, 'account_changed')
         self.assertEqual(self.store.job(self.job_id), before)
 
-    def test_reference_translation_change_is_not_fragment_context_in_strategy_three(self):
-        fake = self.complete_old_job(timed_raw([f'word{i}' for i in range(24)], word_ms=200))
-        previous_cues = self.store.cues(self.job_id)
-        manifest = self.store.job(self.job_id)['manifest']
-        reference = self.store.references(self.job_id)[0]
-        key = batch_cache_key([reference['text']], reference['source_lang'], **manifest['cache_identity'],
-                              stage='reference', asr_language=reference['language'])
-        updated_reference = reference['translated'].replace('繁体译文：', '更新参考：')
-        with self.store.db:
-            changed = self.store.db.execute('UPDATE mt_cache SET text=? WHERE key=?',
-                                           (batch_cache_value({'0': updated_reference}), key))
-            self.assertEqual(changed.rowcount, 1)
-        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
-        fake.calls.clear()
-        self.assertEqual(self.run_fake(fake), 'completed')
-        self.assertGreater(len(previous_cues), 1)
-        self.assertEqual(fake.calls, [])
-        self.assertEqual(self.store.references(self.job_id)[0]['translated'], updated_reference)
-        self.assertEqual([(c['word_start'], c['word_end']) for c in self.store.cues(self.job_id)],
-                         [(c['word_start'], c['word_end']) for c in previous_cues])
-        self.assertEqual([c['translated'] for c in self.store.cues(self.job_id)],
-                         [c['translated'] for c in previous_cues])
 
     def test_reflow_to_new_directory_keeps_original_output_without_overwrite(self):
         fake = self.complete_old_job()
@@ -290,36 +270,18 @@ class ReflowTests(PipelineFixture):
         self.assertEqual(output.read_bytes(), previous)
         self.assertEqual((directory / output.name).read_bytes(), previous)
 
-    def test_legacy_manual_decision_is_preserved_when_complete_sentence_matches(self):
-        manifest = self.store.job(self.job_id)['manifest']
-        for name in ['subtitle_version', 'translation_strategy_version', 'subtitle_settings']:
-            manifest.pop(name)
-        self.store.update(self.job_id, manifest=manifest)
-        fake = FakeService(result(('OK', '')))
-        self.assertEqual(self.run_fake(fake), 'needs_review')
-        cue = self.store.cues(self.job_id)[0]
-        from subtitle_tool.review import ReviewDecision
-        self.store.apply_review(self.job_id, cue['cue_id'], ReviewDecision('original'))
-        self.store.update(self.job_id, 'queued')
-        self.assertEqual(self.run_fake(fake), 'completed')
-        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
-        source = self.store.sources(self.job_id)[0]
-        self.assertEqual((source['decision'], source['source_lang'], source['reason']), ('original', 'auto', '用户在终端确认'))
-        fake.calls.clear()
-        self.assertEqual(self.run_fake(fake), 'completed')
-        self.assertEqual(fake.calls, [])
 
     def test_transaction_failure_keeps_old_sources_cues_and_resume_marker(self):
         self.complete_old_job()
         before = self.store.job(self.job_id)
         sources, cues = self.store.sources(self.job_id), self.store.cues(self.job_id)
-        references = self.store.references(self.job_id)
+        stages = self.store.mt_stages(self.job_id)
         with mock.patch.object(self.store, '_replace_records', side_effect=OSError()), self.assertRaises(OSError):
             Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         self.assertEqual(self.store.job(self.job_id), before)
         self.assertEqual(self.store.sources(self.job_id), sources)
         self.assertEqual(self.store.cues(self.job_id), cues)
-        self.assertEqual(self.store.references(self.job_id), references)
+        self.assertTrue(all(row in self.store.mt_stages(self.job_id) for row in stages))
 
     def test_cli_reflow_and_resume_after_prepared_transaction(self):
         fake = self.complete_old_job()

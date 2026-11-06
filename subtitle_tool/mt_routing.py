@@ -391,6 +391,24 @@ class MTRouter:
                     recovery.recovering = False
                     recovery.probe_active = False
 
+    def cached_result(self, cache, *, prefer_other_than=None, deadline):
+        """Check exact caches independently of permission to send new requests."""
+        ordered = sorted(enumerate(self.entries), key=lambda item: (
+            _matches(item[1], prefer_other_than), item[1].tier != 'free', item[0]))
+        for _, entry in ordered:
+            self.control.check_start()
+            if self.clock() >= deadline:
+                raise RouteExhausted(deadline=True)
+            hit = cache(entry)
+            if hit is not None:
+                if not isinstance(hit, CacheHit):
+                    raise TypeError('Cache callback must return CacheHit or None')
+                self.control.check_inflight()
+                if self.clock() >= deadline:
+                    raise RouteExhausted(deadline=True)
+                return RouteResult(hit.value, entry, True, 0, 0.0, 0)
+        return None
+
     def run(self, invoke, *, cache=None, prefer_other_than=None, prepare=None, deadline_seconds=180.0, stage=None):
         """Return a RouteResult; raise a content-free error when all routes fail."""
         if (isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, (int, float)) or
@@ -398,24 +416,12 @@ class MTRouter:
             raise ValueError('deadline_seconds must be between 0 and 180')
         if stage is not None and (not isinstance(stage, str) or not stage):
             raise ValueError('Invalid route stage')
-        start = self.clock()
-        deadline = start + deadline_seconds
+        deadline = self.clock() + deadline_seconds
         self.control.check_start()
-        ordered = sorted(enumerate(self.entries), key=lambda item: (
-            _matches(item[1], prefer_other_than), item[1].tier != 'free', item[0]))
         if cache is not None:
-            for _, entry in ordered:
-                self.control.check_start()
-                if self.clock() >= deadline:
-                    raise RouteExhausted(deadline=True)
-                hit = cache(entry)
-                if hit is not None:
-                    if not isinstance(hit, CacheHit):
-                        raise TypeError('Cache callback must return CacheHit or None')
-                    self.control.check_inflight()
-                    if self.clock() >= deadline:
-                        raise RouteExhausted(deadline=True)
-                    return RouteResult(hit.value, entry, True, 0, 0.0, 0)
+            result = self.cached_result(cache, prefer_other_than=prefer_other_than, deadline=deadline)
+            if result is not None:
+                return result
 
         counts, stopped, failures = {}, set(), []
         attempts = switches = 0

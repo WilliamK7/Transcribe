@@ -62,21 +62,19 @@ def plan_sentence_groups(sources):
     return groups
 
 
-def _schema(stage, data, *, prompt_version=QUALITY_PROMPT_VERSION):
+def _schema(stage, data):
     if stage == 'glossary':
         item = {'type': 'object', 'properties': {'source': {'type': 'string'}, 'translation': {'type': 'string'},
                                                 'sentence': {'type': 'string'}},
                 'required': ['source', 'translation', 'sentence'], 'additionalProperties': False}
-        if prompt_version >= 2:
-            item['properties']['sentence']['enum'] = [str(s['id']) for s in data['sentences']]
+        item['properties']['sentence']['enum'] = [str(s['id']) for s in data['sentences']]
         return {'type': 'object', 'properties': {'terms': {'type': 'array', 'items': item}},
                 'required': ['terms'], 'additionalProperties': False}
     if stage == 'review':
         item = {'type': 'object', 'properties': {'id': {'type': 'string'},
                 'category': {'type': 'string', 'enum': list(ISSUE_CATEGORIES)}, 'evidence': {'type': 'string'}},
                 'required': ['id', 'category', 'evidence'], 'additionalProperties': False}
-        if prompt_version >= 2:
-            item['properties']['id']['enum'] = [str(f['id']) for f in data['fragments']]
+        item['properties']['id']['enum'] = [str(f['id']) for f in data['fragments']]
         return {'type': 'object', 'properties': {'issues': {'type': 'array', 'items': item}},
                 'required': ['issues'], 'additionalProperties': False}
     items = data['sentences'] if stage == 'draft' else data['fragments']
@@ -90,7 +88,7 @@ def _schema(stage, data, *, prompt_version=QUALITY_PROMPT_VERSION):
 def make_stage_payload(stage, data, backend, *, capabilities, prompt_version=QUALITY_PROMPT_VERSION):
     if stage not in PROMPTS:
         raise ValueError('Unknown translation stage')
-    if type(prompt_version) is not int or prompt_version not in {1, 2}:
+    if type(prompt_version) is not int or prompt_version != QUALITY_PROMPT_VERSION:
         raise ToolError('翻译提示词版本不受支持，请用 --reflow。', 'cache_version')
     if (not isinstance(capabilities, dict) or set(capabilities) != {'response_format', 'input_bytes', 'output_tokens'} or
             capabilities['response_format'] not in {'json_object', 'json_schema', 'text'} or
@@ -98,15 +96,14 @@ def make_stage_payload(stage, data, backend, *, capabilities, prompt_version=QUA
             type(capabilities['output_tokens']) is not int or not 1 <= capabilities['output_tokens'] <= 32768):
         raise ToolError('翻译模型能力档案无效。', 'mt_config')
     prompt = PROMPTS[stage]
-    if prompt_version >= 2:
-        prompt += '直接返回所需 JSON，不附解释、Markdown 或思考过程。'
-        if stage == 'review':
-            prompt += ('审核对象是 translations 中按 fragments 编号排列的最终字幕，结合完整原句和跨片连读判断。'
-                       '不要把正常分片、同义表达或与 draft 措辞不同本身当作错误。'
-                       '合并重复疑点，每条 evidence 用一句简短文字指出原文与译文的具体差异。')
-        if capabilities['response_format'] != 'json_schema':
-            prompt += '输出必须符合此 JSON Schema：' + json.dumps(
-                _schema(stage, data, prompt_version=prompt_version), ensure_ascii=False, separators=(',', ':'))
+    prompt += '直接返回所需 JSON，不附解释、Markdown 或思考过程。'
+    if stage == 'review':
+        prompt += ('审核对象是 translations 中按 fragments 编号排列的最终字幕，结合完整原句和跨片连读判断。'
+                   '不要把正常分片、同义表达或与 draft 措辞不同本身当作错误。'
+                   '合并重复疑点，每条 evidence 用一句简短文字指出原文与译文的具体差异。')
+    if capabilities['response_format'] != 'json_schema':
+        prompt += '输出必须符合此 JSON Schema：' + json.dumps(
+            _schema(stage, data), ensure_ascii=False, separators=(',', ':'))
     payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
                'messages': [{'role': 'system', 'content': prompt},
                             {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}]}
@@ -114,15 +111,15 @@ def make_stage_payload(stage, data, backend, *, capabilities, prompt_version=QUA
         payload['response_format'] = {'type': 'json_object'}
     elif capabilities['response_format'] == 'json_schema':
         payload['response_format'] = {'type': 'json_schema', 'json_schema': {
-            'name': 'subtitle_' + stage, 'strict': True, 'schema': _schema(stage, data, prompt_version=prompt_version)}}
+            'name': 'subtitle_' + stage, 'strict': True, 'schema': _schema(stage, data)}}
     if backend.is_openrouter:
         payload.update(provider={'require_parameters': True}, plugins=[{'id': 'response-healing'}])
-        if prompt_version >= 2 and backend.model == 'openrouter/free':
+        if backend.model == 'openrouter/free':
             # Reasoning shares max_tokens with visible JSON; leave room for the result.
             payload['reasoning'] = {'effort': 'low'}
     elif backend.provider == 'bailian':
         payload.update(enable_thinking=False, temperature=0)
-    elif (prompt_version >= 2 and backend.provider == 'qiniu' and
+    elif (backend.provider == 'qiniu' and
           backend.model == 'deepseek/deepseek-v4.1-flash'):
         payload['reasoning_effort'] = 'low'
     try:
@@ -153,15 +150,10 @@ def parse_stage_response(stage, body, *, ids=(), originals=()):
         if stage in {'draft', 'align', 'correct'}:
             if list(ids) != [str(i) for i in range(len(ids))] or len(originals) != len(ids):
                 raise ValueError()
-            translated = parse_batch_response(body, originals, request_version=5)
+            translated = parse_batch_response(body, originals)
             cc = OpenCC('t2s')
             return {'translations': {key: cc.convert(text) for key, text in translated.items()}}
-        if not isinstance(body, dict) or body.get('error') is not None:
-            raise ValueError()
-        choices = body.get('choices')
-        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-            raise ValueError()
-        choice = choices[0]
+        choice = body['choices'][0]
         if choice.get('finish_reason') != 'stop' or not isinstance(choice.get('message'), dict):
             raise ValueError()
         value = json.loads(choice['message']['content'], object_pairs_hook=_unique_object)

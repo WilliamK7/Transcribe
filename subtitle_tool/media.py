@@ -160,7 +160,7 @@ class Media:
             run_process([self.executable("ffmpeg"), "-nostdin", "-v", "error", "-y", "-copyts", "-i", source,
                          "-map", f"0:{track}", "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "copy",
                          "-avoid_negative_ts", "disabled", "-output_ts_offset", f"{-begin_seconds:.9f}",
-                         *(["-fflags", "+bitexact"] if target.suffix == ".ogg" and extract_recipe_version == 2 else []),
+                         *(["-fflags", "+bitexact"] if target.suffix == ".ogg" and extract_recipe_version == EXTRACT_RECIPE_VERSION else []),
                          temp], self.cancel)
             os.replace(temp, target)
         finally:
@@ -258,7 +258,7 @@ class Media:
     def prepare(self, source, directory, info, track_index, channel, limit_bytes=MAX_UPLOAD_BYTES,
                 *, force_method=None, extract_recipe_version=EXTRACT_RECIPE_VERSION):
         """Prefer lossless stream copy; every fallback uses the existing corrected PCM timeline."""
-        if type(extract_recipe_version) is not int or extract_recipe_version not in {1, EXTRACT_RECIPE_VERSION}:
+        if type(extract_recipe_version) is not int or extract_recipe_version != EXTRACT_RECIPE_VERSION:
             raise ToolError("媒体提取配方版本不受支持。", "cache_version")
         directory.mkdir(parents=True, exist_ok=True)
         track = next(t for t in info["tracks"] if t["index"] == track_index)

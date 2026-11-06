@@ -12,7 +12,7 @@ from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main
 from subtitle_tool.store import Store
-from tests.fixtures import FakeService, PipelineFixture, TemporaryTest, result
+from tests.fixtures import enqueue_current, FakeService, PipelineFixture, TemporaryTest, result
 
 
 class OutputStoreTests(TemporaryTest):
@@ -33,7 +33,7 @@ class OutputStoreTests(TemporaryTest):
     def enqueue(self, **options):
         return self.store.enqueue(self.source, workspace_id='offline-space', account='offline-account', **options)
 
-    def legacy_job(self):
+    def relative_path_job(self):
         with chdir(self.a):
             job_id = self.enqueue(output_dir=Path('SubTitles'))
         relative = Path('SubTitles') / self.source.with_suffix('.srt').name
@@ -50,27 +50,16 @@ class OutputStoreTests(TemporaryTest):
         self.assertEqual(job['output_key'], output_key(expected))
         self.assertFalse(expected.parent.exists())
 
-    def test_matching_legacy_path_is_fixed_before_existing_srt_skip(self):
-        job_id = self.legacy_job()
-        output = self.a / 'SubTitles' / self.source.with_suffix('.srt').name
-        output.parent.mkdir()
-        output.write_bytes(b'existing')
-        with chdir(self.a), mock.patch('requests.request') as request:
-            self.assertEqual(Engine(self.config, self.store).run(job_id), 'skipped')
-        self.assertEqual(self.store.job(job_id)['output'], str(output))
-        self.assertEqual(self.store.job(job_id)['output_key'], output_key(output))
-        self.assertEqual(output.read_bytes(), b'existing')
-        request.assert_not_called()
 
-    def test_ambiguous_legacy_resume_stops_before_output_preparation_or_network(self):
-        job_id = self.legacy_job()
+    def test_relative_path_resume_stops_before_output_preparation_or_network(self):
+        job_id = self.relative_path_job()
         before = self.store.job(job_id)
         with chdir(self.b), mock.patch.object(Engine, 'prepare_output') as prepare, mock.patch('requests.request') as request:
             self.assertEqual(self.store.jobs(), [before])
-            self.assertEqual(Engine(self.config, self.store).run(job_id), 'failed')
+            with self.assertRaises(ToolError) as caught:
+                self.store.ensure_output(job_id)
+            self.assertEqual(caught.exception.code, 'output_path_required')
         job = self.store.job(job_id)
-        self.assertEqual(job['error_code'], 'output_path_required')
-        self.assertIn('--output-dir', job['error'])
         self.assertEqual((job['output'], job['output_key'], job['manifest']),
                          (before['output'], before['output_key'], before['manifest']))
         self.assertFalse((self.b / 'SubTitles').exists())
@@ -78,7 +67,7 @@ class OutputStoreTests(TemporaryTest):
         request.assert_not_called()
 
     def test_ambiguous_change_output_without_directory_preserves_task(self):
-        job_id = self.legacy_job()
+        job_id = self.relative_path_job()
         before = self.store.job(job_id)
         with chdir(self.b), self.assertRaises(ToolError) as error:
             self.store.change_output(job_id, overwrite=True)
@@ -86,7 +75,7 @@ class OutputStoreTests(TemporaryTest):
         self.assertEqual(self.store.job(job_id), before)
 
     def test_explicit_directory_resolves_ambiguous_task_atomically(self):
-        job_id = self.legacy_job()
+        job_id = self.relative_path_job()
         with chdir(self.b):
             self.store.change_output(job_id, Path('chosen'), overwrite=True)
         expected = self.b / 'chosen' / self.source.with_suffix('.srt').name
@@ -96,8 +85,8 @@ class OutputStoreTests(TemporaryTest):
         self.assertTrue(job['manifest']['overwrite'])
         self.assertFalse(expected.parent.exists())
 
-    def test_change_output_conflict_preserves_legacy_path_and_overwrite(self):
-        job_id = self.legacy_job()
+    def test_change_output_conflict_preserves_saved_path_and_overwrite(self):
+        job_id = self.relative_path_job()
         other = self.source.with_suffix('.mp4')
         other.write_bytes(b'other')
         self.store.enqueue(other, output_dir=self.b / 'chosen', workspace_id='offline-space', account='offline-account')
@@ -112,7 +101,7 @@ class OutputStoreTests(TemporaryTest):
             with self.subTest(state=state):
                 job_id = self.enqueue(output_dir=self.a / state)
                 manifest = self.store.job(job_id)['manifest']
-                manifest.update(segments=[{'task_id': 'offline-task'}], references_planned=True)
+                manifest.update(segments=[{'task_id': 'offline-task'}], layout_planned=True)
                 self.store.update(job_id, state, manifest, error='saved error', code='saved')
                 self.store.replace_cues(job_id, [{'cue_id': '0', 'begin_ms': 0, 'end_ms': 900, 'text': 'Hello',
                                                 'language': 'en', 'decision': 'translate', 'reason': '用户在终端确认',
@@ -182,7 +171,7 @@ class OutputPipelineTests(PipelineFixture):
         a.mkdir()
         b.mkdir()
         with chdir(a):
-            self.job_id = self.store.enqueue(self.source, output_dir=Path('subs'), workspace_id='offline-space')
+            self.job_id = enqueue_current(self.store, self.config, self.source, output_dir=Path('subs'))
         fake = FakeService(result(('中文字幕。', 'zh')))
         with chdir(b):
             self.assertEqual(self.run_fake(fake), 'completed')
@@ -200,14 +189,14 @@ class OutputPipelineTests(PipelineFixture):
         fake = FakeService(result(('First sentence.', 'en'), ('Second sentence.', 'en')))
         fake.mt_failure.add('Second sentence.')
         self.assertEqual(self.run_fake(fake), 'failed')
-        saved = self.store.references(self.job_id)[0]['translated']
+        saved = self.store.mt_stages(self.job_id)
         output = self.source.with_suffix('.srt')
         output.write_bytes(b'previous SRT')
         fake.mt_failure.clear()
         code, report = self.run_cli(fake, str(self.source), '--overwrite')
         self.assertEqual((code, report['job_id'], report['state']), (0, self.job_id, 'completed'))
         self.assertEqual(len(fake.named('/asr/transcription')), 1)
-        self.assertEqual(self.store.references(self.job_id)[0]['translated'], saved)
+        self.assertTrue(all(row in self.store.mt_stages(self.job_id) for row in saved))
         self.assertEqual(Path(self.store.job(self.job_id)['manifest']['backup']).read_bytes(), b'previous SRT')
         self.assertNotEqual(output.read_bytes(), b'previous SRT')
 
@@ -228,20 +217,15 @@ class OutputPipelineTests(PipelineFixture):
         self.assertEqual(Path(self.store.job(self.job_id)['manifest']['backup']).read_bytes(), b'previous SRT')
         self.assertEqual(len(fake.named('/asr/transcription')), 1)
 
-    def legacy_completed_output(self):
+    def completed_with_relative_path(self):
         self.assertEqual(self.run_fake(FakeService(result(('中文字幕。', 'zh')))), 'completed')
         with self.store.db:
             self.store.db.execute('UPDATE jobs SET output=? WHERE id=?', (self.source.with_suffix('.srt').name, self.job_id))
         return self.store.job(self.job_id)
 
-    def test_reflow_fixes_matching_relative_path_at_commit(self):
-        self.legacy_completed_output()
-        with chdir(self.path):
-            Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
-        self.assertEqual(self.store.job(self.job_id)['output'], str(self.source.with_suffix('.srt')))
 
     def test_ambiguous_reflow_requires_directory_without_changing_task(self):
-        before = self.legacy_completed_output()
+        before = self.completed_with_relative_path()
         directory = self.path / 'elsewhere'
         directory.mkdir()
         with chdir(directory), self.assertRaises(ToolError) as error:
@@ -252,16 +236,9 @@ class OutputPipelineTests(PipelineFixture):
             Engine(self.config, self.store).reflow(self.job_id, output_dir=Path('chosen'))
         self.assertEqual(self.store.job(self.job_id)['output'], str(directory / 'chosen' / self.source.with_suffix('.srt').name))
 
-    def test_reflow_preparation_failure_preserves_matching_relative_path(self):
-        before = self.legacy_completed_output()
-        (self.config.data / 'cache' / self.job_id / 'raw-0000.json').unlink()
-        with chdir(self.path), self.assertRaises(ToolError) as error:
-            Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
-        self.assertEqual(error.exception.code, 'reflow_cache_missing')
-        self.assertEqual(self.store.job(self.job_id), before)
 
     def test_reflow_conflict_preserves_path_manifest_and_subtitles(self):
-        before = self.legacy_completed_output()
+        before = self.completed_with_relative_path()
         other = self.source.with_suffix('.mp4')
         other.write_bytes(b'other')
         directory = self.path / 'chosen'

@@ -50,13 +50,6 @@ def batch_response_metadata(body):
     return metadata
 
 
-def safe_request_id(value):
-    if isinstance(value, str) and re.fullmatch(
-            r'(?:chatcmpl-[0-9a-fA-F]{16,64}|(?:chatcmpl-)?[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})', value):
-        return value
-    return ''
-
-
 def safe_model_id(value):
     if (isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}', value)
             and '://' not in value and not value.lower().startswith(('sk-', 'bearer'))):
@@ -109,60 +102,38 @@ class MTDiagnostics:
         except (OSError, ValueError, TypeError, OverflowError):
             return False
 
-    def write_runtime(self, event):
-        """Separate callback and whitelist; runtime events never count as format repairs."""
-        from .mt_runtime import RUNTIME_CATEGORIES
+    def write_quota(self, event):
         try:
-            if event.get('kind') not in {'runtime_request', 'runtime_wait', 'runtime_quota', 'runtime_drain',
-                                       'runtime_fallback', 'runtime_commit'}:
+            if event.get('kind') != 'runtime_quota':
                 return False
-            record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
-            if isinstance(event.get('category'), str) and event['category'] in RUNTIME_CATEGORIES:
-                record['category'] = event['category']
-            self._routing(record, event)
-            for field in ['attempt', 'status', 'duration_ms', 'shared_wait_ms', 'pacing_wait_ms',
-                          'discarded', 'used', 'limit', 'remaining', 'local_remaining', 'committed_count',
-                          'choice_error_count', 'detail_free_error_finish_count', 'error_type_known_count',
-                          'content_filter_count', 'message_refusal_count',
-                          'error_type_missing_count', 'error_type_unknown_count', 'error_type_malformed_count']:
-                value = event.get(field)
-                if type(value) is int and 0 <= value <= 2**63 - 1:
-                    record[field] = value
-            for field in ['retryable', 'deadline_terminated', 'cached', 'top_level_error']:
-                if type(event.get(field)) is bool:
-                    record[field] = event[field]
-            observed = event.get('observed_at')
-            if isinstance(observed, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?\+00:00', observed):
-                datetime.fromisoformat(observed)
-                record['observed_at'] = observed
-            return self._append(record)
-        except (OSError, ValueError, TypeError, OverflowError):
+            category = event.get('category')
+            if category not in {'quota_observed', 'quota_refresh_failed', 'quota_console_session_invalid'}:
+                return False
+            return self._append({'time': datetime.now(timezone.utc).isoformat(),
+                                 'kind': 'runtime_quota', 'category': category})
+        except (OSError, ValueError, TypeError):
             return False
 
     def write(self, event):
         try:
-            if event.get('kind') not in {'invalid_response', 'split'}:
+            if event.get('kind') != 'invalid_response':
                 return False
             record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
             self._routing(record, event)
             if event.get('category') in VALIDATION_CATEGORIES:
                 record['category'] = event['category']
-            for key in ['fragment_start', 'fragment_end', 'depth', 'expected_count', 'actual_count',
-                        'begin_ms', 'end_ms', 'content_length']:
+            for key in ['expected_count', 'actual_count', 'content_length']:
                 value = event.get(key)
                 if type(value) is int and 0 <= value <= 2**63 - 1:
                     record[key] = value
             if event['kind'] == 'invalid_response' and event.get('actual_count') is None:
                 record['actual_count'] = None
-            if type(event.get('repair')) is bool:
-                record['repair'] = event['repair']
             if type(event.get('code_fence')) is bool:
                 record['code_fence'] = event['code_fence']
             for key, allowed in _FORMAT_ENUMS.items():
                 value = event.get(key)
                 if isinstance(value, str) and value in allowed:
                     record[key] = value
-            record['request_id'] = safe_request_id(event.get('request_id'))
             return self._append(record)
         except (OSError, ValueError, TypeError, OverflowError):
             return False
@@ -173,19 +144,9 @@ class MTDiagnostics:
             model = safe_model_id(event.get(field))
             if model:
                 record[field] = model
-        if type(event.get('request_version')) is int and event['request_version'] in {1, 2, 3, 4, 5}:
-            record['request_version'] = event['request_version']
-        if event.get('stage') in {'reference', 'subtitle', 'glossary', 'draft', 'align', 'review', 'correct'}:
+        if event.get('stage') in {'glossary', 'draft', 'align', 'review', 'correct'}:
             record['stage'] = event['stage']
-        if event.get('quota_source') in {'local_ledger', 'server_observation', 'free_tier_only'}:
-            record['quota_source'] = event['quota_source']
         for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}')]:
             value = event.get(field)
             if isinstance(value, str) and re.fullmatch(pattern, value):
-                record[field] = value
-        for field, allowed in [('backend', {'primary', 'fallback'}), ('provider', {'openrouter', 'bailian', 'openai_compatible', 'qiniu'}),
-                ('reason', {'quota_exhausted', 'quota_local_empty', 'format_exhausted', 'retry_after',
-                            'transient_exhausted', 'content_refused'})]:
-            value = event.get(field)
-            if isinstance(value, str) and value in allowed:
                 record[field] = value

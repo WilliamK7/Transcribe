@@ -240,8 +240,7 @@ class CLIQuotaSource:
             raise QuotaSourceError()
         return result
 
-    def _fingerprint_context(self, snapshot, *, version=1, require_login=True, require_domestic=True,
-                             full_profile=False):
+    def _fingerprint_context(self, snapshot, *, version=1, require_login=True, require_domestic=True):
         try:
             if type(version) is not int or version not in (1, 2):
                 raise ValueError()
@@ -254,8 +253,7 @@ class CLIQuotaSource:
                     self._openapi_credentials(selected)
                 # v2 queries obtain their own token from the confirmed AK/SK;
                 # they never use this independent browser/CLI session token.
-                selected = {k: v for k, v in selected.items() if
-                            (k not in ('access_token', 'accessToken') if full_profile else k in _OPENAPI_CONTEXT_FIELDS)}
+                selected = {k: v for k, v in selected.items() if k in _OPENAPI_CONTEXT_FIELDS}
             elif require_login and (not isinstance(token, str) or not token.strip()):
                 raise ValueError()
             context = {'schema': version, 'cli_version': _CLI_VERSION, 'config_dir': str(folder),
@@ -278,16 +276,10 @@ class CLIQuotaSource:
         return version, self._fingerprint_context(snapshot, version=version)
 
     def binding_fingerprint(self, proof):
-        """Normalize an exactly matching early v2 binding without changing its identity."""
-        snapshot = self._read_context()
-        options = dict(version=proof.context_version, require_login=False, require_domestic=False)
-        current = self._fingerprint_context(snapshot, **options)[2]
-        if current == proof.context_fingerprint:
-            return current
-        if proof.context_version == 2 and self._fingerprint_context(
-                snapshot, full_profile=True, **options)[2] == proof.context_fingerprint:
-            return current
-        return None
+        """Check the selected authentication context without refreshing credentials."""
+        current = self._fingerprint_context(self._read_context(), version=proof.context_version,
+                                           require_login=False, require_domestic=False)[2]
+        return current if current == proof.context_fingerprint else None
 
     def bound_to(self, proof):
         try:

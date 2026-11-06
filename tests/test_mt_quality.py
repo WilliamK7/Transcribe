@@ -79,19 +79,11 @@ class QualityContractTests(unittest.TestCase):
         schema = payload['response_format']['json_schema']['schema']
         self.assertEqual(schema['properties']['issues']['items']['properties']['id']['enum'], ['0', '1'])
 
-    def test_prompt_one_wire_and_persistent_cache_key_stay_unchanged(self):
-        from subtitle_tool.mt_quality import PROMPTS
-        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': []}
-        legacy = make_stage_payload('draft', data, self.qiniu, capabilities=self.qiniu_caps, prompt_version=1)
-        self.assertEqual(legacy, {'model': self.qiniu.model, 'stream': False, 'max_tokens': 4096,
-            'messages': [{'role': 'system', 'content': PROMPTS['draft']},
-                         {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}],
-            'response_format': {'type': 'json_object'}})
-        key = stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps,
-                              scope=self.scope, prompt_version=1)
-        self.assertEqual(key, 'f6bbb1832877235689ce752c640a324f633b9eb9abfac7762993f8e32d8917b5')
-        self.assertNotEqual(key, stage_cache_key('draft', data, self.qiniu,
-                                                capabilities=self.qiniu_caps, scope=self.scope))
+    def test_retired_prompt_is_rejected(self):
+        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
+        with self.assertRaises(ToolError) as caught:
+            make_stage_payload('draft', data, self.qiniu, capabilities=self.qiniu_caps, prompt_version=1)
+        self.assertEqual(caught.exception.code, 'cache_version')
 
     def test_new_prompt_leaves_output_budget_for_json_on_slow_reasoning_routes(self):
         from dataclasses import replace
@@ -103,8 +95,6 @@ class QualityContractTests(unittest.TestCase):
             with self.subTest(provider=backend.provider):
                 current = make_stage_payload('draft', data, backend, capabilities=capabilities)
                 self.assertEqual(current[field], value)
-                legacy = make_stage_payload('draft', data, backend, capabilities=capabilities, prompt_version=1)
-                self.assertNotIn(field, legacy)
         custom = replace(self.qiniu, model='custom-model')
         payload = make_stage_payload('draft', data, custom, capabilities=self.qiniu_caps)
         self.assertNotIn('reasoning_effort', payload)
@@ -162,9 +152,26 @@ class QualityContractTests(unittest.TestCase):
         self.assertNotEqual(stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope={'account': 'a'}),
                             stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope={'account': 'b'}))
 
+    def test_translation_mapping_rejects_duplicate_missing_extra_and_empty_results(self):
+        invalid = ['{"translations":{"0":"甲","0":"乙","1":"丙"}}',
+                   '{"translations":{"0":"甲"}}',
+                   '{"translations":{"0":"甲","1":"乙","2":"丙"}}',
+                   '{"translations":{"0":"甲","1":" "}}']
+        for content in invalid:
+            response = body({})
+            response['choices'][0]['message']['content'] = content
+            with self.subTest(content=content), self.assertRaises(ToolError):
+                parse_stage_response('align', response, ids=['0', '1'], originals=['First.', 'Second.'])
+        response = body({'translations': {'1': '第二句', '0': '第一句'}})
+        self.assertEqual(parse_stage_response('align', response, ids=['0', '1'], originals=['First.', 'Second.']),
+                         {'translations': {'0': '第一句', '1': '第二句'}})
+        response['choices'][0]['finish_reason'] = 'length'
+        with self.assertRaises(ToolError):
+            parse_stage_response('align', response, ids=['0', '1'], originals=['First.', 'Second.'])
+
     def test_single_long_sentence_never_creates_a_group_over_sixty_seconds(self):
         from subtitle_tool.config import Settings
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         from subtitle_tool.subtitles import normalize, plan_fragments
         from tests.fixtures import timed_raw
         raw = timed_raw([f'word{i}' for i in range(70)], word_ms=1000)

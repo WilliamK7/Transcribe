@@ -283,7 +283,7 @@ class QuotaTests(unittest.TestCase):
         self.source.query.side_effect = QuotaSourceError('quota_console_session_invalid')
         with tempfile.TemporaryDirectory() as temp:
             writer = MTDiagnostics(Path(temp), 'a' * 32)
-            self.quota.on_event = writer.write_runtime
+            self.quota.on_event = writer.write_quota
             self.assertEqual(self.failure(), 'quota_unknown')
             records = [json.loads(line) for line in writer.path.read_text(encoding='utf-8').splitlines()]
         self.assertEqual(records[-1]['category'], 'quota_console_session_invalid')

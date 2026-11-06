@@ -13,7 +13,6 @@ from subtitle_tool.instance import ProcessLock
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import Progress, main
 from subtitle_tool.store import Store
-from subtitle_tool.subtitles import mt_cache_key
 from tests.fixtures import TemporaryTest, response
 
 
@@ -49,32 +48,10 @@ class ConfigTests(TemporaryTest):
             config.set_key("offline-local-key")
             self.assertEqual((config.data / "key.txt").read_text(), "offline-local-key")
             self.assertEqual(config.get_key(), "offline-local-key")
-            self.assertFalse((config.data / "key.dpapi").exists())
             self.assertFalse(list(config.data.glob("*.tmp")))
         with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "offline-env-key"}):
             self.assertEqual(config.get_key(), "offline-env-key")
 
-    def test_legacy_key_removed_only_after_successful_atomic_migration(self):
-        config = Config(self.path)
-        legacy = config.data / "key.dpapi"
-        legacy.write_bytes(b"old-ciphertext")
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("subtitle_tool.config.decrypt_legacy", return_value=b"offline-migrated"):
-            with mock.patch("subtitle_tool.config.atomic_bytes", side_effect=OSError()):
-                with self.assertRaises(ToolError):
-                    config.get_key()
-            self.assertTrue(legacy.exists())
-            self.assertEqual(config.get_key(), "offline-migrated")
-        self.assertFalse(legacy.exists())
-
-    def test_failed_decryption_keeps_legacy_file(self):
-        config = Config(self.path)
-        legacy = config.data / "key.dpapi"
-        legacy.write_bytes(b"unreadable")
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("subtitle_tool.config.decrypt_legacy", side_effect=ToolError("重新输入", "credentials")):
-            with self.assertRaises(ToolError):
-                config.get_key()
-        self.assertTrue(legacy.exists())
-        self.assertFalse((config.data / "key.txt").exists())
 
     def test_workspace_is_one_dns_label(self):
         self.assertEqual(validate_workspace_id("Abc-123"), "abc-123")
@@ -90,19 +67,10 @@ class ConfigTests(TemporaryTest):
         with mock.patch("requests.request", return_value=response({"output": {"task_status": "PENDING"}})) as request:
             cloud.query("offline-id")
             self.assertIn("https://space-a.cn-beijing.maas.aliyuncs.com/api/v1/tasks/", request.call_args.args[1])
-        with mock.patch("requests.request", return_value=response({"choices": [{"finish_reason": "stop", "message": {"content": "译文"}}]})) as request:
-            cloud.translate("Hello", "English")
-            self.assertEqual(request.call_args.args[1], "https://space-a.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions")
         with mock.patch.object(cloud.http, "json", return_value={"data": {}}) as request:
             with self.assertRaises(ToolError):
                 cloud.policy()
             self.assertEqual(request.call_args.args[1], "https://dashscope.aliyuncs.com/api/v1/uploads")
-
-    def test_mt_cache_isolated_by_account_workspace_and_version(self):
-        args = dict(account="account-a", workspace_id="space-a", access_mode="workspace", processing_version=2)
-        original = mt_cache_key("hello", **args)
-        for field, value in [("account", "account-b"), ("workspace_id", "space-b"), ("access_mode", "legacy_public"), ("processing_version", 1)]:
-            self.assertNotEqual(original, mt_cache_key("hello", **(args | {field: value})))
 
 
 class CliTests(TemporaryTest):
@@ -121,21 +89,6 @@ class CliTests(TemporaryTest):
         self.config_patch.stop()
         super().tearDown()
 
-    def test_recovery_progress_displays_interval_change_and_return_to_zero(self):
-        progress = Progress()
-        with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
-            progress('offline-job', 'mt_recovery', 8, 5.6)
-            progress('offline-job', 'mt_recovery', 0.11, 0)
-        self.assertEqual(output.getvalue().splitlines(), [
-            '[offline-job] 翻译提速：请求间隔 8.00 → 5.60 秒',
-            '[offline-job] 翻译提速：请求间隔 0.11 秒，恢复无额外间隔'])
-
-    def test_quota_wait_is_distinct_from_server_throttling(self):
-        progress = Progress()
-        with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
-            progress('offline-job', 'mt_quota_wait', 40.5, 60)
-        self.assertEqual(output.getvalue().strip(),
-                         '[offline-job] 翻译配额等待：约 40.50 秒，滚动窗口最多 60 次请求')
 
     def test_pool_progress_describes_active_stages_and_login_action(self):
         progress = Progress()
@@ -147,14 +100,6 @@ class CliTests(TemporaryTest):
         self.assertIn('15 秒', output.getvalue())
         self.assertIn('bl auth login --console', output.getvalue())
 
-    def test_content_refusal_fallback_is_not_reported_as_exhausted_retries(self):
-        progress = Progress()
-        with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
-            progress('offline-job', 'mt_fallback',
-                     {'reason': 'content_refused', 'category': 'content_policy_violation', 'attempt': 1}, None)
-        self.assertIn('明确拒绝生成，当前完整组直接转百炼', output.getvalue())
-        self.assertNotIn('1/4', output.getvalue())
-        self.assertNotIn('临时服务故障', output.getvalue())
 
     def test_no_arguments_displays_help_without_creating_store(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
@@ -236,7 +181,10 @@ class CliTests(TemporaryTest):
     def test_jobs_cancel_and_noninteractive_review(self):
         store = Store(self.config.data / "jobs.sqlite")
         job_id = store.enqueue(self.source, "beijing", workspace_id="offline-space")
-        store.replace_cues(job_id, [{"cue_id": "0", "begin_ms": 0, "end_ms": 900, "text": "OK", "language": "", "decision": "uncertain", "reason": "missing"}])
+        from subtitle_tool.subtitles import normalize, make_fragment
+        from tests.fixtures import result
+        sources = normalize(result(('OK', '')), 0, '0000')[0]
+        store.initialize_subtitles(job_id, sources, [make_fragment(s) for s in sources], store.job(job_id)['manifest'])
         store.update(job_id, "needs_review", code="language_uncertain")
         store.close()
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output, mock.patch("sys.stderr", new_callable=io.StringIO), mock.patch("builtins.input", side_effect=AssertionError("must not prompt")):
@@ -268,7 +216,10 @@ class CliTests(TemporaryTest):
         manifest = store.job(job_id)["manifest"]
         if media:
             manifest["media"] = media
-        store.replace_cues(job_id, [{"cue_id": "0", "begin_ms": 0, "end_ms": 900, "text": "OK", "language": "", "decision": "uncertain", "reason": "missing"}])
+        from subtitle_tool.subtitles import normalize, make_fragment
+        from tests.fixtures import result
+        sources = normalize(result(('OK', '')), 0, '0000')[0]
+        store.initialize_subtitles(job_id, sources, [make_fragment(s) for s in sources], store.job(job_id)['manifest'])
         store.update(job_id, "needs_review", manifest, code=code)
         store.close()
         return job_id
@@ -277,7 +228,7 @@ class CliTests(TemporaryTest):
         job_id = self.add_review_job()
         def run(engine, current):
             cue = engine.store.cues(current)[0]
-            self.assertEqual(cue["cue_id"], "0")
+            self.assertTrue(cue["cue_id"].startswith("0000:"))
             self.assertEqual((cue["decision"], cue["source_lang"]), ("translate", "English"))
             engine.store.update(current, "completed")
             return "completed"

@@ -9,16 +9,10 @@ import threading
 from pathlib import Path
 
 ASR_MODEL = "qwen3-asr-flash-filetrans"
-MT_MODEL = "qwen-mt-flash"
 NORMALIZER_VERSION = 4
 PROCESSING_VERSION = 2
 SUBTITLE_VERSION = 2
 DISPLAY_TIMING_VERSION = 2
-TRANSLATION_STRATEGY_VERSION = 3
-# Qwen-MT's 8192-token input limit includes translation memory and template tokens.
-# UTF-8 bytes upper-bound byte-tokenized text; reserve additional template capacity.
-MT_INPUT_BUDGET = 6000
-MT_TEMPLATE_RESERVE = 512
 MAX_LAYOUT_ROUNDS = 2
 MAX_UPLOAD_BYTES = 1_000_000_000
 MAX_ASR_SECONDS = 12 * 3600
@@ -34,17 +28,10 @@ def validate_workspace_id(value: str) -> str:
 
 
 def connection_identity(manifest: dict) -> dict:
-    """Missing fields identify pre-CLI public-endpoint tasks, never the current settings."""
-    region = manifest.get("region", "beijing")
-    if region != "beijing":
-        raise ToolError("旧新加坡任务数据已保留；本版只支持北京，不能自动切换地域恢复。", "legacy_region")
-    mode = manifest.get("access_mode", "legacy_public")
-    workspace = manifest.get("workspace_id", "")
-    if mode == "workspace":
-        workspace = validate_workspace_id(workspace)
-    elif mode != "legacy_public" or workspace:
-        raise ToolError("任务的工作空间／接入方式记录不一致。", "cache_mismatch")
-    return {"region": region, "workspace_id": workspace, "access_mode": mode}
+    if manifest.get('region') != 'beijing' or manifest.get('access_mode') != 'workspace':
+        raise ToolError('任务需要北京工作空间身份。', 'cache_mismatch')
+    return {'region': 'beijing', 'workspace_id': validate_workspace_id(manifest.get('workspace_id')),
+            'access_mode': 'workspace'}
 
 
 class ToolError(Exception):

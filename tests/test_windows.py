@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import ctypes
+
 import os
 import subprocess
 import sys
 import threading
 import unittest
 
-from subtitle_tool.config import Blob, Config
 from subtitle_tool.instance import ProcessLock
 from subtitle_tool.media import Media, run_process
 from tests.fixtures import ROOT, TemporaryTest
@@ -15,30 +14,6 @@ from tests.fixtures import ROOT, TemporaryTest
 
 @unittest.skipUnless(os.name == "nt", "Windows integration required")
 class WindowsTests(TemporaryTest):
-    def test_real_dpapi_legacy_key_migration(self):
-        config = Config(self.path)
-        legacy = config.data / "key.dpapi"
-        # Produce old-format ciphertext only in this migration test.
-        data = b"offline-legacy-key"
-        buffer = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
-        source, target = Blob(len(data), buffer), Blob()
-        crypt = ctypes.WinDLL("crypt32", use_last_error=True)
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        crypt.CryptProtectData.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p,
-                                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(Blob)]
-        crypt.CryptProtectData.restype = ctypes.c_int
-        kernel.LocalFree.argtypes = [ctypes.c_void_p]
-        kernel.LocalFree.restype = ctypes.c_void_p
-        self.assertTrue(crypt.CryptProtectData(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(target)))
-        try:
-            legacy.write_bytes(ctypes.string_at(target.pbData, target.cbData))
-        finally:
-            kernel.LocalFree(target.pbData)
-        from unittest import mock
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(config.get_key(), "offline-legacy-key")
-        self.assertFalse(legacy.exists())
-        self.assertEqual((config.data / "key.txt").read_bytes(), b"offline-legacy-key")
 
     def test_exclusive_lock_and_release_across_instances_and_processes(self):
         first, second = ProcessLock(self.path), ProcessLock(self.path)

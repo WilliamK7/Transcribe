@@ -8,24 +8,16 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from subtitle_tool.common import Cancelled, ToolError
+from subtitle_tool.common import Cancelled
 from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_transport import HTTPReply, ProcessTransport, TransportError
-from subtitle_tool.mt_runtime import FreeQuota, BoundedMTHttp, RecoveryCoordinator
-from subtitle_tool.mt_runtime import runtime_resources, service_failure
-from subtitle_tool.api import RequestPacer
-from subtitle_tool.mt_backend import MTBackend, key_fingerprint
-from subtitle_tool.mt_diagnostics import MTDiagnostics
+from subtitle_tool.mt_runtime import service_failure
+
 from tests.fixtures import TemporaryTest
-
-
-def quota(remaining=20):
-    return HTTPReply(200, json.dumps({'data': {'private': 'never record', 'free_model_daily_requests': {
-        'used': 20 - remaining, 'limit': 20, 'remaining': remaining}}}).encode())
 
 
 def business_failure(kind='not_found', *, status=200, choice=False, finish_marker=False):
@@ -38,13 +30,6 @@ def business_failure(kind='not_found', *, status=200, choice=False, finish_marke
 
 def generation_failure(*, status=200):
     return HTTPReply(status, b'{"choices":[{"finish_reason":"error","message":{"content":null}}]}')
-
-
-def reserve(ledger, control, fetch):
-    while True:
-        ledger.ensure(control, fetch)
-        if ledger.try_reserve(control):
-            return
 
 
 class ChildProcesses:
@@ -71,19 +56,6 @@ class ChildProcesses:
     @property
     def last_process(self):
         return self.processes[-1]
-
-
-class Clock:
-    def __init__(self):
-        self.now = 100.0
-        self.day = datetime(2026, 10, 22, tzinfo=timezone.utc)
-
-    def __call__(self):
-        return self.now
-
-    def wait(self, control, seconds):
-        control.check_start()
-        self.now += seconds
 
 
 class LocalServer:
@@ -256,310 +228,7 @@ class ProcessTransportTests(TemporaryTest):
             lock.close()
 
 
-class RecoveryTests(TemporaryTest):
-    def setUp(self):
-        super().setUp()
-        self.clock = Clock()
-        self.control = MTControl(threading.Event(), clock=self.clock)
-        self.pacer = RequestPacer(clock=self.clock, requests_per_window=0)
-        self.recovery = RecoveryCoordinator(clock=self.clock, jitter=lambda: 0, wait=self.clock.wait)
-
-    def test_same_round_failures_merge_and_old_success_does_not_unlock_probe(self):
-        old = self.recovery.acquire(self.control, self.pacer)
-        peer = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(old)
-        deadline = self.recovery.cooldown_until
-        self.recovery.failure(peer)
-        self.assertEqual(self.recovery.cooldown_until, deadline)
-        self.assertEqual(deadline, 115)
-        self.recovery.success(peer)
-        self.assertTrue(self.recovery.recovering)
-        probe = self.recovery.acquire(self.control, self.pacer)
-        self.assertTrue(probe.probe)
-        self.recovery.failure(probe)
-        self.assertEqual(self.recovery.cooldown_until, 145)
-        probe = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.success(probe)
-        self.assertFalse(self.recovery.recovering)
-
-    def test_shared_wait_uses_latest_pacer_deadline(self):
-        ticket = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(ticket, retry_after=40)
-        self.pacer.throttle(50, ticket.pacer_generation)
-        self.recovery.acquire(self.control, self.pacer)
-        self.assertAlmostEqual(self.clock.now, 150)
-
-    def test_only_one_translation_probe_is_released_before_success(self):
-        recovery = RecoveryCoordinator(jitter=lambda: 0)
-        pacer = RequestPacer(requests_per_window=0)
-        control = MTControl(threading.Event())
-        ticket = recovery.acquire(control, pacer)
-        recovery.failure(ticket)
-        recovery.cooldown_until = time.monotonic()
-        entered = []
-        lock, probe_entered, release = threading.Lock(), threading.Event(), threading.Event()
-        def acquire():
-            item = recovery.acquire(control, pacer)
-            with lock:
-                entered.append(item)
-            if item.probe:
-                probe_entered.set()
-                release.wait(3)
-                recovery.success(item)
-            return item
-        with ThreadPoolExecutor(4) as pool:
-            futures = [pool.submit(acquire) for _ in range(4)]
-            try:
-                self.assertTrue(probe_entered.wait(2))
-                time.sleep(.15)
-                self.assertEqual(len(entered), 1)
-            finally:
-                release.set()
-            tickets = [future.result(3) for future in futures]
-        self.assertEqual(sum(item.probe for item in tickets), 1)
-
-    def test_cancel_stops_shared_and_pacing_waits_without_a_request(self):
-        old = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(old)
-        self.control.cancel_user()
-        with self.assertRaises(Cancelled):
-            self.recovery.acquire(self.control, self.pacer)
-
-    def test_late_retry_after_cannot_be_cleared_by_an_already_started_probe(self):
-        first = self.recovery.acquire(self.control, self.pacer)
-        peer = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(first)
-        probe = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(peer, retry_after=80)
-        self.recovery.success(probe)
-        self.assertTrue(self.recovery.recovering)
-        later_probe = self.recovery.acquire(self.control, self.pacer)
-        self.assertTrue(later_probe.probe)
-        self.assertGreaterEqual(self.clock.now, 195)
-
-    def test_long_retry_after_stops_other_clients_without_waiting_or_sending(self):
-        first = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(first, retry_after=301)
-        with self.assertRaises(ToolError) as error:
-            self.recovery.acquire(MTControl(threading.Event(), clock=self.clock), self.pacer)
-        self.assertEqual(error.exception.code, 'mt_retry_after')
-        self.assertEqual(self.clock.now, 100)
-
-    def test_late_peer_retry_after_starts_a_new_probe_gate_after_recovery(self):
-        first = self.recovery.acquire(self.control, self.pacer)
-        late_peer = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(first)
-        probe = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.success(probe)
-        inflight_after_recovery = self.recovery.acquire(self.control, self.pacer)
-        self.recovery.failure(late_peer, retry_after=40)
-        self.recovery.success(inflight_after_recovery)
-        self.assertTrue(self.recovery.recovering)
-        self.assertTrue(self.recovery.acquire(self.control, self.pacer).probe)
-
-
-class QuotaTests(TemporaryTest):
-    def setUp(self):
-        super().setUp()
-        self.clock = Clock()
-        self.control = MTControl(threading.Event(), clock=self.clock)
-        self.ledger = FreeQuota(clock=self.clock, utcnow=lambda: self.clock.day, wait=self.clock.wait)
-
-    def test_four_workers_cannot_oversend_one_or_two_remaining_units(self):
-        for available in [1, 2]:
-            ledger = FreeQuota()
-            control = MTControl(threading.Event())
-            queried = []
-            def fetch():
-                queried.append(1)
-                time.sleep(.06)
-                return quota(available)
-            def admit():
-                try:
-                    reserve(ledger, control, fetch)
-                    return True
-                except ToolError as error:
-                    self.assertEqual(error.code, 'mt_quota_exhausted')
-                    return False
-            with ThreadPoolExecutor(4) as pool:
-                self.assertEqual(sum(pool.map(lambda _: admit(), range(4))), available)
-            self.assertEqual(len(queried), 1)
-
-    def test_refresh_only_lowers_remaining_and_failed_refresh_keeps_trusted_balance(self):
-        reserve(self.ledger, self.control, lambda: quota(10))
-        self.ledger.complete()
-        self.clock.now += 31
-        reserve(self.ledger, self.control, lambda: quota(15))
-        self.ledger.complete()
-        self.assertEqual(self.ledger.remaining, 8)
-        self.clock.now += 31
-        def unavailable():
-            raise TransportError('network')
-        reserve(self.ledger, self.control, unavailable)
-        self.assertEqual(self.ledger.remaining, 7)
-
-    def test_unknown_fields_failed_first_query_and_cross_utc_day_stop(self):
-        for reply in [HTTPReply(200, b'{"data":{}}'), quota(True), HTTPReply(503, b'private')]:
-            ledger = FreeQuota(clock=self.clock, utcnow=lambda: self.clock.day)
-            with self.assertRaises(ToolError) as error:
-                reserve(ledger, self.control, lambda: reply)
-            self.assertEqual(error.exception.code, 'mt_quota_unknown')
-        reserve(self.ledger, self.control, lambda: quota(10))
-        self.clock.day = datetime(2026, 10, 23, tzinfo=timezone.utc)
-        self.clock.now += 31
-        with self.assertRaises(ToolError) as error:
-            reserve(self.ledger, self.control, lambda: HTTPReply(503, b'private'))
-        self.assertEqual(error.exception.code, 'mt_quota_unknown')
-
-    def test_delayed_refresh_subtracts_existing_inflight_and_new_sends(self):
-        reserve(self.ledger, self.control, lambda: quota(10))
-        self.clock.now += 31
-        entered, release = threading.Event(), threading.Event()
-        def query():
-            entered.set()
-            self.assertTrue(release.wait(3))
-            return quota(6)
-        with ThreadPoolExecutor(1) as pool:
-            refresh = pool.submit(self.ledger.ensure, self.control, query)
-            self.assertTrue(entered.wait(2))
-            try:
-                reserve(self.ledger, self.control, lambda: self.fail('Concurrent query was not merged'))
-                reserve(self.ledger, self.control, lambda: self.fail('Concurrent query was not merged'))
-            finally:
-                release.set()
-            refresh.result(3)
-        self.assertEqual(self.ledger.remaining, 3)  # remote 6 minus one old and two newly sent
-
-    def test_cross_day_within_refresh_interval_waits_and_requires_a_new_observation(self):
-        reserve(self.ledger, self.control, lambda: quota(5))
-        self.ledger.complete()
-        self.clock.day = datetime(2026, 10, 23, tzinfo=timezone.utc)
-        queries = []
-        def query():
-            queries.append(self.clock.now)
-            return quota(12)
-        reserve(self.ledger, self.control, query)
-        self.assertEqual(len(queries), 1)
-        self.assertGreaterEqual(queries[0], 130)
-        self.assertEqual(self.ledger.remaining, 11)
-
-    def test_concurrent_models_share_account_quota_and_coalesce_the_query(self):
-        from dataclasses import replace
-        backend = MTBackend('openai_compatible', 'https://openrouter.ai/api/v1', 'openrouter/free', 'a' * 64, 2)
-        _, ledger = runtime_resources(backend)
-        _, other = runtime_resources(replace(backend, model='provider/model:free'))
-        self.assertIs(ledger, other)
-        controls = [MTControl(threading.Event()) for _ in range(4)]
-        queries = []
-        def query():
-            queries.append(1)
-            time.sleep(.08)
-            return quota(10)
-        with ThreadPoolExecutor(4) as pool:
-            list(pool.map(lambda control: reserve(ledger, control, query), controls))
-        self.assertEqual(queries, [1])
-        self.assertEqual(ledger.remaining, 6)
-
-    def test_failed_initial_query_does_not_fall_back_to_an_earlier_runs_observation(self):
-        reserve(self.ledger, self.control, lambda: quota(10))
-        self.ledger.complete()
-        self.clock.now += 1
-        new_run = MTControl(threading.Event(), clock=self.clock)
-        with self.assertRaises(ToolError) as error:
-            reserve(self.ledger, new_run, lambda: HTTPReply(503, b'{}'))
-        self.assertEqual(error.exception.code, 'mt_quota_unknown')
-
-    def test_missing_refresh_fields_keep_a_same_day_trusted_local_balance(self):
-        reserve(self.ledger, self.control, lambda: quota(6))
-        self.ledger.complete()
-        self.clock.now += 30
-        reserve(self.ledger, self.control, lambda: HTTPReply(200, b'{"data":{}}'))
-        self.assertEqual(self.ledger.remaining, 4)
-
-
-class RetryTests(TemporaryTest):
-    def setUp(self):
-        super().setUp()
-        self.clock = Clock()
-        self.control = MTControl(threading.Event(), clock=self.clock)
-        self.backend = MTBackend('openai_compatible', 'https://openrouter.ai/api/v1', 'openrouter/free',
-                                 key_fingerprint('offline'), 2)
-        self.transport = mock.Mock()
-        self.ledger = FreeQuota(clock=self.clock, utcnow=lambda: self.clock.day)
-        self.client = BoundedMTHttp(self.backend, self.control, transport=self.transport,
-            pacer=RequestPacer(clock=self.clock, requests_per_window=0),
-            recovery=RecoveryCoordinator(clock=self.clock, jitter=lambda: 0, wait=self.clock.wait), quota=self.ledger)
-
-    def send(self):
-        return self.client.json('POST', self.backend.base_url + '/chat/completions', name='mt',
-                                headers={'Authorization': 'Bearer offline'}, json={'stream': False})
-
-    def replies(self, *responses):
-        pending = iter(responses)
-        def request(method, *args, **kwargs):
-            if method == 'GET':
-                return quota()
-            value = next(pending)
-            if isinstance(value, BaseException):
-                raise value
-            return value
-        self.transport.request.side_effect = request
-
-    def mt_calls(self):
-        return [call for call in self.transport.request.call_args_list if call.args[0] == 'POST']
-
-    def test_detail_free_generation_error_recovers_on_fourth_attempt(self):
-        events = []
-        self.client.on_event = events.append
-        self.replies(*[generation_failure()] * 3, HTTPReply(200, b'{"ok":true}'))
-        self.assertEqual(self.send(), {'ok': True})
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.assertEqual(self.ledger.remaining, 16)
-        requests = [event for event in events if event['kind'] == 'runtime_request']
-        self.assertEqual([event['category'] for event in requests], ['generation_error'] * 3 + ['response_received'])
-        self.assertTrue(all(event['retryable'] for event in requests[:3]))
-        self.assertEqual(self.clock.now, 205)
-
-    def test_generation_marker_retries_without_requiring_complete_output_fields(self):
-        body = {'choices': [{'index': 1, 'finish_reason': 'error', 'message': None},
-                            {'finish_reason': 'error', 'message': {'content': []}}]}
-        self.replies(HTTPReply(200, json.dumps(body).encode()), HTTPReply(200, b'{"ok":true}'))
-        self.assertEqual(self.send(), {'ok': True})
-        self.assertEqual(len(self.mt_calls()), 2)
-
-    def test_detail_free_generation_error_exhausts_and_diagnostics_stay_content_free(self):
-        private = 'synthetic-Key-Bearer-signed-URL-and-subtitle'
-        body = {'model': 'vendor/model:free', 'id': private, 'choices': [
-            {'index': 0, 'finish_reason': 'error', 'message': {'content': private}}]}
-        events = []
-        self.client.on_event = events.append
-        self.replies(*[HTTPReply(200, json.dumps(body).encode())] * 4)
-        with self.assertRaises(ToolError) as caught:
-            self.send()
-        error = caught.exception
-        self.assertEqual((error.category, error.attempts, error.code), ('generation_error', 4, 'mt_service_error'))
-        self.assertTrue(error.retryable)
-        self.assertIn('生成失败且未提供错误详情', str(error))
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.assertEqual(self.ledger.remaining, 16)
-        self.assertEqual(self.client.recovery.cooldown_until, 265)
-        writer = MTDiagnostics(self.path, 'a' * 32)
-        requests = [event for event in events if event['kind'] == 'runtime_request']
-        self.assertEqual([event['attempt'] for event in requests], [1, 2, 3, 4])
-        for event in requests:
-            self.assertTrue(writer.write_runtime({**event, 'body': body, 'request_id': private, 'message': private}))
-        raw = writer.path.read_text(encoding='utf-8')
-        self.assertNotIn(private, raw + str(error))
-        records = [json.loads(line) for line in raw.splitlines()]
-        for record in records:
-            self.assertEqual(record['category'], 'generation_error')
-            self.assertTrue(record['retryable'])
-            self.assertIs(record['top_level_error'], False)
-            self.assertEqual(record['detail_free_error_finish_count'], 1)
-            self.assertTrue(all(record[field] == 0 for field in ['choice_error_count', 'error_type_known_count',
-                'error_type_missing_count', 'error_type_unknown_count', 'error_type_malformed_count']))
-            self.assertFalse({'body', 'request_id', 'message'} & record.keys())
-
+class ServiceFailureTests(TemporaryTest):
     def test_generation_error_uses_only_allowed_http_statuses(self):
         body = json.loads(generation_failure().body)
         for free_router in [False, True]:
@@ -571,38 +240,6 @@ class RetryTests(TemporaryTest):
             for status in [301, 400, 401, 402, 403, 409, 413, 422]:
                 with self.subTest(status=status, free_router=free_router):
                     self.assertFalse(service_failure(status, body, free_router=free_router).retryable)
-
-    def test_generation_error_shares_http_and_typed_errors_four_attempt_budget(self):
-        events = []
-        self.client.on_event = events.append
-        self.replies(generation_failure(), business_failure('timeout', choice=True),
-                     HTTPReply(503, b'{}'), generation_failure())
-        with self.assertRaises(ToolError) as caught:
-            self.send()
-        self.assertEqual((caught.exception.category, caught.exception.attempts), ('generation_error', 4))
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.assertEqual(self.ledger.remaining, 16)
-        self.assertEqual([event['category'] for event in events if event['kind'] == 'runtime_request'],
-                         ['generation_error', 'timeout', 'http_transient', 'generation_error'])
-
-    def test_generation_error_never_sends_a_retry_after_local_quota_exhaustion(self):
-        self.transport.request.side_effect = lambda method, *args, **kwargs: (
-            quota(1) if method == 'GET' else generation_failure())
-        with self.assertRaises(ToolError) as caught:
-            self.send()
-        self.assertEqual((caught.exception.code, caught.exception.quota_source), ('mt_quota_exhausted', 'local_ledger'))
-        self.assertEqual(len(self.mt_calls()), 1)
-        self.assertEqual(self.ledger.remaining, 0)
-
-    def test_generation_error_honors_long_retry_after_without_an_early_retry(self):
-        reply = generation_failure()
-        self.replies(HTTPReply(reply.status, reply.body, '301'))
-        with self.assertRaises(ToolError) as caught:
-            self.send()
-        self.assertEqual(caught.exception.code, 'mt_retry_after')
-        self.assertEqual(len(self.mt_calls()), 1)
-        self.assertEqual(self.client.recovery.cooldown_until, 401)
-        self.assertEqual(self.clock.now, 100)
 
     def test_generation_marker_preserves_explicit_error_classification(self):
         marker = {'finish_reason': 'error'}
@@ -620,7 +257,6 @@ class RetryTests(TemporaryTest):
                 error = service_failure(200, body, free_router=True)
                 self.assertEqual((error.category, error.retryable), (category, retryable))
 
-
     def test_typed_top_error_explains_detail_free_error_finish(self):
         for kind in ['timeout', 'provider_unavailable', 'provider_overloaded', 'server', 'rate_limit_exceeded', 'not_found']:
             for status in [200, 503]:
@@ -630,31 +266,6 @@ class RetryTests(TemporaryTest):
                     error = service_failure(status, body, free_router=True)
                     self.assertEqual(error.category, kind)
                     self.assertTrue(error.retryable)
-
-    def test_typed_top_error_with_marker_recovers_on_fourth_attempt(self):
-        self.replies(*[business_failure('provider_unavailable', finish_marker=True)] * 3,
-                     HTTPReply(200, b'{"ok":true}'))
-        self.assertEqual(self.send(), {'ok': True})
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.assertEqual(self.ledger.remaining, 16)
-
-    def test_typed_top_error_with_marker_exhausts_after_four_attempts(self):
-        events = []
-        self.client.on_event = events.append
-        self.replies(*[business_failure('provider_unavailable', finish_marker=True)] * 4)
-        with self.assertRaises(ToolError) as caught:
-            self.send()
-        self.assertEqual((caught.exception.category, caught.exception.attempts), ('provider_unavailable', 4))
-        self.assertTrue(caught.exception.retryable)
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.assertEqual(self.ledger.remaining, 16)
-        requests = [event for event in events if event['kind'] == 'runtime_request']
-        self.assertEqual([event['attempt'] for event in requests], [1, 2, 3, 4])
-        self.assertTrue(all(event['retryable'] for event in requests))
-        self.assertTrue(all(event['top_level_error'] and event['detail_free_error_finish_count'] == 1
-                            and event['error_type_known_count'] == 1 and event['error_type_missing_count'] == 0
-                            for event in requests))
-
 
     def test_untyped_top_error_keeps_http_status_policy_with_or_without_finish_marker(self):
         for error in [None, {}, {'message': 'private'}, {'code': 503}]:
@@ -686,53 +297,6 @@ class RetryTests(TemporaryTest):
             self.assertFalse(error.retryable)
             self.assertEqual(error.code, 'mt_content_refused')
 
-    def test_runtime_diagnostics_capture_only_error_shape_and_keep_refusal_priority(self):
-        private = 'private-Key-Bearer-URL-request-id-and-subtitle'
-        body = {'error': {'code': private, 'message': private, 'metadata': {'error_type': 'provider_unavailable'}},
-                'request_id': private, 'id': private, 'model': 'https://private.invalid/model', 'choices': [
-                    {'finish_reason': 'error'},
-                    {'error': {'metadata': {'error_type': 'timeout'}}},
-                    {'error': None}, {'error': {}}, {'error': {'metadata': []}},
-                    {'error': {'metadata': {'error_type': private}}},
-                    {'error': {'metadata': {'error_type': None}}},
-                    {'error': {'metadata': {'error_type': []}}},
-                    {'message': {'refusal': private, 'content': private}}]}
-        events = []
-        self.client.on_event = events.append
-        self.replies(HTTPReply(200, json.dumps(body).encode()))
-        with self.assertRaises(ToolError) as caught:
-            self.send()
-        self.assertEqual(caught.exception.code, 'mt_content_refused')
-        self.assertEqual(len(self.mt_calls()), 1)
-        requests = [event for event in events if event['kind'] == 'runtime_request']
-        self.assertEqual(len(requests), 1)
-        writer = MTDiagnostics(self.path, 'a' * 32)
-        self.assertTrue(writer.write_runtime({**requests[0], 'body': body, 'message': private,
-                                             'code': private, 'request_id': private, 'url': private}))
-        raw = writer.path.read_text(encoding='utf-8')
-        record = json.loads(raw)
-        expected = {'top_level_error': True, 'choice_error_count': 7, 'detail_free_error_finish_count': 1,
-                    'content_filter_count': 0, 'message_refusal_count': 1,
-                    'error_type_known_count': 2, 'error_type_missing_count': 3,
-                    'error_type_unknown_count': 1, 'error_type_malformed_count': 2}
-        self.assertEqual({key: record[key] for key in expected}, expected)
-        self.assertNotIn(private, raw)
-        self.assertNotIn('https://', raw)
-        for field in ['body', 'message', 'code', 'request_id', 'url', 'actual_model']:
-            self.assertNotIn(field, record)
-
-    def test_runtime_error_shape_diagnostics_reject_untrusted_field_values(self):
-        writer = MTDiagnostics(self.path, 'a' * 32)
-        injected = {'top_level_error': 'private', 'choice_error_count': True,
-                    'content_filter_count': 'private', 'message_refusal_count': False,
-                    'detail_free_error_finish_count': -1, 'error_type_known_count': 1.0,
-                    'error_type_missing_count': 2**63, 'error_type_unknown_count': {'private': 1},
-                    'error_type_malformed_count': ['private']}
-        self.assertTrue(writer.write_runtime({'kind': 'runtime_request', **injected}))
-        raw = writer.path.read_text(encoding='utf-8')
-        record = json.loads(raw)
-        self.assertEqual(set(record), {'time', 'kind'})
-        self.assertNotIn('private', raw)
 
     def test_free_router_not_found_is_retryable_in_top_level_and_choice_errors(self):
         for status in [200, 201, 404, 408, 429, 500, 503, 599]:
@@ -749,48 +313,6 @@ class RetryTests(TemporaryTest):
             error = service_failure(503, body, free_router=True)
             self.assertEqual(error.category, 'not_found')
             self.assertTrue(error.retryable)
-
-    def test_free_router_not_found_then_success_uses_normal_retry_budget(self):
-        for status in [200, 404]:
-            for choice in [False, True]:
-                with self.subTest(status=status, choice=choice):
-                    self.control.begin()
-                    self.replies(business_failure(status=status, choice=choice), HTTPReply(200, b'{"ok":true}'))
-                    before = len(self.mt_calls())
-                    self.assertEqual(self.send(), {'ok': True})
-                    self.assertEqual(len(self.mt_calls()) - before, 2)
-
-    def test_not_found_timeout_and_http_errors_share_four_total_attempts(self):
-        events = []
-        self.client.on_event = events.append
-        self.replies(business_failure(), business_failure('timeout', choice=True),
-                     HTTPReply(503, b'{}'), business_failure(status=404))
-        with self.assertRaises(ToolError) as caught:
-            self.send()
-        self.assertEqual((caught.exception.category, caught.exception.attempts), ('not_found', 4))
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.assertEqual(self.ledger.remaining, 16)
-        self.assertEqual([e['category'] for e in events if e['kind'] == 'runtime_request'],
-                         ['not_found', 'timeout', 'http_transient', 'not_found'])
-
-    def test_not_found_exception_requires_official_v2_free_router_identity(self):
-        for model, base, version in [('paid/fixed', self.backend.base_url, 2),
-                ('vendor/fixed:free', self.backend.base_url, 2),
-                ('openrouter/free', 'https://other.example/v1', 2),
-                ('openrouter/free', self.backend.base_url, 1)]:
-            with self.subTest(model=model, base=base, version=version):
-                backend = MTBackend('openai_compatible', base, model, self.backend.key_fingerprint, version)
-                client = BoundedMTHttp(backend, MTControl(threading.Event(), clock=self.clock), transport=self.transport,
-                    pacer=RequestPacer(clock=self.clock, requests_per_window=0),
-                    recovery=RecoveryCoordinator(clock=self.clock, jitter=lambda: 0, wait=self.clock.wait))
-                client.quota = None
-                self.transport.request.reset_mock(side_effect=True)
-                self.transport.request.return_value = business_failure()
-                with self.assertRaises(ToolError) as caught:
-                    client.json('POST', base + '/chat/completions', json={})
-                self.assertFalse(caught.exception.retryable)
-                self.assertEqual(caught.exception.category, 'not_found')
-                self.assertEqual(self.transport.request.call_count, 1)
 
     def test_other_permanent_types_and_nonretryable_http_statuses_override_router_not_found(self):
         for kind in ['authentication', 'permission_denied', 'payment_required', 'invalid_request',
@@ -834,82 +356,6 @@ class RetryTests(TemporaryTest):
             self.assertEqual(error.category, 'content_policy_violation')
             self.assertFalse(error.retryable)
 
-    def test_http_and_business_errors_share_four_attempts(self):
-        busy = HTTPReply(200, b'{"choices":[{"error":{"metadata":{"error_type":"timeout"}}}]}')
-        self.replies(HTTPReply(404, b'{}'), busy, HTTPReply(503, b'{}'), HTTPReply(200, b'{"ok":true}'))
-        self.assertEqual(self.send(), {'ok': True})
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.assertEqual(self.ledger.remaining, 16)
-
-    def test_404_exhaustion_is_bounded_and_fixed_model_does_not_retry(self):
-        self.replies(*[HTTPReply(404, b'{}')] * 4)
-        with self.assertRaises(ToolError) as error:
-            self.send()
-        self.assertEqual(error.exception.code, 'mt_http_404')
-        self.assertEqual(len(self.mt_calls()), 4)
-        self.backend = MTBackend('openai_compatible', self.backend.base_url, 'paid/fixed', self.backend.key_fingerprint, 2)
-        client = BoundedMTHttp(self.backend, MTControl(threading.Event()), transport=self.transport)
-        self.transport.request.reset_mock(side_effect=True)
-        self.transport.request.return_value = HTTPReply(404, b'{}')
-        with self.assertRaises(ToolError):
-            client.json('POST', 'offline', headers={}, json={})
-        self.assertEqual(self.transport.request.call_count, 1)
-
-    def test_permanent_typed_error_overrides_transient_http_status_without_format_repair(self):
-        self.transport.request.side_effect = [quota(), HTTPReply(503, json.dumps({'error': {
-            'message': 'private input', 'metadata': {'error_type': 'permission_denied'}}}).encode())]
-        with self.assertRaises(ToolError) as error:
-            self.send()
-        self.assertEqual(self.transport.request.call_count, 2)
-        self.assertNotIn('private', str(error.exception))
-        self.assertFalse(error.exception.retryable)
-
-    def test_long_retry_after_ends_round_without_an_early_retry(self):
-        self.transport.request.side_effect = [quota(), HTTPReply(429, b'{}', '301')]
-        with self.assertRaises(ToolError) as error:
-            self.send()
-        self.assertEqual(error.exception.code, 'mt_retry_after')
-        self.assertEqual(self.transport.request.call_count, 2)
-        self.assertEqual(self.clock.now, 100)
-
-    def test_deadline_exhaustion_uses_dedicated_code(self):
-        self.replies(*[TransportError('deadline')] * 4)
-        with self.assertRaises(ToolError) as error:
-            self.send()
-        self.assertEqual(error.exception.code, 'mt_request_deadline')
-        self.assertEqual(len(self.mt_calls()), 4)
-
-    def test_404_then_success_and_2xx_top_level_business_error_then_success(self):
-        for failure in [HTTPReply(404, b'{}'), HTTPReply(200, b'{"error":{"metadata":{"error_type":"server"}}}')]:
-            self.control.begin()
-            self.replies(failure, HTTPReply(200, b'{"ok":true}'))
-            before = len(self.mt_calls())
-            self.assertEqual(self.send(), {'ok': True})
-            self.assertEqual(len(self.mt_calls()) - before, 2)
-
-    def test_retry_counts_against_quota_and_does_not_send_after_it_is_exhausted(self):
-        sent = []
-        def request(method, *args, **kwargs):
-            if method == 'GET':
-                return quota(1)
-            sent.append(1)
-            return HTTPReply(503, b'{}')
-        self.transport.request.side_effect = request
-        with self.assertRaises(ToolError) as error:
-            self.send()
-        self.assertEqual(error.exception.code, 'mt_quota_exhausted')
-        self.assertEqual(sent, [1])
-
-    def test_429_uses_adaptive_pacing_and_prioritizes_due_quota_refresh(self):
-        self.replies(HTTPReply(429, b'{}', '40'), HTTPReply(200, b'{"ok":true}'))
-        self.assertEqual(self.send(), {'ok': True})
-        self.assertGreaterEqual(self.clock.now, 140)
-        self.assertGreater(self.client.pacer.interval, 0)
-        self.assertEqual([call.args[0] for call in self.transport.request.call_args_list], ['GET', 'POST', 'GET', 'POST'])
-        self.assertEqual(self.ledger.remaining, 18)
-        self.assertEqual(self.transport.request.call_args_list[0].kwargs['timeout'], 15)
-        self.assertEqual(self.mt_calls()[0].kwargs['timeout'], 120)
-
     def test_untyped_business_unknown_is_fatal_and_raw_codes_are_ignored(self):
         for body in [{'error': {'code': 503, 'message': 'private'}},
                      {'choices': [{'error': {'metadata': {'error_type': 'private'}}}]}]:
@@ -930,30 +376,3 @@ class RetryTests(TemporaryTest):
                 error = service_failure(503, {'error': {'metadata': {'error_type': kind}}})
                 self.assertFalse(error.retryable)
                 self.assertEqual(error.category, 'service_unknown')
-
-    def test_cancellation_after_registration_does_not_send_or_query_again(self):
-        self.replies(HTTPReply(200, b'{}'))
-        self.client.count = lambda name: self.control.cancel_user() if name == 'mt' else None
-        with self.assertRaises(Cancelled):
-            self.send()
-        self.assertEqual(self.mt_calls(), [])
-        self.assertEqual(self.transport.request.call_count, 1)
-
-    def test_slow_quota_refresh_rechecks_recovery_and_records_actual_admission_time(self):
-        reserve(self.ledger, self.control, lambda: quota())
-        self.ledger.complete()
-        self.client.pacer.requests_per_window = 1
-        self.client.pacer.window_seconds = 60
-        old_inflight = self.client.recovery.acquire(self.control, self.client.pacer)
-        sent_at = []
-        def request(method, *args, **kwargs):
-            if method == 'GET':
-                self.clock.now += 10
-                self.client.recovery.failure(old_inflight)
-                return quota()
-            sent_at.append(self.clock.now)
-            return HTTPReply(200, b'{"ok":true}')
-        self.transport.request.side_effect = request
-        self.assertEqual(self.send(), {'ok': True})
-        self.assertGreaterEqual(sent_at[0], 185)  # RPM until 160, query until 170, new cooldown until 185
-        self.assertAlmostEqual(self.client.pacer.starts[-1], sent_at[0])

@@ -12,7 +12,7 @@ from unittest import mock
 from subtitle_tool.common import Cancelled
 from subtitle_tool.mt_backend import MTBackend, OPENROUTER_BASE_URL
 from subtitle_tool.mt_control import MTControl
-from subtitle_tool.mt_quota_v5 import V5Quota
+from subtitle_tool.mt_quota import OpenRouterQuota
 from subtitle_tool.mt_routing import CacheHit, MTRouter, RouteEntry, RouteFailure
 from subtitle_tool.mt_runtime import FreeQuota, reset_quota_for_resume
 from subtitle_tool.mt_transport import HTTPReply, TransportError
@@ -41,17 +41,17 @@ def quota_reply(remaining):
         'used': 10 - remaining, 'limit': 10, 'remaining': remaining}, 'private': 'DO-NOT-LOG'}}).encode())
 
 
-class QuotaV5Tests(unittest.TestCase):
+class QuotaTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.control = MTControl(threading.Event(), clock=self.clock)
-        self.ledger = FreeQuota(clock=self.clock, utcnow=lambda: self.clock.day, wait=self.clock.wait)
+        self.ledger = FreeQuota(clock=self.clock, utcnow=lambda: self.clock.day)
         self.reply = quota_reply(4)
         self.requests = []
         self.events = []
         self.transport = mock.Mock()
         self.transport.request.side_effect = self.fetch
-        self.quota = V5Quota(self.control, lambda entry: 'synthetic-key', clock=self.clock,
+        self.quota = OpenRouterQuota(self.control, lambda entry: 'synthetic-key', clock=self.clock,
                              transport=self.transport, ledger_for=lambda backend: self.ledger,
                              on_event=self.events.append)
         self.free = candidate()
@@ -113,15 +113,19 @@ class QuotaV5Tests(unittest.TestCase):
         self.assertIn('quota_refresh_failed', [event.get('category') for event in self.events])
         self.assertNotIn('private response', repr(self.events))
 
-    def test_legacy_and_v5_share_refresh_accounting_for_inflight_requests(self):
-        legacy_events = []
-        self.ledger.ensure(self.control, lambda: self.reply, on_event=legacy_events.append)
-        self.assertTrue(self.ledger.try_reserve(self.control))
+    def test_refresh_subtracts_existing_and_new_inflight_requests(self):
+        from contextlib import ExitStack
+        active = ExitStack()
+        self.addCleanup(active.close)
+        first = active.enter_context(self.quota.reserve(self.free, 15))
+        first.claim()
+        first.mark_sent()
         self.clock.now += 31
 
         def fetch_during_refresh(*args, **kwargs):
-            # A legacy request may reserve while the v5 observation is in flight.
-            self.assertTrue(self.ledger.try_reserve(self.control))
+            second = active.enter_context(self.quota.reserve(self.free, 15))
+            second.claim()
+            second.mark_sent()
             return quota_reply(4)
 
         self.transport.request.side_effect = fetch_during_refresh
@@ -130,10 +134,8 @@ class QuotaV5Tests(unittest.TestCase):
             reservation.claim()
             reservation.mark_sent()
         self.assertEqual((self.ledger.remaining, self.ledger.inflight), (1, 2))
-        self.ledger.complete()
-        self.ledger.complete()
+        active.close()
         self.assertEqual(self.ledger.inflight, 0)
-        self.assertEqual(legacy_events[0]['local_remaining'], 4)
         self.assertEqual(self.events[-1], {'kind': 'runtime_quota', 'category': 'quota_observed'})
 
     def test_no_dispatch_after_claim_refunds_before_paid_fallback(self):
@@ -158,7 +160,7 @@ class QuotaV5Tests(unittest.TestCase):
         ledger = FreeQuota()
         transport = mock.Mock()
         transport.request.return_value = quota_reply(3)
-        quota = V5Quota(control, lambda entry: 'synthetic-key', transport=transport,
+        quota = OpenRouterQuota(control, lambda entry: 'synthetic-key', transport=transport,
                         ledger_for=lambda backend: ledger)
         with quota.reserve(self.free, 15) as reservation:
             reservation.claim()
@@ -184,7 +186,7 @@ class QuotaV5Tests(unittest.TestCase):
 
         clock = TickingClock()
         control = MTControl(threading.Event(), clock=clock)
-        quota = V5Quota(control, lambda entry: self.fail('no key needed'), clock=clock)
+        quota = OpenRouterQuota(control, lambda entry: self.fail('no key needed'), clock=clock)
         qiniu = RouteEntry('qiniu', MTBackend('qiniu', 'https://api.qnaigc.com/v1',
                                             'qiniu/conatus-free', 'b' * 64, 5), 'free')
         paid = candidate('paid', model='openrouter/paid', tier='paid')
@@ -305,7 +307,7 @@ class QuotaV5Tests(unittest.TestCase):
         control = MTControl(threading.Event())
         transport = mock.Mock()
         transport.request.side_effect = [quota_reply(0), quota_reply(2)]
-        quota = V5Quota(control, lambda entry: 'synthetic-key', transport=transport)
+        quota = OpenRouterQuota(control, lambda entry: 'synthetic-key', transport=transport)
         with mock.patch.dict('subtitle_tool.mt_runtime._QUOTAS', clear=True):
             with self.assertRaises(RouteFailure) as exhausted:
                 with quota.reserve(self.free, 15):
@@ -343,7 +345,7 @@ class QuotaV5Tests(unittest.TestCase):
                 time.sleep(.03)
                 return quota_reply(2)
 
-        quota = V5Quota(control, lambda entry: 'synthetic-key', transport=Transport(),
+        quota = OpenRouterQuota(control, lambda entry: 'synthetic-key', transport=Transport(),
                         ledger_for=lambda backend: ledger)
         routes = [candidate('a'), candidate('b', model='vendor/model:free')]
 

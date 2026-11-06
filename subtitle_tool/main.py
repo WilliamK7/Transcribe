@@ -10,13 +10,10 @@ import threading
 import time
 from pathlib import Path
 
-from .common import ASR_MODEL, DISPLAY_TIMING_VERSION, MT_MODEL, ToolError, validate_workspace_id
-from .config import Config, Settings
+from .common import ASR_MODEL, ToolError, validate_workspace_id
+from .config import Config
 from .engine import Engine
 from .instance import ProcessLock
-from .mt_backend import configured_mt
-from .mt_fallback import fallback_policy, saved_fallback
-from .policy import display_timing_version, load_policy
 from .reports import ReportWriter
 from .store import STATES, Store
 from .review import MT_LANGUAGES, ReviewDecision
@@ -31,6 +28,7 @@ def parser():
     actions.add_argument("--retime", metavar="JOB_ID", help="复用最终字幕和译文，仅升级显示时间；覆盖须搭配 --overwrite")
     actions.add_argument("--review", metavar="JOB_ID", help="终端确认音轨、声道或逐条语种后继续")
     actions.add_argument("--jobs", action="store_true", help="列出任务（每行 JSON）")
+    actions.add_argument("--export-archive", metavar="JOB_ID", help="校验并导出归档字幕，须指定 --output-dir")
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
     actions.add_argument("--configure", action="store_true", help="配置 Workspace ID 和隐藏输入 Key")
     actions.add_argument("--configure-key", action="store_true", help="隐藏输入 Key，明文保存到 data/key.txt")
@@ -62,8 +60,6 @@ def parser():
     result.add_argument("--channel", choices=["mix", "left", "right"], help="明确混音／首声道／第二声道")
     result.add_argument("--output-dir", type=Path, help="显式选择输出目录，默认视频同目录")
     result.add_argument("--non-interactive", action="store_true", help="不询问；遇歧义持久化待复核状态并非零退出")
-    result.add_argument('--mt-fallback', choices=['none', 'bailian'],
-                        help='OpenRouter 的百炼后备；新任务及恢复默认启用，百炼可能产生费用')
     result.add_argument('--mt-paid', choices=['allow', 'deny'],
                         help='翻译池是否允许付费候选；新任务默认 allow')
     result.add_argument("--report", type=Path, help="保存结构化结果，不包含 Key、上传链接或转写文字")
@@ -102,29 +98,6 @@ class Progress:
                 message = f"音频：{method}，{done['codec']}/{done['container']}，{done['segments']} 段，{done['bytes']:,} 字节；{done['reason']}"
             elif stage == "retry":
                 message = f"网络重试 {done}/{total}，有限退避"
-            elif stage == "mt_service_wait":
-                message = f"翻译服务暂不可用，共享等待 {done:.1f} 秒后先尝试一个请求"
-            elif stage == 'mt_fallback':
-                reasons = {'quota_exhausted': '服务端观测免费额度不足，本轮剩余组转百炼',
-                           'quota_local_empty': '本地免费可用余量归零，本轮剩余组转百炼',
-                           'format_exhausted': '译文结构或覆盖校验失败，当前原组转百炼',
-                           'content_refused': '主后端明确拒绝生成，当前完整组直接转百炼',
-                           'retry_after': '要求等待超过 300 秒，当前组转百炼'}
-                failure = {'deadline': '仍超时', 'timeout': '上游仍超时', 'network': '网络连接仍失败',
-                           'rate_limit_exceeded': '仍被限流', 'provider_overloaded': '上游仍过载',
-                           'provider_unavailable': '上游仍不可用'}.get(done['category'], '临时服务故障仍未恢复')
-                message = 'OpenRouter ' + reasons.get(done['reason'],
-                    f"本请求已尝试 {done['attempt']}/4 次，{failure}；当前组转百炼") + '（可能产生费用）'
-            elif stage == "mt_cooldown":
-                message = f"翻译限流：共享冷却增加 {done:.2f} 秒，请求间隔 {total:.2f} 秒"
-            elif stage == "mt_quota_wait":
-                message = f"翻译配额等待：约 {done:.2f} 秒，滚动窗口最多 {total} 次请求"
-            elif stage == "mt_recovery":
-                message = (f"翻译提速：请求间隔 {done:.2f} → {total:.2f} 秒" if total else
-                           f"翻译提速：请求间隔 {done:.2f} 秒，恢复无额外间隔")
-            elif stage == 'mt_split':
-                message = (f"批量译文校验失败：缩小翻译请求，{done} 片按 {done // 2}＋{done - done // 2} 片顺序重试；"
-                           "字幕分段和时间保持不变")
             elif stage == 'mt_quota_login':
                 message = ('百炼额度查询的控制台会话失效，暂时跳过百炼免费候选；'
                            '请用 bl auth login --console 重新登录并更新本机绑定。')
@@ -135,7 +108,7 @@ class Progress:
                          'align': '字幕对齐', 'review': '译文复核', 'correct': '译文修正'}
                 parts = [f"{names[name]} {count} 组" for name, count in done['stages'].items() if name in names]
                 message = f"翻译进行中：{'、'.join(parts)}；当前阶段最长 {done['elapsed']} 秒"
-            elif stage in {"translating", "reference_translating", "subtitle_translating"} and total is not None:
+            elif stage == "subtitle_translating" and total is not None:
                 message = f"{STATES[stage]}／已处理 {done}/{total}"
             elif stage == "layout_adjusting" and total is not None:
                 message = f"排版调整 {done}/{total}"
@@ -223,13 +196,9 @@ def summary(store, job_id):
             "layout_round": manifest.get("layout_round", 0), "warnings": manifest.get("warnings", []),
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
     mt = manifest.get("mt_snapshot", {})
-    item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", MT_MODEL)}
+    item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", manifest.get("contract", {}).get("mt"))}
     item["mt_provider"] = mt.get("provider", "bailian")
-    if 'mt_fallback_policy' in manifest:
-        fallback = saved_fallback(manifest)
-        item['mt_fallback'] = {'enabled': manifest['mt_fallback_policy']['enabled'],
-                               'provider': fallback.provider, 'model': fallback.model}
-    if 'mt_route_snapshot' in manifest:
+    if 'mt_route_snapshot' in manifest and not manifest.get('archived'):
         from .mt_pool import saved_route
         route = saved_route(manifest)
         item['mt_route'] = {'paid_enabled': route['routing']['paid_enabled'],
@@ -240,9 +209,6 @@ def summary(store, job_id):
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
     counts = item["counts"]
     item["timings"] = {"run_seconds": counts.get("run_ms", 0) / 1000,
-                       "mt_cooldown_seconds": counts.get("mt_cooldown_ms", 0) / 1000,
-                       "mt_shared_wait_seconds": counts.get("mt_shared_wait_ms", 0) / 1000,
-                       "mt_pacing_wait_seconds": counts.get("mt_pacing_wait_ms", 0) / 1000,
                        "stages_seconds": {k[6:-3]: v / 1000 for k, v in counts.items()
                                           if k.startswith("stage_") and k.endswith("_ms")}}
     if manifest.get("reflow"):
@@ -254,22 +220,6 @@ def summary(store, job_id):
         item["audio"]["segments"] = len(manifest["segments"])
         item["audio"]["bytes"] = sum(s.get("bytes", 0) for s in manifest["segments"])
     return item
-
-
-def can_retime(store, job):
-    if job['state'] != 'failed' or job['error_code'] != 'timeline':
-        return False
-    try:
-        manifest = job['manifest']
-        if display_timing_version(manifest) >= DISPLAY_TIMING_VERSION:
-            return False
-        cues = store.cues(job['id'])
-        Engine.validate_retime_ready(manifest, cues)
-        settings = Engine.retime_settings(manifest, load_policy(manifest, verify_execution=False).settings(Settings()))
-        Engine.render_subtitles(cues, settings, {**manifest, 'display_timing_version': DISPLAY_TIMING_VERSION})
-        return True
-    except (ToolError, KeyError, ValueError, TypeError):
-        return False
 
 
 def hint(store, job_id):
@@ -286,8 +236,6 @@ def hint(store, job_id):
     elif job["state"] == "submission_unknown":
         print(f"绑定已知 ID：{command} --bind-task-id 云端任务ID\n"
               f"明确接受可能重复计费后重发：{command} --allow-resubmit", file=sys.stderr)
-    elif can_retime(store, job):
-        print(f'译文已完成，可用 --retime 仅校时：.\\scripts\\transcribe.ps1 --retime {job_id}', file=sys.stderr)
     elif job["state"] in {"failed", "cancelled", "queued"}:
         print("恢复命令：" + command, file=sys.stderr)
 
@@ -297,7 +245,7 @@ def main(argv=None):
     args = argument_parser.parse_args(argv)
     action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.cancel or args.configure or
               args.configure_key or args.configure_mt or args.check_mt or args.inspect_bailian_quota or args.self_test or
-              args.configure_mt_pool or args.bind_bailian_account or args.confirm_bailian_protection)
+              args.configure_mt_pool or args.bind_bailian_account or args.confirm_bailian_protection or args.export_archive)
     if args.confirm_same_account != bool(args.bind_bailian_account):
         raise ToolError('绑定百炼 CLI 时必须明确附带 --confirm-same-account。', 'input')
     if args.confirm_propagation_waited != bool(args.confirm_bailian_protection):
@@ -321,8 +269,6 @@ def main(argv=None):
     if (args.reflow or args.retime) and (args.track is not None or args.channel is not None):
         raise ToolError("重排／校时沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
     config = Config()
-    if args.mt_fallback is not None and not (args.files or args.resume or args.reflow):
-        raise ToolError('--mt-fallback 仅用于新任务、--resume 或 --reflow。', 'input')
     if args.mt_paid is not None and not (args.files or args.resume or args.reflow or args.check_mt):
         raise ToolError('--mt-paid 仅用于新任务、--resume、--reflow 或 --check-mt。', 'input')
     if args.workspace_id is not None:
@@ -405,37 +351,18 @@ def main(argv=None):
             print('七牛 Key 已明文保存到 data/qiniu-key.txt，并选择翻译池；环境变量 QINIU_API_KEY 仍优先。', file=sys.stderr)
             return 0
         if args.check_mt:
-            from .api import OpenAICompatible
-            from .mt_backend import MTBackend, QINIU_BASE_URL, QINIU_FREE_MODEL, key_fingerprint
-            from .mt_pool import configured_route, is_pool_config
-            if args.check_mt == 'configured' and is_pool_config(config):
-                from .mt_pipeline_v5 import check_pool
-                workspace = validate_workspace_id(config.settings.workspace_id)
-                account = key_fingerprint(config.get_key())
-                identity = {'region': 'beijing', 'workspace_id': workspace, 'access_mode': 'workspace',
-                            'account': account}
-                route = configured_route(config, identity,
-                                         paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
-                if route['routing']['paid_enabled']:
-                    print('在线检查可能使用付费翻译候选；可用 --mt-paid deny 禁止付费请求。', file=sys.stderr)
-                print(json.dumps(check_pool(config, identity, route, cancel), ensure_ascii=False))
-                return 0
-            if args.mt_paid is not None:
-                raise ToolError('--mt-paid 仅用于翻译池；单后端检查不使用此参数。', 'mt_config')
+            from dataclasses import replace
+            from .mt_backend import key_fingerprint
+            from .mt_pool import configured_route
+            from .mt_pipeline import check_pool
+            identity = {'region': 'beijing', 'workspace_id': validate_workspace_id(config.settings.workspace_id),
+                        'access_mode': 'workspace', 'account': key_fingerprint(config.get_key())}
             if args.check_mt == 'qiniu':
-                key = config.get_qiniu_key()
-                backend = MTBackend('qiniu', QINIU_BASE_URL, QINIU_FREE_MODEL, key_fingerprint(key), 4)
-            else:
-                workspace = config.settings.workspace_id
-                if config.mt_settings().mt_provider == 'bailian':
-                    workspace = validate_workspace_id(workspace)
-                backend = configured_mt(config, {'region': 'beijing', 'workspace_id': workspace,
-                                                  'access_mode': 'workspace'})
-                key = backend.credential(config)
-            cloud = OpenAICompatible(key, backend, cancel,
-                                     rpm=config.mt_rpm() if backend.provider == 'openai_compatible' else 0)
-            cloud.translate_batch(['A cache stores a previously computed result.'], 'English')
-            print(json.dumps({'status': 'ok', 'provider': backend.provider, 'model': backend.model}, ensure_ascii=False))
+                config.settings = replace(config.settings, mt_provider='pool', mt_backends=[{'id': 'qiniu_free'}])
+            route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
+            if route['routing']['paid_enabled']:
+                print('在线检查可能使用付费翻译候选；可用 --mt-paid deny 禁止付费请求。', file=sys.stderr)
+            print(json.dumps(check_pool(config, identity, route, cancel), ensure_ascii=False))
             return 0
         if args.configure or args.configure_key:
             if not interactive:
@@ -455,13 +382,23 @@ def main(argv=None):
             print(json.dumps(result, ensure_ascii=False))
             return 0
         if args.report:
-            report_writer = ReportWriter(config, args.report, inputs=args.files, output_dir=args.output_dir,
-                                         job_id=args.resume or args.reflow or args.retime or args.review)
+            protected_inputs = list(args.files)
+            if args.export_archive and args.output_dir is not None:
+                protected_inputs.append(args.output_dir / (args.export_archive + '.srt'))
+            report_writer = ReportWriter(config, args.report, inputs=protected_inputs, output_dir=args.output_dir,
+                                         job_id=args.resume or args.reflow or args.retime or args.review or args.export_archive)
             report_writer.validate()
         store = Store(config.data / "jobs.sqlite")
         progress = Progress()
         engine = Engine(config, store, cancel, progress)
         engine.recover_jobs()
+        if args.export_archive:
+            from .archives import export_archive
+            item = export_archive(config, args.export_archive, args.output_dir, overwrite=args.overwrite)
+            print(json.dumps(item, ensure_ascii=False))
+            if report_writer:
+                report_writer.write([item])
+            return 0
         if args.jobs:
             report = [summary(store, j["id"]) for j in store.jobs()]
             for item in report:
@@ -507,14 +444,15 @@ def main(argv=None):
                     job["manifest"].get("workspace_id") != config.settings.workspace_id):
                 raise ToolError("恢复沿用任务原接入方式和工作空间；--workspace-id 不能迁移旧任务。", "cache_mismatch")
             if args.reflow:
-                engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir,
-                              mt_fallback=args.mt_fallback, mt_paid=args.mt_paid)
+                current_job = engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir,
+                                            mt_paid=args.mt_paid)
+                ids = [current_job]
             elif args.retime:
                 engine.retime(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
             elif args.resume:
                 engine.resume(current_job, track=args.track, channel=args.channel, output_dir=args.output_dir,
                               overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit,
-                              mt_fallback=args.mt_fallback, mt_paid=args.mt_paid)
+                              mt_paid=args.mt_paid)
             else:
                 engine.select_input(current_job, args.track, args.channel)
                 if args.overwrite or args.output_dir:
@@ -524,27 +462,13 @@ def main(argv=None):
             key = config.get_key()
             account = hashlib.sha256(key.encode()).hexdigest()
             identity = {'region': 'beijing', 'workspace_id': workspace, 'access_mode': 'workspace', 'account': account}
-            from .mt_pool import configured_route, is_pool_config
-            route = None
-            if is_pool_config(config):
-                if args.mt_fallback is not None:
-                    raise ToolError('翻译池请使用 --mt-paid allow|deny，不支持 --mt-fallback。', 'mt_config')
-                route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
-                snapshot = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
-                policy = None
-            else:
-                if args.mt_paid is not None:
-                    raise ToolError('--mt-paid 仅用于翻译池；旧单后端使用 --mt-fallback。', 'mt_config')
-                mt = configured_mt(config, identity, asr_key=key)
-                snapshot = mt.snapshot()
-                policy = fallback_policy({**identity, 'translation_strategy_version': mt.translation_strategy_version,
-                                          'mt_snapshot': snapshot}, args.mt_fallback)
+            from .mt_pool import configured_route
+            route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
+            snapshot = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
             for source in args.files:
                 job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
                                        workspace_id=workspace, account=account, settings=config.settings, mt_snapshot=snapshot,
-                                       mt_fallback_policy=policy, mt_route_snapshot=route)
-                if route is None:
-                    engine.configure_fallback(job_id, args.mt_fallback)
+                                       mt_route_snapshot=route)
                 engine.select_input(job_id, args.track, args.channel)
                 if job_id not in ids:
                     ids.append(job_id)
@@ -561,9 +485,6 @@ def main(argv=None):
             else:
                 if manifest.get('retime'):
                     print('仅校时：使用本地已保存的字幕和译文，无需调用云端。',
-                          file=sys.stderr, flush=True)
-                elif manifest.get('mt_fallback_policy', {}).get('enabled'):
-                    print(f'已启用按组百炼后备（{saved_fallback(manifest).model}），可能产生费用；可用 --mt-fallback none 关闭后续后备。',
                           file=sys.stderr, flush=True)
                 elif manifest.get('mt_route_snapshot', {}).get('routing', {}).get('paid_enabled'):
                     print('已启用翻译池付费候选，可能产生费用；可用 --mt-paid deny 禁止付费请求。',

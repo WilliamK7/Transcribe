@@ -15,7 +15,7 @@ from subtitle_tool.mt_routing import RouteFailure
 from tests.fixtures import SavedResultFixture, result, timed_raw
 
 
-class V5PipelineTests(SavedResultFixture):
+class PoolPipelineTests(SavedResultFixture):
     def setUp(self):
         super().setUp()
         self.config.set_qiniu_key('synthetic-qiniu')
@@ -32,7 +32,7 @@ class V5PipelineTests(SavedResultFixture):
         self.quota_queries = 0
         self.stage_hook = None
 
-    def run_v5(self, cancel=None, engine=None):
+    def run_pool(self, cancel=None, engine=None, run=None):
         parent = self
         class Transport:
             def request(self, method, url, **kwargs):
@@ -74,9 +74,8 @@ class V5PipelineTests(SavedResultFixture):
                     cancel.set()
                 return HTTPReply(200, json.dumps(response, ensure_ascii=False).encode('utf-8'))
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()), \
-             mock.patch('subtitle_tool.mt_runtime.ProcessTransport', return_value=Transport()), \
              mock.patch('subtitle_tool.mt_backend.qiniu_free_active', return_value=True):
-            return (engine or Engine(self.config, self.store, cancel)).run(self.job_id)
+            return run() if run is not None else (engine or Engine(self.config, self.store, cancel)).run(self.job_id)
 
     def install(self):
         self.save_result(result(('A cache stores a result.', 'en'), ('The next call reuses it.', 'en')))
@@ -84,9 +83,90 @@ class V5PipelineTests(SavedResultFixture):
         manifest = self.store.job(self.job_id)['manifest']
         self.assertEqual(manifest['translation_strategy_version'], 5)
 
+    def test_unchanged_stage_reads_each_cache_miss_once(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        with mock.patch.object(self.store, 'cache_get', wraps=self.store.cache_get) as lookup:
+            self.assertEqual(self.run_pool(), 'completed')
+        keys = [call.args[0] for call in lookup.call_args_list]
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(len(set(keys)), 4)
+        self.assertEqual(len(keys), 4)
+
+    def test_cli_sigint_saves_inflight_draft_and_starts_no_later_stage(self):
+        import _thread
+        from subtitle_tool.main import main
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        observed = threading.Event()
+        request_cancel = Engine.request_cancel
+        def cancel(engine, **kwargs):
+            request_cancel(engine, **kwargs)
+            observed.set()
+        def interrupt(stage, data):
+            if stage == 'draft':
+                _thread.interrupt_main()
+                self.assertTrue(observed.wait(3))
+        self.stage_hook = interrupt
+        with mock.patch('subtitle_tool.main.Config', return_value=self.config), \
+                mock.patch.object(Engine, 'request_cancel', new=cancel), \
+                mock.patch('sys.stdout', new_callable=io.StringIO), \
+                mock.patch('sys.stderr', new_callable=io.StringIO):
+            code = self.run_pool(run=lambda: main(['--resume', self.job_id, '--non-interactive']))
+        self.assertEqual(code, 130)
+        self.assertEqual(self.store.job(self.job_id)['state'], 'cancelled')
+        self.assertEqual([stage for stage, _, _ in self.calls], ['glossary', 'draft'])
+        self.assertEqual({row['stage'] for row in self.store.mt_stages(self.job_id)}, {'glossary', 'draft'})
+
+    def test_review_cache_prefers_other_backend_even_when_paid_network_is_denied(self):
+        from subtitle_tool.mt_pipeline import Pipeline
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}, {'id': 'qiniu_paid'}]
+        self.config.settings.mt_routing = {'paid_enabled': False}
+        self.install()
+        manifest = self.store.job(self.job_id)['manifest']
+        engine = Engine(self.config, self.store)
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
+        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'draft': {'0': '缓存。'},
+                'fragments': [{'id': '0', 'sentence': '0', 'text': 'Cache.'}],
+                'translations': {'0': '缓存。'}, 'glossary': []}
+        cached = json.dumps({'value': {'issues': []}, 'actual_model': 'synthetic', 'usage': None})
+        with mock.patch.object(self.store, 'cache_get', return_value=cached), \
+                mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected HTTP')):
+            value, origin, _ = pipeline.stage('review', data, ids=['0'], prefer='qiniu_free')
+        self.assertEqual(value, {'issues': []})
+        self.assertEqual(origin, 'qiniu_paid')
+        self.assertEqual(self.store.counts(self.job_id), {'mt_v5_review_cache_hit': 1})
+
+    def test_trimmed_input_can_still_reuse_its_exact_persistent_cache(self):
+        from subtitle_tool.mt_pipeline import Pipeline
+        from subtitle_tool.mt_quality import stage_cache_key
+        self.config.settings.mt_backends = [{'id': 'qiniu_free', 'capabilities': {'input_bytes': 3000}}]
+        self.install()
+        manifest = self.store.job(self.job_id)['manifest']
+        engine = Engine(self.config, self.store)
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
+        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': []}
+        entry = pipeline.router.entries[0]
+        key = stage_cache_key('draft', data, entry.backend,
+                              capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.scope,
+                              prompt_version=pipeline.prompt_version)
+        record = {'value': {'translations': {'0': '缓存。'}}, 'actual_model': 'synthetic', 'usage': None}
+        with self.store.db:
+            self.store.db.execute('INSERT INTO mt_cache VALUES(?,?)', (key, json.dumps(record)))
+        data['context'] = [{'position': 'before', 'text': 'synthetic background ' * 200}]
+        with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected HTTP')), \
+                mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
+            value, origin, _ = pipeline.stage('draft', data, ids=['0'], originals=['Cache.'])
+        self.assertEqual(value, record['value'])
+        self.assertEqual(origin, 'qiniu_free')
+        self.assertEqual(self.store.counts(self.job_id), {'mt_v5_draft_cache_hit': 1})
+        self.assertTrue(data['context'])
+
     def test_stages_complete_and_record_private_provenance(self):
         self.install()
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         names = [stage for stage, _, _ in self.calls]
         self.assertEqual(names.count('glossary'), 1)
         self.assertEqual(names.count('draft'), 1)
@@ -102,28 +182,6 @@ class V5PipelineTests(SavedResultFixture):
             self.assertEqual(final['actual_model'], production['record']['actual_model'])
             self.assertEqual(final['backend'], production['record']['backend'])
 
-    def test_old_prompt_resumes_saved_draft_and_reflow_selects_new_prompt(self):
-        self.install()
-        manifest = self.store.job(self.job_id)['manifest']
-        self.assertEqual(manifest['execution_snapshot']['prompt_version'], 2)
-        manifest['execution_snapshot']['prompt_version'] = 1
-        self.store.update(self.job_id, manifest=manifest)
-        cancel = threading.Event()
-        self.cancel_after = 'draft'
-        self.assertEqual(self.run_v5(cancel), 'cancelled')
-        saved = {item['key']: item for item in self.store.mt_stages(self.job_id)}
-        self.assertEqual({item['stage'] for item in saved.values()}, {'glossary', 'draft'})
-        self.cancel_after = None
-        self.calls.clear()
-        self.store.update(self.job_id, 'queued')
-        self.assertEqual(self.run_v5(), 'completed')
-        self.assertEqual([stage for stage, _, _ in self.calls], ['align', 'review'])
-        self.assertEqual(self.store.job(self.job_id)['manifest']['execution_snapshot']['prompt_version'], 1)
-        for key, item in saved.items():
-            self.assertEqual(self.store.mt_stage_entry(self.job_id, key),
-                             {'stage': item['stage'], 'record': item['record']})
-        Engine(self.config, self.store).reflow(self.job_id, output_dir=self.path / 'new-prompt')
-        self.assertEqual(self.store.job(self.job_id)['manifest']['execution_snapshot']['prompt_version'], 2)
 
     def test_first_group_is_saved_while_later_glossary_request_is_blocked(self):
         self.save_result(result(*[(f'Technical sentence {i}.', 'en') for i in range(9)]))
@@ -145,7 +203,7 @@ class V5PipelineTests(SavedResultFixture):
         outcome = []
         def run():
             try:
-                outcome.append(self.run_v5())
+                outcome.append(self.run_pool())
             except BaseException as error:
                 outcome.append(error)
 
@@ -166,7 +224,7 @@ class V5PipelineTests(SavedResultFixture):
     def test_review_service_failure_keeps_complete_translation_and_safe_warning(self):
         self.install()
         self.review_failure = True
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
         warnings = self.store.job(self.job_id)['manifest']['warnings']
         self.assertTrue(any('复核' in warning for warning in warnings))
@@ -177,48 +235,23 @@ class V5PipelineTests(SavedResultFixture):
         self.assertNotIn('A cache', diagnostic)
         self.assertNotIn('qiniu-synthetic', diagnostic)
 
-    def test_old_partial_draft_retains_global_glossary_and_reuses_saved_stage(self):
-        self.install()
-        cancel = threading.Event()
-        self.cancel_after = 'draft'
-        self.assertEqual(self.run_v5(cancel), 'cancelled')
-        manifest = self.store.job(self.job_id)['manifest']
-        manifest.pop('mt_glossary_schedule')
-        self.store.update(self.job_id, manifest=manifest)
-        self.cancel_after = None
-        self.calls.clear()
-        Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'completed')
-        self.assertEqual(self.store.job(self.job_id)['manifest']['mt_glossary_schedule'], 'global-v1')
-        self.assertNotIn('draft', [stage for stage, _, _ in self.calls])
-        self.assertNotIn('glossary', [stage for stage, _, _ in self.calls])
-
-    def test_explicit_reflow_clears_old_glossary_schedule(self):
-        self.install()
-        manifest = self.store.job(self.job_id)['manifest']
-        manifest['mt_glossary_schedule'] = 'global-v1'
-        self.store.update(self.job_id, manifest=manifest)
-        Engine(self.config, self.store).reflow(self.job_id)
-        self.assertIsNone(self.store.job(self.job_id)['manifest'].get('mt_glossary_schedule'))
-        self.assertEqual(self.run_v5(), 'completed')
-        self.assertEqual(self.store.job(self.job_id)['manifest']['mt_glossary_schedule'], 'prefix-v1')
 
     def test_failed_advisory_glossary_is_not_requeried_when_resuming_a_draft(self):
         self.install()
         self.fail_stage = 'glossary'
         self.cancel_after = 'draft'
-        self.assertEqual(self.run_v5(threading.Event()), 'cancelled')
+        self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         markers = [row for row in self.store.mt_stages(self.job_id) if row['stage'] == 'glossary_unavailable']
         self.assertEqual(len(markers), 1)
         self.fail_stage = self.cancel_after = None
         self.calls.clear()
         Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual(self.run_pool(), 'completed')
         self.assertNotIn('glossary', [stage for stage, _, _ in self.calls])
         self.assertNotIn('draft', [stage for stage, _, _ in self.calls])
 
     def test_glossary_prefix_uses_source_order_and_wait_can_be_cancelled(self):
-        from subtitle_tool.mt_pipeline_v5 import GlossaryPrefix
+        from subtitle_tool.mt_pipeline import GlossaryPrefix
         from subtitle_tool.mt_control import MTControl
         from subtitle_tool.common import Cancelled
         from types import SimpleNamespace
@@ -255,7 +288,7 @@ class V5PipelineTests(SavedResultFixture):
         self.assertEqual(outcome, ['cancelled'])
 
     def test_group_heartbeat_reports_activity_and_stops_after_scope(self):
-        from subtitle_tool.mt_pipeline_v5 import GroupProgress
+        from subtitle_tool.mt_pipeline import GroupProgress
         from types import SimpleNamespace
         reported = threading.Event()
         events = []
@@ -275,7 +308,7 @@ class V5PipelineTests(SavedResultFixture):
         self.assertEqual(events[-1][1]['stages'], {'glossary': 1})
 
     def test_invalid_reply_records_safe_reason_without_output_text(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
         engine = Engine(self.config, self.store)
@@ -288,7 +321,7 @@ class V5PipelineTests(SavedResultFixture):
                 kwargs['on_dispatch']()
                 return HTTPReply(200, json.dumps(response).encode())
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
-            pipeline = Pipeline(engine, self.job_id, manifest, scope, 1)
+            pipeline = Pipeline(engine, self.job_id, manifest, scope)
             with self.assertRaises(ToolError):
                 pipeline.stage('draft', {'sentences': [{'id': '0', 'text': 'private-source-text'}],
                     'context': [], 'glossary': []}, ids=['0'], originals=['private-source-text'])
@@ -302,13 +335,13 @@ class V5PipelineTests(SavedResultFixture):
         self.assertNotIn('private-source-text', log)
 
     def test_console_login_failure_emits_one_actionable_progress_message(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.install()
         progress = mock.Mock()
         engine = Engine(self.config, self.store, progress=progress)
         manifest = self.store.job(self.job_id)['manifest']
         _, scope = engine.identity(self.job_id, manifest, persist=False)
-        pipeline = Pipeline(engine, self.job_id, manifest, scope, 1)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
         for _ in range(3):
             pipeline._quota_event({'kind': 'runtime_quota', 'category': 'quota_console_session_invalid'})
         progress.assert_called_once_with(self.job_id, 'mt_quota_login', None, None)
@@ -316,7 +349,7 @@ class V5PipelineTests(SavedResultFixture):
     def test_two_repairs_stop_with_full_output_and_safe_warning(self):
         self.install()
         self.review_issue = True
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertEqual([stage for stage, _, _ in self.calls].count('correct'), 2)
         self.assertEqual([stage for stage, _, _ in self.calls].count('review'), 3)
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
@@ -325,13 +358,13 @@ class V5PipelineTests(SavedResultFixture):
     def test_failed_group_saves_no_partial_cues_and_resume_reuses_completed_stages(self):
         self.install()
         self.fail_stage = 'align'
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         self.assertFalse(any(cue['translated'] for cue in self.store.cues(self.job_id)))
         self.assertEqual([stage for stage, _, _ in self.calls].count('draft'), 1)
         self.fail_stage = None
         self.calls.clear()
         Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertNotIn('draft', [stage for stage, _, _ in self.calls])
         self.assertNotIn('glossary', [stage for stage, _, _ in self.calls])
 
@@ -339,7 +372,7 @@ class V5PipelineTests(SavedResultFixture):
         self.install()
         self.cancel_after = 'draft'
         cancel = threading.Event()
-        self.assertEqual(self.run_v5(cancel), 'cancelled')
+        self.assertEqual(self.run_pool(cancel), 'cancelled')
         self.assertNotIn('align', [stage for stage, _, _ in self.calls])
         self.assertNotIn('review', [stage for stage, _, _ in self.calls])
         self.assertFalse(any(cue['translated'] for cue in self.store.cues(self.job_id)))
@@ -348,7 +381,7 @@ class V5PipelineTests(SavedResultFixture):
         self.save_result(result(('Cache result.', 'en')))
         Engine(self.config, self.store).reflow(self.job_id, mt_paid='deny')
         self.fail_stage = 'draft'
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         self.assertTrue(self.calls)
         self.assertFalse(any('deepseek' in data.get('_model', '') or 'maas.aliyuncs.com' in url
                              for _, url, data in self.calls))
@@ -357,7 +390,7 @@ class V5PipelineTests(SavedResultFixture):
         self.config.settings.mt_backends = [{'id': 'bailian_paid', 'tier': 'free', 'model': 'qwen-test'}]
         self.save_result(result(('A cache stores a result.', 'en')))
         Engine(self.config, self.store).reflow(self.job_id, mt_paid='deny')
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         self.assertEqual(self.calls, [])
 
     def test_verified_synthetic_bailian_route_reserves_and_settles_usage(self):
@@ -375,7 +408,7 @@ class V5PipelineTests(SavedResultFixture):
             return BailianQuota(control, **kwargs)
         with mock.patch.dict('subtitle_tool.mt_bailian_quota._ACCOUNTS', {}, clear=True), \
              mock.patch('subtitle_tool.mt_bailian_quota.BailianQuota', side_effect=quota):
-            self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+            self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertEqual(source.query.call_count, 1)
         self.assertGreaterEqual(len(self.calls), 4)
         self.assertTrue(all(data['_model'] == 'qwen-test' for _, _, data in self.calls))
@@ -403,14 +436,14 @@ class V5PipelineTests(SavedResultFixture):
             self.assertEqual(main(['--bind-bailian-account', '--confirm-same-account']), 0)
             self.assertEqual(main(['--confirm-bailian-protection', 'qwen3.8-27b',
                                    '--confirm-propagation-waited']), 0)
-            self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+            self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertGreaterEqual(source.query.call_count, 2)
         self.assertGreaterEqual(len(self.calls), 4)
         self.assertTrue(all(data['_model'] == 'qwen3.8-27b' for _, _, data in self.calls))
         self.assertNotIn('synthetic-token', output.getvalue())
 
     def test_blocked_dispatch_is_not_counted_as_an_http_request(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.config.settings.mt_backends = [{'id': 'bailian_paid', 'tier': 'free', 'model': 'qwen-test'}]
         self.install()
         manifest = self.store.job(self.job_id)['manifest']
@@ -433,7 +466,7 @@ class V5PipelineTests(SavedResultFixture):
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()), \
              mock.patch.object(Pipeline, '_reserve_quota', reserve):
             with self.assertRaises(ToolError):
-                Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+                Pipeline(engine, self.job_id, manifest, scope).stage(
                     'draft', data, ids=['0'], originals=['Synthetic sentence.'])
         self.assertEqual(sent, [])
         counts = self.store.counts(self.job_id)
@@ -441,7 +474,7 @@ class V5PipelineTests(SavedResultFixture):
         self.assertEqual(counts.get('mt_v5_bailian_paid_draft_request', 0), 0)
 
     def test_local_integrity_error_in_review_does_not_become_soft_warning(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.install()
         original = Pipeline.stage
         def stage(pipeline, name, *args, **kwargs):
@@ -449,12 +482,12 @@ class V5PipelineTests(SavedResultFixture):
                 raise ToolError('保存的复核记录无效。', 'cache_mismatch')
             return original(pipeline, name, *args, **kwargs)
         with mock.patch.object(Pipeline, 'stage', stage):
-            self.assertEqual(self.run_v5(), 'failed')
+            self.assertEqual(self.run_pool(), 'failed')
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
         self.assertFalse(any(cue['translated'] for cue in self.store.cues(self.job_id)))
 
     def test_router_propagates_unexpected_local_preparation_error(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
         manifest = self.store.job(self.job_id)['manifest']
@@ -470,12 +503,12 @@ class V5PipelineTests(SavedResultFixture):
         with mock.patch.object(Pipeline, '_reserve_quota', invalid_preparation), \
              mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
             with self.assertRaises(ToolError) as error:
-                Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+                Pipeline(engine, self.job_id, manifest, scope).stage(
                     'draft', data, ids=['0'], originals=['Cache.'])
         self.assertEqual(error.exception.code, 'cache_mismatch')
 
     def test_smaller_candidate_budget_falls_back_to_a_larger_candidate(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.config.settings.mt_backends = [
             {'id': 'qiniu_free', 'capabilities': {'input_bytes': 3000}}, {'id': 'qiniu_paid'}]
         self.install()
@@ -496,7 +529,7 @@ class V5PipelineTests(SavedResultFixture):
 
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()), \
              mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
-            _, origin, _ = Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+            _, origin, _ = Pipeline(engine, self.job_id, manifest, scope).stage(
                 'draft', data, ids=['0'], originals=[sentence])
         self.assertEqual(origin, 'qiniu_paid')
         self.assertEqual(calls, ['deepseek/deepseek-v4.1-flash'])
@@ -507,7 +540,7 @@ class V5PipelineTests(SavedResultFixture):
         raw = timed_raw([f'cache{i:03}' for i in range(400)], word_ms=20)
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id)
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         drafts = [data for stage, _, data in self.calls if stage == 'draft']
         self.assertGreater(len(drafts), 1)
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
@@ -522,7 +555,7 @@ class V5PipelineTests(SavedResultFixture):
         raw = timed_raw([f'cache{i:03}' for i in range(400)], word_ms=20)
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id, mt_paid='deny')
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertGreater(sum(stage == 'draft' for stage, _, _ in self.calls), 1)
         self.assertFalse(any(data['_model'] == 'deepseek/deepseek-v4.1-flash' for _, _, data in self.calls))
 
@@ -542,7 +575,7 @@ class V5PipelineTests(SavedResultFixture):
                 if reason == 'credential':
                     self.config.set_qiniu_key('changed-qiniu-after-freeze')
                 with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=reason != 'expired'):
-                    self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+                    self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
                 self.assertGreater(sum(stage == 'draft' for stage, _, _ in self.calls), 1)
                 self.assertTrue(all(data['_model'] == 'openrouter/free' for _, _, data in self.calls))
                 self.calls.clear()
@@ -557,7 +590,7 @@ class V5PipelineTests(SavedResultFixture):
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id, mt_paid='deny')
         with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
-            self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+            self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertGreater(sum(stage == 'draft' for stage, _, _ in self.calls), 1)
         self.assertTrue(all(data['_model'] != 'qwen-test' for _, _, data in self.calls))
 
@@ -587,14 +620,14 @@ class V5PipelineTests(SavedResultFixture):
                     binding.identity.side_effect = lambda route: VerifiedIdentity(
                         'synthetic-account', 'offline-space', route.backend.key_fingerprint, 'cn-beijing', 'c' * 64)
                     binding.protection.return_value = True
-                    self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+                    self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
                 self.assertGreater(sum(stage == 'draft' for stage, _, _ in self.calls), 1)
                 self.assertTrue(all('maas.aliyuncs.com' not in url for _, url, _ in self.calls))
                 self.assertGreater(source.query.call_count, 0)
                 self.calls.clear()
 
     def test_json_object_and_schema_candidates_share_expiration_priority(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.config.settings.mt_backends = [
             {'id': 'first', 'provider': 'bailian', 'base_url': None, 'model': 'qwen3.8-27b',
              'credential_ref': 'bailian', 'tier': 'free', 'weight': 1, 'rpm': 0,
@@ -606,14 +639,14 @@ class V5PipelineTests(SavedResultFixture):
         manifest = self.store.job(self.job_id)['manifest']
         engine = Engine(self.config, self.store)
         _, scope = engine.identity(self.job_id, manifest, persist=False)
-        pipeline = Pipeline(engine, self.job_id, manifest, scope, 1)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
         pipeline.bailian_quota.priority = lambda candidate: date(2099, 12, 20 if candidate.id == 'first' else 10)
         result = pipeline.router.run(lambda candidate, timeout, attempt: candidate.id)
         self.assertEqual(result.entry.id, 'second')
 
     def test_cached_large_bailian_stage_is_checked_before_quota_or_smaller_network_budget(self):
         from subtitle_tool.mt_bailian_quota import BailianQuota, VerifiedIdentity
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.config.settings.mt_backends = [
             {'id': 'bailian_paid', 'tier': 'free', 'model': 'qwen-test'},
             {'id': 'qiniu_free', 'capabilities': {'input_bytes': 3000}}]
@@ -647,11 +680,11 @@ class V5PipelineTests(SavedResultFixture):
              mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()), \
              mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
             with mock.patch('subtitle_tool.mt_bailian_quota.BailianQuota', side_effect=quota):
-                _, first_origin, _ = Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+                _, first_origin, _ = Pipeline(engine, self.job_id, manifest, scope).stage(
                     'draft', data, ids=['0'], originals=[text])
             with self.store.db:
                 self.store.db.execute('DELETE FROM mt_stages WHERE job_id=?', (self.job_id,))
-            _, cached_origin, _ = Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+            _, cached_origin, _ = Pipeline(engine, self.job_id, manifest, scope).stage(
                 'draft', data, ids=['0'], originals=[text])
         self.assertEqual((first_origin, cached_origin), ('bailian_paid', 'bailian_paid'))
         self.assertEqual(len(calls), 1)
@@ -659,16 +692,16 @@ class V5PipelineTests(SavedResultFixture):
 
     def test_retime_accepts_saved_route_origins_without_network(self):
         self.install()
-        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual(self.run_pool(), 'completed')
         self.calls.clear()
         engine = Engine(self.config, self.store)
         engine.retime(self.job_id, overwrite=True)
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertEqual(self.calls, [])
 
     def test_retime_rejects_tampered_final_production_link(self):
         self.install()
-        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual(self.run_pool(), 'completed')
         cue = self.store.cues(self.job_id)[0]
         final = self.store.mt_stage_entry(self.job_id, cue['mt_stage_key'])['record']
         final['production_stage_key'] = 'f' * 64
@@ -681,7 +714,7 @@ class V5PipelineTests(SavedResultFixture):
 
     def test_retime_rejects_changed_cue_not_matching_final_stage(self):
         self.install()
-        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual(self.run_pool(), 'completed')
         cue = self.store.cues(self.job_id)[0]
         with self.store.db:
             self.store.db.execute('UPDATE cues SET translated=? WHERE job_id=? AND cue_id=?',
@@ -694,7 +727,7 @@ class V5PipelineTests(SavedResultFixture):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}, {'id': 'bailian_paid'}]
         self.install()
         with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=False):
-            self.assertEqual(self.run_v5(), 'completed')
+            self.assertEqual(self.run_pool(), 'completed')
         self.assertTrue(all(cue['mt_origin'] == 'bailian_paid' for cue in self.store.cues(self.job_id)))
         self.config.set_qiniu_key('changed-unused-qiniu')
         Engine(self.config, self.store).retime(self.job_id, overwrite=True)
@@ -702,7 +735,7 @@ class V5PipelineTests(SavedResultFixture):
     def test_retime_rejects_changed_used_key_before_saving_or_publishing(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
-        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual(self.run_pool(), 'completed')
         before = self.store.job(self.job_id)
         output = Path(before['output'])
         content = output.read_bytes()
@@ -719,22 +752,22 @@ class V5PipelineTests(SavedResultFixture):
     def test_already_published_file_recovers_without_original_mt_key(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
-        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual(self.run_pool(), 'completed')
         self.store.update(self.job_id, 'failed', error='synthetic interruption', code='local_io')
         self.config.set_qiniu_key('changed-after-publish')
         Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
 
     def test_unpublished_translation_still_requires_used_mt_key(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
-        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual(self.run_pool(), 'completed')
         output = Path(self.store.job(self.job_id)['output'])
         output.unlink()
         self.store.update(self.job_id, 'failed', error='synthetic interruption', code='local_io')
         self.config.set_qiniu_key('changed-before-republish')
         Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'mt_account_changed')
 
     def test_resume_with_a_previously_committed_group_validates_route_origin(self):
@@ -742,17 +775,17 @@ class V5PipelineTests(SavedResultFixture):
         self.save_result(result(*[(f'Technical sentence {i}.', 'en') for i in range(9)]))
         Engine(self.config, self.store).reflow(self.job_id)
         self.fail_second_group = True
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         self.assertTrue(any(cue['translated'] for cue in self.store.cues(self.job_id)))
         self.fail_second_group = False
         Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
 
     def test_tampered_saved_stage_metadata_blocks_reuse(self):
         self.install()
         self.fail_stage = 'align'
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'draft')
         row['record']['stage'] = 'review'
         row['record']['request_model'] = 'invalid-synthetic-model'
@@ -761,13 +794,13 @@ class V5PipelineTests(SavedResultFixture):
                                   (json.dumps(row['record']), self.job_id, row['key']))
         self.fail_stage = None
         Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
 
     def test_non_string_actual_model_cannot_be_accepted_from_saved_stage(self):
         self.install()
         self.fail_stage = 'align'
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'draft')
         row['record']['actual_model'] = False
         with self.store.db:
@@ -775,20 +808,20 @@ class V5PipelineTests(SavedResultFixture):
                                   (json.dumps(row['record']), self.job_id, row['key']))
         self.fail_stage = None
         Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_v5(), 'failed')
+        self.assertEqual(self.run_pool(), 'failed')
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
 
     def test_openrouter_observed_exhaustion_falls_back_without_free_post(self):
         self.config.settings.mt_backends = [{'id': 'openrouter_free'}, {'id': 'bailian_paid'}]
         self.quota_remaining = 0
         self.install()
-        self.assertEqual(self.run_v5(), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertGreater(self.quota_queries, 0)
         self.assertFalse(any('openrouter.ai' in url for _, url, _ in self.calls))
         self.assertTrue(all(cue['mt_origin'] == 'bailian_paid' for cue in self.store.cues(self.job_id)))
 
     def test_denied_paid_still_reuses_exact_saved_stage_before_trimming_context(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         self.config.settings.mt_backends = [
             {'id': 'qiniu_free', 'capabilities': {'input_bytes': 3000}}, {'id': 'qiniu_paid'}]
         self.install()
@@ -809,25 +842,25 @@ class V5PipelineTests(SavedResultFixture):
                 return HTTPReply(200, json.dumps(body, ensure_ascii=False).encode('utf-8'))
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
             with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=False):
-                _, origin, _ = Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+                _, origin, _ = Pipeline(engine, self.job_id, manifest, scope).stage(
                     'draft', data, ids=['0'], originals=['Cache.'])
             self.assertEqual(origin, 'qiniu_paid')
             manifest['mt_route_snapshot']['routing']['paid_enabled'] = False
             self.store.update(self.job_id, manifest=manifest)
             with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
-                _, origin, _ = Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+                _, origin, _ = Pipeline(engine, self.job_id, manifest, scope).stage(
                     'draft', data, ids=['0'], originals=['Cache.'])
             with self.store.db:
                 self.store.db.execute('DELETE FROM mt_stages WHERE job_id=?', (self.job_id,))
             with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
-                _, cached_origin, _ = Pipeline(engine, self.job_id, manifest, scope, 1).stage(
+                _, cached_origin, _ = Pipeline(engine, self.job_id, manifest, scope).stage(
                     'draft', data, ids=['0'], originals=['Cache.'])
         self.assertEqual(origin, 'qiniu_paid')
         self.assertEqual(cached_origin, 'qiniu_paid')
         self.assertEqual(calls, ['deepseek/deepseek-v4.1-flash'])
 
     def test_explicit_bailian_arrearage_blocks_same_account_paid_routes_only(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         capabilities = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
         def entry(identity, model, tier):
             return {'id': identity, 'provider': 'bailian', 'base_url': None, 'model': model,
@@ -862,7 +895,7 @@ class V5PipelineTests(SavedResultFixture):
             for failure_status in (400, 403):
                 with self.subTest(status=failure_status):
                     calls.clear()
-                    pipeline = Pipeline(engine, self.job_id, manifest, scope, 1)
+                    pipeline = Pipeline(engine, self.job_id, manifest, scope)
                     for text in ['First synthetic sentence.', 'Second synthetic sentence.']:
                         data = {'sentences': [{'id': '0', 'text': text}], 'context': [], 'glossary': []}
                         with self.assertRaises(ToolError) as error:
@@ -871,7 +904,7 @@ class V5PipelineTests(SavedResultFixture):
                     self.assertEqual(calls, ['synthetic-free', 'synthetic-paid-one', 'synthetic-free'])
 
     def test_free_tier_only_response_disables_exact_model_even_when_labelled_paid(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         capabilities = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
         def entry(identity, model):
             return {'id': identity, 'provider': 'bailian', 'base_url': None, 'model': model,
@@ -895,7 +928,7 @@ class V5PipelineTests(SavedResultFixture):
                     'content': json.dumps({'translations': {'0': '完整译文'}})}}]}
                 return HTTPReply(200, json.dumps(body).encode())
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
-            pipeline = Pipeline(engine, self.job_id, manifest, scope, 1)
+            pipeline = Pipeline(engine, self.job_id, manifest, scope)
             for text in ('First synthetic sentence.', 'Second synthetic sentence.'):
                 data = {'sentences': [{'id': '0', 'text': text}], 'context': [], 'glossary': []}
                 _, origin, _ = pipeline.stage('draft', data, ids=['0'], originals=[text])
@@ -903,7 +936,7 @@ class V5PipelineTests(SavedResultFixture):
         self.assertEqual(calls, ['synthetic-paid-one', 'synthetic-paid-two', 'synthetic-paid-two'])
 
     def test_unclassified_403_does_not_disable_other_paid_models(self):
-        from subtitle_tool.mt_pipeline_v5 import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline
         capabilities = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
         def entry(identity, model):
             return {'id': identity, 'provider': 'bailian', 'base_url': None, 'model': model,
@@ -928,7 +961,7 @@ class V5PipelineTests(SavedResultFixture):
                     'content': json.dumps({'translations': {'0': '完整译文'}})}}]}
                 return HTTPReply(200, json.dumps(body).encode('utf-8'))
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
-            pipeline = Pipeline(engine, self.job_id, manifest, scope, 1)
+            pipeline = Pipeline(engine, self.job_id, manifest, scope)
             data = {'sentences': [{'id': '0', 'text': 'Synthetic sentence.'}], 'context': [], 'glossary': []}
             _, origin, _ = pipeline.stage('draft', data, ids=['0'], originals=['Synthetic sentence.'])
         self.assertEqual(origin, 'paid_two')
@@ -938,7 +971,7 @@ class V5PipelineTests(SavedResultFixture):
         from subtitle_tool.review import ReviewDecision
         self.install()
         engine = Engine(self.config, self.store)
-        self.assertEqual(self.run_v5(engine=engine), 'completed')
+        self.assertEqual(self.run_pool(engine=engine), 'completed')
         self.calls.clear()
         manifest = self.store.job(self.job_id)['manifest']
         manifest['overwrite'] = True
@@ -946,7 +979,7 @@ class V5PipelineTests(SavedResultFixture):
         engine.apply_review(self.job_id, self.store.cues(self.job_id)[0]['cue_id'],
                             ReviewDecision('translate', 'Japanese'))
         engine.finish_review(self.job_id)
-        self.assertEqual(self.run_v5(engine=engine), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.run_pool(engine=engine), 'completed', self.store.job(self.job_id)['error'])
         drafts = [data for stage, _, data in self.calls if stage == 'draft']
         self.assertTrue(drafts)
         self.assertTrue(any(item['source_language'] == 'Japanese' and item['decision_origin'] == 'manual'
