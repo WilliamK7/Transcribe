@@ -86,19 +86,25 @@ HTTP 429 按有效 `Retry-After` 秒数或 HTTP 日期冷却；缺失、非有�
 
 `--inspect-bailian-quota` 通过 Windows npm 安装的官方 CLI 2.7.2 查询北京地域额度，输出 `models`：模型、类型、余额、总额、到期日期、`auto_stop` 和 `observation_usable`。后者要求文本模型、有效总额与余量比例、正余额、有效日期及开关开启。CLI 只返回到期日期，工具从该北京日期开始视为不可用。查询失败使用 `mt_quota_unknown`。
 
-账户绑定及逐模型保护确认由用户提供，操作见 [README](../README.md#使用百炼免费额度)。`data/bailian-quota-binding.json` 固定原 ASR Key、北京工作空间及 CLI 登录上下文的指纹；上下文改变使确认失效。逐模型确认要求观察到开关开启，之后观察到关闭会撤销该模型确认。额度查询只观察配置，开关传播及其他程序消耗可能延迟反映，实际计费保护依赖云端“免费额度用完即停”生效。
+账户绑定及逐模型保护确认由用户提供，操作见 [README](../README.md#使用百炼免费额度)。`data/bailian-quota-binding.json` 固定原 ASR Key、北京工作空间及 CLI 认证上下文的指纹。版本 1 保留完整配置及控制台令牌校验；所选配置有 AK/SK 时，新绑定采用版本 2，只纳入 AK/SK（含旧字段别名）、可选 STS、代理身份、地域、站点、工作空间、目录及 Profile。界面偏好、默认模型和独立控制台令牌不影响版本 2 的确认。早期版本 2 的完整配置指纹只有与当前配置精确匹配时才规范化，保留原确认；版本 1 不自动升级。重新绑定清空模型确认，身份变化或观察到保护开关关闭时撤销相应确认。实际计费保护依赖云端“免费额度用完即停”生效。
+
+版本 2 从同一份配置快照取得指纹和 AK/SK，经隐藏子进程的私有管道交给官方 CLI 模块；模块版本与维护见 [BUILD](BUILD.md)。只使用这些 AK/SK 生成的令牌，查询范围限于模型目录、免费额度和保护状态。令牌按绑定隔离并在内存复用，只有响应解析及前后身份检查通过才提交；不写入 CLI 配置或临时凭据文件。每次查询最多生成一次令牌，已有令牌仅在明确会话失效时续期。管道传输、生成及完整查询共用 15 秒上限、4 MiB 响应上限；取消／到期终止并回收子进程。日志排除原始异常与令牌。令牌生成依据[官方鉴权接口](https://help.aliyun.com/zh/model-studio/cli/installation)。
 
 默认池不添加百炼免费候选。用户显式添加的 `qwen3.8-27b` 与 `qwen3.8-max-0902` 分别使用 `json_object` 与 `json_schema`，输入／输出上限分别为 32768 字节／4096 token。百炼免费网络请求须匹配绑定及对应模型确认，并有有效、未到期、报告开关开启的额度观察；额度查询失败或观察无效时跳过该候选。通过身份校验且请求完全匹配的已有缓存仍可复用；百炼付费入口仍按付费许可执行。新人额度按模型及快照分别核算，不按 UTC 日重置；主账号与 RAM 子账号共享，实际余额和开关状态以[官方规则](https://help.aliyun.com/zh/model-studio/new-free-quota)为准。
 
 百炼按确认账户及精确模型共享进程内 token 账本，并发查询合并；新运行重新查询，观察至多使用 20 秒。每次 HTTP 尝试在发送前以完整请求 JSON 的 UTF-8 字节数、输出 token 上限和 1024 的余量作保守预占；可用时按响应中的输入／输出 token 结算，未知用量保留预占，确认未发送的预占按观察代次保守退回。刷新扣除在途预占，本轮同模型本地余额不因刷新增加。该估算并非计费保证，其他程序的并发消耗及控制台更新延迟仍受云端开关约束。
 
-百炼额度查询失败后，同一绑定上下文从失败完成时起共享 10 秒重试间隔；期间跳过免费候选，不复用旧额度。绑定上下文变化可立即重新查询。官方 CLI 认证退出码 3 记录为 `quota_console_session_invalid`，终端每轮提示一次重新登录；其余查询失败记录为 `quota_refresh_failed`。原始 CLI 响应及错误不进入诊断。
+百炼额度暂时查询失败后，同一绑定上下文从失败完成时起共享 10 秒重试间隔；期间跳过免费候选，不复用旧额度。官方 CLI 认证退出码 3 记录为 `quota_console_session_invalid`，终端每轮提示一次重新登录；同一运行内不再查询已确认失效的登录绑定，也不复用其旧额度。新绑定可立即查询，新一轮运行可重新检查（仍受共享的 10 秒间隔限制）。其余查询失败记录为 `quota_refresh_failed`。原始 CLI 响应及错误不进入诊断。
 
 池请求收到百炼 HTTP 403 且错误码精确为 `AllocationQuota.FreeTierOnly` 时，在本轮按当前百炼 Key、工作空间及精确模型禁用该模型候选，其他模型不因此被禁用；`429` 和其他 `403` 不推断为该模型免费额度耗尽。切换等级不会关闭百炼的云端开关，池也不允许相同后端身份重复配置。错误码含义见[百炼错误码](https://help.aliyun.com/zh/model-studio/error-code)。
 
 `qiniu/conatus-free` 仅在北京时间 2026-10-24 00:00 至 2026-11-30 23:59 的活动期内派发；本地判断使用上界 2026-12-01 00:00（不含）。服务端额度、实名认证和结束规则以[七牛活动页](https://www.qiniu.com/ai/free-models/conatus-2026)为准。该免费模型额度不足不会自动转为七牛的付费模型；工具可能依据池的付费许可另行调用付费候选。
 
 `--mt-paid allow|deny` 只控制后续付费候选网络调用，不清除已完成的付费结果或缓存；通过身份校验且请求完全匹配的付费缓存可以复用。不同候选的能力可能使分组或上下文裁剪改变，不能保证跨分组命中。池不接受 `--mt-fallback`。每个请求使用 `stream:false`，模型能力档案的 `response_format` 分别决定发送 `json_object`、严格 `json_schema` 或不发送格式字段的 `text`；OpenRouter 附带参数要求及 Response Healing，百炼附带 `enable_thinking:false` 和 `temperature:0`。无论格式档案如何，本地仍校验响应结构、编号、非空译文和正常结束。
+
+策略 5 新任务及显式重排使用提示词版本 2：`json_object`／`text` 档案在提示词中明确完整输出 Schema；术语原句和复核片段编号限于输入集合，复核以跨片连读的最终字幕为对象。OpenRouter 动态免费路由 `openrouter/free` 使用 `reasoning.effort:low`（固定模型不推定支持），七牛精确模型 `deepseek/deepseek-v4.1-flash` 使用 `reasoning_effort:low`；其他七牛模型不添加该参数。推理与可见输出共享预算，降低推理量用于减少预算耗尽，但不保证模型延迟或语义效果，参见 [OpenRouter 推理参数](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)及[七牛聊天参数](https://developer.qiniu.com/aitokenapi/13390/chat-completions)。完整请求仍计入预算并接受原有本地校验。旧任务普通恢复保留提示词版本 1 的请求、工作键和缓存键；两版缓存隔离。
+
+同一运行中，入口在同一阶段连续两次返回不合法结构后，后续五分钟优先使用同等级中其他已就绪的候选；到期只放行一个恢复探测。其他阶段不受影响；同等级没有其他就绪候选时仍可尝试该入口，正在进行的恢复探测除外，其等待计入原有等待预算。该状态不持久化，不改变免费优先、付费许可或缓存优先顺序。
 
 策略 5 在同一组内依次执行术语提取、带上下文的整句翻译、片段对齐和自动复核；组间复用现有工作线程，不增加模型并发。新任务使用 `mt_glossary_schedule:prefix-v1`：按来源顺序累积术语，先出现的同名术语优先，人工术语优先于模型结果；每组只等待自己及前序组的术语结果，不等待全片术语完成。前缀与线程完成先后无关，等待可取消。开始运行时固定该调度方式；没有该字段但已有草稿或后续阶段的旧任务使用 `global-v1`，重建原有完整术语表以保持已保存阶段的请求输入。已有匹配术语结果可复用，终端显示术语处理进度。
 
@@ -180,7 +186,7 @@ OpenRouter 契约 2／3 支持 `--mt-fallback {none,bailian}`，仅用于新任�
 | `subtitle_version` / `translation_strategy_version` | `2` / `5`（翻译池）、`4`（OpenRouter 或七牛单后端）、`3`（其他单后端） |
 | `display_timing_version` | `2`；独立的最终显示时间策略 |
 | `subtitle_settings` | 入队时的 `zh_line_width`、`other_line_width`、`chinese_first` |
-| `execution_snapshot` | `format_version:1`；策略 5 为 `prompt_version:1/recovery_version:3`，策略 4 为 `10/2`，策略 3 为 `9/1`；均有 `context_version:1` |
+| `execution_snapshot` | `format_version:1`；策略 5 新建为 `prompt_version:2/recovery_version:3`（普通恢复仍支持提示词 1），策略 4 为 `10/2`，策略 3 为 `9/1`；均有 `context_version:1` |
 | `mt_snapshot` | `format_version:1`、`provider`、`base_url`、`model`、`key_fingerprint`（SHA-256）、`request_version:1/2/3/4/5`；池使用首个可用入口的快照 |
 | `mt_route_snapshot` | 池专用格式 1：`entries`、`routing`、`quality`，包括全部入口身份与能力、付费许可、等待设置及人工术语表 |
 

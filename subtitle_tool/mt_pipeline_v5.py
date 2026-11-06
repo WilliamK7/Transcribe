@@ -15,7 +15,7 @@ from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
 from .mt_backend import saved_mt
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
-from .mt_quality import (QUALITY_PROMPT_VERSION, make_stage_payload, parse_stage_response, plan_sentence_groups,
+from .mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
                          stage_cache_key, validate_glossary)
 from .mt_routing import CacheHit, MTRouter, RouteEntry, RouteExhausted, RouteFailure, RouteResult
 from .mt_runtime import bailian_failure, service_failure
@@ -131,9 +131,10 @@ def check_pool(config, identity, route, cancel):
     """Online smoke test using an in-memory task and one synthetic sentence."""
     from .mt_control import MTControl
     from .store import Store
+    from .policy import current_execution_snapshot
     primary = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
     manifest = {**identity, 'mt_snapshot': primary, 'mt_route_snapshot': route,
-                'translation_strategy_version': 5}
+                'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot(5)}
     scope = {**identity, 'processing_version': 2}
     store = Store(Path(':memory:'))
     try:
@@ -222,7 +223,9 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
 
 class Pipeline:
     def __init__(self, engine, job_id, manifest, scope, context_version):
+        from .policy import load_policy
         self.engine, self.store, self.job_id, self.manifest = engine, engine.store, job_id, manifest
+        self.prompt_version = load_policy(manifest).prompt_version
         self.scope = {key: value for key, value in scope.items() if key != 'mt_identity'}
         self.context_version = context_version
         self.context = threading.local()
@@ -303,7 +306,7 @@ class Pipeline:
     def _request_payload(self, stage, data, entry):
         try:
             return make_stage_payload(stage, data, entry.backend,
-                                      capabilities=self.profiles[entry.id]['capabilities'])
+                                      capabilities=self.profiles[entry.id]['capabilities'], prompt_version=self.prompt_version)
         except ToolError as error:
             if error.code != 'mt_input_budget':
                 raise
@@ -337,7 +340,8 @@ class Pipeline:
             fits = False
             for entry in candidates:
                 try:
-                    make_stage_payload(stage, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'])
+                    make_stage_payload(stage, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
+                                       prompt_version=self.prompt_version)
                     fits = True
                     break
                 except ToolError as error:
@@ -354,7 +358,8 @@ class Pipeline:
                     for entry in fallback:
                         try:
                             make_stage_payload(stage, data, entry.backend,
-                                               capabilities=self.profiles[entry.id]['capabilities'])
+                                               capabilities=self.profiles[entry.id]['capabilities'],
+                                               prompt_version=self.prompt_version)
                             return data
                         except ToolError as error:
                             if error.code != 'mt_input_budget':
@@ -362,7 +367,7 @@ class Pipeline:
                 raise ToolError('翻译阶段完整请求超过所有可用模型的输入预算。', 'mt_input_budget')
 
     def _work_key(self, name, data):
-        return _digest({'strategy': 5, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
+        return _digest({'strategy': 5, 'prompt': self.prompt_version, 'stage': name, 'data': data,
                         'scope': self.scope, 'profiles': self.snapshot['entries']})
 
     def stage(self, name, data, *, ids=(), originals=(), prefer=None):
@@ -418,7 +423,7 @@ class Pipeline:
             try:
                 entry.backend.credential(self.engine.config)
                 key = stage_cache_key(name, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                                      scope=self.scope)
+                                      scope=self.scope, prompt_version=self.prompt_version)
             except ToolError as error:
                 if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
                     return None
@@ -550,7 +555,7 @@ class Pipeline:
             remaining = max(0.0, 180.0 - (time.monotonic() - started))
             result = self.router.run(invoke, cache=cached, prefer_other_than=prefer,
                                      prepare=lambda entry, wait: self._reserve_quota(entry, wait, name, data),
-                                     deadline_seconds=remaining)
+                                     deadline_seconds=remaining, stage=name)
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
             'model': result.entry.backend.model, 'actual_model': result.value['actual_model'],
             'duration_ms': round((time.monotonic() - started) * 1000), 'wait_ms': round(result.waited * 1000),
@@ -561,7 +566,8 @@ class Pipeline:
         record = {**result.value, 'backend': result.entry.id, 'request_model': result.entry.backend.model,
                   'stage': name}
         cache_key = stage_cache_key(name, data, result.entry.backend,
-                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.scope)
+                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.scope,
+                                    prompt_version=self.prompt_version)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             self.store.commit_mt_stage(self.job_id, work_key, name, record,

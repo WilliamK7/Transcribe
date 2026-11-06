@@ -16,7 +16,7 @@ from .mt import _DuplicateKey, _unique_object, parse_batch_response
 from .review import decision_origin
 
 
-QUALITY_PROMPT_VERSION = 1
+QUALITY_PROMPT_VERSION = 2
 INPUT_BUDGET = 32 * 1024
 OUTPUT_TOKENS = 4096
 ISSUE_CATEGORIES = ('omission', 'addition', 'terminology', 'number', 'negation', 'condition', 'repetition', 'meaning')
@@ -62,17 +62,21 @@ def plan_sentence_groups(sources):
     return groups
 
 
-def _schema(stage, data):
+def _schema(stage, data, *, prompt_version=QUALITY_PROMPT_VERSION):
     if stage == 'glossary':
         item = {'type': 'object', 'properties': {'source': {'type': 'string'}, 'translation': {'type': 'string'},
                                                 'sentence': {'type': 'string'}},
                 'required': ['source', 'translation', 'sentence'], 'additionalProperties': False}
+        if prompt_version >= 2:
+            item['properties']['sentence']['enum'] = [str(s['id']) for s in data['sentences']]
         return {'type': 'object', 'properties': {'terms': {'type': 'array', 'items': item}},
                 'required': ['terms'], 'additionalProperties': False}
     if stage == 'review':
         item = {'type': 'object', 'properties': {'id': {'type': 'string'},
                 'category': {'type': 'string', 'enum': list(ISSUE_CATEGORIES)}, 'evidence': {'type': 'string'}},
                 'required': ['id', 'category', 'evidence'], 'additionalProperties': False}
+        if prompt_version >= 2:
+            item['properties']['id']['enum'] = [str(f['id']) for f in data['fragments']]
         return {'type': 'object', 'properties': {'issues': {'type': 'array', 'items': item}},
                 'required': ['issues'], 'additionalProperties': False}
     items = data['sentences'] if stage == 'draft' else data['fragments']
@@ -83,26 +87,44 @@ def _schema(stage, data):
             'required': ['translations'], 'additionalProperties': False}
 
 
-def make_stage_payload(stage, data, backend, *, capabilities):
+def make_stage_payload(stage, data, backend, *, capabilities, prompt_version=QUALITY_PROMPT_VERSION):
     if stage not in PROMPTS:
         raise ValueError('Unknown translation stage')
+    if type(prompt_version) is not int or prompt_version not in {1, 2}:
+        raise ToolError('翻译提示词版本不受支持，请用 --reflow。', 'cache_version')
     if (not isinstance(capabilities, dict) or set(capabilities) != {'response_format', 'input_bytes', 'output_tokens'} or
             capabilities['response_format'] not in {'json_object', 'json_schema', 'text'} or
             type(capabilities['input_bytes']) is not int or not 1 <= capabilities['input_bytes'] <= 1048576 or
             type(capabilities['output_tokens']) is not int or not 1 <= capabilities['output_tokens'] <= 32768):
         raise ToolError('翻译模型能力档案无效。', 'mt_config')
+    prompt = PROMPTS[stage]
+    if prompt_version >= 2:
+        prompt += '直接返回所需 JSON，不附解释、Markdown 或思考过程。'
+        if stage == 'review':
+            prompt += ('审核对象是 translations 中按 fragments 编号排列的最终字幕，结合完整原句和跨片连读判断。'
+                       '不要把正常分片、同义表达或与 draft 措辞不同本身当作错误。'
+                       '合并重复疑点，每条 evidence 用一句简短文字指出原文与译文的具体差异。')
+        if capabilities['response_format'] != 'json_schema':
+            prompt += '输出必须符合此 JSON Schema：' + json.dumps(
+                _schema(stage, data, prompt_version=prompt_version), ensure_ascii=False, separators=(',', ':'))
     payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
-               'messages': [{'role': 'system', 'content': PROMPTS[stage]},
+               'messages': [{'role': 'system', 'content': prompt},
                             {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}]}
     if capabilities['response_format'] == 'json_object':
         payload['response_format'] = {'type': 'json_object'}
     elif capabilities['response_format'] == 'json_schema':
         payload['response_format'] = {'type': 'json_schema', 'json_schema': {
-            'name': 'subtitle_' + stage, 'strict': True, 'schema': _schema(stage, data)}}
+            'name': 'subtitle_' + stage, 'strict': True, 'schema': _schema(stage, data, prompt_version=prompt_version)}}
     if backend.is_openrouter:
         payload.update(provider={'require_parameters': True}, plugins=[{'id': 'response-healing'}])
+        if prompt_version >= 2 and backend.model == 'openrouter/free':
+            # Reasoning shares max_tokens with visible JSON; leave room for the result.
+            payload['reasoning'] = {'effort': 'low'}
     elif backend.provider == 'bailian':
         payload.update(enable_thinking=False, temperature=0)
+    elif (prompt_version >= 2 and backend.provider == 'qiniu' and
+          backend.model == 'deepseek/deepseek-v4.1-flash'):
+        payload['reasoning_effort'] = 'low'
     try:
         size = len(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
     except (TypeError, UnicodeError, ValueError):
@@ -112,11 +134,11 @@ def make_stage_payload(stage, data, backend, *, capabilities):
     return payload
 
 
-def stage_cache_key(stage, data, backend, *, capabilities, scope):
-    value = {'version': QUALITY_PROMPT_VERSION, 'strategy': 5, 'simplification': 'opencc-t2s-0.1.7',
+def stage_cache_key(stage, data, backend, *, capabilities, scope, prompt_version=QUALITY_PROMPT_VERSION):
+    value = {'version': prompt_version, 'strategy': 5, 'simplification': 'opencc-t2s-0.1.7',
              'backend': backend.snapshot(),
              'capabilities': capabilities, 'scope': scope,
-             'request': make_stage_payload(stage, data, backend, capabilities=capabilities)}
+             'request': make_stage_payload(stage, data, backend, capabilities=capabilities, prompt_version=prompt_version)}
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 
 

@@ -58,6 +58,26 @@ class AdaptiveSchedulingTests(unittest.TestCase):
         self.pacer.wait(self.cancel)
         self.assertAlmostEqual(self.now, 71)
 
+    def test_nonblocking_and_waiting_admission_share_window_and_cooldown(self):
+        pacer = RequestPacer(clock=lambda: self.now, requests_per_window=2, window_seconds=61)
+        self.assertEqual(pacer.try_start(), 0)
+        self.assertEqual(pacer.wait(self.cancel), 0)
+        self.now = 10
+        self.assertEqual((pacer.quota_ready_at(), pacer.ready_at()), (61, 61))
+        admit = mock.Mock(return_value=True)
+        self.assertIsNone(pacer.try_start(admit))
+        admit.assert_not_called()
+
+        pacer.throttle(80, 0)
+        self.assertEqual((pacer.quota_ready_at(), pacer.ready_at()), (61, 90))
+        self.now = 61
+        self.assertEqual((pacer.quota_ready_at(), pacer.ready_at()), (0, 90))
+        self.now = 90
+        self.assertIsNone(pacer.try_start(lambda: False))
+        self.assertEqual(list(pacer.starts), [])
+        self.assertEqual(pacer.wait(self.cancel), 1)
+        self.assertEqual(list(pacer.starts), [90])
+
     def test_quota_and_server_cooldown_use_later_deadline(self):
         for cooldown, expected in [(15, 61), (90, 90)]:
             with self.subTest(cooldown=cooldown):

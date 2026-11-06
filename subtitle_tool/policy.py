@@ -47,6 +47,7 @@ class ExecutionPolicy:
     layout: LayoutPolicy | None
     context_version: int
     display_timing_version: int
+    prompt_version: int
 
     def settings(self, runtime):
         """Saved result settings plus current concurrency and polling parameters."""
@@ -84,14 +85,18 @@ def load_policy(manifest, *, verify_execution=True):
     _version(plan.get("extract_recipe_version", 1) if plan else EXTRACT_RECIPE_VERSION,
              {1, EXTRACT_RECIPE_VERSION})
     context_version = 0
+    prompt_version = 1
     if verify_execution and manifest.get('translation_strategy_version') in {4, 5} and 'execution_snapshot' not in manifest:
         raise ToolError('结构化翻译缺少执行版本，请用 --reflow。', 'cache_version')
     if verify_execution and "execution_snapshot" in manifest:
         snapshot = manifest["execution_snapshot"]
         current = current_execution_snapshot(manifest.get('translation_strategy_version', 0))
+        if manifest.get('translation_strategy_version') == 5 and isinstance(snapshot, dict):
+            current['prompt_version'] = _version(snapshot.get('prompt_version'), {1, QUALITY_PROMPT_VERSION})
         required = set(current) - {"context_version"}
         if (not isinstance(snapshot, dict) or set(snapshot) not in (required, set(current)) or
                 any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in required)):
             raise ToolError("任务的提示词／响应恢复执行版本与当前实现不匹配，请用 --reflow 显式重排。", "cache_version")
         context_version = _version(snapshot.get("context_version", 0), {0, CONTEXT_VERSION})
-    return ExecutionPolicy(normalizer, layout, context_version, display_timing)
+        prompt_version = snapshot['prompt_version']
+    return ExecutionPolicy(normalizer, layout, context_version, display_timing, prompt_version)

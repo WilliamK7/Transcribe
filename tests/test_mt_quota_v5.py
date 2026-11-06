@@ -13,7 +13,7 @@ from subtitle_tool.common import Cancelled
 from subtitle_tool.mt_backend import MTBackend, OPENROUTER_BASE_URL
 from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_quota_v5 import V5Quota
-from subtitle_tool.mt_routing import CacheHit, MTRouter, RouteEntry, RouteExhausted, RouteFailure
+from subtitle_tool.mt_routing import CacheHit, MTRouter, RouteEntry, RouteFailure
 from subtitle_tool.mt_runtime import FreeQuota, reset_quota_for_resume
 from subtitle_tool.mt_transport import HTTPReply, TransportError
 
@@ -112,6 +112,29 @@ class QuotaV5Tests(unittest.TestCase):
         self.assertEqual(self.ledger.remaining, 2)
         self.assertIn('quota_refresh_failed', [event.get('category') for event in self.events])
         self.assertNotIn('private response', repr(self.events))
+
+    def test_legacy_and_v5_share_refresh_accounting_for_inflight_requests(self):
+        legacy_events = []
+        self.ledger.ensure(self.control, lambda: self.reply, on_event=legacy_events.append)
+        self.assertTrue(self.ledger.try_reserve(self.control))
+        self.clock.now += 31
+
+        def fetch_during_refresh(*args, **kwargs):
+            # A legacy request may reserve while the v5 observation is in flight.
+            self.assertTrue(self.ledger.try_reserve(self.control))
+            return quota_reply(4)
+
+        self.transport.request.side_effect = fetch_during_refresh
+        with self.quota.reserve(self.free, 15) as reservation:
+            self.assertEqual((self.ledger.remaining, self.ledger.inflight), (2, 2))
+            reservation.claim()
+            reservation.mark_sent()
+        self.assertEqual((self.ledger.remaining, self.ledger.inflight), (1, 2))
+        self.ledger.complete()
+        self.ledger.complete()
+        self.assertEqual(self.ledger.inflight, 0)
+        self.assertEqual(legacy_events[0]['local_remaining'], 4)
+        self.assertEqual(self.events[-1], {'kind': 'runtime_quota', 'category': 'quota_observed'})
 
     def test_no_dispatch_after_claim_refunds_before_paid_fallback(self):
         paid = candidate('paid', model='openrouter/paid', tier='paid')

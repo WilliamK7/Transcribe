@@ -82,7 +82,7 @@ class LocalBailianBinding:
         required = {'version', 'source', 'region', 'workspace', 'key_fingerprint',
                     'cli_fingerprint', 'confirmed_models', 'invalidated'}
         if (not isinstance(record, dict) or set(record) != required or
-                type(record['version']) is not int or record['version'] != 1 or
+                type(record['version']) is not int or record['version'] not in (1, 2) or
                 record['source'] != 'user_confirmed' or record['region'] != 'cn-beijing' or
                 type(record['invalidated']) is not bool or
                 not isinstance(record['workspace'], str) or
@@ -105,7 +105,7 @@ class LocalBailianBinding:
         namespace = hashlib.sha256(str(self.path.resolve()).encode('utf-8')).hexdigest()
         return VerifiedIdentity('user-confirmed-local:' + namespace, record['workspace'],
                                 record['key_fingerprint'], record['region'],
-                                record['cli_fingerprint'])
+                                record['cli_fingerprint'], record['version'])
 
     def _current(self):
         record = self._read()
@@ -120,9 +120,13 @@ class LocalBailianBinding:
             self._invalidate(record)
         if self._scope() != (record['workspace'], 'beijing'):
             self._invalidate(record)
-        _, _, context = self.source._context(require_login=False, require_domestic=False)
-        if context != record['cli_fingerprint']:
+        context = self.source.binding_fingerprint(proof)
+        if context is None:
             self._invalidate(record)
+        if context != record['cli_fingerprint']:
+            record['cli_fingerprint'] = context
+            atomic_json(self.path, record)
+            proof = self._proof(record)
         if not self.source.bound_to(proof):
             raise ValueError()
         return record, proof
@@ -144,8 +148,8 @@ class LocalBailianBinding:
             if (not isinstance(key_fingerprint, str) or not _FINGERPRINT.fullmatch(key_fingerprint) or
                     self._key() != key_fingerprint or self._scope() != (workspace, 'beijing')):
                 raise ValueError()
-            _, _, context = self.source._context()
-            record = {'version': 1, 'source': 'user_confirmed', 'region': 'cn-beijing',
+            version, (_, _, context) = self.source.binding_context()
+            record = {'version': version, 'source': 'user_confirmed', 'region': 'cn-beijing',
                       'workspace': workspace, 'key_fingerprint': key_fingerprint,
                       'cli_fingerprint': context, 'confirmed_models': [], 'invalidated': False}
             with _LOCK:
@@ -165,14 +169,18 @@ class LocalBailianBinding:
         try:
             with _LOCK:
                 _, proof = self._current()
-            if (entry.backend.provider != 'bailian' or entry.backend.key_fingerprint != proof.key_fingerprint or
-                    entry.backend.base_url != f'https://{proof.workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'):
+            if not self._matches_entry(entry, proof):
                 return None
             return proof
         except Cancelled:
             raise
         except Exception:
             return None
+
+    @staticmethod
+    def _matches_entry(entry, proof):
+        return (entry.backend.provider == 'bailian' and entry.backend.key_fingerprint == proof.key_fingerprint and
+                entry.backend.base_url == f'https://{proof.workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1')
 
     def confirm_protection(self, models, *, control, timeout=15.0):
         """After user confirmation, record models currently observed switched on.
@@ -229,7 +237,7 @@ class LocalBailianBinding:
             model = entry.backend.model
             with _LOCK:
                 record, proof = self._current()
-                if (self.identity(entry) != proof or model in self._revoked or
+                if (not self._matches_entry(entry, proof) or model in self._revoked or
                         model not in record['confirmed_models']):
                     return False
                 if row is not None and row.auto_stop is False:

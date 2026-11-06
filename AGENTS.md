@@ -21,6 +21,8 @@ Windows x64 自用字幕 CLI。用法见 [README.md](README.md)，接口与恢�
 
 ## 源码位置
 
+以下 Python 文件位于 `subtitle_tool/`；百炼续期桥接为同目录的 `mt_bailian_bridge.mjs`。
+
 - `main.py`：CLI；`engine.py`：任务生命周期；`store.py`：持久化事务。
 - `review.py`、`policy.py`、`saved_results.py`、`publication.py`：人工决定、执行版本、恢复校验及字幕发布。
 - `api.py`、`mt_backend.py`、`mt.py`：云端请求、后端身份及单后端翻译。

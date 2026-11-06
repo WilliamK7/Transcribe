@@ -289,6 +289,71 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(records[-1]['category'], 'quota_console_session_invalid')
         self.assertNotIn('private', repr(records))
 
+    def test_invalid_session_is_queried_once_for_both_models_throughout_run(self):
+        self.source.query.side_effect = QuotaSourceError('quota_console_session_invalid')
+        events = []
+        self.quota.on_event = events.append
+        other = entry('other-model', name='other')
+        for _ in range(340):
+            self.assertEqual(self.failure(), 'quota_unknown')
+            self.assertEqual(self.failure(route=other), 'quota_unknown')
+            self.clock.now += 11  # Exceed the ordinary failure cooldown every round.
+        self.assertEqual(self.source.query.call_count, 1)
+        self.assertEqual(sum(event['kind'] == 'quota_query' for event in events), 1)
+        self.assertEqual(sum(event.get('category') == 'quota_console_session_invalid' for event in events), 1)
+        self.assertFalse(self.quota.potential(self.route))
+        self.assertFalse(self.quota.potential(other))
+        self.assertIsNone(self.quota.priority(self.route))
+
+    def test_changed_console_proof_can_retry_but_cannot_revive_invalid_proof(self):
+        self.source.query.side_effect = QuotaSourceError('quota_console_session_invalid')
+        self.assertEqual(self.failure(), 'quota_unknown')
+        invalid = self.proof
+        self.proof = VerifiedIdentity('account-a', 'ws-test', 'a' * 64, 'cn-beijing', 'd' * 64)
+        self.source.query.side_effect = lambda **kwargs: json.dumps(self.rows).encode()
+        self.send()
+        self.assertEqual(self.source.query.call_count, 2)
+        self.proof = invalid
+        self.clock.now += 11
+        self.assertEqual(self.failure(), 'quota_unknown')
+        self.assertEqual(self.source.query.call_count, 2)
+
+    def test_new_run_after_invalid_session_rechecks_binding_protection_and_expiry(self):
+        self.source.query.side_effect = QuotaSourceError('quota_console_session_invalid')
+        self.assertEqual(self.failure(), 'quota_unknown')
+        self.clock.now += 11
+        self.source.query.side_effect = lambda **kwargs: json.dumps(self.rows).encode()
+        self.assertEqual(self.failure(), 'quota_unknown')
+        resumed = BailianQuota(self.control, identity=lambda route: self.proof,
+                               protection=lambda route, observation: False, source=self.source,
+                               clock=self.clock, today=lambda: self.clock.today)
+        self.assertEqual(self.failure(resumed), 'quota_unknown')
+        resumed.protection = lambda route, observation: True
+        self.source.bound_to.return_value = False
+        self.assertEqual(self.failure(resumed), 'quota_unknown')
+        self.assertEqual(self.source.query.call_count, 1)
+        self.source.bound_to.return_value = True
+        self.rows = [row(autoStop=False)]
+        self.assertEqual(self.failure(resumed), 'quota_unknown')
+        self.clock.now += 21
+        self.rows = [row(expires=self.clock.today.isoformat())]
+        self.assertEqual(self.failure(resumed), 'quota_unknown')
+        self.clock.now += 21
+        self.rows = [row()]
+        with resumed.reserve(self.route, 5, estimate=100) as reservation:
+            reservation.claim()
+            reservation.mark_sent()
+        self.assertEqual(self.source.query.call_count, 4)
+
+    def test_unclassified_source_failure_remains_retryable_after_cooldown(self):
+        self.source.query.side_effect = QuotaSourceError()
+        self.assertEqual(self.failure(), 'quota_unknown')
+        self.assertTrue(self.quota.potential(self.route))
+        self.clock.now += 11
+        self.source.query.side_effect = lambda **kwargs: json.dumps(self.rows).encode()
+        self.send()
+        self.assertEqual(self.source.query.call_count, 2)
+
     def test_cancel_and_cache_hit_make_no_network_request(self):
         router = MTRouter([self.route], paid_enabled=False, control=self.control, clock=self.clock)
         result = router.run(lambda *args: self.fail('no request'), cache=lambda route: CacheHit('cached'),

@@ -172,22 +172,8 @@ class V5Quota:
         except (TransportError, ValueError, KeyError, TypeError, RecursionError):
             pass
         finally:
-            with ledger.condition:
-                observed = ledger.utcnow()
-                if value is not None and observed.date() == day:
-                    remote = min(value['remaining'], max(0, value['limit'] - value['used']))
-                    available = max(0, remote - active - (ledger.reservations - sent))
-                    ledger.remaining = min(ledger.remaining, available) if ledger.day == day else available
-                    ledger.day = day
-                    ledger.trusted.add(self.control)
-                    ledger.observed_monotonic = ledger.clock()
-                    ledger.observation = {**value, 'observed_at': observed.isoformat()}
-                    category = 'quota_observed'
-                else:
-                    category = 'quota_refresh_failed'
-                ledger.refreshing = False
-                ledger.condition.notify_all()
-            self.on_event({'kind': 'runtime_quota', 'category': category})
+            event = ledger._finish_refresh(self.control, value, day, sent, active)
+            self.on_event({'kind': 'runtime_quota', 'category': event['category']})
 
         self.control.check_start()
         if authentication:

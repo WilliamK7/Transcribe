@@ -35,6 +35,10 @@ _CLI_VERSION = '2.7.2'
 _MODEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}\Z')
 _DATE = re.compile(r'\d{4}-\d{2}-\d{2}\Z')
 _FINGERPRINT = re.compile(r'[0-9a-f]{64}\Z')
+_OPENAPI_CONTEXT_FIELDS = frozenset({
+    'access_key_id', 'access_key_secret', 'openapi_access_key_id', 'openapi_access_key_secret',
+    'security_token', 'console_region', 'console_site', 'console_switch_agent', 'workspace_id',
+})
 _ACCOUNTS = {}
 _ACCOUNTS_LOCK = threading.Lock()
 _OBSERVATIONS = itertools.count()
@@ -55,6 +59,7 @@ class VerifiedIdentity:
     key_fingerprint: str = field(repr=False)
     region: str
     context_fingerprint: str = field(repr=False)
+    context_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -180,13 +185,16 @@ class CLIQuotaSource:
     """
     def __init__(self, *, config_dir=None):
         self._config_dir = config_dir
+        self._token = None
+        self._token_context = None
+        self._token_lock = threading.Lock()
 
     def _folder(self):
         configured = self._config_dir or os.environ.get('BAILIAN_CONFIG_DIR') or Path.home() / '.bailian'
         return Path(configured).expanduser().resolve()
 
-    def _context(self, *, require_login=True, require_domestic=True):
-        """Privately fingerprint the exact selected CLI config, never its mask."""
+    def _read_context(self):
+        """Read credentials and their identity from one selected profile snapshot."""
         try:
             folder = self._folder()
             path = folder / 'config.json'
@@ -207,11 +215,50 @@ class CLIQuotaSource:
                 raise ValueError()
             if not isinstance(selected, dict):
                 raise ValueError()
-            token = selected.get('access_token') or selected.get('accessToken')
-            if ((require_login and (not isinstance(token, str) or not token.strip())) or
-                    (require_domestic and selected.get('console_site', 'domestic') != 'domestic')):
+            return folder, profile, selected
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+            raise QuotaSourceError() from None
+
+    @staticmethod
+    def _openapi_credentials(selected):
+        result = {}
+        for source, target in (('access_key_id', 'accessKeyId'), ('access_key_secret', 'accessKeySecret'),
+                               ('security_token', 'securityToken')):
+            value = selected.get(source)
+            if source != 'security_token' and (not isinstance(value, str) or not value.strip()):
+                value = selected.get('openapi_' + source)
+            if isinstance(value, str):
+                value = value.strip()
+            if source == 'security_token' and value in (None, ''):
+                continue
+            if (not isinstance(value, str) or not 1 <= len(value) <= 16384 or
+                    any(c.isspace() or ord(c) < 32 for c in value)):
+                raise QuotaSourceError()
+            result[target] = value
+        agent = selected.get('console_switch_agent')
+        if agent is not None and (type(agent) is not int or not 1 <= agent <= _MAX_SAFE_INTEGER):
+            raise QuotaSourceError()
+        return result
+
+    def _fingerprint_context(self, snapshot, *, version=1, require_login=True, require_domestic=True,
+                             full_profile=False):
+        try:
+            if type(version) is not int or version not in (1, 2):
                 raise ValueError()
-            context = {'schema': 1, 'cli_version': _CLI_VERSION, 'config_dir': str(folder),
+            folder, profile, selected = snapshot
+            token = selected.get('access_token') or selected.get('accessToken')
+            if require_domestic and selected.get('console_site', 'domestic') != 'domestic':
+                raise ValueError()
+            if version == 2:
+                if require_login:
+                    self._openapi_credentials(selected)
+                # v2 queries obtain their own token from the confirmed AK/SK;
+                # they never use this independent browser/CLI session token.
+                selected = {k: v for k, v in selected.items() if
+                            (k not in ('access_token', 'accessToken') if full_profile else k in _OPENAPI_CONTEXT_FIELDS)}
+            elif require_login and (not isinstance(token, str) or not token.strip()):
+                raise ValueError()
+            context = {'schema': version, 'cli_version': _CLI_VERSION, 'config_dir': str(folder),
                        'profile': profile, 'selected': selected, 'query_region': 'cn-beijing',
                        'query_site': 'domestic'}
             raw = json.dumps(context, sort_keys=True, ensure_ascii=True, allow_nan=False,
@@ -220,11 +267,33 @@ class CLIQuotaSource:
         except (OSError, ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
             raise QuotaSourceError() from None
 
+    def _context(self, *, version=1, require_login=True, require_domestic=True):
+        return self._fingerprint_context(self._read_context(), version=version,
+            require_login=require_login, require_domestic=require_domestic)
+
+    def binding_context(self):
+        snapshot = self._read_context()
+        version = 2 if any(k in snapshot[2] for k in (
+            'access_key_id', 'access_key_secret', 'openapi_access_key_id', 'openapi_access_key_secret')) else 1
+        return version, self._fingerprint_context(snapshot, version=version)
+
+    def binding_fingerprint(self, proof):
+        """Normalize an exactly matching early v2 binding without changing its identity."""
+        snapshot = self._read_context()
+        options = dict(version=proof.context_version, require_login=False, require_domestic=False)
+        current = self._fingerprint_context(snapshot, **options)[2]
+        if current == proof.context_fingerprint:
+            return current
+        if proof.context_version == 2 and self._fingerprint_context(
+                snapshot, full_profile=True, **options)[2] == proof.context_fingerprint:
+            return current
+        return None
+
     def bound_to(self, proof):
         try:
             return (isinstance(proof, VerifiedIdentity) and
                     bool(_FINGERPRINT.fullmatch(proof.context_fingerprint)) and
-                    self._context()[2] == proof.context_fingerprint)
+                    self._context(version=proof.context_version)[2] == proof.context_fingerprint)
         except (QuotaSourceError, TypeError):
             return False
 
@@ -250,6 +319,25 @@ class CLIQuotaSource:
         except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
             raise QuotaSourceError() from None
 
+    def _renewal_command(self):
+        command = self._command()
+        package = Path(command[1]).parent.parent
+        # The bridge verifies the dependency versions Node actually resolves.
+        return [command[0], str(Path(__file__).with_name('mt_bailian_bridge.mjs')), str(package)]
+
+    def _renewal_input(self, proof):
+        snapshot = self._read_context()
+        if self._fingerprint_context(snapshot, version=2)[2] != proof.context_fingerprint:
+            raise QuotaSourceError()
+        with self._token_lock:
+            token = self._token if self._token_context == proof else None
+        body = json.dumps({'credentials': self._openapi_credentials(snapshot[2]), 'token': token,
+                           'switchAgent': snapshot[2].get('console_switch_agent')},
+                          ensure_ascii=True).encode('utf-8')
+        if len(body) > MAX_CLI_ERROR:
+            raise QuotaSourceError()
+        return body
+
     def query(self, *, control, timeout, proof=None):
         if proof is not None and not self.bound_to(proof):
             raise QuotaSourceError()
@@ -272,6 +360,8 @@ class CLIQuotaSource:
         environment = {key: value for key in allowed if (value := os.environ.get(key)) is not None}
         # Node's formatDate uses the process-local timezone. Match beijing_today.
         environment['TZ'] = 'Asia/Shanghai'
+        environment['DO_NOT_TRACK'] = '1'
+        environment['NO_UPDATE_NOTIFIER'] = '1'
 
         def read_stream(stream, target, limit):
             try:
@@ -287,9 +377,11 @@ class CLIQuotaSource:
                 read_failed.set()
 
         try:
-            command = self._command()
+            renewing = proof is not None and proof.context_version == 2
+            command = self._renewal_command() if renewing else self._command()
+            request = self._renewal_input(proof) if renewing else None
             environment['BAILIAN_CONFIG_DIR'] = str(self._folder())
-            if proof is not None:
+            if proof is not None and not renewing:
                 folder, profile, fingerprint = self._context()
                 if fingerprint != proof.context_fingerprint:
                     raise QuotaSourceError()
@@ -298,12 +390,20 @@ class CLIQuotaSource:
             control.check_start()
             if time.monotonic() >= query_deadline:
                 raise QuotaSourceError()
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            process = subprocess.Popen(command, stdin=subprocess.PIPE if renewing else subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, shell=False, close_fds=True, env=environment,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             readers = [threading.Thread(target=read_stream, args=(stream, target, limit), daemon=True)
                        for stream, target, limit in ((process.stdout, output, MAX_CLI_RESPONSE),
                                                      (process.stderr, error_output, MAX_CLI_ERROR))]
+            if renewing:
+                def write_input():
+                    try:
+                        with process.stdin:
+                            process.stdin.write(request)
+                    except (OSError, ValueError):
+                        read_failed.set()
+                readers.append(threading.Thread(target=write_input, daemon=True))
             for reader in readers:
                 reader.start()
             while True:
@@ -317,6 +417,22 @@ class CLIQuotaSource:
                 raise _cli_failure(process.returncode, error_output)
             if proof is not None and not self.bound_to(proof):
                 raise QuotaSourceError()
+            if renewing:
+                try:
+                    envelope = json.loads(output, object_pairs_hook=_unique)
+                    if not isinstance(envelope, dict) or set(envelope) != {'token', 'observation'}:
+                        raise ValueError()
+                    token = envelope['token']
+                    if (not isinstance(token, str) or not 1 <= len(token) <= 16384 or
+                            any(c.isspace() or ord(c) < 32 for c in token)):
+                        raise ValueError()
+                    observation = json.dumps(envelope['observation'], ensure_ascii=True).encode('utf-8')
+                    parse_observation(observation)
+                except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+                    raise QuotaSourceError() from None
+                with self._token_lock:
+                    self._token_context, self._token = proof, token
+                return observation
             return bytes(output)
         except (Cancelled, ToolError):
             raise
@@ -445,6 +561,10 @@ class BailianQuota:
         self.source = source if source is not None else CLIQuotaSource()
         self.on_event = on_event
         self.observation = observation
+        # A fixed CLI login error needs user action, not periodic refreshes.
+        # Keep it in this run only; a new proof or pipeline may query again.
+        self._invalid_sessions = set()
+        self._session_lock = threading.Lock()
 
     def _binding(self, entry):
         if self.identity is None:
@@ -453,6 +573,7 @@ class BailianQuota:
             proof = self.identity(entry)
             if (not isinstance(proof, VerifiedIdentity) or not isinstance(proof.account, str) or
                     not 1 <= len(proof.account) <= 256 or proof.region != 'cn-beijing' or
+                    type(proof.context_version) is not int or proof.context_version not in (1, 2) or
                     not isinstance(proof.key_fingerprint, str) or not _FINGERPRINT.fullmatch(proof.key_fingerprint) or
                     not isinstance(proof.context_fingerprint, str) or not _FINGERPRINT.fullmatch(proof.context_fingerprint) or
                     proof.key_fingerprint != entry.backend.key_fingerprint):
@@ -481,16 +602,21 @@ class BailianQuota:
     def _source_bound(self, proof):
         """Check the selected console context before and after a query."""
         try:
+            if self._session_invalid(proof):
+                return False
             return self.source.bound_to(proof) is True
         except Cancelled:
             raise
         except Exception:
             return False
 
+    def _session_invalid(self, proof):
+        with self._session_lock:
+            return proof in self._invalid_sessions
+
     def _fresh(self, account, proof):
-        context = (proof.context_fingerprint, proof.key_fingerprint, proof.workspace)
         return (account.observed_at is not None and account.observation_sequence is not None and
-                account.observation_sequence > self.created_sequence and account.observation_context == context and
+                account.observation_sequence > self.created_sequence and account.observation_context == proof and
                 0 <= self.clock() - account.observed_at < OBSERVATION_TTL)
 
     def potential(self, entry):
@@ -555,6 +681,8 @@ class BailianQuota:
             self.control.check_start()
             with account.condition:
                 now = self.clock()
+                if self._session_invalid(proof):
+                    raise _failure()
                 if account.rows is not None and self._fresh(account, proof):
                     row = account.rows.get(entry.backend.model)
                     if row is None or not self._protected(entry, row) or not row.usable(self.today()):
@@ -602,6 +730,9 @@ class BailianQuota:
             rows = None
             failure_category = ('quota_console_session_invalid'
                                 if error.category == 'quota_console_session_invalid' else 'quota_refresh_failed')
+            if failure_category == 'quota_console_session_invalid':
+                with self._session_lock:
+                    self._invalid_sessions.add(proof)
         except Exception:
             rows = None
         finally:
@@ -609,8 +740,7 @@ class BailianQuota:
                 account.rows = rows
                 account.observed_at = self.clock() if rows is not None else None
                 account.observation_sequence = next(_OBSERVATIONS) if rows is not None else None
-                account.observation_context = ((proof.context_fingerprint, proof.key_fingerprint, proof.workspace)
-                                               if rows is not None else None)
+                account.observation_context = proof if rows is not None else None
                 if rows is not None:
                     account.last_failure_at = account.last_failure_proof = None
                 elif not cancelled:

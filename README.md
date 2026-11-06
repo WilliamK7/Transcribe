@@ -50,16 +50,18 @@ Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans`
 
 百炼免费额度按地域、模型及快照核算，用完或到期后默认转付费。为免费入口开启“免费额度用完即停”，等待生效后再使用，详见[官方额度规则](https://help.aliyun.com/zh/model-studio/new-free-quota)。
 
-使用 Windows npm 安装的官方 CLI **2.7.2**，确保 PATH 可找到 `bl.cmd` 和 Node.js，登录控制台会话：
+使用 Windows npm 安装的官方 CLI **2.7.2**，确保 PATH 可找到 `bl.cmd` 和 Node.js。可登录控制台会话：
 
 ```powershell
 bl auth login --console
 .\scripts\transcribe.ps1 --inspect-bailian-quota
 ```
 
-检查只读查询模型余额、到期日期及 `auto_stop`；`observation_usable` 表示额度字段有效，账户绑定和保护确认另行保存。CLI 只返回到期日期，工具从该北京日期开始跳过模型。CLI 安装和鉴权见[官方说明](https://help.aliyun.com/zh/model-studio/cli/installation)，首次登录可能创建 API Key。
+检查只读查询余额、到期日期及 `auto_stop`，从到期日零点起跳过模型。`observation_usable` 表示额度字段有效，账户绑定和保护确认另行检查。`bl auth status` 只显示本地凭据状态；实际可用性以额度查询为准。
 
-确认 CLI 账户与工具的北京工作空间、Key 属于同一主账号，然后添加模型并绑定：
+长期运行可在 CLI 所选配置中保存 OpenAPI AK/SK，工具用它生成并续期查询令牌；已有 AK/SK 且 `bl usage free` 查询成功时，无需再登录浏览器。AK/SK 登录与 RAM 用户权限见[官方鉴权说明](https://help.aliyun.com/zh/model-studio/cli/installation)和[权限管理](https://help.aliyun.com/zh/model-studio/permission-management-overview)。`BailianGateway.Team.NotAuthorised` 需要由主账号将 RAM 用户加入对应百炼团队并授权，重复登录不能替代授权。
+
+确认 CLI 所选 AK/SK（未配置时为控制台登录账户）与工具的北京工作空间、Key 属于同一主账号，然后添加模型并绑定：
 
 ```powershell
 .\scripts\transcribe.ps1 --configure-mt-pool --bailian-free-model qwen3.8-27b --bailian-free-model qwen3.8-max-0902
@@ -75,9 +77,9 @@ bl auth login --console
 
 添加模型保留已有池条目；默认池没有百炼免费入口。命令使用已保存的北京工作空间，新入口用于新任务，旧任务通过 `--reflow` 应用。
 
-绑定及逐模型确认保存在 `data/bailian-quota-binding.json`，只记录指纹。Key、工作空间或 CLI 登录上下文改变后重新绑定并确认；重新绑定清除原模型确认。观察到云端开关关闭也会撤销该模型确认。免费请求同时检查账户绑定、模型确认、有效余额和开关状态；观察及本地估算可能延迟，实际计费保护依赖云端开关生效。
+配置 AK/SK 后，重新绑定并确认模型保护一次即可启用自动续期。Key、AK/SK、工作空间或 CLI 认证身份改变时重新确认；单纯的令牌续期保留确认。观察到保护开关关闭时撤销对应模型确认。绑定记录只保存指纹，详见[额度与绑定契约](docs/API_CONTRACT.md#翻译池请求契约-5)。
 
-控制台会话与模型 API Key 独立。遇到会话失效时，结束当前运行，重新执行 `bl auth login --console`、账户绑定和模型保护确认，再用原任务 ID `--resume`。查询失败时跳过百炼免费候选，其他允许的候选仍可使用。
+只使用浏览器登录时，会话失效后重新登录、绑定并确认模型保护，再 `--resume`。使用 AK/SK 时由工具自动续期；凭据被撤销或权限不足时修正相应配置。查询失败会跳过百炼免费候选，其他允许的候选继续使用。
 
 ### 自定义翻译池
 

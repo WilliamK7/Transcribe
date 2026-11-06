@@ -285,6 +285,24 @@ class CliTests(TemporaryTest):
             self.assertEqual(main(["--review", job_id]), 0)
             self.assertEqual(json.loads(output.getvalue())["state"], "completed")
 
+    def test_review_hint_matches_pending_decision(self):
+        for code in ('language_uncertain', 'audio_track', 'audio_channel'):
+            with self.subTest(code=code):
+                job_id = self.add_review_job(code)
+                with mock.patch('sys.stdout', new_callable=io.StringIO), \
+                        mock.patch('sys.stderr', new_callable=io.StringIO) as output, \
+                        mock.patch('builtins.input', side_effect=AssertionError('must not prompt')):
+                    self.assertEqual(main(['--review', job_id, '--non-interactive']), 2)
+                message = output.getvalue()
+                self.assertIn(f'--review {job_id}', message)
+                if code == 'language_uncertain':
+                    self.assertNotIn('--track', message)
+                    self.assertNotIn('--channel', message)
+                    self.assertIn('交互终端', message)
+                else:
+                    self.assertIn(f'--resume {job_id}', message)
+                    self.assertIn('--channel', message)
+
     def test_interactive_review_pause_does_not_prompt_again(self):
         job_id = self.add_review_job()
         with mock.patch("sys.stdin", new=mock.Mock(isatty=lambda: True)), mock.patch("builtins.input", return_value="q") as prompt, mock.patch("sys.stderr", new_callable=io.StringIO), mock.patch("sys.stdout", new_callable=io.StringIO):

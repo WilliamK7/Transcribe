@@ -56,31 +56,27 @@ class RequestPacer:
         with self.lock:
             self.requests_per_window = requests_per_window
 
+    def _deadlines_locked(self, now):
+        while self.starts and self.starts[0] + self.window_seconds <= now:
+            self.starts.popleft()
+        deadline = self.cooldown_until
+        if self.last_started is not None:
+            deadline = max(deadline, self.last_started + self.interval)
+        quota_until = 0.0
+        if self.requests_per_window and len(self.starts) >= self.requests_per_window:
+            quota_until = self.starts[-self.requests_per_window] + self.window_seconds
+        return deadline, quota_until
+
     def ready_at(self):
         """Nonblocking view used by OpenRouter's combined recovery/RPM gate."""
         with self.lock:
-            now = self.clock()
-            while self.starts and self.starts[0] + self.window_seconds <= now:
-                self.starts.popleft()
-            deadline = self.cooldown_until
-            if self.last_started is not None:
-                deadline = max(deadline, self.last_started + self.interval)
-            if self.requests_per_window and len(self.starts) >= self.requests_per_window:
-                deadline = max(deadline, self.starts[-self.requests_per_window] + self.window_seconds)
-            return deadline
+            return max(self._deadlines_locked(self.clock()))
 
     def try_start(self, admit=lambda: True):
         with self.lock:
             # Admit the request and reserve quota under the shared scheduling lock.
             now = self.clock()
-            while self.starts and self.starts[0] + self.window_seconds <= now:
-                self.starts.popleft()
-            deadline = self.cooldown_until
-            if self.last_started is not None:
-                deadline = max(deadline, self.last_started + self.interval)
-            if self.requests_per_window and len(self.starts) >= self.requests_per_window:
-                deadline = max(deadline, self.starts[-self.requests_per_window] + self.window_seconds)
-            if deadline > now:
+            if max(self._deadlines_locked(now)) > now:
                 return None
             if not admit():
                 return None
@@ -90,12 +86,7 @@ class RequestPacer:
 
     def quota_ready_at(self):
         with self.lock:
-            now = self.clock()
-            while self.starts and self.starts[0] + self.window_seconds <= now:
-                self.starts.popleft()
-            if self.requests_per_window and len(self.starts) >= self.requests_per_window:
-                return self.starts[-self.requests_per_window] + self.window_seconds
-            return 0.0
+            return self._deadlines_locked(self.clock())[1]
 
     def wait(self, cancel, progress=None):
         while True:
@@ -103,18 +94,12 @@ class RequestPacer:
             notice = None
             with self.lock:
                 now = self.clock()
-                while self.starts and self.starts[0] + self.window_seconds <= now:
-                    self.starts.popleft()
-                deadline = self.cooldown_until
-                if self.last_started is not None:
-                    deadline = max(deadline, self.last_started + self.interval)
-                if self.requests_per_window and len(self.starts) >= self.requests_per_window:
-                    quota_until = self.starts[-self.requests_per_window] + self.window_seconds
-                    if (progress is not None and quota_until > deadline and quota_until - now >= 2
-                            and quota_until > self.quota_notice_until):
-                        notice = quota_until - now
-                        self.quota_notice_until = quota_until
-                    deadline = max(deadline, quota_until)
+                deadline, quota_until = self._deadlines_locked(now)
+                if (progress is not None and quota_until > deadline and quota_until - now >= 2
+                        and quota_until > self.quota_notice_until):
+                    notice = quota_until - now
+                    self.quota_notice_until = quota_until
+                deadline = max(deadline, quota_until)
                 delay = deadline - now
                 if delay <= 0:
                     self.last_started = now

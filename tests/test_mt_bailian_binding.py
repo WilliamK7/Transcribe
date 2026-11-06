@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -85,6 +86,222 @@ class BindingTests(unittest.TestCase):
             reservation.mark_sent()
             reservation.settle({'input_tokens': 20, 'output_tokens': 30})
         self.assertEqual(self.source.query.call_count, 2)
+
+    def enable_openapi(self):
+        self.cli_config.update(access_key_id='private-ak', access_key_secret='private-sk')
+        self.write_cli()
+
+    def test_openapi_binding_survives_console_rotation_without_reconfirming_models(self):
+        self.enable_openapi()
+        self.bind()
+        self.confirm()
+        proof = self.binding.identity(self.route)
+        self.assertEqual(proof.context_version, 2)
+        for token in ('another-account-browser-token', '', None):
+            self.cli_config['access_token'] = token
+            self.write_cli()
+            self.assertEqual(self.binding.identity(self.route), proof)
+            self.assertTrue(self.binding.protection(self.route, None))
+        saved = self.binding.path.read_text(encoding='utf-8')
+        self.assertEqual(json.loads(saved)['version'], 2)
+        for private in ('private-ak', 'private-sk', 'private-console-token'):
+            self.assertNotIn(private, saved)
+
+    def test_openapi_binding_ignores_cli_preferences_and_unused_model_credentials(self):
+        self.enable_openapi()
+        self.bind()
+        self.confirm()
+        proof = self.binding.current_proof()
+        self.cli_config.update(language='en-US', telemetry=False, output='json',
+                               default_image_model='other-image-model', api_key='other-model-key',
+                               base_url='https://other-model.example/v1', timeout=30)
+        self.write_cli()
+        self.assertEqual(self.binding.current_proof(), proof)
+        self.assertTrue(self.binding.protection(self.route, None))
+
+    def test_early_openapi_binding_normalizes_only_an_exactly_matching_profile(self):
+        self.enable_openapi()
+        self.cli_config['language'] = 'zh-CN'
+        self.write_cli()
+        self.bind()
+        self.confirm()
+        current = self.binding.current_proof()
+        record = json.loads(self.binding.path.read_text())
+        record['cli_fingerprint'] = self.source._fingerprint_context(
+            self.source._read_context(), version=2, full_profile=True)[2]
+        self.binding.path.write_text(json.dumps(record))
+        self.assertEqual(self.binding.current_proof(), current)
+        saved = json.loads(self.binding.path.read_text())
+        self.assertEqual(saved['confirmed_models'], ['qwen-test'])
+        self.assertEqual(saved['cli_fingerprint'], current.context_fingerprint)
+        # Old fingerprints cannot prove which field changed before normalization.
+        self.binding.path.write_text(json.dumps(record))
+        self.cli_config['access_key_id'] = 'different-account'
+        self.write_cli()
+        self.assertIsNone(self.binding.current_proof())
+
+    def test_openapi_identity_changes_revoke_confirmation_even_if_restored(self):
+        self.enable_openapi()
+        for field, value in (('access_key_id', 'other-ak'), ('access_key_secret', 'other-sk'),
+                             ('security_token', 'new-sts'), ('console_switch_agent', 67890),
+                             ('console_site', 'international'), ('workspace_id', 'other-ws')):
+            with self.subTest(field=field):
+                self.bind()
+                self.confirm()
+                old = dict(self.cli_config)
+                self.cli_config[field] = value
+                self.write_cli()
+                self.assertIsNone(self.binding.identity(self.route))
+                self.cli_config = old
+                self.write_cli()
+                self.assertIsNone(self.binding.identity(self.route))
+        self.bind()
+        self.confirm()
+        old = self.cli_config.pop('access_key_secret')
+        self.write_cli()
+        self.assertIsNone(self.binding.identity(self.route))
+        self.cli_config['access_key_secret'] = old
+        self.write_cli()
+        self.assertIsNone(self.binding.identity(self.route))
+
+    def test_legacy_binding_does_not_silently_adopt_new_openapi_credentials(self):
+        self.bind()
+        self.confirm()
+        self.assertEqual(json.loads(self.binding.path.read_text())['version'], 1)
+        self.enable_openapi()
+        self.assertIsNone(self.binding.identity(self.route))
+        self.bind()
+        self.assertEqual(json.loads(self.binding.path.read_text())['version'], 2)
+        self.assertFalse(self.binding.protection(self.route, None))
+
+    def test_old_binding_that_already_contains_openapi_still_uses_old_token_identity(self):
+        self.enable_openapi()
+        self.bind()
+        record = json.loads(self.binding.path.read_text())
+        record.update(version=1, cli_fingerprint=self.source._context(version=1)[2])
+        self.binding.path.write_text(json.dumps(record))
+        proof = self.binding.current_proof()
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof.context_version, 1)
+        self.cli_config['access_token'] = 'new-token'
+        self.write_cli()
+        self.assertIsNone(self.binding.current_proof())
+
+    def test_openapi_incomplete_credentials_cannot_create_binding(self):
+        self.enable_openapi()
+        for value in ('', None, [], 'with whitespace'):
+            self.cli_config['access_key_secret'] = value
+            self.write_cli()
+            with self.subTest(value=value), self.assertRaises(ToolError):
+                self.bind()
+
+    def test_official_legacy_openapi_field_aliases_bind_and_use_same_snapshot(self):
+        self.cli_config.update(openapi_access_key_id='legacy-ak', openapi_access_key_secret='legacy-sk')
+        self.write_cli()
+        self.bind()
+        proof = self.binding.current_proof()
+        self.assertEqual(proof.context_version, 2)
+        self.assertEqual(json.loads(self.source._renewal_input(proof))['credentials'],
+                         {'accessKeyId': 'legacy-ak', 'accessKeySecret': 'legacy-sk'})
+        self.cli_config.update(access_key_id='new-ak', access_key_secret='')
+        self.write_cli()
+        self.bind()
+        proof = self.binding.current_proof()
+        self.assertEqual(json.loads(self.source._renewal_input(proof))['credentials'],
+                         {'accessKeyId': 'new-ak', 'accessKeySecret': 'legacy-sk'})
+        del self.cli_config['openapi_access_key_secret']
+        self.write_cli()
+        with self.assertRaises(ToolError):
+            self.bind()
+
+    def test_openapi_child_uses_private_pipe_and_only_its_own_cached_token(self):
+        self.enable_openapi()
+        self.bind()
+        proof = self.binding.current_proof()
+        source = CLIQuotaSource(config_dir=self.config_dir)
+        script = ('import json,sys,os; r=json.load(sys.stdin); '
+                  'assert r["credentials"]["accessKeyId"]=="private-ak"; '
+                  'assert r["credentials"]["accessKeySecret"]=="private-sk"; '
+                  'assert r["switchAgent"]==12345; '
+                  'assert r["token"]==({expected}); '
+                  'assert "DASHSCOPE_API_KEY" not in os.environ; '
+                  'print(json.dumps({{"token":"private-generated-token","observation":[]}}))')
+        popen = subprocess.Popen
+        def capture(command, **kwargs):
+            self.assertEqual(kwargs['stdin'], subprocess.PIPE)
+            self.assertEqual(kwargs['creationflags'], subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            return popen(command, **kwargs)
+        for expected in ('None', repr('private-generated-token')):
+            child = [sys.executable, '-c', script.format(expected=expected)]
+            with mock.patch.object(source, '_renewal_command', return_value=child), \
+                 mock.patch('subtitle_tool.mt_bailian_quota.subprocess.Popen', side_effect=capture), \
+                 mock.patch.dict(os.environ, {'DASHSCOPE_API_KEY': 'unrelated-private-key'}):
+                self.assertEqual(source.query(control=self.control, timeout=3, proof=proof), b'[]')
+            self.cli_config['access_token'] = 'unrelated-browser-account-token'
+            self.write_cli()
+    def test_openapi_token_cache_is_not_shared_with_another_confirmed_context(self):
+        self.enable_openapi()
+        self.bind()
+        source = CLIQuotaSource(config_dir=self.config_dir)
+        script = ('import json,sys; r=json.load(sys.stdin); assert r["token"] is None; '
+                  'print(json.dumps({"token":"generated-token","observation":[]}))')
+        with mock.patch.object(source, '_renewal_command', return_value=[sys.executable, '-c', script]):
+            source.query(control=self.control, timeout=3, proof=self.binding.current_proof())
+            self.cli_config['access_key_id'] = 'new-account-ak'
+            self.write_cli()
+            self.bind()
+            source.query(control=self.control, timeout=3, proof=self.binding.current_proof())
+
+    def test_openapi_child_identity_change_and_invalid_reply_do_not_publish_token(self):
+        self.enable_openapi()
+        self.bind()
+        source = CLIQuotaSource(config_dir=self.config_dir)
+        proof = self.binding.current_proof()
+        script = ('import json,sys; from pathlib import Path; json.load(sys.stdin); '
+                  'p=Path(sys.argv[1]); c=json.loads(p.read_text()); c["access_key_id"]="other-ak"; '
+                  'p.write_text(json.dumps(c)); '
+                  'print(json.dumps({"token":"private-untrusted-token","observation":[]}))')
+        child = [sys.executable, '-c', script, str(self.config_path)]
+        with mock.patch.object(source, '_renewal_command', return_value=child), self.assertRaises(QuotaSourceError):
+            source.query(control=self.control, timeout=3, proof=proof)
+        self.assertIsNone(source._token)
+        self.write_cli()
+        for reply in ('{"token":"private-untrusted-token","observation":{}}',
+                      '{"token":"one","token":"two","observation":[]}',
+                      '{"token":null,"observation":[]}'):
+            script = 'import sys; sys.stdin.read(); print(' + repr(reply) + ')'
+            with mock.patch.object(source, '_renewal_command', return_value=[sys.executable, '-c', script]), \
+                 self.assertRaises(QuotaSourceError):
+                source.query(control=self.control, timeout=3, proof=proof)
+            self.assertIsNone(source._token)
+
+    def test_openapi_child_cancel_and_timeout_reap_process_with_pending_stdin(self):
+        self.enable_openapi()
+        self.cli_config['security_token'] = 'x' * 16000
+        self.write_cli()
+        self.bind()
+        proof = self.binding.current_proof()
+        source = CLIQuotaSource(config_dir=self.config_dir)
+        popen, children = subprocess.Popen, []
+        def capture(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            children.append(child)
+            return child
+        for cancel in (False, True):
+            control = MTControl(threading.Event())
+            timer = threading.Timer(.2, control.cancel_user) if cancel else None
+            if timer:
+                timer.start()
+            try:
+                with mock.patch.object(source, '_renewal_command',
+                                       return_value=[sys.executable, '-c', 'import time; time.sleep(30)']), \
+                     mock.patch('subtitle_tool.mt_bailian_quota.subprocess.Popen', side_effect=capture), \
+                     self.assertRaises((QuotaSourceError, ToolError)):
+                    source.query(control=control, timeout=2 if cancel else .3, proof=proof)
+            finally:
+                if timer:
+                    timer.cancel()
+            self.assertIsNotNone(children[-1].poll())
 
     def test_selected_profile_or_credentials_change_invalidates_without_query(self):
         self.bind()

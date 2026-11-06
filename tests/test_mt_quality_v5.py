@@ -65,6 +65,53 @@ class QualityContractTests(unittest.TestCase):
         self.assertNotIn('private evidence', str(error.exception))
         self.assertEqual(error.exception.code, 'mt_batch_invalid')
 
+    def test_json_object_review_supplies_the_fields_and_categories_it_validates(self):
+        from subtitle_tool.mt_quality import ISSUE_CATEGORIES
+        data = {'fragments': [{'id': '0', 'text': 'The value is two.'}]}
+        payload = make_stage_payload('review', data, self.qiniu, capabilities=self.qiniu_caps)
+        instruction = payload['messages'][0]['content']
+        for field in ('issues', 'id', 'category', 'evidence', *ISSUE_CATEGORIES):
+            self.assertIn('"' + field + '"', instruction)
+
+    def test_review_schema_limits_evidence_to_actual_fragment_ids(self):
+        data = {'fragments': [{'id': '0', 'text': 'One.'}, {'id': '1', 'text': 'Two.'}]}
+        payload = make_stage_payload('review', data, self.router, capabilities=self.router_caps)
+        schema = payload['response_format']['json_schema']['schema']
+        self.assertEqual(schema['properties']['issues']['items']['properties']['id']['enum'], ['0', '1'])
+
+    def test_prompt_one_wire_and_persistent_cache_key_stay_unchanged(self):
+        from subtitle_tool.mt_quality import PROMPTS
+        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': []}
+        legacy = make_stage_payload('draft', data, self.qiniu, capabilities=self.qiniu_caps, prompt_version=1)
+        self.assertEqual(legacy, {'model': self.qiniu.model, 'stream': False, 'max_tokens': 4096,
+            'messages': [{'role': 'system', 'content': PROMPTS['draft']},
+                         {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}],
+            'response_format': {'type': 'json_object'}})
+        key = stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps,
+                              scope=self.scope, prompt_version=1)
+        self.assertEqual(key, 'f6bbb1832877235689ce752c640a324f633b9eb9abfac7762993f8e32d8917b5')
+        self.assertNotEqual(key, stage_cache_key('draft', data, self.qiniu,
+                                                capabilities=self.qiniu_caps, scope=self.scope))
+
+    def test_new_prompt_leaves_output_budget_for_json_on_slow_reasoning_routes(self):
+        from dataclasses import replace
+        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
+        deepseek = replace(self.qiniu, model='deepseek/deepseek-v4.1-flash')
+        for backend, capabilities, field, value in [
+                (self.router, self.router_caps, 'reasoning', {'effort': 'low'}),
+                (deepseek, self.qiniu_caps, 'reasoning_effort', 'low')]:
+            with self.subTest(provider=backend.provider):
+                current = make_stage_payload('draft', data, backend, capabilities=capabilities)
+                self.assertEqual(current[field], value)
+                legacy = make_stage_payload('draft', data, backend, capabilities=capabilities, prompt_version=1)
+                self.assertNotIn(field, legacy)
+        custom = replace(self.qiniu, model='custom-model')
+        payload = make_stage_payload('draft', data, custom, capabilities=self.qiniu_caps)
+        self.assertNotIn('reasoning_effort', payload)
+        fixed = replace(self.router, model='vendor/non-reasoning-model')
+        payload = make_stage_payload('draft', data, fixed, capabilities=self.router_caps)
+        self.assertNotIn('reasoning', payload)
+
     def test_stage_cache_identity_covers_prompt_glossary_context_and_backend(self):
         data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': []}
         original = stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope=self.scope)

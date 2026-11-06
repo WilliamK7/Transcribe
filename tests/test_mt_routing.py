@@ -51,6 +51,245 @@ class RouterTests(unittest.TestCase):
         self.assertLessEqual(selected.count('a'), 850)
         self.assertEqual(router.run(lambda e, timeout, attempt: e.id, prefer_other_than=a).entry, b)
 
+    def test_format_failures_are_scoped_to_stage_and_cache_remains_available(self):
+        bad, good = entry('bad', weight=3), entry('good')
+        router = self.router([bad, good])
+        calls = []
+
+        def review(candidate, timeout, attempt):
+            calls.append(candidate.id)
+            if candidate == bad:
+                raise RouteFailure('format_exhausted')
+            return 'valid review'
+
+        for _ in range(3):
+            self.assertEqual(router.run(review, stage='review', prefer_other_than=good).value, 'valid review')
+        self.assertEqual(calls, ['bad', 'good', 'bad', 'good', 'good'])
+        self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='draft',
+                                    prefer_other_than=good).value, 'bad')
+        cached = router.run(lambda *args: self.fail('cached review must not dispatch'), stage='review',
+                            cache=lambda candidate: CacheHit('saved') if candidate == bad else None)
+        self.assertEqual(cached.value, 'saved')
+        self.assertTrue(cached.cached)
+
+        self.clock.now += 301
+        self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
+                                    prefer_other_than=good).value, 'bad')
+        self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
+                                    prefer_other_than=good).value, 'bad')
+
+    def test_suspect_free_candidate_is_still_tried_before_paid_fallback(self):
+        free, paid = entry('free'), entry('paid', 'paid')
+        router = self.router([free, paid])
+        calls = []
+
+        def invoke(candidate, timeout, attempt):
+            calls.append(candidate.id)
+            if candidate == free:
+                raise RouteFailure('format_exhausted')
+            return 'valid review'
+
+        for _ in range(4):
+            self.assertEqual(router.run(invoke, stage='review').value, 'valid review')
+        self.assertEqual(calls, ['free', 'paid'] * 4)
+
+    def test_format_recovery_probe_does_not_block_other_healthy_entries(self):
+        bad, good = entry('bad', weight=3), entry('good')
+        router = self.router([bad, good])
+
+        def fail_bad(candidate, timeout, attempt):
+            if candidate == bad:
+                raise RouteFailure('format_exhausted')
+            return 'good'
+
+        for _ in range(2):
+            router.run(fail_bad, stage='review', prefer_other_than=good)
+        self.clock.now += 301
+        entered, release = threading.Event(), threading.Event()
+
+        def probe(candidate, timeout, attempt):
+            self.assertEqual(candidate, bad)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError('probe not released')
+            return candidate.id
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(router.run, probe, stage='review', prefer_other_than=good)
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
+                                            prefer_other_than=good).value, 'good')
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=5).value, 'bad')
+        self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
+                                    prefer_other_than=good).value, 'bad')
+
+    def test_single_free_format_probe_respects_existing_wait_budget(self):
+        for paid_enabled in (True, False):
+            for budget in (0, 3, 15):
+                with self.subTest(paid_enabled=paid_enabled, budget=budget):
+                    self.clock.now = 0
+                    self.clock.waits.clear()
+                    free, paid = entry('free'), entry('paid', 'paid')
+                    router = self.router([free, paid], paid_enabled=paid_enabled, free_wait_seconds=budget)
+
+                    def fail_free(candidate, timeout, attempt):
+                        if candidate == free:
+                            raise RouteFailure('format_exhausted')
+                        return 'paid'
+
+                    for _ in range(2):
+                        if paid_enabled:
+                            self.assertEqual(router.run(fail_free, stage='review').value, 'paid')
+                        else:
+                            with self.assertRaises(RouteExhausted):
+                                router.run(fail_free, stage='review')
+                    self.clock.now += 301
+                    entered, release = threading.Event(), threading.Event()
+
+                    def probe(candidate, timeout, attempt):
+                        self.assertEqual(candidate, free)
+                        entered.set()
+                        if not release.wait(5):
+                            raise AssertionError('probe not released')
+                        return 'free'
+
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(router.run, probe, stage='review')
+                        try:
+                            self.assertTrue(entered.wait(5))
+                            self.assertEqual(router.run(lambda candidate, *args: candidate.id,
+                                                        stage='draft').value, 'free')
+                            if paid_enabled:
+                                result = router.run(lambda candidate, *args: candidate.id, stage='review')
+                                self.assertEqual(result.value, 'paid')
+                                self.assertAlmostEqual(result.free_waited, budget)
+                            else:
+                                with self.assertRaises(RouteExhausted) as error:
+                                    router.run(lambda candidate, *args: candidate.id, stage='review')
+                                self.assertAlmostEqual(error.exception.waited, budget)
+                        finally:
+                            release.set()
+                        self.assertEqual(future.result(timeout=5).value, 'free')
+                    self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review').value,
+                                     'free')
+
+    def test_all_unhealthy_free_entries_use_only_one_probe_each(self):
+        first, second, paid = entry('first', weight=3), entry('second'), entry('paid', 'paid')
+        router = self.router([first, second, paid])
+
+        def fail_free(candidate, timeout, attempt):
+            if candidate.tier == 'free':
+                raise RouteFailure('format_exhausted')
+            return 'paid'
+
+        for _ in range(2):
+            self.assertEqual(router.run(fail_free, stage='review').value, 'paid')
+        entered, both_entered, release = threading.Event(), threading.Event(), threading.Event()
+        lock, probes = threading.Lock(), []
+
+        def probe(candidate, timeout, attempt):
+            with lock:
+                probes.append(candidate.id)
+                entered.set()
+                if len(probes) == 2:
+                    both_entered.set()
+            if not release.wait(5):
+                raise AssertionError('probes not released')
+            return candidate.id
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = [pool.submit(router.run, probe, stage='review')]
+            try:
+                self.assertTrue(entered.wait(5))
+                pending.append(pool.submit(router.run, probe, stage='review'))
+                self.assertTrue(both_entered.wait(5))
+                self.assertCountEqual(probes, ['first', 'second'])
+                result = router.run(lambda candidate, *args: candidate.id, stage='review')
+                self.assertEqual(result.value, 'paid')
+                self.assertAlmostEqual(result.free_waited, 15)
+            finally:
+                release.set()
+            self.assertCountEqual([future.result(timeout=5).value for future in pending], ['first', 'second'])
+
+    def test_waiter_uses_free_after_active_probe_finishes(self):
+        free, paid = entry('free'), entry('paid', 'paid')
+        router = self.router([free, paid])
+
+        def fail_free(candidate, timeout, attempt):
+            if candidate == free:
+                raise RouteFailure('format_exhausted')
+            return 'paid'
+
+        for _ in range(2):
+            self.assertEqual(router.run(fail_free, stage='review').value, 'paid')
+        self.clock.now += 301
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def probe(candidate, timeout, attempt):
+            self.assertEqual(candidate, free)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError('probe not released')
+            return 'free'
+
+        def first_run():
+            try:
+                return router.run(probe, stage='review')
+            finally:
+                finished.set()
+
+        def wait_for_probe(control, seconds):
+            release.set()
+            if not finished.wait(5):
+                raise AssertionError('probe did not finish')
+            self.clock.wait(control, seconds)
+
+        router.wait = wait_for_probe
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(first_run)
+            try:
+                self.assertTrue(entered.wait(5))
+                calls = []
+                result = router.run(lambda candidate, *args: calls.append(candidate.id) or candidate.id,
+                                    stage='review')
+                self.assertEqual((result.value, calls), ('free', ['free']))
+                self.assertAlmostEqual(result.free_waited, 0.1)
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=5).value, 'free')
+
+    def test_old_success_cannot_clear_new_format_quarantine(self):
+        bad, good = entry('bad', weight=3), entry('good')
+        router = self.router([bad, good])
+        entered, release = threading.Event(), threading.Event()
+
+        def old_request(candidate, timeout, attempt):
+            self.assertEqual(candidate, bad)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError('old request not released')
+            return candidate.id
+
+        def fail_bad(candidate, timeout, attempt):
+            if candidate == bad:
+                raise RouteFailure('format_exhausted')
+            return 'good'
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(router.run, old_request, stage='review', prefer_other_than=good)
+            try:
+                self.assertTrue(entered.wait(5))
+                for _ in range(2):
+                    self.assertEqual(router.run(fail_bad, stage='review', prefer_other_than=good).value, 'good')
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=5).value, 'bad')
+        self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
+                                    prefer_other_than=good).value, 'good')
+
     def test_expiration_preference_stays_within_equally_capable_bailian_candidates(self):
         later = entry('later', provider='bailian', model='qwen-later')
         sooner = entry('sooner', provider='bailian', model='qwen-sooner')

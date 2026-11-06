@@ -44,7 +44,7 @@ class V5PipelineTests(SavedResultFixture):
                 if kwargs.get('on_dispatch') is not None:
                     kwargs['on_dispatch']()
                 payload = kwargs['json']
-                stage = next(name for name, prompt in PROMPTS.items() if prompt == payload['messages'][0]['content'])
+                stage = next(name for name, prompt in PROMPTS.items() if payload['messages'][0]['content'].startswith(prompt))
                 data = json.loads(payload['messages'][1]['content'])
                 data['_model'] = payload['model']
                 parent.calls.append((stage, url, data))
@@ -101,6 +101,29 @@ class V5PipelineTests(SavedResultFixture):
             self.assertEqual(final['backend'], cue['mt_origin'])
             self.assertEqual(final['actual_model'], production['record']['actual_model'])
             self.assertEqual(final['backend'], production['record']['backend'])
+
+    def test_old_prompt_resumes_saved_draft_and_reflow_selects_new_prompt(self):
+        self.install()
+        manifest = self.store.job(self.job_id)['manifest']
+        self.assertEqual(manifest['execution_snapshot']['prompt_version'], 2)
+        manifest['execution_snapshot']['prompt_version'] = 1
+        self.store.update(self.job_id, manifest=manifest)
+        cancel = threading.Event()
+        self.cancel_after = 'draft'
+        self.assertEqual(self.run_v5(cancel), 'cancelled')
+        saved = {item['key']: item for item in self.store.mt_stages(self.job_id)}
+        self.assertEqual({item['stage'] for item in saved.values()}, {'glossary', 'draft'})
+        self.cancel_after = None
+        self.calls.clear()
+        self.store.update(self.job_id, 'queued')
+        self.assertEqual(self.run_v5(), 'completed')
+        self.assertEqual([stage for stage, _, _ in self.calls], ['align', 'review'])
+        self.assertEqual(self.store.job(self.job_id)['manifest']['execution_snapshot']['prompt_version'], 1)
+        for key, item in saved.items():
+            self.assertEqual(self.store.mt_stage_entry(self.job_id, key),
+                             {'stage': item['stage'], 'record': item['record']})
+        Engine(self.config, self.store).reflow(self.job_id, output_dir=self.path / 'new-prompt')
+        self.assertEqual(self.store.job(self.job_id)['manifest']['execution_snapshot']['prompt_version'], 2)
 
     def test_first_group_is_saved_while_later_glossary_request_is_blocked(self):
         self.save_result(result(*[(f'Technical sentence {i}.', 'en') for i in range(9)]))
@@ -675,6 +698,23 @@ class V5PipelineTests(SavedResultFixture):
         self.assertTrue(all(cue['mt_origin'] == 'bailian_paid' for cue in self.store.cues(self.job_id)))
         self.config.set_qiniu_key('changed-unused-qiniu')
         Engine(self.config, self.store).retime(self.job_id, overwrite=True)
+
+    def test_retime_rejects_changed_used_key_before_saving_or_publishing(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        self.assertEqual(self.run_v5(), 'completed')
+        before = self.store.job(self.job_id)
+        output = Path(before['output'])
+        content = output.read_bytes()
+        self.config.set_qiniu_key('changed-used-qiniu')
+        self.calls.clear()
+        with self.assertRaises(ToolError) as error:
+            Engine(self.config, self.store).retime(self.job_id, overwrite=True)
+        self.assertEqual(error.exception.code, 'mt_account_changed')
+        self.assertEqual(self.store.job(self.job_id), before)
+        self.assertEqual(output.read_bytes(), content)
+        self.assertFalse((self.config.root / '.build' / 'retime').exists())
+        self.assertEqual(self.calls, [])
 
     def test_already_published_file_recovers_without_original_mt_key(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]

@@ -51,7 +51,7 @@ def parser():
                         choices=['qwen3.8-27b', 'qwen3.8-max-0902'], metavar='MODEL',
                         help='配合 --configure-mt-pool 追加已核实模型，可重复指定')
     result.add_argument('--confirm-same-account', action='store_true',
-                        help='确认 CLI 登录账户与当前北京 ASR 工作空间属于同一主账户')
+                        help='确认 CLI 所选 AK/SK（未配置时为控制台登录）与当前北京 ASR 工作空间属于同一主账户')
     result.add_argument('--confirm-propagation-waited', action='store_true',
                         help='确认已开启所选模型的额度用尽停用并已等待其生效')
     result.add_argument("--workspace-id", help="本次新任务使用的北京 Workspace ID（域名标签）")
@@ -278,8 +278,11 @@ def hint(store, job_id):
         print(job["error"], file=sys.stderr)
     command = f".\\scripts\\transcribe.ps1 --resume {job_id}"
     if job["state"] == "needs_review":
-        print(f"已保存待复核状态：.\\scripts\\transcribe.ps1 --review {job_id}\n"
-              f"非交互恢复可明确指定：{command} --track 音轨索引 --channel left（按实际选择）", file=sys.stderr)
+        print(f"已保存待复核状态：.\\scripts\\transcribe.ps1 --review {job_id}", file=sys.stderr)
+        if job["error_code"] in {"audio_track", "audio_channel"}:
+            print(f"非交互恢复可明确指定：{command} --track 音轨索引 --channel left（按实际选择）", file=sys.stderr)
+        else:
+            print("请在交互终端运行上面的 --review 命令，逐句确认语种及是否翻译。", file=sys.stderr)
     elif job["state"] == "submission_unknown":
         print(f"绑定已知 ID：{command} --bind-task-id 云端任务ID\n"
               f"明确接受可能重复计费后重发：{command} --allow-resubmit", file=sys.stderr)
@@ -349,7 +352,7 @@ def main(argv=None):
                 if proof is not None:
                     binding.observe(proof, rows)
             except (QuotaSourceError, ValueError):
-                raise ToolError('无法读取百炼 CLI 免费额度；请检查官方 CLI 版本和控制台登录。', 'mt_quota_unknown') from None
+                raise ToolError('无法读取百炼 CLI 免费额度；请检查官方 CLI 版本、AK/SK 权限或控制台登录。', 'mt_quota_unknown') from None
             models = [{'model': row.model, 'type': row.kind, 'remaining': row.remaining, 'total': row.total,
                        'expires': row.expires.isoformat() if row.expires else None, 'auto_stop': row.auto_stop,
                        'observation_usable': row.usable(beijing_today()) and row.remaining > 0}

@@ -200,7 +200,8 @@ class Store:
 
     def jobs(self):
         with self.lock:
-            return [self.job(r[0]) for r in self.db.execute("SELECT id FROM jobs ORDER BY created")]
+            return [dict(row, manifest=json.loads(row["manifest"]))
+                    for row in self.db.execute("SELECT * FROM jobs ORDER BY created")]
 
     def update(self, job_id, state=None, manifest=None, error="", code="", request_id=""):
         with self.lock, self.db:

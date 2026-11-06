@@ -71,6 +71,37 @@ class ZeroDurationWordTests(unittest.TestCase):
         self.assertTrue(new['words'])
 
 
+class ReviewDecisionPreservationTests(unittest.TestCase):
+    def test_mixed_manual_and_automatic_fragments_preserve_legacy_sentence_identity(self):
+        for legacy_identity in [False, True]:
+            with self.subTest(legacy_identity=legacy_identity):
+                source = normalize(result(('Keep this.', 'en')), 0, '0000', preserve_sentences=True)[0][0]
+                sentence_id = source['sentence_id']
+                cues = [dict(cue_id=sentence_id + ':0', sentence_id=sentence_id, text='Keep ', language='en',
+                             decision='original', source_lang='auto', reason='用户在终端确认'),
+                        dict(cue_id=sentence_id + ':1', sentence_id=sentence_id, text='this.', language='en',
+                             decision='original', source_lang='auto', decision_origin='automatic', reason='ASR')]
+                if legacy_identity:
+                    for cue in cues:
+                        cue.pop('sentence_id')
+                Engine.preserve_review_decisions([source], [], cues)
+                self.assertEqual((source['decision'], source['source_lang'], source['decision_origin']),
+                                 ('original', 'auto', 'manual'))
+
+    def test_conflicting_and_orphaned_manual_fragments_still_block_reflow(self):
+        for broken in ['conflicting', 'orphaned']:
+            with self.subTest(broken=broken):
+                source = normalize(result(('Keep this.', 'en')), 0, '0000', preserve_sentences=True)[0][0]
+                sentence_id = source['sentence_id']
+                cue = dict(cue_id=sentence_id + ':0', text='Keep this.', language='en', decision='original',
+                           source_lang='auto', decision_origin='manual', reason='confirmed')
+                other = {**cue, 'cue_id': sentence_id + ':1', 'decision': 'translate'} if broken == 'conflicting' else {
+                    **cue, 'cue_id': '0000:99999999:0'}
+                with self.assertRaises(ToolError) as error:
+                    Engine.preserve_review_decisions([source], [], [cue, other])
+                self.assertEqual(error.exception.code, 'reflow_review')
+
+
 class ReflowTests(PipelineFixture):
     def setUp(self):
         super().setUp()

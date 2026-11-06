@@ -142,7 +142,6 @@ class Engine:
                 saved_fallback(previous).credential(self.config)
                 proposed = {**previous['mt_fallback_policy'], 'enabled': proposed['enabled']}
                 if proposed == previous['mt_fallback_policy']:
-                    validate_origins(previous, self.store.references(job_id) + self.store.cues(job_id))
                     return
             else:
                 snapshot = self.config.root / '.build' / 'mt-fallback' / job_id / (str(time.time_ns()) + '.json')
@@ -323,10 +322,7 @@ class Engine:
         policy = load_policy(manifest, verify_execution=False)
         settings = self.retime_settings(manifest, policy.settings(self.config.settings))
         self.identity(job_id, manifest, persist=False)
-        if manifest.get('translation_strategy_version') == 5:
-            from .mt_pipeline_v5 import validate_provenance
-            validate_provenance(self, job_id, manifest)
-        else:
+        if manifest.get('translation_strategy_version') != 5:
             saved_mt(manifest).credential(self.config)
         cache = self.config.data / "cache" / job_id
         self.validate_saved_subtitles(job_id, manifest, cache)
@@ -376,12 +372,16 @@ class Engine:
     @staticmethod
     def preserve_review_decisions(sources, previous_sources, previous_cues):
         previous = {s["sentence_id"]: s for s in previous_sources}
+        cues_by_sentence = {}
+        for cue in previous_cues:
+            sentence_id = cue.get("sentence_id", ":".join(cue["cue_id"].split(":")[:2]))
+            cues_by_sentence.setdefault(sentence_id, []).append(cue)
         accounted = set()
         compact = lambda value: re.sub(r"\s", "", value)
         for source in sources:
             sentence_id = source["sentence_id"]
             old = previous.get(sentence_id)
-            cues = [c for c in previous_cues if c.get("sentence_id", ":".join(c["cue_id"].split(":")[:2])) == sentence_id]
+            cues = cues_by_sentence.get(sentence_id, [])
             manual = [c for c in cues if decision_origin(c) == "manual"]
             if old and decision_origin(old) == "manual":
                 if any(old.get(k) != source.get(k) for k in ["text", "language", "original_timings"]):

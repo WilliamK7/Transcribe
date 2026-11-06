@@ -20,6 +20,8 @@ from .mt_backend import MTBackend, QINIU_FREE_MODEL, qiniu_free_active
 
 
 _SCOPES = frozenset({'entry', 'model', 'credential', 'endpoint', 'free_quota', 'model_quota', 'paid_account'})
+_FORMAT_FAILURE_THRESHOLD = 2
+_FORMAT_RETRY_SECONDS = 300.0
 _CATEGORIES = frozenset({
     'timeout', 'provider_unavailable', 'provider_overloaded', 'server', 'rate_limit_exceeded',
     'context_length_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded', 'string_too_long',
@@ -115,6 +117,14 @@ class _Recovery:
 
 
 @dataclass
+class _FormatHealth:
+    failures: int = 0
+    retry_at: float = 0.0
+    generation: int = 0
+    probe_active: bool = False
+
+
+@dataclass
 class _Ticket:
     generations: dict
     probes: tuple
@@ -122,6 +132,9 @@ class _Ticket:
     token: object = field(default_factory=object)
     started_at: float | None = None
     dispatched: bool = False
+    format_key: tuple | None = None
+    format_generation: int = 0
+    format_probe: bool = False
 
 
 class _DispatchReservation:
@@ -211,6 +224,7 @@ class MTRouter:
         self.states = {entry.id: _Admission() for entry in self.entries}
         self.disabled = set()
         self.recoveries = {key: _Recovery() for entry in self.entries for key in _applicable_keys(entry)}
+        self._format_health = {}
 
     def _available(self, entry):
         if (entry.backend.provider == 'qiniu' and entry.backend.model == QINIU_FREE_MODEL and
@@ -218,7 +232,7 @@ class MTRouter:
             return False
         return bool(self.availability(entry))
 
-    def _select(self, tier, counts, stopped, preferred):
+    def _select(self, tier, counts, stopped, preferred, stage):
         available = {entry.id for entry in self.entries if entry.tier == tier and self._available(entry)}
         priorities = {entry.id: self.priority(entry) for entry in self.entries if entry.id in available}
         with self.lock:
@@ -237,6 +251,9 @@ class MTRouter:
                 delay = max(0.0, *(self.recoveries[key].cooldown_until - now for key in keys))
                 if any(self.recoveries[key].recovering and self.recoveries[key].probe_active for key in keys):
                     delay = max(delay, 0.1)
+                health = self._format_health.get((stage, entry.id)) if stage is not None else None
+                if health is not None and health.probe_active:
+                    delay = max(delay, 0.1)
                 if entry.rpm and len(state.starts) + state.pending >= entry.rpm:
                     window_delay = (state.starts[-entry.rpm][0] + 61.0 - now
                                     if len(state.starts) >= entry.rpm else 0.1)
@@ -246,6 +263,16 @@ class MTRouter:
                 else:
                     ready.append((entry, state, order))
             if ready:
+                if stage is not None:
+                    healthy = []
+                    for item in ready:
+                        health = self._format_health.get((stage, item[0].id))
+                        if health is None or not health.retry_at or (health.retry_at <= now and not health.probe_active):
+                            healthy.append(item)
+                    # Keep free-first routing: if the entire tier is unhealthy,
+                    # continue trying it instead of moving early to paid routes.
+                    if healthy:
+                        ready = healthy
                 other = [item for item in ready if not _matches(item[0], preferred)] if preferred is not None else []
                 if other:
                     ready = other
@@ -268,6 +295,13 @@ class MTRouter:
                 for key in probes:
                     self.recoveries[key].probe_active = True
                 ticket = _Ticket({key: self.recoveries[key].generation for key in keys}, probes, bool(entry.rpm))
+                if stage is not None:
+                    ticket.format_key = (stage, entry.id)
+                    health = self._format_health.get(ticket.format_key)
+                    if health is not None:
+                        ticket.format_generation = health.generation
+                        if health.retry_at and not health.probe_active:
+                            health.probe_active = ticket.format_probe = True
                 if entry.rpm:
                     state.pending += 1
                 return entry, ticket, None
@@ -288,6 +322,10 @@ class MTRouter:
                 recovery = self.recoveries[key]
                 if ticket.generations[key] == recovery.generation:
                     recovery.probe_active = False
+            if ticket.format_probe:
+                health = self._format_health.get(ticket.format_key)
+                if health is not None and ticket.format_generation == health.generation:
+                    health.probe_active = False
 
     def _confirm(self, entry, ticket):
         """Reject an admission invalidated by a peer before it starts HTTP."""
@@ -307,6 +345,14 @@ class MTRouter:
 
     def _record_failure(self, entry, ticket, failure):
         with self.lock:
+            if failure.category == 'format_exhausted' and ticket.dispatched and ticket.format_key is not None:
+                health = self._format_health.setdefault(ticket.format_key, _FormatHealth())
+                if ticket.format_generation == health.generation:
+                    health.failures += 1
+                    if health.failures >= _FORMAT_FAILURE_THRESHOLD:
+                        health.retry_at = self.clock() + _FORMAT_RETRY_SECONDS
+                        health.generation += 1
+                        health.probe_active = False
             key = _scope_key(entry, failure.scope)
             if failure.disable:
                 self.disabled.add(key)
@@ -331,6 +377,12 @@ class MTRouter:
 
     def _record_success(self, ticket):
         with self.lock:
+            health = self._format_health.get(ticket.format_key)
+            if health is not None and ticket.format_generation == health.generation:
+                health.failures = 0
+                health.retry_at = 0.0
+                health.probe_active = False
+                health.generation += 1
             for key in ticket.probes:
                 recovery = self.recoveries[key]
                 if ticket.generations[key] == recovery.generation:
@@ -339,11 +391,13 @@ class MTRouter:
                     recovery.recovering = False
                     recovery.probe_active = False
 
-    def run(self, invoke, *, cache=None, prefer_other_than=None, prepare=None, deadline_seconds=180.0):
+    def run(self, invoke, *, cache=None, prefer_other_than=None, prepare=None, deadline_seconds=180.0, stage=None):
         """Return a RouteResult; raise a content-free error when all routes fail."""
         if (isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, (int, float)) or
                 not math.isfinite(deadline_seconds) or not 0 <= deadline_seconds <= 180):
             raise ValueError('deadline_seconds must be between 0 and 180')
+        if stage is not None and (not isinstance(stage, str) or not stage):
+            raise ValueError('Invalid route stage')
         start = self.clock()
         deadline = start + deadline_seconds
         self.control.check_start()
@@ -375,7 +429,7 @@ class MTRouter:
                 raise RouteExhausted(deadline=True, failures=failures, attempts=attempts, waited=waited)
             if tier == 'paid' and not self.paid_enabled:
                 raise RouteExhausted(failures=failures, attempts=attempts, waited=waited)
-            entry, ticket, delay = self._select(tier, counts, stopped, prefer_other_than)
+            entry, ticket, delay = self._select(tier, counts, stopped, prefer_other_than, stage)
             if entry is None:
                 budget = self.free_wait_seconds - free_waited if tier == 'free' else remaining
                 if delay is None or budget <= 0:
@@ -436,18 +490,17 @@ class MTRouter:
                     if tier == 'free' and free_waited > self.free_wait_seconds:
                         tier = 'paid'
                         continue
-                    if failure is None:
+                    if failure is None and reservation is not None:
                         available = self._available(entry)
                         self.control.check_start()
                         if not available or not self._confirm(entry, ticket):
                             continue
-                        if reservation is not None:
-                            try:
-                                reservation.claim()
-                            except Cancelled:
-                                raise
-                            except RouteFailure as error:
-                                failure = error
+                        try:
+                            reservation.claim()
+                        except Cancelled:
+                            raise
+                        except RouteFailure as error:
+                            failure = error
                     if failure is None:
                         self.control.check_start()
                         if not self._available(entry) or not self._confirm(entry, ticket):

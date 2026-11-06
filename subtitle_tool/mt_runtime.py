@@ -336,6 +336,26 @@ class FreeQuota:
             raise ValueError()
         return {k: value[k] for k in ('used', 'limit', 'remaining')}
 
+    def _finish_refresh(self, control, value, day, sent, active):
+        """Commit one observation and account for reservations made during its query."""
+        with self.condition:
+            observed = self.utcnow()
+            if value is not None and observed.date() == day:
+                remote = min(value['remaining'], max(0, value['limit'] - value['used']))
+                available = max(0, remote - active - (self.reservations - sent))
+                self.remaining = min(self.remaining, available) if self.day == day else available
+                self.day = day
+                self.trusted.add(control)
+                self.observed_monotonic = self.clock()
+                self.observation = {**value, 'observed_at': observed.isoformat()}
+                event = {'kind': 'runtime_quota', 'category': 'quota_observed', **self.observation,
+                         'local_remaining': self.remaining}
+            else:
+                event = {'kind': 'runtime_quota', 'category': 'quota_refresh_failed'}
+            self.refreshing = False
+            self.condition.notify_all()
+        return event
+
     def ensure(self, control, fetch, on_event=lambda event: None):
         while True:
             control.check_start()
@@ -372,23 +392,7 @@ class FreeQuota:
         except (TransportError, ValueError, KeyError, TypeError, RecursionError):
             pass
         finally:
-            with self.condition:
-                observed = self.utcnow()
-                if value is not None and observed.date() == day:
-                    remote = min(value['remaining'], max(0, value['limit'] - value['used']))
-                    available = max(0, remote - active - (self.reservations - sent))
-                    self.remaining = min(self.remaining, available) if self.day == day else available
-                    self.day = day
-                    self.trusted.add(control)
-                    self.observed_monotonic = self.clock()
-                    self.observation = {**value, 'observed_at': observed.isoformat()}
-                    event = {'kind': 'runtime_quota', 'category': 'quota_observed', **self.observation,
-                             'local_remaining': self.remaining}
-                else:
-                    event = {'kind': 'runtime_quota', 'category': 'quota_refresh_failed'}
-                self.refreshing = False
-                self.condition.notify_all()
-            on_event(event)
+            on_event(self._finish_refresh(control, value, day, sent, active))
         control.check_start()
         with self.condition:
             if self.day != self.utcnow().date() or control not in self.trusted:
