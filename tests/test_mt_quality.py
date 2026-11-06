@@ -79,12 +79,6 @@ class QualityContractTests(unittest.TestCase):
         schema = payload['response_format']['json_schema']['schema']
         self.assertEqual(schema['properties']['issues']['items']['properties']['id']['enum'], ['0', '1'])
 
-    def test_retired_prompt_is_rejected(self):
-        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
-        with self.assertRaises(ToolError) as caught:
-            make_stage_payload('draft', data, self.qiniu, capabilities=self.qiniu_caps, prompt_version=1)
-        self.assertEqual(caught.exception.code, 'cache_version')
-
     def test_new_prompt_leaves_output_budget_for_json_on_slow_reasoning_routes(self):
         from dataclasses import replace
         data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
@@ -175,7 +169,7 @@ class QualityContractTests(unittest.TestCase):
         from subtitle_tool.subtitles import normalize, plan_fragments
         from tests.fixtures import timed_raw
         raw = timed_raw([f'word{i}' for i in range(70)], word_ms=1000)
-        source = normalize(raw, 0, '0000', duration_ms=80000, preserve_sentences=True)[0][0]
+        source = normalize(raw, 0, '0000', duration_ms=80000)[0][0]
         cues = plan_fragments(source, Settings())
         pipeline = Pipeline.__new__(Pipeline)
         pipeline._fit = lambda stage, data, **kwargs: data

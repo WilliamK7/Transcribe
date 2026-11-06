@@ -142,7 +142,7 @@ class OggRecoveryTests(PipelineFixture):
             with self.subTest(case=case):
                 self.job_id = enqueue_current(self.store, self.config, source, output_dir=self.path / case)
                 cache = self.config.data / "cache" / self.job_id
-                plan, segments = media.prepare(source, cache, info, track, "ask", extract_recipe_version=2)
+                plan, segments = media.prepare(source, cache, info, track, "ask")
                 if case == "unknown_version":
                     plan["extract_recipe_version"] = 99
                 manifest = self.store.job(self.job_id)["manifest"]

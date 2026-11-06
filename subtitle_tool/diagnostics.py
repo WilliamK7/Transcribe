@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
-from .common import DISPLAY_TIMING_VERSION
 from .config import Config, Settings
 from .instance import ProcessLock
 from .media import Media, run_process
@@ -47,9 +46,9 @@ def self_test(config: Config, report: Path):
         raw = {"transcripts": [{"channel_id": 0, "sentences": [
             {"begin_time": 100, "end_time": 1200, "text": "中文本地验证。", "language": "zh"},
             {"begin_time": 1160, "end_time": 2260, "text": "独立显示时间检查。", "language": "zh"}]}]}
-        sources, _ = normalize(raw, plan["audio_offset_ms"], "0", preserve_sentences=True)
+        sources, _ = normalize(raw, plan["audio_offset_ms"], "0")
         cues = [make_fragment(source) for source in sources]
-        intervals, adjustments = plan_display_timing(cues, version=DISPLAY_TIMING_VERSION)
+        intervals, adjustments = plan_display_timing(cues)
         assert cues[0]["end_ms"] - cues[1]["begin_ms"] == adjustments[0]["adjustment_ms"] == 40
         assert intervals[0]["end_ms"] == intervals[1]["begin_ms"]
         srt = render_srt(cues, Settings(), display_intervals=intervals)

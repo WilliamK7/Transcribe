@@ -75,13 +75,12 @@ class RetimeTests(SavedResultFixture):
 
     def test_overwrite_is_explicit_and_invalid_conflicts_do_not_change_the_task(self):
         self.prepare_completed()
-        for overwrite, code in [(False, "overwrite_required")]:
-            with self.subTest(overwrite=overwrite), self.assertRaises(ToolError) as caught:
-                Engine(self.config, self.store).retime(self.job_id, overwrite=overwrite)
-            self.assertEqual(caught.exception.code, code)
-            self.assertEqual(self.store.job(self.job_id), self.before)
-            self.assertEqual(self.output.read_bytes(), self.old_content)
-            self.assert_evidence_unchanged()
+        with self.assertRaises(ToolError) as caught:
+            Engine(self.config, self.store).retime(self.job_id)
+        self.assertEqual(caught.exception.code, 'overwrite_required')
+        self.assertEqual(self.store.job(self.job_id), self.before)
+        self.assertEqual(self.output.read_bytes(), self.old_content)
+        self.assert_evidence_unchanged()
         self.assertFalse((self.config.root / ".build" / "retime").exists())
 
     def test_incomplete_saved_layout_or_translation_is_not_rebuilt(self):

@@ -34,7 +34,7 @@ class PointSentenceGroupTests(TemporaryTest):
     def test_fourteen_character_point_merges_with_next_original_sentence_eighty_ms_away(self):
         raw = nearby_point()
         before = copy.deepcopy(raw)
-        sources, warnings = normalize(raw, 1250, "s", duration_ms=5000, preserve_sentences=True)
+        sources, warnings = normalize(raw, 1250, "s", duration_ms=5000)
         self.assertEqual(raw, before)
         self.assertEqual(len(sources), 2)
         source = sources[-1]
@@ -50,10 +50,7 @@ class PointSentenceGroupTests(TemporaryTest):
             "kind": "merged_asr_nearby_point", "direction": "next", "distance_ms": 80,
             "original_neighbor_begin_ms": 2080, "original_neighbor_end_ms": 3360}])
         self.assertTrue(warnings)
-        self.assertEqual(plan_display_timing(sources, version=2)[1], [])
-        with self.assertRaises(ToolError) as caught:
-            normalize(raw, 1250, "s", duration_ms=5000, normalizer_version=3)
-        self.assertEqual(caught.exception.code, "cache_version")
+        self.assertEqual(plan_display_timing(sources)[1], [])
 
     def test_nearby_original_neighbors_allow_four_hundred_ms_but_reject_four_hundred_and_one(self):
         for direction in ["previous", "next"]:
@@ -66,19 +63,19 @@ class PointSentenceGroupTests(TemporaryTest):
                             normalize(raw, 0, "s", duration_ms=5000)
                         self.assertEqual(caught.exception.code, "timeline")
                     else:
-                        sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+                        sources, _ = normalize(raw, 0, "s", duration_ms=5000)
                         source = sources[0] if direction == "previous" else sources[-1]
                         self.assertEqual(source["timing_adjustments"][0]["distance_ms"], distance)
                         self.assertEqual(source["timing_adjustments"][0]["direction"], direction)
                         self.assertEqual(source["asr_sentence_indices"], [0, 1] if direction == "previous" else [1, 2])
                         self.assertEqual(source["words"], [])
-                        self.assertEqual(plan_display_timing(sources, version=2)[1], [])
+                        self.assertEqual(plan_display_timing(sources)[1], [])
                     self.assertEqual(raw, before)
 
     def test_nearby_previous_neighbor_keeps_short_point_direction_priority(self):
         raw = nearby_point()
         raw["transcripts"][0]["sentences"][0]["end_time"] = 1600
-        sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+        sources, _ = normalize(raw, 0, "s", duration_ms=5000)
         self.assertEqual(sources[0]["asr_sentence_indices"], [0, 1])
         self.assertEqual((sources[0]["begin_ms"], sources[0]["end_ms"]), (0, 2000))
         self.assertEqual(sources[0]["timing_adjustments"][0]["distance_ms"], 400)
@@ -90,7 +87,7 @@ class PointSentenceGroupTests(TemporaryTest):
                 sentences = raw["transcripts"][0]["sentences"]
                 short = point_sentence(2000)
                 sentences.insert(1 if short_first else 2, short)
-                sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+                sources, _ = normalize(raw, 0, "s", duration_ms=5000)
                 self.assertEqual(sources[-1]["asr_sentence_indices"], [1, 2, 3])
                 self.assertEqual(sources[-1]["text"], " ".join(s["text"] for s in sentences[1:]))
                 self.assertEqual(sources[-1]["words"], [])
@@ -124,7 +121,7 @@ class PointSentenceGroupTests(TemporaryTest):
         sentences[:] = [point_sentence(1000, "A synthetic sentence one."),
             {"begin_time": 1400, "end_time": 2400, "text": "The timed sentence.", "language": "en"},
             point_sentence(2800, "Another synthetic point.")]
-        sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+        sources, _ = normalize(raw, 0, "s", duration_ms=5000)
         self.assertEqual(len(sources), 1)
         self.assertEqual((sources[0]["begin_ms"], sources[0]["end_ms"]), (1000, 2800))
         self.assertEqual(sources[0]["asr_sentence_indices"], [0, 1, 2])
@@ -136,7 +133,7 @@ class PointSentenceGroupTests(TemporaryTest):
             normalize(raw, 0, "s", duration_ms=5000)
         self.assertEqual(caught.exception.code, "timeline")
         sentences.append({"begin_time": 3200, "end_time": 4500, "text": "The final sentence.", "language": "en"})
-        sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+        sources, _ = normalize(raw, 0, "s", duration_ms=5000)
         self.assertEqual([s["asr_sentence_indices"] for s in sources], [[0, 1, 2], [3, 4]])
         self.assertEqual(sources[-1]["timing_adjustments"][0]["kind"], "merged_asr_boundary_point")
         self.assertEqual(sources[-1]["timing_adjustments"][0]["direction"], "next")
@@ -144,7 +141,7 @@ class PointSentenceGroupTests(TemporaryTest):
     def test_long_same_point_group_reuses_previous_interval_and_keeps_all_evidence(self):
         raw = boundary_points()
         before = copy.deepcopy(raw)
-        sources, warnings = normalize(raw, 1250, "s", duration_ms=5000, preserve_sentences=True)
+        sources, warnings = normalize(raw, 1250, "s", duration_ms=5000)
         self.assertEqual(raw, before)
         self.assertEqual(len(sources), 2)
         source = sources[0]
@@ -160,12 +157,8 @@ class PointSentenceGroupTests(TemporaryTest):
             {"asr_sentence_index": i, "anchor_ms": 2000, "original_begin_ms": 2000, "original_end_ms": 2000,
              "kind": "merged_asr_boundary_point", "direction": "previous"} for i in [1, 2]])
         self.assertTrue(warnings)
-        intervals, _ = plan_display_timing(sources, version=2)
+        intervals, _ = plan_display_timing(sources)
         self.assertEqual([(i["begin_ms"], i["end_ms"]) for i in intervals], [(1250, 3250), (3250, 5250)])
-        for version in [1, 2, 3]:
-            with self.subTest(saved_version=version), self.assertRaises(ToolError) as caught:
-                normalize(raw, 1250, "s", duration_ms=5000, normalizer_version=version)
-            self.assertEqual(caught.exception.code, "cache_version")
 
     def test_group_uses_next_original_interval_when_previous_cannot_anchor_it(self):
         for previous in [None, "other_language", "gap"]:
@@ -180,7 +173,7 @@ class PointSentenceGroupTests(TemporaryTest):
                 else:
                     sentences[0]["end_time"] = 1999
                 first = 0 if previous is None else 1
-                sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+                sources, _ = normalize(raw, 0, "s", duration_ms=5000)
                 source = sources[-1]
                 self.assertEqual((source["begin_ms"], source["end_ms"]), (2000, 4000))
                 self.assertEqual(source["asr_sentence_indices"], list(range(first, first + 3)))
@@ -194,7 +187,7 @@ class PointSentenceGroupTests(TemporaryTest):
         sentences = raw["transcripts"][0]["sentences"]
         sentences.pop(2)
         sentences[-1]["begin_time"] = 3500
-        sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+        sources, _ = normalize(raw, 0, "s", duration_ms=5000)
         self.assertEqual((sources[0]["begin_ms"], sources[0]["end_ms"]), (0, 2000))
         self.assertEqual(sources[0]["asr_sentence_indices"], [0, 1])
 
@@ -220,7 +213,7 @@ class PointSentenceGroupTests(TemporaryTest):
         point = sentences[2]
         point["words"] = [{"begin_time": 2000, "end_time": 2000, "text": "Another", "punctuation": ""},
                           {"begin_time": 2000, "end_time": 2000, "text": "synthetic point", "punctuation": "."}]
-        sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+        sources, _ = normalize(raw, 0, "s", duration_ms=5000)
         self.assertEqual(sources[0]["text"], "Earlier sentence. Yes. Another synthetic point.")
         self.assertEqual(sources[0]["asr_sentence_indices"], [0, 1, 2])
         self.assertEqual(sources[0]["words"], [])
@@ -238,7 +231,7 @@ class PointSentenceGroupTests(TemporaryTest):
         raw["transcripts"][0]["sentences"] = [point_sentence(1000, "A synthetic sentence one."),
             {"begin_time": 1000, "end_time": 2000, "text": "The timed sentence.", "language": "en"},
             point_sentence(2000, "Another synthetic point.")]
-        sources, _ = normalize(raw, 0, "s", duration_ms=5000, preserve_sentences=True)
+        sources, _ = normalize(raw, 0, "s", duration_ms=5000)
         self.assertEqual(len(sources), 1)
         self.assertEqual((sources[0]["begin_ms"], sources[0]["end_ms"]), (1000, 2000))
         self.assertEqual(sources[0]["asr_sentence_indices"], [0, 1, 2])

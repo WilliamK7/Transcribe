@@ -10,15 +10,9 @@ from subtitle_tool.common import ToolError
 from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import summary
-from subtitle_tool.policy import load_policy
-from subtitle_tool.subtitles import render_srt, make_fragment, normalize, plan_display_timing, validate_display_intervals
+from subtitle_tool.subtitles import render_srt, plan_display_timing, validate_display_intervals
 
 from tests.fixtures import FakeService, SavedResultFixture, overlapping_raw, srt_intervals
-
-
-def original_cues(raw):
-    sources, _ = normalize(raw, 0, "0000", preserve_sentences=True)
-    return sources, [{**make_fragment(s), "decision": "original"} for s in sources]
 
 
 class DisplayTimingPipelineTests(SavedResultFixture):
@@ -37,19 +31,6 @@ class DisplayTimingPipelineTests(SavedResultFixture):
                          [(1000, 5000), (4960, 8320)])
         Engine(self.config, self.store).validate_saved_subtitles(self.job_id, manifest)
 
-
-    def test_unknown_version_stops_before_cache_requests_and_publication(self):
-        self.save_result(overlapping_raw())
-        initial = self.store.job(self.job_id)["manifest"]
-        for version in [-1, 3, True, "1", None]:
-            with self.subTest(version=version):
-                manifest = {**initial, "display_timing_version": version}
-                self.store.update(self.job_id, "queued", manifest)
-                fake = FakeService(overlapping_raw())
-                self.assertEqual(self.run_fake(fake), "failed")
-                self.assertEqual(self.store.job(self.job_id)["error_code"], "cache_version")
-                self.assertEqual(fake.calls, [])
-                self.assertFalse(self.source.with_suffix(".srt").exists())
 
     def test_unrepairable_overlap_preserves_complete_translations_and_output(self):
         raw = overlapping_raw(overlap=501)
@@ -115,18 +96,15 @@ class DisplayTimingV2Tests(unittest.TestCase):
     def test_300ms_reproduction_keeps_evidence_and_only_trims_the_first_end(self):
         cues = [cue(298, 1549460, 1554980), cue(299, 1554680, 1558000)]
         saved = copy.deepcopy(cues)
-        with self.assertRaises(ToolError) as caught:
-            plan_display_timing(cues, version=1)
-        self.assertEqual(caught.exception.code, 'cache_version')
-        intervals, adjustments = plan_display_timing(cues, version=2)
+        intervals, adjustments = plan_display_timing(cues)
         self.assertEqual([(r['begin_ms'], r['end_ms']) for r in intervals],
                          [(1549460, 1554680), (1554680, 1558000)])
         self.assertEqual(adjustments, [dict(cue_id=cues[0]['cue_id'], old_begin_ms=1549460,
             old_end_ms=1554980, new_begin_ms=1549460, new_end_ms=1554680, adjustment_ms=300,
             reason='bounded_sentence_overlap')])
         self.assertEqual(cues, saved)
-        self.assertEqual(plan_display_timing(cues, version=2), (intervals, adjustments))
-        content, saved_adjustments = Engine.render_subtitles(cues, Settings(), {'display_timing_version': 2})
+        self.assertEqual(plan_display_timing(cues), (intervals, adjustments))
+        content, saved_adjustments = Engine.render_subtitles(cues, Settings())
         self.assertEqual(saved_adjustments, adjustments)
         self.assertEqual(srt_intervals(content), [(1549460, 1554680), (1554680, 1558000)])
 
@@ -136,10 +114,10 @@ class DisplayTimingV2Tests(unittest.TestCase):
             with self.subTest(overlap=overlap):
                 if overlap > 500:
                     with self.assertRaises(ToolError) as caught:
-                        plan_display_timing(cues, version=2)
+                        plan_display_timing(cues)
                     self.assertIn('500ms', str(caught.exception))
                 else:
-                    intervals, adjustments = plan_display_timing(cues, version=2)
+                    intervals, adjustments = plan_display_timing(cues)
                     self.assertEqual(intervals[0]['end_ms'], 5000 - overlap)
                     self.assertEqual(adjustments[0]['adjustment_ms'], overlap)
 
@@ -149,11 +127,11 @@ class DisplayTimingV2Tests(unittest.TestCase):
             cues = [cue(1, 0, duration), cue(2, duration - overlap, 9000)]
             with self.subTest(duration=duration):
                 if accepted:
-                    intervals, _ = plan_display_timing(cues, version=2)
+                    intervals, _ = plan_display_timing(cues)
                     self.assertEqual(intervals[0]['end_ms'], duration - overlap)
                 else:
                     with self.assertRaises(ToolError) as caught:
-                        plan_display_timing(cues, version=2)
+                        plan_display_timing(cues)
                     self.assertIn('10%', str(caught.exception))
                     self.assertNotIn(cues[0]['text'], str(caught.exception))
 
@@ -162,12 +140,12 @@ class DisplayTimingV2Tests(unittest.TestCase):
             cues = [cue(1, 0, remaining + 100), cue(2, remaining, remaining + following)]
             with self.subTest(remaining=remaining, following=following):
                 if accepted:
-                    plan_display_timing(cues, version=2)
+                    plan_display_timing(cues)
                 else:
                     with self.assertRaises(ToolError) as caught:
-                        plan_display_timing(cues, version=2)
+                        plan_display_timing(cues)
                     self.assertIn('1000ms', str(caught.exception))
-        intervals, adjustments = plan_display_timing([cue(1, 0, 200), cue(2, 300, 500)], version=2)
+        intervals, adjustments = plan_display_timing([cue(1, 0, 200), cue(2, 300, 500)])
         self.assertEqual([i['end_ms'] for i in intervals], [200, 500])
         self.assertEqual(adjustments, [])
 
@@ -178,7 +156,7 @@ class DisplayTimingV2Tests(unittest.TestCase):
                     {**second, 'sentence_id': first['sentence_id']}, {**second, 'sentence_id': '0000:00000000'}]
         for other in variants:
             with self.subTest(other=other), self.assertRaises(ToolError) as caught:
-                plan_display_timing([first, other], version=2)
+                plan_display_timing([first, other])
             self.assertIn('区间结构冲突', str(caught.exception))
             self.assertIn(first['sentence_id'], str(caught.exception))
             self.assertIn('[0, 5000)', str(caught.exception))
@@ -187,24 +165,14 @@ class DisplayTimingV2Tests(unittest.TestCase):
     def test_chained_conflicts_are_deterministic_and_idempotent(self):
         cues = [cue(1, 0, 5000), cue(2, 4700, 9700), cue(3, 9400, 14400)]
         before = copy.deepcopy(cues)
-        intervals, adjustments = plan_display_timing(cues, version=2)
+        intervals, adjustments = plan_display_timing(cues)
         validate_display_intervals(cues, intervals)
         self.assertEqual([i['end_ms'] for i in intervals], [4700, 9400, 14400])
         self.assertEqual([a['adjustment_ms'] for a in adjustments], [300, 300])
-        self.assertEqual(plan_display_timing(cues, version=2), (intervals, adjustments))
+        self.assertEqual(plan_display_timing(cues), (intervals, adjustments))
         displayed = [{**c, **i} for c, i in zip(cues, intervals)]
-        self.assertEqual(plan_display_timing(displayed, version=2), (intervals, []))
+        self.assertEqual(plan_display_timing(displayed), (intervals, []))
         self.assertEqual(cues, before)
-
-
-    def test_unknown_display_versions_are_rejected_by_policy_and_renderer(self):
-        for version in [-1, 3, True, '2', None]:
-            with self.subTest(version=version):
-                for operation in [lambda: load_policy({'display_timing_version': version}),
-                                  lambda: Engine.render_subtitles([], Settings(), {'display_timing_version': version})]:
-                    with self.assertRaises(ToolError) as caught:
-                        operation()
-                    self.assertEqual(caught.exception.code, 'cache_version')
 
 
 class DisplayTimingV2PipelineTests(SavedResultFixture):
@@ -221,8 +189,8 @@ class DisplayTimingV2PipelineTests(SavedResultFixture):
         manifest['display_timing_version'] = 2
         self.store.update(self.job_id, manifest=manifest)
         self.fake = FakeService(raw)
-        with mock.patch.object(Engine, 'preflight_display_timing'), mock.patch.object(Engine, 'render_subtitles',
-                side_effect=lambda cues, settings, manifest: (render_srt(cues, settings), [])):
+        with mock.patch('subtitle_tool.mt_pipeline.plan_display_timing'), mock.patch.object(Engine, 'render_subtitles',
+                side_effect=lambda cues, settings: (render_srt(cues, settings), [])):
             self.assertEqual(self.run_fake(self.fake), 'completed')
         self.fake.calls.clear()
         return self.store.job(self.job_id)['manifest']
@@ -238,7 +206,6 @@ class DisplayTimingV2PipelineTests(SavedResultFixture):
         job = self.store.job(self.job_id)
         self.assertEqual(job['error_code'], 'timeline')
         self.assertEqual(self.store.counts(self.job_id).get('mt', 0), 0)
-        self.assertEqual(self.store.counts(self.job_id).get('mt_subtitle_request', 0), 0)
         self.assertNotIn('publication_intent', job['manifest'])
         self.assertNotIn('display_timing_adjustments', job['manifest'])
 

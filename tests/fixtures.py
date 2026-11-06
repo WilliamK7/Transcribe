@@ -6,7 +6,6 @@ import re
 import shutil
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -182,7 +181,7 @@ class SavedResultFixture(TemporaryTest):
                         contract={"asr": ASR_MODEL, "normalizer": NORMALIZER_VERSION,
                                   "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}})
         atomic_json(self.cache / "raw-0000.json", raw)
-        sources, warnings = normalize(raw, 0, "0000", duration_ms=10000, preserve_sentences=True)
+        sources, warnings = normalize(raw, 0, "0000", duration_ms=10000)
         if normalized:
             manifest.update(normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
                             warnings=warnings)
@@ -202,7 +201,6 @@ class SavedResultFixture(TemporaryTest):
 @unittest.skipUnless(os.name == "nt" and (ROOT / "tools" / "ffmpeg.exe").exists(), "Windows/bundled tools required")
 class PipelineFixture(TemporaryTest):
     fixture_seconds = 10
-    translation_strategy_version = None
 
     @classmethod
     def setUpClass(cls):
@@ -227,10 +225,6 @@ class PipelineFixture(TemporaryTest):
         shutil.copyfile(self.fixture, self.source)
         self.store = Store(self.config.data / "jobs.sqlite")
         self.job_id = enqueue_current(self.store, self.config, self.source)
-        if self.translation_strategy_version is not None:
-            manifest = self.store.job(self.job_id)['manifest']
-            manifest['translation_strategy_version'] = self.translation_strategy_version
-            self.store.update(self.job_id, manifest=manifest)
 
     def tearDown(self):
         self.store.close()

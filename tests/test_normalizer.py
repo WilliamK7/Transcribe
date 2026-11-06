@@ -30,30 +30,15 @@ class NormalizerBoundaryTests(TemporaryTest):
         for raw in [result(), {"transcripts": [{"text": "", "sentences": []}]}, result(("完整字幕。", "zh"))]:
             normalize(raw, 0, "s", duration_ms=1000)
 
-    def test_old_versions_keep_their_validation_and_reject_unknown_versions(self):
+    def test_negative_global_offset_and_short_point_repair(self):
         raw = result(("完整字幕。", "zh"))
-        raw["transcripts"][0]["sentences"][0].update(begin_time=5000, end_time=6000)
-        for version in [1, 2, 3]:
-            with self.assertRaises(ToolError) as caught:
-                normalize(raw, 0, 's', normalizer_version=version)
-            self.assertEqual(caught.exception.code, 'cache_version')
-        with self.assertRaises(ToolError) as caught:
-            normalize(raw, 0, "s", normalizer_version=99)
-        self.assertEqual(caught.exception.code, "cache_version")
-
-    def test_saved_versions_keep_negative_global_offset_and_short_point_repair(self):
-        raw = result(("完整字幕。", "zh"))
-        cues, warnings = normalize(raw, -100, "s", duration_ms=1000, normalizer_version=4)
+        cues, warnings = normalize(raw, -100, "s", duration_ms=1000)
         self.assertEqual((cues[0]["begin_ms"], cues[0]["end_ms"]), (0, 800))
         self.assertTrue(warnings)
         raw = result()
         raw["transcripts"][0]["sentences"].append(point_sentence(900))
-        expected = normalize(raw, 500, "s", duration_ms=1000, normalizer_version=4)
-        cues, _ = expected
+        cues, _ = normalize(raw, 500, "s", duration_ms=1000)
         self.assertEqual((cues[0]["begin_ms"], cues[0]["end_ms"]), (1400, 1500))
-        for version in [4]:
-            with self.subTest(version=version):
-                self.assertEqual(normalize(raw, 500, "s", duration_ms=1000, normalizer_version=version), expected)
 
 
 class NormalizerVersionPipelineTests(PipelineFixture):

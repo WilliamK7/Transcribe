@@ -6,7 +6,7 @@ import re
 import threading
 from datetime import datetime, timezone
 
-from .mt import VALIDATION_CATEGORIES
+from .mt_quality import VALIDATION_CATEGORIES
 
 
 _WRITE_LOCK = threading.Lock()

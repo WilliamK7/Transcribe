@@ -25,7 +25,7 @@ class ZeroDurationWordTests(unittest.TestCase):
                 for index in zeros:
                     sentence['words'][index]['end_time'] = sentence['words'][index]['begin_time']
                 saved = copy.deepcopy(raw)
-                source = normalize(raw, 0, '0000', preserve_sentences=True, subtitle_version=2)[0][0]
+                source = normalize(raw, 0, '0000')[0][0]
                 self.assertEqual(raw, saved)
                 self.assertEqual(source['word_timing_status'], 'reliable_grouped_points')
                 self.assertEqual(len(source['words']), 20 - len(zeros))
@@ -56,25 +56,16 @@ class ZeroDurationWordTests(unittest.TestCase):
                     sentence['words'][1]['text'] = 'wrong'
                 else:
                     sentence['words'][1]['punctuation'] = '!'
-                source = normalize(raw, 0, '0000', preserve_sentences=True, subtitle_version=2)[0][0]
+                source = normalize(raw, 0, '0000')[0][0]
                 self.assertEqual(source['words'], [])
                 cue = plan_fragments(source, Settings())[0]
                 self.assertEqual((cue['begin_ms'], cue['end_ms'], cue['text']), (0, 6000, sentence['text']))
-
-    def test_version_one_still_rejects_point_words(self):
-        raw = timed_raw(['word'] * 20)
-        raw['transcripts'][0]['sentences'][0]['words'][0]['end_time'] = 0
-        with self.assertRaises(ToolError):
-            normalize(raw, 0, '0000', preserve_sentences=True, subtitle_version=1)
-        new = normalize(raw, 0, '0000', preserve_sentences=True, subtitle_version=2)[0][0]
-        self.assertTrue(new['words'])
-
 
 class ReviewDecisionPreservationTests(unittest.TestCase):
     def test_mixed_manual_and_automatic_fragments_preserve_legacy_sentence_identity(self):
         for legacy_identity in [False, True]:
             with self.subTest(legacy_identity=legacy_identity):
-                source = normalize(result(('Keep this.', 'en')), 0, '0000', preserve_sentences=True)[0][0]
+                source = normalize(result(('Keep this.', 'en')), 0, '0000')[0][0]
                 sentence_id = source['sentence_id']
                 cues = [dict(cue_id=sentence_id + ':0', sentence_id=sentence_id, text='Keep ', language='en',
                              decision='original', source_lang='auto', reason='用户在终端确认'),
@@ -90,7 +81,7 @@ class ReviewDecisionPreservationTests(unittest.TestCase):
     def test_conflicting_and_orphaned_manual_fragments_still_block_reflow(self):
         for broken in ['conflicting', 'orphaned']:
             with self.subTest(broken=broken):
-                source = normalize(result(('Keep this.', 'en')), 0, '0000', preserve_sentences=True)[0][0]
+                source = normalize(result(('Keep this.', 'en')), 0, '0000')[0][0]
                 sentence_id = source['sentence_id']
                 cue = dict(cue_id=sentence_id + ':0', text='Keep this.', language='en', decision='original',
                            source_lang='auto', decision_origin='manual', reason='confirmed')
@@ -147,8 +138,7 @@ class ReflowTests(PipelineFixture):
         self.assertTrue(fake.calls)
         self.assertTrue(all(call[1].endswith('/chat/completions') for call in fake.calls))
         manifest = self.store.job(self.job_id)['manifest']
-        for name in ['subtitle_settings']:
-            self.assertEqual((manifest[name]['zh_line_width'], manifest[name]['other_line_width']), (44, 84))
+        self.assertEqual((manifest['subtitle_settings']['zh_line_width'], manifest['subtitle_settings']['other_line_width']), (44, 84))
         sources, cues = self.store.sources(self.job_id), self.store.cues(self.job_id)
         self.assertEqual([c['text'] for c in cues], [s['text'] for s in sources])
         self.assertEqual([(c['begin_ms'], c['end_ms']) for c in cues], [(0, 3000), (3000, 6600)])

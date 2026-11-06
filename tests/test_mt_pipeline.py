@@ -150,8 +150,7 @@ class PoolPipelineTests(SavedResultFixture):
         data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': []}
         entry = pipeline.router.entries[0]
         key = stage_cache_key('draft', data, entry.backend,
-                              capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.scope,
-                              prompt_version=pipeline.prompt_version)
+                              capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.scope)
         record = {'value': {'translations': {'0': '缓存。'}}, 'actual_model': 'synthetic', 'usage': None}
         with self.store.db:
             self.store.db.execute('INSERT INTO mt_cache VALUES(?,?)', (key, json.dumps(record)))
@@ -314,23 +313,34 @@ class PoolPipelineTests(SavedResultFixture):
         engine = Engine(self.config, self.store)
         manifest = self.store.job(self.job_id)['manifest']
         _, scope = engine.identity(self.job_id, manifest, persist=False)
-        response = {'choices': [{'finish_reason': 'stop', 'message': {
-            'content': json.dumps({'translations': {'9': 'private-generated-text'}})}}]}
+        response = {}
         class Transport:
             def request(self, method, url, **kwargs):
                 kwargs['on_dispatch']()
                 return HTTPReply(200, json.dumps(response).encode())
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
             pipeline = Pipeline(engine, self.job_id, manifest, scope)
-            with self.assertRaises(ToolError):
-                pipeline.stage('draft', {'sentences': [{'id': '0', 'text': 'private-source-text'}],
-                    'context': [], 'glossary': []}, ids=['0'], originals=['private-source-text'])
+            cases = [
+                ('{"translations":{"9":"private-generated-text"}}', 'stop', 'id_out_of_range', 1),
+                ('{"translations":{}}', 'stop', 'id_missing', 0),
+                ('{"translations":{"0":"甲","0":"乙"}}', 'stop', 'json_duplicate_key', None),
+                ('{"translations":{"0":" "}}', 'stop', 'translation_invalid', 1),
+                ('{"translations":{"0":"完整译文"}}', 'length', 'unfinished', 1),
+                ('{"translations":', 'length', 'unfinished', None),
+                ('not JSON', 'stop', 'json_invalid', None),
+                ('[]', 'stop', 'response_structure', None),
+            ]
+            for content, finish, _, _ in cases:
+                response['choices'] = [{'finish_reason': finish, 'message': {'content': content}}]
+                with self.subTest(finish=finish, content=content), self.assertRaises(ToolError):
+                    pipeline.stage('draft', {'sentences': [{'id': '0', 'text': 'private-source-text'}],
+                        'context': [], 'glossary': []}, ids=['0'], originals=['private-source-text'])
         log = (self.config.root / '.build' / 'mt-diagnostics' / (self.job_id + '.jsonl')).read_text(encoding='utf-8')
         events = [json.loads(line) for line in log.splitlines()]
-        invalid = next(event for event in events if event['kind'] == 'invalid_response')
-        self.assertEqual(invalid['category'], 'id_out_of_range')
-        self.assertEqual(invalid['stage'], 'draft')
-        self.assertEqual(invalid['expected_count'], 1)
+        invalid = [event for event in events if event['kind'] == 'invalid_response']
+        self.assertEqual([(event['category'], event['actual_count']) for event in invalid],
+                         [(category, count) for _, _, category, count in cases])
+        self.assertTrue(all(event['stage'] == 'draft' and event['expected_count'] == 1 for event in invalid))
         self.assertNotIn('private-generated-text', log)
         self.assertNotIn('private-source-text', log)
 
@@ -811,6 +821,36 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertEqual(self.run_pool(), 'failed')
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
 
+    def test_invalid_saved_values_block_stage_and_cross_task_cache_reuse(self):
+        self.install()
+        self.fail_stage = 'align'
+        self.assertEqual(self.run_pool(), 'failed')
+        row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'draft')
+        cache_key, cached = next((key, json.loads(value)) for key, value in
+                                self.store.db.execute('SELECT key,text FROM mt_cache')
+                                if json.loads(value)['value'] == row['record']['value'])
+        self.fail_stage = None
+        for storage in ['stage', 'cache']:
+            for invalid in [None, [], {'translations': {'0': '甲'}},
+                            {'translations': {'0': '甲', '1': ' '}},
+                            {'translations': {'0': '甲', '1': '乙', '2': '多余'}}]:
+                with self.subTest(storage=storage, invalid=invalid):
+                    with self.store.db:
+                        if storage == 'stage':
+                            self.store.db.execute('UPDATE mt_stages SET record=? WHERE job_id=? AND stage_key=?',
+                                (json.dumps({**row['record'], 'value': invalid}), self.job_id, row['key']))
+                        else:
+                            self.store.db.execute('DELETE FROM mt_stages WHERE job_id=? AND stage_key=?',
+                                                  (self.job_id, row['key']))
+                            self.store.db.execute('UPDATE mt_cache SET text=? WHERE key=?',
+                                                  (json.dumps({**cached, 'value': invalid}), cache_key))
+                    self.calls.clear()
+                    Engine(self.config, self.store).resume(self.job_id)
+                    self.assertEqual(self.run_pool(), 'failed')
+                    self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
+                    self.assertEqual(self.calls, [])
+                    self.assertFalse(self.source.with_suffix('.srt').exists())
+
     def test_openrouter_observed_exhaustion_falls_back_without_free_post(self):
         self.config.settings.mt_backends = [{'id': 'openrouter_free'}, {'id': 'bailian_paid'}]
         self.quota_remaining = 0
@@ -976,8 +1016,8 @@ class PoolPipelineTests(SavedResultFixture):
         manifest = self.store.job(self.job_id)['manifest']
         manifest['overwrite'] = True
         self.store.update(self.job_id, 'needs_review', manifest, code='language_uncertain')
-        engine.apply_review(self.job_id, self.store.cues(self.job_id)[0]['cue_id'],
-                            ReviewDecision('translate', 'Japanese'))
+        self.store.apply_review(self.job_id, self.store.cues(self.job_id)[0]['cue_id'],
+                                ReviewDecision('translate', 'Japanese'))
         engine.finish_review(self.job_id)
         self.assertEqual(self.run_pool(engine=engine), 'completed', self.store.job(self.job_id)['error'])
         drafts = [data for stage, _, data in self.calls if stage == 'draft']

@@ -54,11 +54,9 @@ def read_json(path):
         raise mismatch() from error
 
 
-def normalize_raw(cache, manifest, segment, *, version=None):
-    version = version if version is not None else manifest["contract"]["normalizer"]
+def normalize_raw(cache, manifest, segment):
     return normalize(read_json(raw_path(cache, segment)), segment_offset(manifest) + segment["offset_ms"], segment["id"],
-                     duration_ms=segment.get("duration_ms"), preserve_sentences=True,
-                     subtitle_version=manifest["subtitle_version"], normalizer_version=version)
+                     duration_ms=segment.get("duration_ms"))
 
 
 def _validate_source(source, segments, manifest):

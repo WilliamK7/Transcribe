@@ -39,7 +39,7 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`；`
 
 `qiniu/conatus-free` 仅在北京时间 2026-10-24 00:00 至 2026-11-30 23:59 的活动期内派发；本地判断使用上界 2026-12-01 00:00（不含）。服务端额度、实名认证和结束规则以[七牛活动页](https://www.qiniu.com/ai/free-models/conatus-2026)为准。该免费模型额度不足不会自动转为七牛的付费模型；工具可能依据池的付费许可另行调用付费候选。
 
-`--mt-paid allow|deny` 只控制后续付费候选网络调用，不清除已完成的付费结果或缓存；通过身份校验且请求完全匹配的付费缓存可以复用。已有本任务阶段记录优先恢复；查找跨任务缓存时，对齐／复核／纠正优先选择不同于上一相关阶段后端的匹配结果，其次免费优先，此排序不产生新请求。上下文或术语裁剪后按新输入重新查缓存，输入未变时只查一次。不同候选的能力可能使分组或上下文裁剪改变，不能保证跨分组命中。池不接受 `--mt-fallback`。每个请求使用 `stream:false`，模型能力档案的 `response_format` 分别决定发送 `json_object`、严格 `json_schema` 或不发送格式字段的 `text`；OpenRouter 附带参数要求及 Response Healing，百炼附带 `enable_thinking:false` 和 `temperature:0`。无论格式档案如何，本地仍校验响应结构、编号、非空译文和正常结束。
+`--mt-paid allow|deny` 只控制后续付费候选网络调用，不清除已完成的付费结果或缓存；通过身份校验且请求完全匹配的付费缓存可以复用。已有本任务阶段记录优先恢复；查找跨任务缓存时，对齐／复核／纠正优先选择不同于上一相关阶段后端的匹配结果，其次免费优先，此排序不产生新请求。上下文或术语裁剪后按新输入重新查缓存，输入未变时只查一次。不同候选的能力可能使分组或上下文裁剪改变，不能保证跨分组命中。每个请求使用 `stream:false`，模型能力档案的 `response_format` 分别决定发送 `json_object`、严格 `json_schema` 或不发送格式字段的 `text`；OpenRouter 附带参数要求及 Response Healing，百炼附带 `enable_thinking:false` 和 `temperature:0`。无论格式档案如何，本地仍校验响应结构、编号、非空译文和正常结束。
 
 策略 5 新任务及显式重排使用提示词版本 2：`json_object`／`text` 档案在提示词中明确完整输出 Schema；术语原句和复核片段编号限于输入集合，复核以跨片连读的最终字幕为对象。OpenRouter 动态免费路由 `openrouter/free` 使用 `reasoning.effort:low`（固定模型不推定支持），七牛精确模型 `deepseek/deepseek-v4.1-flash` 使用 `reasoning_effort:low`；其他七牛模型不添加该参数。推理与可见输出共享预算，降低推理量用于减少预算耗尽，但不保证模型延迟或语义效果，参见 [OpenRouter 推理参数](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)及[七牛聊天参数](https://developer.qiniu.com/aitokenapi/13390/chat-completions)。完整请求仍计入预算并接受原有本地校验。
 

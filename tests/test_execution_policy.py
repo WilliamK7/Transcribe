@@ -13,12 +13,19 @@ class ExecutionPolicyTests(SavedResultFixture):
         from subtitle_tool.policy import current_execution_snapshot
         self.save_result()
         original = self.store.job(self.job_id)["manifest"]
-        invalid = [(field, 999) for field in ["format_version", "prompt_version", "recovery_version"]]
-        invalid.extend(("context_version", value) for value in [-1, 2, True, "1", None])
-        for field, value in invalid:
-            with self.subTest(field=field, value=value):
+        paths = [(field,) for field in ['processing_version', 'subtitle_version', 'display_timing_version',
+                                        'translation_strategy_version', 'normalized_version']]
+        paths += [('execution_snapshot', field) for field in current_execution_snapshot()]
+        paths += [('contract', 'normalizer'), ('media_plan', 'extract_recipe_version')]
+        invalid = [(path, value) for path in paths for value in [0, 999, True, '2', None]]
+        invalid.append((('mt_glossary_schedule',), 'unsupported'))
+        for path, value in invalid:
+            with self.subTest(path=path, value=value):
                 manifest = copy.deepcopy(original)
-                manifest["execution_snapshot"] = {**current_execution_snapshot(), field: value}
+                target = manifest
+                for name in path[:-1]:
+                    target = target.setdefault(name, {})
+                target[path[-1]] = value
                 self.store.update(self.job_id, "queued", manifest)
                 fake = FakeService(result())
                 with mock.patch.object(self.store, "cache_get", side_effect=AssertionError("no cache")):

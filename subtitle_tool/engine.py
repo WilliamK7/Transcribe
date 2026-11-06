@@ -21,11 +21,11 @@ from .media import Media
 from .mt_control import MTControl
 from .mt_backend import saved_mt
 from .store import TERMINAL, Store
-from .review import ReviewDecision, decision_origin
-from .policy import asr_contract, current_execution_snapshot, display_timing_version, load_policy
+from .review import decision_origin
+from .policy import asr_contract, current_execution_snapshot, load_policy
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
                             validate_normalized, validate_segments)
-from .publication import file_hash, inspect_intent, prepare_intent, write_srt
+from .publication import inspect_intent, prepare_intent, write_srt
 from .subtitles import make_fragment, normalize, plan_display_timing, render_srt
 
 
@@ -62,9 +62,6 @@ class Engine:
             elif job["state"] not in {"failed", "needs_review", "queued"}:
                 self.store.update(job["id"], "queued")
 
-    def change_output(self, job_id, directory=None, overwrite=False):
-        self.store.change_output(job_id, directory, overwrite)
-
     def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
                task_id=None, allow_resubmit=False, mt_paid=None):
         """Prepare an explicitly requested resume; run() remains the sole executor."""
@@ -91,7 +88,7 @@ class Engine:
                 self.resolve_unknown(job_id, task_id, allow_resubmit)
             return
         if overwrite or output_dir is not None:
-            self.change_output(job_id, output_dir, overwrite)
+            self.store.change_output(job_id, output_dir, overwrite)
         if unknown_submission(job["manifest"], job["state"]):
             self.store.update(job_id, "submission_unknown")
         elif job["state"] == "cancelled":
@@ -110,9 +107,6 @@ class Engine:
         self.store.update(job_id, state, manifest,
                           error="用户停止本地任务；已提交的云端任务仍可能计费。",
                           code="submission_unknown" if interrupted and ambiguous else "cancelled")
-
-    def apply_review(self, job_id, cue_id, decision: ReviewDecision):
-        self.store.apply_review(job_id, cue_id, decision)
 
     def review_media(self, job_id):
         job = self.store.job(job_id)
@@ -210,8 +204,7 @@ class Engine:
             except (OSError, ValueError) as error:
                 raise ToolError("重排无法读取本地转写，原任务及字幕已保留。", "reflow_cache_invalid") from error
             items, notes = normalize(raw, offset + segment["offset_ms"], segment_id,
-                                     duration_ms=segment.get("duration_ms"), preserve_sentences=True,
-                                     subtitle_version=SUBTITLE_VERSION, normalizer_version=NORMALIZER_VERSION)
+                                     duration_ms=segment.get("duration_ms"))
             sources.extend(items)
             warnings.extend(notes)
         sources.sort(key=lambda s: (s["begin_ms"], s["end_ms"], s["sentence_id"]))
@@ -225,12 +218,11 @@ class Engine:
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                      "backup", "cue_count", "output_settings", "normalized_file", "no_speech"]:
             manifest.pop(name, None)
-        strategy = 5
-        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=strategy,
+        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
                         mt_glossary_schedule="prefix-v1",
                         display_timing_version=DISPLAY_TIMING_VERSION,
                         mt_snapshot=mt_snapshot,
-                        execution_snapshot=current_execution_snapshot(strategy),
+                        execution_snapshot=current_execution_snapshot(),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
                                            ["zh_line_width", "other_line_width", "chinese_first"]},
                         normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
@@ -275,7 +267,7 @@ class Engine:
             check_cancel(self.cancel)
             raw = json.loads(files['raw-' + segment['id'] + '.json'])
             items, notes = normalize(raw, manifest['audio_offset_ms'] + segment['offset_ms'], segment['id'],
-                                     duration_ms=segment.get('duration_ms'), preserve_sentences=True)
+                                     duration_ms=segment.get('duration_ms'))
             sources.extend(items)
             warnings.extend(notes)
         sources.sort(key=lambda s: (s['begin_ms'], s['end_ms'], s['sentence_id']))
@@ -324,14 +316,13 @@ class Engine:
         policy = load_policy(manifest, verify_execution=False)
         settings = policy.settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
-        cache = self.config.data / "cache" / job_id
         self.validate_saved_subtitles(job_id, manifest)
         cues = self.store.cues(job_id)
         self.validate_retime_ready(manifest, cues)
         self.verify_source_output(job_id, manifest, output)
         candidate = copy.deepcopy(manifest)
         candidate["display_timing_version"] = DISPLAY_TIMING_VERSION
-        content, adjustments = self.render_subtitles(cues, settings, candidate)
+        content, adjustments = self.render_subtitles(cues, settings)
         intent = prepare_intent(output, content, overwrite)
         check_cancel(self.cancel)
         snapshot = self.config.root / ".build" / "retime" / job_id / (str(time.time_ns()) + ".json")
@@ -351,8 +342,7 @@ class Engine:
 
     @staticmethod
     def validate_retime_ready(manifest, cues):
-        if (not cues or manifest.get("subtitle_version") and
-                not (manifest.get("layout_complete") and manifest.get("layout_planned")) or
+        if (not cues or not (manifest.get("layout_complete") and manifest.get("layout_planned")) or
                 any(c["decision"] not in {"original", "translate"} or
                     c["decision"] == "translate" and not c.get("translated") for c in cues)):
             raise ToolError("仅校时需要完整的最终字幕、译文和排版；请先恢复原任务。", "retime_incomplete")
@@ -484,17 +474,12 @@ class Engine:
             self.store.update(job_id, name, manifest)
             self.progress(job_id, name, done, total)
 
-        def cloud_progress(name, done, total):
-            if name == "mt_cooldown":
-                self.store.count(job_id, "mt_cooldown_ms", round(done * 1000))
-            self.progress(job_id, name, done, total)
-
         def client():
             nonlocal api
             if api is None:
                 api = Bailian(key, manifest["region"], self.cancel,
                     count=lambda name: self.store.count(job_id, name),
-                    progress=cloud_progress,
+                    progress=lambda name, done, total: self.progress(job_id, name, done, total),
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
             return api
 
@@ -510,12 +495,10 @@ class Engine:
 
         try:
             check_cancel(self.cancel)
-            load_policy(manifest)
-            display_timing_version(manifest)
+            execution_policy = load_policy(manifest)
             from .mt_pipeline import validate_provenance
             validate_provenance(self, job_id, manifest, verify_credentials=False)
             output = self.store.ensure_output(job_id)
-            subtitle_version = SUBTITLE_VERSION
             published = False
             if "publication_intent" in manifest:
                 key, scope = self.identity(job_id, manifest, persist=False)
@@ -525,10 +508,6 @@ class Engine:
                     raise mismatch()
                 if published:
                     manifest["backup"] = intent["backup"] if intent["backup"] and Path(intent["backup"]).is_file() else ""
-            elif (manifest.get("expected_srt_sha256") and output.is_file() and
-                  manifest["expected_srt_sha256"] == file_hash(output)):
-                key, scope = self.identity(job_id, manifest, persist=False)
-                published = True
             if published:
                 stage("completed")
                 if not (manifest.get("reflow") or manifest.get("retime")):
@@ -538,27 +517,21 @@ class Engine:
                 stage("skipped")
                 return "skipped"
             cache.mkdir(parents=True, exist_ok=True)
-            execution_policy = load_policy(manifest, verify_execution=not manifest.get("retime"))
             settings = execution_policy.settings(self.config.settings)
-            if manifest.get("retime"):
-                if not manifest.get("normalized") or execution_policy.display_timing_version not in {1, 2}:
-                    raise mismatch()
-            if manifest.get("reflow"):
-                if subtitle_version != SUBTITLE_VERSION or not manifest.get("normalized"):
-                    raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
-            contract = asr_contract(execution_policy.normalizer_version)
-            manifest["contract"] = contract
-            normalizer_version = contract["normalizer"]
+            if manifest.get("retime") and not manifest.get("normalized"):
+                raise mismatch()
+            if manifest.get("reflow") and not manifest.get("normalized"):
+                raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
+            manifest["contract"] = asr_contract()
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
             from .mt_pool import saved_route
             saved_route(manifest)
             self.mt_runtime_active = not bool(manifest.get('retime'))
-            mt_scope = scope
             if manifest.get("normalized"):
                 self.verify_source_output(job_id, manifest, output)
                 self.prepare_output(output)
-                return self.finish_subtitles(job_id, manifest, settings, mt_scope, stage, output, cache)
+                return self.finish_subtitles(job_id, manifest, settings, scope, stage, output, cache)
             saved_asr = False
             if self.store.sources(job_id) or self.store.cues(job_id):
                 raise mismatch()
@@ -568,7 +541,7 @@ class Engine:
                 # Validate already saved raw before any missing known task is queried.
                 for segment in manifest["segments"]:
                     if saved_raw_path(cache, segment).is_file():
-                        normalize_raw(cache, manifest, segment, version=normalizer_version)
+                        normalize_raw(cache, manifest, segment)
                     elif segment.get("raw") and not segment.get("task_id"):
                         raise mismatch()
             self.prepare_output(output)
@@ -717,16 +690,15 @@ class Engine:
                 for segment in manifest["segments"]:
                     raw = json.loads((cache / ("raw-" + segment["id"] + ".json")).read_text(encoding="utf-8"))
                     items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
-                                                duration_ms=segment.get("duration_ms"), preserve_sentences=True,
-                                                subtitle_version=subtitle_version, normalizer_version=normalizer_version)
+                                                duration_ms=segment.get("duration_ms"))
                     cues.extend(items)
                     candidate["warnings"].extend(warnings)
                 cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
                 candidate.update(normalized=True, normalized_count=len(cues),
-                                 normalized_version=normalizer_version)
+                                 normalized_version=NORMALIZER_VERSION)
                 sources, fragments = cues, [make_fragment(s) for s in cues]
                 self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, sources, fragments)
-            return self.finish_subtitles(job_id, manifest, settings, mt_scope, stage, output, cache)
+            return self.finish_subtitles(job_id, manifest, settings, scope, stage, output, cache)
         except LocalStateUnavailable:
             # Never let a generic handler persist an unconfirmed in-memory state.
             raise
@@ -791,29 +763,22 @@ class Engine:
             return "completed"
         if any(c["decision"] == "uncertain" for c in cues):
             raise NeedsReview("部分字幕语种不确定，请用 --review 逐条确认原文或翻译。", "language_uncertain")
-        if "publication_intent" not in manifest:
-            if "expected_srt_sha256" in manifest:
-                candidate = copy.deepcopy(manifest)
-                candidate.pop("expected_srt_sha256")
-                self.commit_local(job_id, manifest, candidate,
-                                  lambda jid, value: self.store.update(jid, manifest=value))
-            if not manifest.get("retime"):
-                from .mt_pipeline import process_subtitles
-                process_subtitles(self, job_id, manifest, settings, scope, stage)
+        if "publication_intent" not in manifest and not manifest.get("retime"):
+            from .mt_pipeline import process_subtitles
+            process_subtitles(self, job_id, manifest, settings, scope, stage)
         cues = self.store.cues(job_id)
         check_cancel(self.cancel)
         stage("writing")
-        content, adjustments = self.render_subtitles(cues, settings, manifest)
+        content, adjustments = self.render_subtitles(cues, settings)
         if "publication_intent" not in manifest:
             candidate = copy.deepcopy(manifest)
             intent = prepare_intent(output, content, manifest["overwrite"])
             candidate.update(publication_intent=intent, expected_srt_sha256=intent["expected_srt_sha256"],
                              cue_count=len(cues))
-            if manifest.get("display_timing_version", 0):
-                candidate["display_timing_adjustments"] = adjustments
+            candidate["display_timing_adjustments"] = adjustments
             self.commit_local(job_id, manifest, candidate,
                               lambda jid, value: self.store.update(jid, manifest=value))
-        elif manifest.get("display_timing_version", 0) and manifest.get("display_timing_adjustments") != adjustments:
+        elif manifest.get("display_timing_adjustments") != adjustments:
             raise mismatch()
         self.verify_source_output(job_id, manifest, output)
         manifest["backup"] = write_srt(output, content, manifest["overwrite"], intent=manifest["publication_intent"])
@@ -823,18 +788,12 @@ class Engine:
         return "completed"
 
     @staticmethod
-    def render_subtitles(cues, settings, manifest):
-        intervals, adjustments = plan_display_timing(cues, version=display_timing_version(manifest))
-        return render_srt(cues, settings, subtitle_version=manifest.get("subtitle_version", SUBTITLE_VERSION),
-                          display_intervals=intervals), adjustments
-
-    @staticmethod
-    def preflight_display_timing(cues, manifest):
-        if display_timing_version(manifest) == 2:
-            plan_display_timing(cues, version=2)
+    def render_subtitles(cues, settings):
+        intervals, adjustments = plan_display_timing(cues)
+        return render_srt(cues, settings, display_intervals=intervals), adjustments
 
 
-    def _translate_pending(self, job_id, tasks, *, stage_name, done, total):
+    def _translate_pending(self, job_id, tasks, *, done, total):
         """Stop new work on failure or cancellation; save in-flight results before returning."""
         errors = []
         workers = self.config.settings.mt_workers
@@ -843,7 +802,7 @@ class Engine:
             futures = {}
             def schedule():
                 while (len(futures) < workers and not errors and not self.cancel.is_set()
-                       and not (self.mt_runtime_active and self.mt_control.stopping)):
+                       and not self.mt_control.stopping):
                     item = next(remaining, None)
                     if item is None:
                         break
@@ -852,8 +811,7 @@ class Engine:
             try:
                 schedule()
                 while futures:
-                    if self.mt_runtime_active:
-                        self.mt_control.stopping  # Observe external cancellation even with silent requests.
+                    self.mt_control.stopping  # Observe external cancellation even with silent requests.
                     completed, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
                     for future in completed:
                         members = futures.pop(future)
@@ -861,18 +819,17 @@ class Engine:
                             future.result()
                             done += sum(not c['translated'] for c in members)
                         except ToolError as e:
-                            if self.mt_runtime_active and e.code != 'cancelled':
+                            if e.code != 'cancelled':
                                 self.mt_control.stop(e)
                             self.store.translation_error(job_id, [c["cue_id"] for c in members], str(e))
                             errors.append(e)
-                        self.progress(job_id, stage_name, done, total)
+                        self.progress(job_id, 'subtitle_translating', done, total)
                     schedule()
             except BaseException as error:
-                if self.mt_runtime_active:
-                    if isinstance(error, (KeyboardInterrupt, Cancelled)):
-                        self.request_cancel(force=True)
-                    else:
-                        self.mt_control.stop(ToolError('翻译阶段本地处理失败，进度已保存。', 'local_io'), force=True)
+                if isinstance(error, (KeyboardInterrupt, Cancelled)):
+                    self.request_cancel(force=True)
+                else:
+                    self.mt_control.stop(ToolError('翻译阶段本地处理失败，进度已保存。', 'local_io'), force=True)
                 raise
         check_cancel(self.cancel)
         if errors:

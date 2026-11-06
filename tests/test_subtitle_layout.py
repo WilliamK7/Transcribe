@@ -14,7 +14,7 @@ from tests import fixtures
 
 
 def sources_of(raw):
-    return normalize(raw, 0, "0000", preserve_sentences=True)[0]
+    return normalize(raw, 0, "0000")[0]
 
 
 class WrappingRegressionTests(unittest.TestCase):
@@ -118,7 +118,7 @@ class SegmentationTests(unittest.TestCase):
             with self.subTest(language=language, count=count):
                 tokens = ['字' if language == 'zh' else 'word'] * count
                 raw = timed_raw(tokens, language=language, word_ms=word_ms, start=1234)
-                source = normalize(raw, 0, '0000', preserve_sentences=True)[0][0]
+                source = normalize(raw, 0, '0000')[0][0]
                 cues = plan_fragments(source, Settings())
                 if count in {60, 24}:
                     self.assertEqual(len(cues), 1)
@@ -130,7 +130,7 @@ class SegmentationTests(unittest.TestCase):
 
     def test_reference_capacity_controls_fragment_count(self):
         raw = timed_raw(['alpha', 'bravo', 'charlie', 'delta'], word_ms=1200, start=1234)
-        source = normalize(raw, 0, '0000', preserve_sentences=True)[0][0]
+        source = normalize(raw, 0, '0000')[0][0]
         narrow = self.settings
         self.assertGreater(len(plan_fragments(source, narrow, reference='中' * 70)), 1)
         self.assertEqual(len(plan_fragments(source, Settings(), reference='中' * 70)), 1)
@@ -143,7 +143,7 @@ class SegmentationTests(unittest.TestCase):
         for word_ms, expected in [(700, 1), (701, 2)]:
             with self.subTest(word_ms=word_ms):
                 raw = timed_raw(['word'] * 10, word_ms=word_ms, start=1234)
-                source = normalize(raw, 0, '0000', preserve_sentences=True)[0][0]
+                source = normalize(raw, 0, '0000')[0][0]
                 cues = plan_fragments(source, Settings())
                 self.assertEqual(len(cues), expected)
                 self.assert_ranges(source, cues)

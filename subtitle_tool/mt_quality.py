@@ -12,8 +12,63 @@ import unicodedata
 from opencc import OpenCC
 
 from .common import ToolError
-from .mt import _DuplicateKey, _unique_object, parse_batch_response
 from .review import decision_origin
+
+
+VALIDATION_CATEGORIES = {
+    'response_structure': '响应外层结构异常', 'json_invalid': 'JSON 无效',
+    'json_duplicate_key': 'JSON 重复键', 'id_missing': '编号缺失',
+    'id_out_of_range': '编号越界',
+    'translation_invalid': '译文无效', 'unfinished': '非正常结束',
+}
+
+
+class BatchValidationError(ToolError):
+    def __init__(self, category, actual_count=None):
+        super().__init__(VALIDATION_CATEGORIES[category] + '；未保存不完整结果。', 'mt_batch_invalid')
+        self.category, self.actual_count = category, actual_count
+
+
+def _unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise BatchValidationError('json_duplicate_key')
+        value[key] = item
+    return value
+
+
+def parse_content(content):
+    """Decode one model JSON object without accepting duplicate fields."""
+    if not isinstance(content, str):
+        raise BatchValidationError('response_structure')
+    try:
+        return json.loads(content, object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError):
+        raise BatchValidationError('json_invalid') from None
+
+
+def validate_translations(value, fragments):
+    """Validate shape only. This cannot establish semantic translation quality."""
+    if (not isinstance(value, dict) or set(value) != {'translations'} or
+            not isinstance(value['translations'], dict)):
+        raise BatchValidationError('response_structure')
+    actual = len(value['translations'])
+    expected = {str(i) for i in range(len(fragments))}
+    translated = {}
+    for identity, text in value['translations'].items():
+        if identity not in expected:
+            raise BatchValidationError('id_out_of_range', actual)
+        if (not isinstance(text, str) or not text.strip() or any(c in text for c in ['-->', '```', '\x00']) or
+                len(text) > max(500, len(fragments[int(identity)]) * 12) or
+                any(unicodedata.category(c) in {'Cc', 'Cs'} and c not in '\n\t\r' for c in text)):
+            raise BatchValidationError('translation_invalid', actual)
+        if any(c.isalnum() for c in fragments[int(identity)]) and not any(c.isalnum() for c in text):
+            raise BatchValidationError('translation_invalid', actual)
+        translated[identity] = text.strip()
+    if set(translated) != expected:
+        raise BatchValidationError('id_missing', actual)
+    return {str(i): translated[str(i)] for i in range(len(fragments))}
 
 
 QUALITY_PROMPT_VERSION = 2
@@ -85,11 +140,9 @@ def _schema(stage, data):
             'required': ['translations'], 'additionalProperties': False}
 
 
-def make_stage_payload(stage, data, backend, *, capabilities, prompt_version=QUALITY_PROMPT_VERSION):
+def make_stage_payload(stage, data, backend, *, capabilities):
     if stage not in PROMPTS:
         raise ValueError('Unknown translation stage')
-    if type(prompt_version) is not int or prompt_version != QUALITY_PROMPT_VERSION:
-        raise ToolError('翻译提示词版本不受支持，请用 --reflow。', 'cache_version')
     if (not isinstance(capabilities, dict) or set(capabilities) != {'response_format', 'input_bytes', 'output_tokens'} or
             capabilities['response_format'] not in {'json_object', 'json_schema', 'text'} or
             type(capabilities['input_bytes']) is not int or not 1 <= capabilities['input_bytes'] <= 1048576 or
@@ -131,32 +184,48 @@ def make_stage_payload(stage, data, backend, *, capabilities, prompt_version=QUA
     return payload
 
 
-def stage_cache_key(stage, data, backend, *, capabilities, scope, prompt_version=QUALITY_PROMPT_VERSION):
-    value = {'version': prompt_version, 'strategy': 5, 'simplification': 'opencc-t2s-0.1.7',
+def stage_cache_key(stage, data, backend, *, capabilities, scope):
+    value = {'version': QUALITY_PROMPT_VERSION, 'strategy': 5, 'simplification': 'opencc-t2s-0.1.7',
              'backend': backend.snapshot(),
              'capabilities': capabilities, 'scope': scope,
-             'request': make_stage_payload(stage, data, backend, capabilities=capabilities, prompt_version=prompt_version)}
+             'request': make_stage_payload(stage, data, backend, capabilities=capabilities)}
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 
 
 def parse_stage_response(stage, body, *, ids=(), originals=()):
-    """Validate envelopes and every generated field; errors never contain model text."""
+    """Validate the wire envelope once; saved values use the same field validator."""
     try:
         if (not isinstance(body, dict) or body.get('error') is not None or
                 not isinstance(body.get('choices'), list) or len(body['choices']) != 1 or
                 not isinstance(body['choices'][0], dict) or body['choices'][0].get('error') is not None or
                 isinstance(body['choices'][0].get('message'), dict) and body['choices'][0]['message'].get('refusal')):
             raise ValueError()
+        choice = body['choices'][0]
+        message = choice.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        if choice.get('finish_reason') != 'stop':
+            if stage not in {'draft', 'align', 'correct'}:
+                raise ValueError()
+            # Keep the count for truncated but parseable replies, without accepting them.
+            try:
+                count = len(validate_translations(parse_content(content), originals))
+            except BatchValidationError as error:
+                count = error.actual_count
+            raise BatchValidationError('unfinished', count)
+        return validate_stage_value(stage, parse_content(content), ids=ids, originals=originals)
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise BatchValidationError('response_structure') from None
+
+
+def validate_stage_value(stage, value, *, ids=(), originals=()):
+    """Validate generated fields from either a response or private saved records."""
+    try:
         if stage in {'draft', 'align', 'correct'}:
             if list(ids) != [str(i) for i in range(len(ids))] or len(originals) != len(ids):
                 raise ValueError()
-            translated = parse_batch_response(body, originals)
+            translated = validate_translations(value, originals)
             cc = OpenCC('t2s')
             return {'translations': {key: cc.convert(text) for key, text in translated.items()}}
-        choice = body['choices'][0]
-        if choice.get('finish_reason') != 'stop' or not isinstance(choice.get('message'), dict):
-            raise ValueError()
-        value = json.loads(choice['message']['content'], object_pairs_hook=_unique_object)
         key = 'terms' if stage == 'glossary' else 'issues' if stage == 'review' else None
         if key is None or not isinstance(value, dict) or set(value) != {key} or not isinstance(value[key], list):
             raise ValueError()
@@ -173,11 +242,10 @@ def parse_stage_response(stage, body, *, ids=(), originals=()):
                 raise ValueError()
         if stage == 'glossary':
             cc = OpenCC('t2s')
-            for item in value['terms']:
-                item['translation'] = cc.convert(item['translation'])
+            return {'terms': [{**item, 'translation': cc.convert(item['translation'])} for item in value['terms']]}
         return value
-    except (KeyError, TypeError, ValueError, _DuplicateKey, RecursionError):
-        raise ToolError('翻译阶段响应格式或编号校验失败；未保存不完整结果。', 'mt_batch_invalid') from None
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise BatchValidationError('response_structure') from None
 
 
 def validate_glossary(extracted, sources, manual):

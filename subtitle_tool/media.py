@@ -154,13 +154,13 @@ class Media:
                 "packets": count, "continuous": continuous, "skip_samples": skipped,
                 "discard_padding": padding, "sample_rate": rate, "time_base": str(time_base)}
 
-    def copy_audio(self, source, target, track, begin_seconds, *, extract_recipe_version=EXTRACT_RECIPE_VERSION):
+    def copy_audio(self, source, target, track, begin_seconds):
         temp = target.with_name(target.stem + ".partial" + target.suffix)
         try:
             run_process([self.executable("ffmpeg"), "-nostdin", "-v", "error", "-y", "-copyts", "-i", source,
                          "-map", f"0:{track}", "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "copy",
                          "-avoid_negative_ts", "disabled", "-output_ts_offset", f"{-begin_seconds:.9f}",
-                         *(["-fflags", "+bitexact"] if target.suffix == ".ogg" and extract_recipe_version == EXTRACT_RECIPE_VERSION else []),
+                         *(["-fflags", "+bitexact"] if target.suffix == ".ogg" else []),
                          temp], self.cancel)
             os.replace(temp, target)
         finally:
@@ -256,10 +256,8 @@ class Media:
                 raise ToolError(invalid_message, "media")
 
     def prepare(self, source, directory, info, track_index, channel, limit_bytes=MAX_UPLOAD_BYTES,
-                *, force_method=None, extract_recipe_version=EXTRACT_RECIPE_VERSION):
+                *, force_method=None):
         """Prefer lossless stream copy; every fallback uses the existing corrected PCM timeline."""
-        if type(extract_recipe_version) is not int or extract_recipe_version != EXTRACT_RECIPE_VERSION:
-            raise ToolError("媒体提取配方版本不受支持。", "cache_version")
         directory.mkdir(parents=True, exist_ok=True)
         track = next(t for t in info["tracks"] if t["index"] == track_index)
         _, offset = self.select(info, track_index, channel)
@@ -282,8 +280,7 @@ class Media:
         if eligible and force_method != "flac":
             target = directory / ("audio" + suffix)
             try:
-                self.copy_audio(source, target, track_index, timeline["begin_seconds"],
-                                extract_recipe_version=extract_recipe_version)
+                self.copy_audio(source, target, track_index, timeline["begin_seconds"])
                 extracted = self.probe(target)
                 extracted_track = extracted["tracks"][0]
                 copied = self.packet_timeline(target, extracted_track, directory)
@@ -305,7 +302,7 @@ class Media:
                     segment = {"id": "0000", "audio": target.name, "offset_ms": 0,
                                "duration_ms": round(timeline["duration_seconds"] * 1000), "codec": codec,
                                "container": suffix[1:], **self.audio_identity(target)}
-                    return {"version": PROCESSING_VERSION, "extract_recipe_version": extract_recipe_version,
+                    return {"version": PROCESSING_VERSION, "extract_recipe_version": EXTRACT_RECIPE_VERSION,
                             "method": "copy", "track": track_index,
                             "channel": channel, "codec": codec, "container": suffix[1:], "audio_offset_ms": offset,
                             "source_timeline": timeline, "extracted_timeline": copied, "limit_bytes": limit_bytes,
@@ -330,7 +327,7 @@ class Media:
             if frames / rate <= MAX_ASR_SECONDS:
                 self.encode_flac(pcm, target)
                 if target.stat().st_size <= limit_bytes:
-                    return {"version": PROCESSING_VERSION, "extract_recipe_version": extract_recipe_version,
+                    return {"version": PROCESSING_VERSION, "extract_recipe_version": EXTRACT_RECIPE_VERSION,
                             "method": "flac", "track": track_index,
                             "channel": channel, "codec": "flac", "container": "flac", "audio_offset_ms": offset,
                             "source_timeline": timeline, "limit_bytes": limit_bytes, "reason": reason}, [
@@ -352,7 +349,7 @@ class Media:
                 if all(s["bytes"] <= limit_bytes for s in segments):
                     for chunk in chunks:
                         (directory / chunk["audio"]).unlink(missing_ok=True)
-                    return {"version": PROCESSING_VERSION, "extract_recipe_version": extract_recipe_version,
+                    return {"version": PROCESSING_VERSION, "extract_recipe_version": EXTRACT_RECIPE_VERSION,
                             "method": "flac", "track": track_index,
                             "channel": channel, "codec": "flac", "container": "flac", "audio_offset_ms": offset,
                             "source_timeline": timeline, "limit_bytes": limit_bytes, "pcm_split_limit": cap,

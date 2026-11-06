@@ -20,8 +20,7 @@ DEFAULT_ENTRIES = (
     ('bailian_paid', 'paid', 1, 'bailian', 'bailian', None, STRUCTURED_BAILIAN_MODEL),
 )
 
-# Explicit selections only; the normal pool template retains its original paid
-# Bailian fallback. Profiles reflect the official structured-output support,
+# Profiles reflect the official structured-output support,
 # while the smaller limits are the application's conservative v5 budgets.
 BAILIAN_FREE_MODELS = {
     'qwen3.8-27b': ('bailian_free_qwen38_27b', 'json_object'),

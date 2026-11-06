@@ -106,16 +106,15 @@ class Store:
                 manifest["mt_snapshot"] = mt_snapshot
             if mt_route_snapshot is not None:
                 manifest['mt_route_snapshot'] = mt_route_snapshot
-            strategy = 5
             if mt_snapshot is not None:
-                saved_mt({**manifest, "translation_strategy_version": strategy})
+                saved_mt({**manifest, "translation_strategy_version": 5})
             if mt_route_snapshot is not None:
                 from .mt_pool import saved_route
-                saved_route({**manifest, 'translation_strategy_version': strategy})
+                saved_route({**manifest, 'translation_strategy_version': 5})
             settings = settings or Settings()
-            manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=strategy,
+            manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
                             display_timing_version=DISPLAY_TIMING_VERSION,
-                            execution_snapshot=current_execution_snapshot(strategy),
+                            execution_snapshot=current_execution_snapshot(),
                             mt_glossary_schedule='prefix-v1',
                             subtitle_settings={k: getattr(settings, k) for k in
                                                ["zh_line_width", "other_line_width", "chinese_first"]})
@@ -277,19 +276,16 @@ class Store:
                 decision_origin(record)
             return sorted(rows, key=lambda s: (s["begin_ms"], s["end_ms"], s["sentence_id"]))
 
-    def _records(self, job_id):
-        result = []
-        for row in self.db.execute("SELECT * FROM cues WHERE job_id=? ORDER BY begin_ms,end_ms,cue_id", (job_id,)):
-            values = dict(row)
-            metadata = json.loads(values.pop("metadata"))
-            record = {**metadata, **values}
-            decision_origin(record)
-            result.append(record)
-        return result
-
     def cues(self, job_id):
         with self.lock:
-            return self._records(job_id)
+            result = []
+            for row in self.db.execute("SELECT * FROM cues WHERE job_id=? ORDER BY begin_ms,end_ms,cue_id", (job_id,)):
+                values = dict(row)
+                metadata = json.loads(values.pop("metadata"))
+                record = {**metadata, **values}
+                decision_origin(record)
+                result.append(record)
+            return result
 
     def apply_review(self, job_id, cue_id, decision: ReviewDecision):
         """Save one confirmation and every dependent local record in one transaction."""
@@ -326,25 +322,6 @@ class Store:
             self.db.executemany('UPDATE cues SET error=? WHERE job_id=? AND cue_id=?',
                                 [(error, job_id, cue_id) for cue_id in cue_ids])
 
-    def _translation_origin(self, job_id, cue_id, origin, stage_key):
-        if origin is not None:
-            manifest = self.job(job_id)['manifest']
-            route = manifest.get('mt_route_snapshot', {})
-            entries = route.get('entries', []) if isinstance(route, dict) else []
-            if not isinstance(origin, str) or not any(isinstance(entry, dict) and entry.get('id') == origin for entry in entries):
-                raise ValueError('Invalid translation origin')
-        row = self.db.execute('SELECT metadata FROM cues WHERE job_id=? AND cue_id=?', (job_id, cue_id)).fetchone()
-        if row is not None:
-            metadata = json.loads(row[0])
-            metadata.pop('mt_origin', None)
-            metadata.pop('mt_stage_key', None)
-            if origin is not None:
-                metadata['mt_origin'] = origin
-            if stage_key is not None:
-                metadata['mt_stage_key'] = stage_key
-            self.db.execute('UPDATE cues SET metadata=? WHERE job_id=? AND cue_id=?',
-                            (json.dumps(metadata, ensure_ascii=False), job_id, cue_id))
-
     def mt_stages(self, job_id):
         with self.lock:
             return [{'key': row['stage_key'], 'stage': row['stage'], 'record': json.loads(row['record'])}
@@ -367,13 +344,20 @@ class Store:
             raise ValueError('Invalid MT stage')
         with self.lock, self.db:
             if translations is not None:
+                if origin is not None:
+                    route = self.job(job_id)['manifest'].get('mt_route_snapshot', {})
+                    entries = route.get('entries', []) if isinstance(route, dict) else []
+                    if (not isinstance(origin, str) or not any(
+                            isinstance(entry, dict) and entry.get('id') == origin for entry in entries)):
+                        raise ValueError('Invalid translation origin')
                 self._clear_publication(job_id)
+                # JSON merge-patch replaces the stage link and removes a stale origin when null.
+                metadata = json.dumps({'mt_origin': origin, 'mt_stage_key': key}, ensure_ascii=False)
                 for cue_id, text in translations.items():
-                    changed = self.db.execute("UPDATE cues SET translated=?,error='' WHERE job_id=? AND cue_id=?",
-                                              (text, job_id, cue_id))
+                    changed = self.db.execute("UPDATE cues SET translated=?,error='',metadata=json_patch(metadata,?) "
+                                              "WHERE job_id=? AND cue_id=?", (text, metadata, job_id, cue_id))
                     if changed.rowcount != 1:
                         raise ToolError('批量翻译的字幕记录不完整，结果未保存。', 'cache_mismatch')
-                    self._translation_origin(job_id, cue_id, origin, key)
             self.db.execute('INSERT OR REPLACE INTO mt_stages(job_id,stage_key,stage,record) VALUES(?,?,?,?)',
                             (job_id, key, stage, json.dumps(record, ensure_ascii=False)))
             if cache_key is not None:

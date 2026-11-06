@@ -15,13 +15,13 @@ from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
 from .mt_backend import saved_mt
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
-from .mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
-                         stage_cache_key, validate_glossary)
+from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, make_stage_payload, parse_stage_response, plan_sentence_groups,
+                         stage_cache_key, validate_glossary, validate_stage_value)
 from .mt_routing import CacheHit, MTRouter, RouteEntry, RouteFailure
 from .mt_runtime import bailian_failure, service_failure
 from .mt_transport import TransportError
 from .review import decision_origin
-from .subtitles import (layout_warnings, plan_fragments, revise_layout, source_context, split_mt_units, validate_fragment,
+from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, source_context, split_mt_units, validate_fragment,
                         validate_unit_coverage)
 
 
@@ -112,10 +112,6 @@ class GlossaryPrefix:
             return self.prefixes[index]
 
 
-def _body(value):
-    return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(value, ensure_ascii=False)}}]}
-
-
 def _valid_usage(value):
     return (value is None or isinstance(value, dict) and set(value) == {'input_tokens', 'output_tokens'} and
             all(type(item) is int and item >= 0 for item in value.values()))
@@ -138,7 +134,7 @@ def check_pool(config, identity, route, cancel):
                 'processing_version': 2, 'subtitle_version': 2, 'display_timing_version': 2,
                 'subtitle_settings': {k: asdict(config.settings)[k] for k in
                                       ['zh_line_width', 'other_line_width', 'chinese_first']},
-                'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot(5)}
+                'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot()}
     scope = {**identity, 'processing_version': 2}
     store = Store(Path(':memory:'))
     try:
@@ -229,7 +225,7 @@ class Pipeline:
     def __init__(self, engine, job_id, manifest, scope):
         from .policy import load_policy
         self.engine, self.store, self.job_id = engine, engine.store, job_id
-        self.prompt_version = load_policy(manifest).prompt_version
+        load_policy(manifest)
         self.scope = dict(scope)
         self.context = threading.local()
         self.group_progress = None
@@ -309,7 +305,7 @@ class Pipeline:
     def _request_payload(self, stage, data, entry):
         try:
             return make_stage_payload(stage, data, entry.backend,
-                                      capabilities=self.profiles[entry.id]['capabilities'], prompt_version=self.prompt_version)
+                                      capabilities=self.profiles[entry.id]['capabilities'])
         except ToolError as error:
             if error.code != 'mt_input_budget':
                 raise
@@ -343,8 +339,7 @@ class Pipeline:
             fits = False
             for entry in candidates:
                 try:
-                    make_stage_payload(stage, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                                       prompt_version=self.prompt_version)
+                    make_stage_payload(stage, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'])
                     fits = True
                     break
                 except ToolError as error:
@@ -361,8 +356,7 @@ class Pipeline:
                     for entry in fallback:
                         try:
                             make_stage_payload(stage, data, entry.backend,
-                                               capabilities=self.profiles[entry.id]['capabilities'],
-                                               prompt_version=self.prompt_version)
+                                               capabilities=self.profiles[entry.id]['capabilities'])
                             return data
                         except ToolError as error:
                             if error.code != 'mt_input_budget':
@@ -370,7 +364,7 @@ class Pipeline:
                 raise ToolError('翻译阶段完整请求超过所有可用模型的输入预算。', 'mt_input_budget')
 
     def _work_key(self, name, data):
-        return _digest({'strategy': 5, 'prompt': self.prompt_version, 'stage': name, 'data': data,
+        return _digest({'strategy': 5, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
                         'scope': self.scope, 'profiles': self.snapshot['entries']})
 
     def stage(self, name, data, *, ids=(), originals=(), prefer=None):
@@ -409,7 +403,7 @@ class Pipeline:
                     pass
                 else:
                     try:
-                        value = parse_stage_response(name, _body(saved.get('value')), ids=ids, originals=originals)
+                        value = validate_stage_value(name, saved.get('value'), ids=ids, originals=originals)
                     except ToolError:
                         raise ToolError('保存的翻译阶段记录无效。', 'cache_mismatch') from None
                     return value, saved['backend'], {'key': work_key, 'actual_model': saved['actual_model'],
@@ -424,7 +418,7 @@ class Pipeline:
             try:
                 entry.backend.credential(self.engine.config)
                 key = stage_cache_key(name, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                                      scope=self.scope, prompt_version=self.prompt_version)
+                                      scope=self.scope)
             except ToolError as error:
                 if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
                     return None
@@ -439,7 +433,7 @@ class Pipeline:
                         safe_model_id(record['actual_model']) != record['actual_model'] or
                         not _valid_usage(record['usage'])):
                     raise ValueError()
-                value = parse_stage_response(name, _body(record['value']), ids=ids, originals=originals)
+                value = validate_stage_value(name, record['value'], ids=ids, originals=originals)
                 return CacheHit({'value': value, 'actual_model': record['actual_model'], 'usage': None})
             except (ValueError, TypeError, KeyError, ToolError):
                 raise ToolError('翻译阶段缓存无效，未复用。', 'cache_mismatch') from None
@@ -502,21 +496,12 @@ class Pipeline:
                                    retry_after=retry_after_seconds(reply.retry_after), disable=disable) from None
             try:
                 value = parse_stage_response(name, body, ids=ids, originals=originals)
-            except ToolError:
+            except BatchValidationError as error:
                 self.store.count(self.job_id, 'mt_invalid_response')
-                from .mt import BatchValidationError, parse_batch_response
-                category, actual_count = 'response_structure', None
-                if name in {'draft', 'align', 'correct'}:
-                    try:
-                        parse_batch_response(body, originals)
-                    except BatchValidationError as error:
-                        category, actual_count = error.category, error.actual_count
-                    except ToolError:
-                        pass
-                self.diagnostics.write({'kind': 'invalid_response', 'category': category,
+                self.diagnostics.write({'kind': 'invalid_response', 'category': error.category,
                     'stage': name, 'model': entry.backend.model, 'request_version': 5,
                     'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', ''),
-                    'expected_count': len(ids), 'actual_count': actual_count,
+                    'expected_count': len(ids), 'actual_count': error.actual_count,
                     **batch_response_metadata(body)})
                 raise RouteFailure('format_exhausted') from None
             if usage is None:
@@ -553,8 +538,7 @@ class Pipeline:
         record = {**result.value, 'backend': result.entry.id, 'request_model': result.entry.backend.model,
                   'stage': name}
         cache_key = stage_cache_key(name, data, result.entry.backend,
-                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.scope,
-                                    prompt_version=self.prompt_version)
+                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.scope)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             self.store.commit_mt_stage(self.job_id, work_key, name, record,
@@ -748,7 +732,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                 parts = split_mt_units(source, parts, fits=lambda cue: pipeline._fits_group(
                     [{'source': source, 'text': cue['text'], 'cues': [cue]}], allow_guarded_fallback=True))
             cues.extend(parts)
-        engine.preflight_display_timing(cues, manifest)
+        plan_display_timing(cues)
         candidate = copy.deepcopy(manifest)
         candidate.update(layout_planned=True, layout_round=0)
         engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, cues)
@@ -756,7 +740,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         check_cancel(engine.cancel)
         stage('subtitle_translating')
         cues = engine.store.cues(job_id)
-        engine.preflight_display_timing(cues, manifest)
+        plan_display_timing(cues)
         for cue in cues:
             if cue.get('sentence_id') not in source_ids:
                 raise ToolError('字幕片段缺少完整句来源。', 'cache_mismatch')
@@ -787,7 +771,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                             sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues), len(cues))
             progress.start()
             try:
-                engine._translate_pending(job_id, tasks, stage_name='subtitle_translating',
+                engine._translate_pending(job_id, tasks,
                                           done=sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues),
                                           total=len(cues))
             finally:
@@ -798,7 +782,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         round_number = manifest['layout_round']
         if round_number < MAX_LAYOUT_ROUNDS:
             stage('layout_adjusting', round_number + 1, MAX_LAYOUT_ROUNDS)
-            revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1, joint=True)
+            revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1)
         if revised is None:
             warnings = layout_warnings(cues, settings)
             if any(item['record'].get('warning') for item in engine.store.mt_stages(job_id)):
@@ -813,5 +797,5 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             return
         candidate = copy.deepcopy(manifest)
         candidate['layout_round'] = round_number + 1
-        engine.preflight_display_timing(revised, manifest)
+        plan_display_timing(revised)
         engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, revised)

@@ -176,7 +176,7 @@ def review(config, store, engine, job_id):
                     if source_lang in MT_LANGUAGES:
                         break
                     print("请使用 auto 或受支持的接口语言名称，不能传 ASR 的 en/ja 标签。", file=sys.stderr)
-            engine.apply_review(job_id, cue["cue_id"], ReviewDecision("original" if choice == "o" else "translate", source_lang))
+            store.apply_review(job_id, cue["cue_id"], ReviewDecision("original" if choice == "o" else "translate", source_lang))
     engine.finish_review(job_id)
     return True
 
@@ -456,7 +456,7 @@ def main(argv=None):
             else:
                 engine.select_input(current_job, args.track, args.channel)
                 if args.overwrite or args.output_dir:
-                    engine.change_output(current_job, args.output_dir, args.overwrite)
+                    store.change_output(current_job, args.output_dir, args.overwrite)
         else:
             workspace = validate_workspace_id(config.settings.workspace_id)
             key = config.get_key()

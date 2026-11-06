@@ -352,7 +352,7 @@ class PipelineTests(PipelineFixture):
         self.assertEqual(self.run_fake(fake), "needs_review")
         self.assertFalse(self.source.with_suffix(".srt").exists())
         cue = self.store.cues(self.job_id)[0]
-        Engine(self.config, self.store).apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
+        self.store.apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(len(fake.named("/chat/completions")), 0)
 
@@ -397,7 +397,7 @@ class PipelineTests(PipelineFixture):
         fake = FakeService(result(("OK", "")))
         self.assertEqual(self.run_fake(fake), "needs_review")
         cue = self.store.cues(self.job_id)[0]
-        Engine(self.config, self.store).apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
+        self.store.apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
         before = len(fake.calls)
         self.config.set_key("offline-other-account")
         self.assertEqual(self.run_fake(fake), "failed")

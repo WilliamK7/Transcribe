@@ -90,13 +90,6 @@ class ArchiveTests(SavedResultFixture):
         with self.assertRaises(ToolError):
             export_archive(self.config, self.job_id, self.config.data)
 
-    def test_rejects_legacy_execution_combinations(self):
-        manifest = self.store.job(self.job_id)['manifest']
-        for field, value in [('translation_strategy_version', 3), ('display_timing_version', 0),
-                             ('processing_version', 1), ('mt_glossary_schedule', 'global-v1')]:
-            with self.subTest(field=field), self.assertRaises(ToolError):
-                load_policy({**manifest, field: value})
-
     def test_rebuild_rolls_back_database_and_cleans_only_new_files(self):
         self.archive()
         jobs = self.store.jobs()

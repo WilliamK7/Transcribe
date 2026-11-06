@@ -13,7 +13,7 @@ MANUAL_REASON = "用户在终端确认"
 
 
 def decision_origin(record) -> Literal["automatic", "manual"]:
-    """The only compatibility reader for the old display-text marker."""
+    """Read explicit decision provenance, including archived display-text markers."""
     if "decision_origin" not in record:
         return "manual" if record.get("reason") == MANUAL_REASON else "automatic"
     value = record["decision_origin"]
