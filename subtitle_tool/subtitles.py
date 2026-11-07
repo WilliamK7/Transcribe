@@ -370,7 +370,15 @@ def wrap(text, width):
         return []
     if width <= 0:
         raise ValueError("Invalid display width")
+    if display_width(text) <= width or punctuation_overflow(text, width):
+        return [text]
     positions = _wrap_positions(text)
+    widths = [0]
+    for char in text:
+        widths.append(widths[-1] + display_width(char))
+    # clean_text collapses whitespace; each boundary is after a nonspace.
+    # A row can therefore have at most one leading space and no trailing one.
+    starts = [position + int(position < len(text) and text[position] == ' ') for position in positions]
     # Each suffix records its best cost and next boundary. Candidate rows are capacity-bounded,
     # except for indivisible tokens and a small punctuation overhang.
     best = {len(positions) - 1: ((0, 0, 0), None)}
@@ -378,13 +386,14 @@ def wrap(text, width):
     for start in range(len(positions) - 2, -1, -1):
         choice = None
         for stop in range(start + 1, len(positions)):
-            line = text[positions[start]:positions[stop]].strip()
-            size = display_width(line)
-            fits = size <= width or punctuation_overflow(line, width) or stop == start + 1
+            begin, end = starts[start], positions[stop]
+            size = widths[end] - widths[begin]
+            fits = (size <= width or stop == start + 1 or
+                    size <= width + 4 and punctuation_overflow(text[begin:end], width))
             if fits and stop in best:
                 suffix = best[stop][0]
                 short = int(stop == len(positions) - 1 and start > 0 and
-                            ((total_words > 2 and 0 < len(LATIN.findall(line)) <= 2) or size < width / 4))
+                            ((total_words > 2 and 0 < len(LATIN.findall(text[begin:end])) <= 2) or size < width / 4))
                 cost = (suffix[0] + 1, suffix[1] + short, suffix[2] + (width - size) ** 2)
                 if choice is None or cost < choice[0]:
                     choice = (cost, stop)

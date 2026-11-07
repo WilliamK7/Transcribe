@@ -105,6 +105,15 @@ class Media:
         time_base = Fraction(track.get("time_base", "0"))
         if rate <= 0 or time_base <= 0:
             raise ToolError("音轨缺少可靠时间基准。", "media_timeline")
+        # A common integer clock represents both packet ticks and audio samples
+        # exactly. Avoid allocating/reducing Fractions for every packet; float
+        # arithmetic here would lose gap/priming precision on long timelines.
+        clock = time_base.denominator * rate
+        packet_tick = time_base.numerator * rate
+        sample_tick = time_base.denominator
+        tolerance = max(2 * sample_tick, 2 * packet_tick)
+        ogg = track.get("container_format") == "ogg"
+        vorbis = track.get("codec_name") == "vorbis"
         with tempfile.TemporaryFile(dir=directory) as packets:
             run_process([self.executable("ffprobe"), "-v", "error", "-select_streams", str(track["index"]),
                          "-show_packets", "-show_entries", "packet=pts,duration:packet_side_data=skip_samples,discard_padding",
@@ -114,15 +123,14 @@ class Media:
             previous_padding = 0
             first, end, previous = None, None, None
             continuous = True
-            tolerance = max(Fraction(2, rate), time_base * 2)
             for line in packets:
                 check_cancel(self.cancel)
                 values = dict(field.rsplit("=", 1) for field in line.decode("ascii").strip().split("|") if "=" in field)
                 if "pts" not in values:
                     continue
                 try:
-                    pts = int(values["pts"]) * time_base
-                    duration = int(values["duration"]) * time_base
+                    pts = int(values["pts"]) * packet_tick
+                    duration = int(values["duration"]) * packet_tick
                     skip = int(next((v for k, v in values.items() if k.endswith("skip_samples")), "0"))
                     pad = int(next((v for k, v in values.items() if k.endswith("discard_padding")), "0"))
                 except (ValueError, KeyError) as e:
@@ -137,20 +145,19 @@ class Media:
                     continuous = False
                 previous_padding = pad
                 if first is None:
-                    first = pts + Fraction(skip, rate)
-                    if track.get("codec_name") == "vorbis":
+                    first = pts + skip * sample_tick
+                    if vorbis:
                         # The first Vorbis packet primes the overlap decoder; it emits no samples.
                         first = pts + duration
                 # Ogg granule positions already trim the final packet duration. MP3 durations do not.
-                ogg = track.get("container_format") == "ogg"
-                end = pts + duration - (0 if ogg else Fraction(pad, rate))
+                end = pts + duration - (0 if ogg else pad * sample_tick)
                 previous = pts + duration
                 count += 1
                 skipped += skip
                 padding += pad
         if first is None or end <= first:
             raise ToolError("无法取得音轨的有效时间范围。", "media_timeline")
-        return {"begin_seconds": float(first), "end_seconds": float(end), "duration_seconds": float(end - first),
+        return {"begin_seconds": first / clock, "end_seconds": end / clock, "duration_seconds": (end - first) / clock,
                 "packets": count, "continuous": continuous, "skip_samples": skipped,
                 "discard_padding": padding, "sample_rate": rate, "time_base": str(time_base)}
 

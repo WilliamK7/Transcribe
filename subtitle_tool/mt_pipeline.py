@@ -7,6 +7,7 @@ import json
 import re
 import time
 import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,9 +16,10 @@ from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
 from .mt_backend import MTBackend
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
-from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, direct_draft_matches,
-                         make_stage_payload, parse_stage_response, plan_sentence_groups,
-                         stage_cache_key, term_appears, validate_glossary, validate_stage_value)
+from .mt_planning import make_unit, restore_group_plan, save_group_plan
+from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, correction_stalled, direct_draft_matches,
+                         estimate_stage_output, make_stage_payload, parse_stage_response, plan_sentence_groups,
+                         stage_cache_key, stage_output_size, term_appears, validate_glossary, validate_stage_value)
 from .mt_routing import MTRouter, RouteEntry, RouteFailure
 from .mt_runtime import bailian_failure, service_failure
 from .mt_transport import TransportError
@@ -78,11 +80,9 @@ class GroupProgress:
 
 
 class GlossaryPrefix:
-    """Freeze each group's terminology from its source-ordered prefix."""
+    """Accumulate source-ordered terms on the scheduler thread."""
     def __init__(self, pipeline, sources):
         self.pipeline, self.sources = pipeline, sources
-        self.condition = threading.Condition()
-        self.next = 0
         self.terms, self.seen = [], set()
         self._add(validate_glossary([], sources, pipeline.snapshot['quality']['manual_glossary']))
 
@@ -95,18 +95,10 @@ class GlossaryPrefix:
                 self.terms.append(term)
                 self.seen.add(identity)
 
-    def for_group(self, index, extracted):
-        with self.condition:
-            while index != self.next:
-                self.pipeline.engine.mt_control.check_start()
-                if self.pipeline.group_progress is not None:
-                    self.pipeline.group_progress.set(index, 'waiting')
-                self.condition.wait(.1)
-            self.pipeline.engine.mt_control.check_start()
-            self._add(validate_glossary(extracted, self.sources, {}))
-            self.next += 1
-            self.condition.notify_all()
-            return tuple(self.terms)
+    def extend(self, extracted):
+        self.pipeline.engine.mt_control.check_start()
+        self._add(validate_glossary(extracted, self.sources, {}))
+        return tuple(self.terms)
 
 
 def _valid_usage(value):
@@ -319,7 +311,7 @@ class Pipeline:
                 raise
             raise RouteFailure('local_error') from None
 
-    def _fit(self, stage, data, *, allow_guarded_fallback=True):
+    def _fit(self, stage, data, *, allow_guarded_fallback=True, output_budget=False):
         """Drop far context first, then excess glossary; never truncate targets."""
         data = dict(data)
         candidates, guarded, cache_only = [], [], []
@@ -343,11 +335,21 @@ class Pipeline:
         # first, so a later refusal does not strand an otherwise usable route.
         fallback = guarded if candidates else []
         candidates = candidates or guarded or cache_only
+        if output_budget:
+            # Avoid choosing group sizes that depend on a paid model while a
+            # usable, smaller free profile is the first network choice.
+            candidates = [entry for entry in candidates if entry.tier == 'free'] or candidates
+        output_estimate = estimate_stage_output(stage, data) if output_budget else None
+        def payload_fits(entry):
+            capabilities = self.profiles[entry.id]['capabilities']
+            if output_budget and output_estimate > min(4096, capabilities['output_tokens']) * 3 // 4:
+                raise ToolError('翻译组预计输出超过规划余量。', 'mt_input_budget')
+            make_stage_payload(stage, data, entry.backend, capabilities=capabilities)
         while True:
             fits = False
             for entry in candidates:
                 try:
-                    make_stage_payload(stage, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'])
+                    payload_fits(entry)
                     fits = True
                     break
                 except ToolError as error:
@@ -363,8 +365,7 @@ class Pipeline:
                 if allow_guarded_fallback:
                     for entry in fallback:
                         try:
-                            make_stage_payload(stage, data, entry.backend,
-                                               capabilities=self.profiles[entry.id]['capabilities'])
+                            payload_fits(entry)
                             return data
                         except ToolError as error:
                             if error.code != 'mt_input_budget':
@@ -375,7 +376,7 @@ class Pipeline:
         return _digest({'strategy': 5, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
                         'scope': self.scope, 'profiles': self.snapshot['entries']})
 
-    def stage(self, name, data, *, ids=(), originals=(), prefer=None):
+    def stage(self, name, data, *, ids=(), originals=(), prefer=None, saved_only=False):
         self.engine.mt_control.check_start()
         group = getattr(self.context, 'group', None)
         if self.group_progress is not None and group is not None:
@@ -504,18 +505,21 @@ class Pipeline:
                     category, scope, disable = 'payment_required', 'paid_account', True
                 elif status == 404 and not entry.backend.free_router:
                     scope, disable = 'model', True
-                raise RouteFailure(category, scope=scope, retryable=failure.retryable,
+                raise RouteFailure(category, scope=scope, retryable=failure.retryable, rate_limited=status == 429,
                                    retry_after=retry_after_seconds(reply.retry_after), disable=disable) from None
             try:
                 value = parse_stage_response(name, body, ids=ids, originals=originals)
             except BatchValidationError as error:
                 self.store.count(self.job_id, 'mt_invalid_response')
+                if error.category == 'output_truncated':
+                    self.store.count(self.job_id, 'mt_output_truncated')
                 self.diagnostics.write({'kind': 'invalid_response', 'category': error.category,
                     'stage': name, 'model': entry.backend.model,
                     'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', ''),
                     'expected_count': len(ids), 'actual_count': error.actual_count,
                     **batch_response_metadata(body)})
-                raise RouteFailure('format_exhausted') from None
+                raise RouteFailure('output_truncated' if error.category == 'output_truncated' else
+                                   'format_exhausted') from None
             if usage is None:
                 self.store.count(self.job_id, 'mt_usage_unknown')
             else:
@@ -527,7 +531,12 @@ class Pipeline:
         # free and paid cache lookup before adapting to permitted network models.
         result = self.router.cached_result(cached, prefer_other_than=prefer, deadline=started + 180.0)
         if result is None:
-            data = self._fit(name, data)
+            try:
+                data = self._fit(name, data)
+            except ToolError as error:
+                if saved_only and error.code == 'mt_input_budget':
+                    return None
+                raise
             new_key = self._work_key(name, data)
             adapted = new_key != work_key
             if adapted:
@@ -536,10 +545,16 @@ class Pipeline:
                 saved = saved_stage()
                 if saved is not None:
                     return saved
-            remaining = max(0.0, 180.0 - (time.monotonic() - started))
-            result = self.router.run(invoke, cache=cached if adapted else None, prefer_other_than=prefer,
-                                     prepare=lambda entry, wait: self._reserve_quota(entry, wait, name, data),
-                                     deadline_seconds=remaining, stage=name)
+            if saved_only:
+                result = (self.router.cached_result(cached, prefer_other_than=prefer, deadline=started + 180.0)
+                          if adapted else None)
+                if result is None:
+                    return None
+            else:
+                remaining = max(0.0, 180.0 - (time.monotonic() - started))
+                result = self.router.run(invoke, cache=cached if adapted else None, prefer_other_than=prefer,
+                                         prepare=lambda entry, wait: self._reserve_quota(entry, wait, name, data),
+                                         deadline_seconds=remaining, stage=name, output_size=stage_output_size(name, data))
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
             'model': result.entry.backend.model, 'actual_model': result.value['actual_model'],
             'duration_ms': round((time.monotonic() - started) * 1000), 'wait_ms': round(result.waited * 1000),
@@ -560,7 +575,7 @@ class Pipeline:
         return record['value'], record['backend'], {'key': work_key, 'actual_model': record['actual_model'],
                                                     'request_model': record['request_model']}
 
-    def _fits_group(self, units, *, allow_guarded_fallback=False):
+    def _fits_group(self, units, *, allow_guarded_fallback=False, output_budget=False):
         if units[-1]['cues'][-1]['end_ms'] - units[0]['cues'][0]['begin_ms'] > 60000:
             return False
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(units)]
@@ -573,16 +588,18 @@ class Pipeline:
         if not direct_draft_matches(sentences, fragments):
             samples.append(('align', base))
         samples.append(('review', {**base, 'translations': {f['id']: '译文' for f in fragments}}))
+        if output_budget:
+            samples.append(('correct', {**samples[-1][1], 'issues': []}))
         try:
             for stage, data in samples:
-                self._fit(stage, data, allow_guarded_fallback=allow_guarded_fallback)
+                self._fit(stage, data, allow_guarded_fallback=allow_guarded_fallback, output_budget=output_budget)
             return True
         except ToolError as error:
             if error.code != 'mt_input_budget':
                 raise
             return False
 
-    def plan_groups(self, sources, cues):
+    def plan_groups(self, sources, cues, *, output_budget=True):
         """Reduce complete-sentence groups first; oversized sentences use reliable cue word boundaries."""
         by_sentence = {}
         for cue in cues:
@@ -593,17 +610,12 @@ class Pipeline:
             for source in source_group:
                 members = sorted(by_sentence.get(source['sentence_id'], []), key=lambda item: item['char_start'])
                 validate_unit_coverage(source, members)
-                def make_unit(start, end):
-                    first = 0 if start == 0 else members[start - 1]['char_end']
-                    last = len(source['text']) if end == len(members) else members[end - 1]['char_end']
-                    return {'source': source, 'text': source['text'][first:last], 'cues': members[start:end]}
                 def split(start, end):
-                    unit = make_unit(start, end)
-                    if self._fits_group([unit]):
+                    unit = make_unit(source, members, start, end)
+                    if self._fits_group([unit], output_budget=output_budget):
                         return [unit]
                     if end - start < 2 or not source.get('words'):
-                        # A sentence that cannot be split may still fit the
-                        # larger guarded model; admission remains fail-closed.
+                        # Intact targets use input-only admission, including guarded models.
                         if self._fits_group([unit], allow_guarded_fallback=True):
                             return [unit]
                         raise ToolError('完整句超过模型预算且没有可用的可靠词时间边界。', 'mt_input_budget')
@@ -617,13 +629,25 @@ class Pipeline:
                     result.extend([[unit] for unit in units])
                     continue
                 unit = units[0]
-                if pending and not self._fits_group([*pending, unit]):
+                if pending and not self._fits_group([*pending, unit], output_budget=output_budget):
                     result.append(pending)
                     pending = []
                 pending.append(unit)
             if pending:
                 result.append(pending)
         return result
+
+    def groups_for_layout(self, sources, cues, manifest):
+        if 'mt_group_plan' in manifest:
+            return restore_group_plan(manifest['mt_group_plan'], sources, cues, manifest['layout_round'])
+        # Existing current-contract stages were produced with the original
+        # input-only planner. Freeze those boundaries before applying new hints
+        # to fresh work, preserving their request identities on resume.
+        groups = self.plan_groups(sources, cues, output_budget=not self.store.has_mt_stages(self.job_id))
+        candidate = copy.deepcopy(manifest)
+        candidate['mt_group_plan'] = save_group_plan(groups, sources, cues, manifest['layout_round'])
+        self.engine.commit_local(self.job_id, manifest, candidate, self.store.save_mt_group_plan)
+        return groups
 
     def glossary(self, group):
         manual = self.snapshot['quality']['manual_glossary']
@@ -681,6 +705,8 @@ class Pipeline:
             aligned, origin, production = self.stage('align', data, ids=ids, originals=originals, prefer=draft_backend)
         current = aligned['translations']
         warning = False
+        stalled = False
+        previous_correction = None
         review_keys, correction_keys, reviewed = [], [], []
         for round_number in range(self.snapshot['quality']['max_revisions'] + 1):
             self.engine.mt_control.check_start()
@@ -708,9 +734,17 @@ class Pipeline:
                 warning = True
                 break
             try:
-                corrected, origin, production = self.stage('correct', {**review_data, 'issues': review['issues']},
-                                                           ids=ids, originals=originals, prefer=reviewer)
+                correction_data = {**review_data, 'issues': review['issues']}
+                stalled = correction_stalled(previous_correction, correction_data)
+                correction = self.stage('correct', correction_data, ids=ids, originals=originals,
+                                        prefer=reviewer, saved_only=stalled)
+                if correction is None:
+                    warning = True
+                    break
+                stalled = False  # A complete saved correction still takes precedence.
+                corrected, origin, production = correction
                 correction_keys.append(production['key'])
+                previous_correction = correction_data
                 current = corrected['translations']
             except Cancelled:
                 raise
@@ -730,9 +764,11 @@ class Pipeline:
         values = {cue['cue_id']: current[str(i)] for i, cue in enumerate(members)}
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
+            counts = {'mt_subtitle_completed': len(values), 'mt_quality_warning': int(warning)}
+            if stalled:
+                counts['mt_correction_stalled'] = 1
             self.store.commit_mt_stage(self.job_id, final_key, 'final', record, translations=values, origin=origin,
-                                       counts={'mt_subtitle_completed': len(values),
-                                               'mt_quality_warning': int(warning)})
+                                       counts=counts)
 
 
 def process_subtitles(engine, job_id, manifest, settings, scope, stage):
@@ -763,36 +799,22 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         stage('subtitle_translating')
         cues = engine.store.cues(job_id)
         plan_display_timing(cues)
-        groups = pipeline.plan_groups(sources, cues)
+        groups = pipeline.groups_for_layout(sources, cues, manifest)
         pending = [index for index, group in enumerate(groups)
                    if any(not cue['translated'] for unit in group for cue in unit['cues'])]
         if pending:
             # Completed earlier groups still contribute their exact saved glossary
             # to the prefix used by later unfinished groups.
             groups = groups[:pending[-1] + 1]
-            prefix = GlossaryPrefix(pipeline, sources)
             progress = GroupProgress(engine, job_id)
             pipeline.group_progress = progress
-            def run_group(index, group):
-                pipeline.context.group = index
-                progress.set(index, 'glossary')
-                try:
-                    glossary = prefix.for_group(index, pipeline.glossary(group))
-                    context = source_context(sources, positions[group[0]['source']['sentence_id']])
-                    pipeline.group(group, glossary, context)
-                finally:
-                    progress.finish(index)
-            tasks = []
-            for index, group in enumerate(groups):
-                members = [cue for unit in group for cue in unit['cues']]
-                tasks.append((members, lambda index=index, group=group: run_group(index, group)))
             engine.progress(job_id, 'subtitle_translating',
                             sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues), len(cues))
             progress.start()
             try:
-                engine._translate_pending(job_id, tasks,
-                                          done=sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues),
-                                          total=len(cues))
+                _translate_groups(pipeline, groups, sources, positions,
+                                  done=sum(c['decision'] != 'translate' or bool(c['translated']) for c in cues),
+                                  total=len(cues))
             finally:
                 progress.close()
                 pipeline.group_progress = None
@@ -818,3 +840,92 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         candidate['layout_round'] = round_number + 1
         plan_display_timing(revised)
         engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, revised)
+
+
+def _translate_groups(pipeline, groups, sources, positions, *, done, total):
+    """Schedule ready translations first; prefix waits never occupy a worker."""
+    engine, job_id = pipeline.engine, pipeline.job_id
+    progress = pipeline.group_progress
+    workers = engine.config.settings.mt_workers
+    prefix = GlossaryPrefix(pipeline, sources)
+    glossaries, errors = {}, []
+    next_glossary = next_group = 0
+
+    def extract(index):
+        engine.mt_control.check_start()
+        pipeline.context.group = index
+        progress.set(index, 'glossary')
+        result = pipeline.glossary(groups[index])
+        progress.set(index, 'waiting')
+        return result
+
+    def translate(index, glossary):
+        engine.mt_control.check_start()
+        pipeline.context.group = index
+        group = groups[index]
+        context = source_context(sources, positions[group[0]['source']['sentence_id']])
+        pipeline.group(group, glossary, context)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+
+        def schedule():
+            nonlocal next_glossary, next_group
+            while len(futures) < workers and not errors and not engine.mt_control.stopping:
+                if next_group in glossaries:
+                    index = next_group
+                    # Freeze only the prefix about to be consumed, keeping both
+                    # terminology and retained memory independent of completion order.
+                    glossary = prefix.extend(glossaries.pop(index))
+                    next_group += 1
+                    members = [cue for unit in groups[index] for cue in unit['cues']]
+                    if all(cue['translated'] for cue in members):
+                        progress.finish(index)
+                        continue
+                    futures[executor.submit(translate, index, glossary)] = (index, False)
+                elif next_glossary < len(groups) and next_glossary - next_group < 2 * workers:
+                    # One extra window hides a slow earlier extraction without
+                    # starting glossary requests for the entire remaining video.
+                    index = next_glossary
+                    next_glossary += 1
+                    futures[executor.submit(extract, index)] = (index, True)
+                else:
+                    break
+
+        try:
+            schedule()
+            while futures:
+                engine.mt_control.stopping  # Observe external cancellation during silent requests.
+                completed, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index, extracting = futures.pop(future)
+                    try:
+                        value = future.result()
+                        if extracting:
+                            glossaries[index] = value
+                        else:
+                            done += sum(not cue['translated'] for unit in groups[index] for cue in unit['cues'])
+                    except ToolError as error:
+                        progress.finish(index)
+                        if error.code != 'cancelled':
+                            engine.mt_control.stop(error)
+                        errors.append(error)
+                    if not extracting:
+                        progress.finish(index)
+                        engine.progress(job_id, 'subtitle_translating', done, total)
+                schedule()
+        except ToolError as error:
+            # Cancellation can race with prefix consumption on this thread.
+            # Keep the normal drain window for requests already dispatched.
+            if error.code != 'cancelled':
+                engine.mt_control.stop(error)
+            errors.append(error)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, Cancelled)):
+                engine.request_cancel(force=True)
+            else:
+                engine.mt_control.stop(ToolError('翻译阶段本地处理失败，进度已保存。', 'local_io'), force=True)
+            raise
+    check_cancel(engine.cancel)
+    if errors:
+        raise errors[0]

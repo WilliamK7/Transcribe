@@ -19,7 +19,7 @@ VALIDATION_CATEGORIES = {
     'response_structure': '响应外层结构异常', 'json_invalid': 'JSON 无效',
     'json_duplicate_key': 'JSON 重复键', 'id_missing': '编号缺失',
     'id_out_of_range': '编号越界',
-    'translation_invalid': '译文无效', 'unfinished': '非正常结束',
+    'translation_invalid': '译文无效', 'unfinished': '非正常结束', 'output_truncated': '输出长度耗尽',
 }
 
 
@@ -125,6 +125,38 @@ def direct_draft_matches(sentences, fragments):
         for index, (sentence, fragment) in enumerate(zip(sentences, fragments)))
 
 
+def stage_output_size(stage, data):
+    """Estimate target workload, including translations and JSON field overhead."""
+    targets = data['sentences'] if stage in {'glossary', 'draft'} else data['fragments']
+    characters = sum(len(item['text']) for item in targets)
+    for field in ('draft', 'translations'):
+        characters = max(characters, sum(len(text) for text in data.get(field, {}).values()))
+    return characters + 32 * len(targets)
+
+
+def estimate_stage_output(stage, data):
+    """Estimate Chinese JSON output, adding room for advisory evidence fields."""
+    targets = data['sentences'] if stage in {'glossary', 'draft'} else data['fragments']
+    return 64 + stage_output_size(stage, data) + (64 * len(targets) if stage in {'glossary', 'review'} else 0)
+
+
+def correction_stalled(previous, current):
+    """Detect repeated evidence with unchanged translations across affected sentences."""
+    if previous is None or not current['issues']:
+        return False
+    for key in ('sentences', 'draft', 'fragments', 'glossary'):
+        if previous[key] != current[key]:
+            return False
+    def issues(data):
+        return {(item['id'], item['category'], item['evidence']) for item in data['issues']}
+    if issues(previous) != issues(current):
+        return False
+    flagged = {item['id'] for item in current['issues']}
+    affected = {item['sentence'] for item in current['fragments'] if item['id'] in flagged}
+    return all(previous['translations'][item['id']] == current['translations'][item['id']]
+               for item in current['fragments'] if item['sentence'] in affected)
+
+
 def _schema(stage, data):
     if stage == 'glossary':
         item = {'type': 'object', 'properties': {'source': {'type': 'string'}, 'translation': {'type': 'string'},
@@ -212,14 +244,17 @@ def parse_stage_response(stage, body, *, ids=(), originals=()):
         message = choice.get('message')
         content = message.get('content') if isinstance(message, dict) else None
         if choice.get('finish_reason') != 'stop':
+            truncated = choice.get('finish_reason') == 'length'
             if stage not in {'draft', 'align', 'correct'}:
+                if truncated:
+                    raise BatchValidationError('output_truncated')
                 raise ValueError()
             # Keep the count for truncated but parseable replies, without accepting them.
             try:
                 count = len(validate_translations(parse_content(content), originals))
             except BatchValidationError as error:
                 count = error.actual_count
-            raise BatchValidationError('unfinished', count)
+            raise BatchValidationError('output_truncated' if truncated else 'unfinished', count)
         return validate_stage_value(stage, parse_content(content), ids=ids, originals=originals)
     except (KeyError, TypeError, ValueError, RecursionError):
         raise BatchValidationError('response_structure') from None

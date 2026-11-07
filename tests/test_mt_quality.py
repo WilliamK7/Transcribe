@@ -5,7 +5,8 @@ import unittest
 from subtitle_tool.common import ToolError
 from subtitle_tool.mt_backend import MTBackend, key_fingerprint
 from subtitle_tool.mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
-                                      stage_cache_key, validate_glossary)
+                                      stage_cache_key, stage_output_size, estimate_stage_output, correction_stalled,
+                                      validate_glossary, BatchValidationError)
 
 
 def source(index, *, language='en', decision='translate', origin='automatic', segment='0000', start=None):
@@ -26,6 +27,31 @@ class QualityContractTests(unittest.TestCase):
         self.qiniu_caps = {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}
         self.router_caps = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
         self.scope = {'account': 'synthetic'}
+
+    def test_stalled_correction_requires_exact_issues_and_unchanged_affected_sentences(self):
+        import copy
+        previous = {'sentences': [], 'draft': {}, 'glossary': [],
+                    'fragments': [{'id': '0', 'sentence': '0', 'text': 'First part.'},
+                                  {'id': '1', 'sentence': '0', 'text': 'Second part.'},
+                                  {'id': '2', 'sentence': '1', 'text': 'Other sentence.'}],
+                    'translations': {'0': '首片', '1': '尾片', '2': '另一句'},
+                    'issues': [{'id': '0', 'category': 'number', 'evidence': '值有误'}]}
+        current = copy.deepcopy(previous)
+        current['translations']['2'] = '修改另一句'
+        self.assertTrue(correction_stalled(previous, current))
+        self.assertFalse(correction_stalled(None, current))
+        current['translations']['1'] = '同句的相邻片已修改'
+        self.assertFalse(correction_stalled(previous, current))
+        for name, value in [('id', '1'), ('category', 'meaning'), ('evidence', '新的具体证据')]:
+            current = copy.deepcopy(previous)
+            current['issues'][0][name] = value
+            self.assertFalse(correction_stalled(previous, current))
+        current = copy.deepcopy(previous)
+        current['issues'] = []
+        self.assertFalse(correction_stalled(previous, current))
+        current['issues'] = previous['issues'] * 2
+        self.assertTrue(correction_stalled(previous, current))
+
 
     def test_groups_respect_sentence_count_span_segment_language_and_human_decision(self):
         records = [source(i) for i in range(9)] + [source(9, language='fr'), source(10, origin='manual'),
@@ -64,6 +90,38 @@ class QualityContractTests(unittest.TestCase):
             parse_stage_response('review', body(invalid), ids=['0'])
         self.assertNotIn('private evidence', str(error.exception))
         self.assertEqual(error.exception.code, 'mt_batch_invalid')
+
+    def test_length_finish_is_classified_for_every_stage_even_with_complete_json(self):
+        for stage, value in [('glossary', {'terms': []}), ('review', {'issues': []}),
+                             *[(name, {'translations': {'0': '完整译文'}}) for name in ('draft', 'align', 'correct')]]:
+            for content in [json.dumps(value), '{"private-incomplete-output":']:
+                response = {'choices': [{'finish_reason': 'length', 'message': {'content': content}}]}
+                with self.subTest(stage=stage, complete=content == json.dumps(value)), self.assertRaises(BatchValidationError) as error:
+                    parse_stage_response(stage, response, ids=['0'], originals=['Synthetic input.'])
+                self.assertEqual(error.exception.category, 'output_truncated')
+                self.assertNotIn('private', str(error.exception))
+
+    def test_output_workload_tracks_targets_and_translations_without_context_or_glossary(self):
+        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': []}
+        size = stage_output_size('draft', data)
+        self.assertEqual(stage_output_size('draft', {**data, 'context': [{'text': 'Background ' * 1000}],
+                                                    'glossary': [{'source': 'Cache', 'translation': '缓存'}]}), size)
+        self.assertGreater(stage_output_size('draft', {**data, 'sentences': data['sentences'] * 2}), size)
+        review = {**data, 'fragments': data['sentences'], 'draft': {'0': '缓存'}, 'translations': {'0': '缓存'}}
+        self.assertEqual(stage_output_size('review', review), size)
+        self.assertGreater(stage_output_size('review', {**review, 'translations': {'0': '长译文' * 100}}), size)
+
+    def test_output_estimates_allow_for_list_fields_and_full_correction_translation(self):
+        target = {'id': '0', 'text': 'A cache.'}
+        data = {'sentences': [target], 'fragments': [{**target, 'sentence': '0'}],
+                'draft': {'0': '整句译文'}, 'translations': {'0': '当前译文'}, 'context': [], 'glossary': []}
+        draft = estimate_stage_output('draft', data)
+        self.assertGreater(estimate_stage_output('glossary', data), draft)
+        self.assertGreater(estimate_stage_output('review', data), draft)
+        self.assertEqual(estimate_stage_output('correct', data), draft)
+        expanded = {**data, 'translations': {'0': '更长的完整译文' * 100}}
+        self.assertGreater(estimate_stage_output('correct', expanded), draft)
+        self.assertEqual(estimate_stage_output('draft', {**data, 'context': [{'text': 'Other ' * 1000}]}), draft)
 
     def test_json_object_review_supplies_the_fields_and_categories_it_validates(self):
         from subtitle_tool.mt_quality import ISSUE_CATEGORIES

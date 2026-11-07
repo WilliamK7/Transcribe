@@ -75,7 +75,7 @@ class MTDiagnostics:
         from .mt_routing import _CATEGORIES, _SCOPES
         try:
             if event.get('kind') not in {'route_attempt', 'route_failure', 'route_wait', 'route_switch',
-                                         'route_complete', 'route_reply'}:
+                                         'route_complete', 'route_reply', 'route_pacing'}:
                 return False
             record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
             self._routing(record, event)
@@ -93,6 +93,19 @@ class MTDiagnostics:
                     record[field] = value
             if type(event.get('cached')) is bool:
                 record['cached'] = event['cached']
+            if type(event.get('dispatched')) is bool:
+                record['dispatched'] = event['dispatched']
+            if event.get('selection') in {'weighted', 'learning', 'performance', 'probe'}:
+                record['selection'] = event['selection']
+            if type(event.get('size_bucket')) is int and 0 <= event['size_bucket'] <= 3:
+                record['size_bucket'] = event['size_bucket']
+            if event.get('kind') == 'route_pacing':
+                if event.get('reason') in {'rate_limit', 'recovered'}:
+                    record['reason'] = event['reason']
+                if type(event.get('concurrency')) is int and 1 <= event['concurrency'] <= 4:
+                    record['concurrency'] = event['concurrency']
+                if type(event.get('interval_ms')) is int and 0 <= event['interval_ms'] <= 15000:
+                    record['interval_ms'] = event['interval_ms']
             return self._append(record)
         except (OSError, ValueError, TypeError, OverflowError):
             return False

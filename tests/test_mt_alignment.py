@@ -225,6 +225,7 @@ class AlignmentTests(SavedResultFixture):
         with mock.patch.object(self.store, 'save_layout', side_effect=save):
             self.assertEqual(self.execute(), 'failed')
         self.assertTrue(interrupted)
+        self.assertNotIn('mt_group_plan', self.store.job(self.job_id)['manifest'])
         cues = self.store.cues(self.job_id)
         self.assertGreater(len(cues), 2)
         self.assertFalse(cues[0]['translated'])
@@ -236,6 +237,8 @@ class AlignmentTests(SavedResultFixture):
         self.fake.stages.clear()
         self.assertEqual(self.execute(), 'completed')
         self.assertIn('align', [name for name, _ in self.fake.stages])
+        manifest = self.store.job(self.job_id)['manifest']
+        self.assertEqual(manifest['mt_group_plan']['layout_round'], manifest['layout_round'])
         Engine(self.config, self.store).retime(self.job_id, overwrite=True)
         self.assertEqual(self.execute(), 'completed')
 

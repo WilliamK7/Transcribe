@@ -215,6 +215,7 @@ class Store:
             self._initialize_subtitles(job_id, sources, cues, manifest)
 
     def _initialize_subtitles(self, job_id, sources, cues, manifest):
+        manifest.pop('mt_group_plan', None)
         self._clear_publication(job_id, manifest)
         self.db.execute("DELETE FROM subtitle_sources WHERE job_id=?", (job_id,))
         self.db.executemany("INSERT INTO subtitle_sources VALUES(?,?,?)",
@@ -258,9 +259,19 @@ class Store:
     def save_layout(self, job_id, cues, manifest):
         """Commit range changes and their resume marker in one SQLite transaction."""
         with self.lock, self.db:
+            manifest.pop('mt_group_plan', None)
             self._clear_publication(job_id, manifest)
             self._replace_records(job_id, cues)
             self.db.execute("UPDATE jobs SET manifest=? WHERE id=?", (json.dumps(manifest, ensure_ascii=False), job_id))
+
+    def save_mt_group_plan(self, job_id, manifest):
+        """Freeze planning before any stage request; cues and evidence stay intact."""
+        with self.lock, self.db:
+            self.db.execute('UPDATE jobs SET manifest=? WHERE id=?', (json.dumps(manifest, ensure_ascii=False), job_id))
+
+    def has_mt_stages(self, job_id):
+        with self.lock:
+            return self.db.execute('SELECT 1 FROM mt_stages WHERE job_id=? LIMIT 1', (job_id,)).fetchone() is not None
 
     def sources(self, job_id):
         with self.lock:
@@ -303,7 +314,7 @@ class Store:
                 item.update(translated="")
             self.db.execute('DELETE FROM mt_stages WHERE job_id=?', (job_id,))
             manifest = job["manifest"]
-            for name in ["layout_planned", "layout_complete", "layout_round",
+            for name in ["layout_planned", "layout_complete", "layout_round", "mt_group_plan",
                          "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                          "no_speech", "cue_count"]:
                 manifest.pop(name, None)

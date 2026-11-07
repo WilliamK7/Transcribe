@@ -8,89 +8,14 @@ from unittest import mock
 import io
 
 from subtitle_tool.engine import Engine
-from subtitle_tool.mt_quality import PROMPTS
 from subtitle_tool.mt_transport import HTTPReply
 from subtitle_tool.common import ToolError
 from subtitle_tool.mt_routing import RouteFailure
-from tests.fixtures import SavedResultFixture, result, timed_raw
+from tests.fixtures import result, timed_raw
+from tests.mt_fixtures import PoolPipelineFixture
 
 
-class PoolPipelineTests(SavedResultFixture):
-    def setUp(self):
-        super().setUp()
-        self.config.set_qiniu_key('synthetic-qiniu')
-        (self.config.data / 'mt-key.txt').write_text('synthetic-openrouter', encoding='utf-8')
-        self.config.settings.mt_provider = 'pool'
-        self.config.settings.mt_workers = 2
-        self.calls = []
-        self.review_failure = False
-        self.review_issue = False
-        self.no_change_correction = False
-        self.fail_stage = None
-        self.cancel_after = None
-        self.fail_second_group = False
-        self.quota_remaining = 1000
-        self.quota_queries = 0
-        self.stage_hook = None
-
-    def run_pool(self, cancel=None, engine=None, run=None):
-        parent = self
-        class Transport:
-            def request(self, method, url, **kwargs):
-                if method == 'GET':
-                    parent.quota_queries += 1
-                    quota = {'data': {'free_model_daily_requests': {'used': 1000 - parent.quota_remaining,
-                                                                    'limit': 1000, 'remaining': parent.quota_remaining}}}
-                    return HTTPReply(200, json.dumps(quota).encode('utf-8'))
-                if kwargs.get('on_dispatch') is not None:
-                    kwargs['on_dispatch']()
-                payload = kwargs['json']
-                stage = next(name for name, prompt in PROMPTS.items() if payload['messages'][0]['content'].startswith(prompt))
-                data = json.loads(payload['messages'][1]['content'])
-                data['_model'] = payload['model']
-                parent.calls.append((stage, url, data))
-                if parent.stage_hook is not None:
-                    parent.stage_hook(stage, data)
-                if stage == parent.fail_stage:
-                    return HTTPReply(400, b'{}')
-                if stage == 'draft' and parent.fail_second_group and any(
-                        'sentence 8' in item['text'] for item in data['sentences']):
-                    return HTTPReply(400, b'{}')
-                if stage == 'review' and parent.review_failure:
-                    return HTTPReply(400, b'{}')
-                if stage == 'glossary':
-                    value = {'terms': []}
-                elif stage == 'draft':
-                    value = {'translations': {item['id']: '完整句译文。' for item in data['sentences']}}
-                elif stage in {'align', 'correct'}:
-                    suffix = (str(sum(call[0] == 'correct' for call in parent.calls))
-                              if stage == 'correct' and not parent.no_change_correction else '')
-                    value = {'translations': (dict(data['translations']) if stage == 'correct' and parent.no_change_correction
-                             else {item['id']: '字幕完整译文。' + suffix for item in data['fragments']})}
-                else:
-                    value = {'issues': ([{'id': '0', 'category': 'number', 'evidence': '数字有疑点'}]
-                                        if parent.review_issue else [])}
-                content = json.dumps(value, ensure_ascii=False)
-                response = {'model': payload['model'], 'usage': {'prompt_tokens': 10, 'completion_tokens': 4},
-                            'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}
-                if stage == parent.cancel_after and cancel is not None:
-                    cancel.set()
-                return HTTPReply(200, json.dumps(response, ensure_ascii=False).encode('utf-8'))
-        with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()), \
-             mock.patch('subtitle_tool.mt_backend.qiniu_free_active', return_value=True):
-            return run() if run is not None else (engine or Engine(self.config, self.store, cancel)).run(self.job_id)
-
-    def install(self, *, split=False):
-        raw = result(('A cache stores a result.', 'en'), ('The next call reuses it.', 'en'))
-        if split:
-            raw = timed_raw(['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel'], word_ms=1000)
-            raw['transcripts'][0]['sentences'].append(
-                {'begin_time': 8500, 'end_time': 9400, 'text': 'A short ending.', 'language': 'en'})
-        self.save_result(raw)
-        Engine(self.config, self.store).reflow(self.job_id)
-        manifest = self.store.job(self.job_id)['manifest']
-        self.assertEqual(manifest['translation_strategy_version'], 5)
-
+class PoolPipelineTests(PoolPipelineFixture):
     def test_unchanged_stage_reads_each_cache_miss_once(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
@@ -265,6 +190,115 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertTrue(saved_while_blocked, 'later glossary work blocked every complete subtitle group')
         self.assertEqual(outcome, ['completed'])
 
+    def test_slow_first_glossary_releases_workers_for_bounded_lookahead(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        raw = result(*[(f'Technical sentence {i}.', 'en') for i in range(64)])
+        for i, sentence in enumerate(raw['transcripts'][0]['sentences']):
+            sentence['begin_time'], sentence['end_time'] = i * 100, i * 100 + 90
+        self.save_result(raw)
+        Engine(self.config, self.store).reflow(self.job_id)
+        blocked, release, lookahead, too_far = (threading.Event() for _ in range(4))
+
+        def hook(stage, data):
+            if stage == 'glossary':
+                first = data['sentences'][0]['text']
+                if first == 'Technical sentence 0.':
+                    blocked.set()
+                    self.assertTrue(release.wait(10))
+                elif first == 'Technical sentence 24.':
+                    lookahead.set()
+                elif first == 'Technical sentence 32.' and not release.is_set():
+                    too_far.set()
+
+        self.stage_hook = hook
+        outcome = []
+        worker = threading.Thread(target=lambda: outcome.append(self.run_pool()))
+        worker.start()
+        try:
+            reached_first = blocked.wait(5)
+            advanced = lookahead.wait(2)
+            unbounded = too_far.wait(.1)
+            drafts_before_release = sum(stage == 'draft' for stage, _, _ in self.calls)
+        finally:
+            release.set()
+            worker.join(20)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(reached_first)
+        self.assertTrue(advanced, 'a worker waiting for an earlier glossary cannot prepare later groups')
+        self.assertFalse(unbounded, 'glossary lookahead must stay within twice the worker count')
+        self.assertEqual(drafts_before_release, 0)
+        self.assertEqual(outcome, ['completed'])
+        self.assertEqual(len(self.calls), 8 * 3)
+
+    def test_prefetched_glossaries_keep_source_order_without_future_terms(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        raw = result(*[(f'Cache uses Marker0 Marker8 Marker16 in sentence {i}.', 'en') for i in range(24)])
+        for i, sentence in enumerate(raw['transcripts'][0]['sentences']):
+            sentence['begin_time'], sentence['end_time'] = i * 100, i * 100 + 90
+        self.save_result(raw)
+        Engine(self.config, self.store).reflow(self.job_id)
+        ready = threading.Event()
+
+        def group_index(data):
+            return int(data['sentences'][0]['text'].rsplit(' ', 1)[1][:-1])
+
+        def terms(data):
+            index = group_index(data)
+            sentence = data['sentences'][0]['id']
+            return [{'source': 'Cache', 'translation': f'缓存{index}', 'sentence': sentence},
+                    {'source': f'Marker{index}', 'translation': f'标记{index}', 'sentence': sentence}]
+
+        def hook(stage, data):
+            if stage == 'glossary':
+                index = group_index(data)
+                if index == 0:
+                    self.assertTrue(ready.wait(5))
+                elif index == 16:
+                    ready.set()
+
+        self.glossary_terms, self.stage_hook = terms, hook
+        self.assertEqual(self.run_pool(), 'completed')
+        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        self.assertEqual(len(drafts), 3)
+        for data in drafts:
+            index = group_index(data)
+            actual = {term['source']: term['translation'] for term in data['glossary']}
+            self.assertEqual(actual, {'Cache': '缓存0', **{f'Marker{i}': f'标记{i}' for i in range(0, index + 1, 8)}})
+
+    def test_cancelling_at_prefix_dispatch_keeps_inflight_glossary(self):
+        from subtitle_tool.mt_pipeline import GlossaryPrefix
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.save_result(result(*[(f'Technical sentence {i}.', 'en') for i in range(9)]))
+        Engine(self.config, self.store).reflow(self.job_id)
+        engine = Engine(self.config, self.store)
+        second_started, cancelled = threading.Event(), threading.Event()
+
+        def hook(stage, data):
+            if stage == 'glossary':
+                if data['sentences'][0]['text'] == 'Technical sentence 0.':
+                    self.assertTrue(second_started.wait(5))
+                else:
+                    second_started.set()
+                    self.assertTrue(cancelled.wait(5))
+
+        original = GlossaryPrefix.extend
+        def consume(prefix, extracted):
+            engine.request_cancel()
+            cancelled.set()
+            return original(prefix, extracted)
+
+        self.stage_hook = hook
+        with mock.patch.object(GlossaryPrefix, 'extend', new=consume):
+            self.assertEqual(self.run_pool(engine=engine), 'cancelled')
+        stages = self.store.mt_stages(self.job_id)
+        self.assertEqual([stage['stage'] for stage in stages], ['glossary', 'glossary'])
+        self.assertEqual(len(self.calls), 2)
+        self.stage_hook = None
+        Engine(self.config, self.store).resume(self.job_id)
+        self.calls.clear()
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertNotIn('glossary', [stage for stage, _, _ in self.calls])
+
     def test_review_service_failure_keeps_complete_translation_and_safe_warning(self):
         self.install()
         self.review_failure = True
@@ -293,67 +327,6 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertEqual(self.run_pool(), 'completed')
         self.assertNotIn('glossary', [stage for stage, _, _ in self.calls])
         self.assertNotIn('draft', [stage for stage, _, _ in self.calls])
-
-    def test_glossary_prefix_uses_source_order_and_wait_can_be_cancelled(self):
-        from subtitle_tool.mt_pipeline import GlossaryPrefix
-        from subtitle_tool.mt_control import MTControl
-        from subtitle_tool.common import Cancelled
-        from types import SimpleNamespace
-        sources = [{'sentence_id': str(i), 'text': 'A cache.', 'decision': 'translate'} for i in range(2)]
-        control = MTControl(threading.Event())
-        pipeline = SimpleNamespace(engine=SimpleNamespace(mt_control=control),
-            snapshot={'quality': {'manual_glossary': {}}}, group_progress=None)
-        prefix = GlossaryPrefix(pipeline, sources)
-        later = [{'source': 'cache', 'translation': '后出现的术语', 'sentence': '1'}]
-        outcome, waiting = [], threading.Event()
-        def run():
-            waiting.set()
-            try:
-                outcome.append(prefix.for_group(1, later))
-            except Cancelled:
-                outcome.append('cancelled')
-        worker = threading.Thread(target=run)
-        worker.start()
-        waiting.wait(2)
-        first = prefix.for_group(0, [{'source': 'cache', 'translation': '先出现的术语', 'sentence': '0'}])
-        worker.join(2)
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(first[0]['translation'], '先出现的术语')
-        self.assertEqual(outcome[0][0]['translation'], '先出现的术语')
-        prefix = GlossaryPrefix(pipeline, sources)
-        outcome.clear()
-        waiting.clear()
-        worker = threading.Thread(target=run)
-        worker.start()
-        waiting.wait(2)
-        control.cancel_user()
-        worker.join(2)
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(outcome, ['cancelled'])
-
-    def test_consumed_glossary_prefixes_do_not_accumulate_quadratic_memory(self):
-        import tracemalloc
-        from types import SimpleNamespace
-        from subtitle_tool.mt_control import MTControl
-        from subtitle_tool.mt_pipeline import GlossaryPrefix
-        count = 1024
-        sources = [{'sentence_id': str(i), 'text': f'术语{i:04}', 'decision': 'translate'}
-                   for i in range(count)]
-        pipeline = SimpleNamespace(engine=SimpleNamespace(mt_control=MTControl(threading.Event())),
-            snapshot={'quality': {'manual_glossary': {}}}, group_progress=None)
-        tracemalloc.start()
-        try:
-            prefix = GlossaryPrefix(pipeline, sources)
-            for i, source in enumerate(sources):
-                result = prefix.for_group(i, [{'source': source['text'], 'translation': '合成术语',
-                                               'sentence': source['sentence_id']}])
-                self.assertEqual(len(result), i + 1)
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-        # One thousand terms fit comfortably; keeping every consumed prefix
-        # alone would retain more than 4 MiB of tuple references.
-        self.assertLess(peak, 2 * 1024 * 1024)
 
     def test_glossary_prefix_matches_whole_terms_in_later_groups(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
@@ -419,8 +392,8 @@ class PoolPipelineTests(SavedResultFixture):
                 ('{"translations":{}}', 'stop', 'id_missing', 0),
                 ('{"translations":{"0":"甲","0":"乙"}}', 'stop', 'json_duplicate_key', None),
                 ('{"translations":{"0":" "}}', 'stop', 'translation_invalid', 1),
-                ('{"translations":{"0":"完整译文"}}', 'length', 'unfinished', 1),
-                ('{"translations":', 'length', 'unfinished', None),
+                ('{"translations":{"0":"完整译文"}}', 'length', 'output_truncated', 1),
+                ('{"translations":', 'length', 'output_truncated', None),
                 ('not JSON', 'stop', 'json_invalid', None),
                 ('[]', 'stop', 'response_structure', None),
             ]
@@ -435,6 +408,11 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertEqual([(event['category'], event['actual_count']) for event in invalid],
                          [(category, count) for _, _, category, count in cases])
         self.assertTrue(all(event['stage'] == 'draft' and event['expected_count'] == 1 for event in invalid))
+        self.assertEqual(self.store.counts(self.job_id)['mt_output_truncated'], 2)
+        failures = [event for event in events if event['kind'] == 'route_failure']
+        self.assertEqual(sum(event['category'] == 'output_truncated' for event in failures), 2)
+        self.assertEqual(self.store.mt_stages(self.job_id), [])
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM mt_cache').fetchone()[0], 0)
         self.assertNotIn('private-generated-text', log)
         self.assertNotIn('private-source-text', log)
 
@@ -458,6 +436,113 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertEqual([stage for stage, _, _ in self.calls].count('review'), 3)
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
         self.assertTrue(any('复核' in warning for warning in self.store.job(self.job_id)['manifest']['warnings']))
+
+    def test_correction_that_ignores_unchanged_reviewed_cues_stops_after_followup_review(self):
+        self.install()
+        self.review_issue = True
+        self.corrected_translations = lambda data: {**data['translations'], '1': '只改了未被指出的另一句。'}
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertEqual([stage for stage, _, _ in self.calls].count('correct'), 1)
+        self.assertEqual([stage for stage, _, _ in self.calls].count('review'), 2)
+        final = next(item['record'] for item in self.store.mt_stages(self.job_id) if item['stage'] == 'final')
+        self.assertTrue(final['warning'])
+        self.assertEqual(len(final['correction_stage_keys']), 1)
+        self.assertEqual(self.store.counts(self.job_id)['mt_correction_stalled'], 1)
+        self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
+
+    def test_stalled_correction_resumes_from_saved_followup_review_without_new_requests(self):
+        self.install()
+        self.review_issue = True
+        self.corrected_translations = lambda data: {**data['translations'], '1': '只改了另一句。'}
+        def hook(stage, data):
+            if stage == 'review' and sum(name == 'review' for name, _, _ in self.calls) == 2:
+                self.cancel_after = 'review'
+        self.stage_hook = hook
+        self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
+        self.calls.clear()
+        self.stage_hook = self.cancel_after = None
+        Engine(self.config, self.store).resume(self.job_id)
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.store.counts(self.job_id)['mt_correction_stalled'], 1)
+
+    def test_stalled_detection_preserves_an_already_saved_second_correction(self):
+        self.install()
+        self.review_issue = True
+        def corrected(data):
+            if sum(stage == 'correct' for stage, _, _ in self.calls) == 2:
+                self.cancel_after = 'correct'
+                self.review_issue = False
+                return {**data['translations'], '0': '第二轮已纠正了数字。'}
+            return {**data['translations'], '1': '只改了另一句。'}
+        self.corrected_translations = corrected
+        with mock.patch('subtitle_tool.mt_pipeline.correction_stalled', return_value=False, create=True):
+            self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
+        self.calls.clear()
+        self.cancel_after = None
+        Engine(self.config, self.store).resume(self.job_id)
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertEqual([stage for stage, _, _ in self.calls], ['review'])
+        final = next(item['record'] for item in self.store.mt_stages(self.job_id) if item['stage'] == 'final')
+        self.assertEqual(len(final['correction_stage_keys']), 2)
+        self.assertFalse(final['warning'])
+        self.assertEqual(self.store.cues(self.job_id)[0]['translated'], '第二轮已纠正了数字。')
+
+    def test_saved_only_stage_reuses_exact_cache_without_quota_or_network(self):
+        from subtitle_tool.mt_pipeline import Pipeline
+        from subtitle_tool.mt_quality import stage_cache_key
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        engine = Engine(self.config, self.store)
+        manifest = self.store.job(self.job_id)['manifest']
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
+        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'draft': {'0': '缓存'},
+                'fragments': [{'id': '0', 'sentence': '0', 'text': 'Cache.'}], 'glossary': [],
+                'translations': {'0': '缓存'}, 'issues': [{'id': '0', 'category': 'meaning', 'evidence': '待复核'}]}
+        candidate = pipeline.router.entries[0]
+        key = stage_cache_key('correct', data, candidate.backend,
+                              capabilities=pipeline.profiles[candidate.id]['capabilities'], scope=scope)
+        with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected HTTP')), \
+                mock.patch.object(pipeline, '_reserve_quota', side_effect=AssertionError('Unexpected quota')):
+            self.assertIsNone(pipeline.stage('correct', data, ids=['0'], originals=['Cache.'], saved_only=True))
+            cached = {'value': {'translations': {'0': '修正译文'}}, 'actual_model': 'synthetic', 'usage': None}
+            with self.store.db:
+                self.store.db.execute('INSERT INTO mt_cache VALUES(?,?)', (key, json.dumps(cached)))
+            value, _, _ = pipeline.stage('correct', data, ids=['0'], originals=['Cache.'], saved_only=True)
+        self.assertEqual(value, cached['value'])
+        self.assertEqual(self.store.counts(self.job_id), {'mt_v5_correct_cache_hit': 1})
+
+    def test_http_429_drives_pacing_and_does_not_mark_the_account_as_exhausted(self):
+        from subtitle_tool.mt_pipeline import Pipeline
+        from tests.mt_fixtures import FakeClock
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        engine = Engine(self.config, self.store)
+        manifest = self.store.job(self.job_id)['manifest']
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        clock, calls = FakeClock(), []
+        class Transport:
+            def request(self, method, url, **kwargs):
+                kwargs['on_dispatch']()
+                calls.append(clock.now)
+                if len(calls) == 1:
+                    return HTTPReply(429, b'{}', '3')
+                response = {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"issues":[]}'}}]}
+                return HTTPReply(200, json.dumps(response).encode())
+        with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
+            pipeline = Pipeline(engine, self.job_id, manifest, scope)
+            pipeline.router.clock, pipeline.router.wait = clock, clock.wait
+            for text in ['One.', 'Two.']:
+                value, _, _ = pipeline.stage('review', {'sentences': [], 'draft': {}, 'glossary': [],
+                    'fragments': [{'id': '0', 'sentence': '0', 'text': text}], 'translations': {'0': '完整译文'}}, ids=['0'])
+                self.assertEqual(value, {'issues': []})
+        self.assertEqual(calls, [0, 3, 4])
+        self.assertFalse(pipeline.router.disabled)
+        self.assertEqual(self.store.counts(self.job_id)['mt_429'], 1)
+        events = [json.loads(line) for line in pipeline.diagnostics.path.read_text(encoding='utf-8').splitlines()]
+        failures = [event for event in events if event['kind'] == 'route_failure']
+        self.assertEqual([event['dispatched'] for event in failures], [True])
 
     def test_unchanged_correction_stops_without_repeating_identical_stage_evidence(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]

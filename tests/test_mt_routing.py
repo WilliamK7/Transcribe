@@ -2,47 +2,18 @@
 from __future__ import annotations
 
 import threading
-import unittest
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from subtitle_tool.common import Cancelled
-from subtitle_tool.mt_backend import MTBackend, QINIU_BASE_URL, QINIU_FREE_MODEL
+from subtitle_tool.mt_backend import QINIU_BASE_URL, QINIU_FREE_MODEL
 from subtitle_tool.mt_control import MTControl
-from subtitle_tool.mt_routing import MTRouter, RouteEntry, RouteExhausted, RouteFailure
+from subtitle_tool.mt_routing import MTRouter, RouteExhausted, RouteFailure
+from tests.mt_fixtures import RouterFixture, entry
 
 
-class FakeClock:
-    def __init__(self):
-        self.now = 0.0
-        self.waits = []
-        self.utc = datetime(2026, 10, 25, tzinfo=timezone.utc)
-
-    def __call__(self):
-        return self.now
-
-    def wait(self, control, seconds):
-        control.check_start()
-        self.waits.append(seconds)
-        self.now += seconds
-
-
-def entry(name, tier='free', weight=1, *, model=None, key='key-a', url='https://a.example/v1',
-          provider='openai_compatible', rpm=0):
-    return RouteEntry(name, MTBackend(provider, url, model or name, key, 5), tier,
-                      weight=weight, rpm=rpm)
-
-
-class RouterTests(unittest.TestCase):
-    def setUp(self):
-        self.clock = FakeClock()
-        self.control = MTControl(threading.Event(), clock=self.clock)
-
-    def router(self, entries, *, paid_enabled=True, **kwargs):
-        return MTRouter(entries, paid_enabled=paid_enabled, control=self.control, clock=self.clock,
-                        utcnow=lambda: self.clock.utc, wait=self.clock.wait, **kwargs)
-
+class RouterTests(RouterFixture):
     def test_weighted_selection_across_groups_and_preferred_other_backend(self):
         a, b = entry('a', weight=3), entry('b')
         router = self.router([a, b])
@@ -421,7 +392,8 @@ class RouterTests(unittest.TestCase):
 
     def test_preparation_failure_skips_free_without_charging_an_http_attempt(self):
         free, paid = entry('free'), entry('paid', 'paid')
-        router = self.router([free, paid])
+        events = []
+        router = self.router([free, paid], on_event=events.append)
         calls = []
 
         @contextmanager
@@ -435,6 +407,8 @@ class RouterTests(unittest.TestCase):
                             prepare=prepare)
         self.assertEqual(calls, [('paid', 1)])
         self.assertEqual((result.attempts, result.waited, result.free_waited), (1, 4, 4))
+        failures = [event for event in events if event['kind'] == 'route_failure']
+        self.assertEqual([event['dispatched'] for event in failures], [False])
 
     def test_prepare_reservation_is_refunded_if_admission_invalidated_before_dispatch(self):
         free = entry('free', provider='qiniu', model=QINIU_FREE_MODEL, url=QINIU_BASE_URL)
@@ -722,7 +696,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(router.run(invoke).value, 'ok')
         self.assertEqual(calls, [0, 3])
         self.assertEqual(router.run(invoke).value, 'ok')
-        self.assertEqual(calls, [0, 3, 3])
+        self.assertEqual(calls, [0, 3, 4])
 
     def test_retryable_failure_without_header_has_shared_bounded_backoff_and_recovers(self):
         free, paid = entry('free'), entry('paid', 'paid')

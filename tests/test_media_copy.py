@@ -7,11 +7,64 @@ import threading
 
 import unittest
 import wave
+from fractions import Fraction
 from unittest import mock
 
 from subtitle_tool.media import Media, run_process
-from subtitle_tool.common import NeedsReview, fingerprint
+from subtitle_tool.common import NeedsReview, ToolError, fingerprint
 from tests.fixtures import enqueue_current, ROOT, FakeService, PipelineFixture, TemporaryTest, result
+
+
+class PacketTimelineTests(TemporaryTest):
+    def scan(self, packets, *, rate=48000, time_base='1/48000', codec='aac', container='mov'):
+        media = Media(ROOT, threading.Event())
+        track = dict(index=0, sample_rate=str(rate), time_base=time_base,
+                     codec_name=codec, container_format=container)
+        def probe(*args, stdout, **kwargs):
+            stdout.write(packets.encode('ascii'))
+        with mock.patch('subtitle_tool.media.run_process', side_effect=probe):
+            return media.packet_timeline(self.path / 'synthetic', track, self.path)
+
+    def test_exact_tolerance_at_large_pts_with_distinct_sample_and_time_bases(self):
+        # At this PTS, floating point subtraction would lose the one-tick distinction.
+        begin = 2**60
+        for gap, continuous in [(2, True), (3, False), (-2, True), (-3, False)]:
+            with self.subTest(gap=gap):
+                end = begin + 40 + gap
+                timeline = self.scan(f'pts={begin}|duration=20\npts={begin + 20 + gap}|duration=20\n',
+                                     rate=44100, time_base='1/1000')
+                self.assertEqual(timeline['continuous'], continuous)
+                self.assertEqual(timeline['begin_seconds'], float(Fraction(begin, 1000)))
+                self.assertEqual(timeline['end_seconds'], float(Fraction(end, 1000)))
+                self.assertEqual(timeline['duration_seconds'], float(Fraction(40 + gap, 1000)))
+
+    def test_priming_padding_and_ogg_granule_rules(self):
+        packets = 'pts=-1024|duration=1024|skip_samples=1024\npts=0|duration=1024|discard_padding=24\n'
+        timeline = self.scan(packets)
+        self.assertEqual(timeline['begin_seconds'], 0)
+        self.assertEqual(timeline['duration_seconds'], float(Fraction(1000, 48000)))
+        self.assertEqual((timeline['skip_samples'], timeline['discard_padding']), (1024, 24))
+        ogg = self.scan(packets, codec='opus', container='ogg')
+        self.assertEqual(ogg['duration_seconds'], float(Fraction(1024, 48000)))
+        vorbis = self.scan('pts=0|duration=128\npts=128|duration=1024\n', codec='vorbis', container='ogg')
+        self.assertEqual(vorbis['begin_seconds'], float(Fraction(128, 48000)))
+        self.assertEqual(vorbis['duration_seconds'], float(Fraction(1024, 48000)))
+
+    def test_sample_tolerance_and_nonunit_time_base_numerator(self):
+        for gap, continuous in [(3, True), (4, False)]:
+            timeline = self.scan(f'pts=0|duration=6\npts={6 + gap}|duration=6\n',
+                                 rate=2, time_base='3/10')
+            self.assertEqual(timeline['continuous'], continuous)
+            self.assertEqual(timeline['duration_seconds'], float(Fraction((12 + gap) * 3, 10)))
+
+    def test_midstream_trimming_and_invalid_packets_are_not_accepted_for_copy(self):
+        for packets in ['pts=0|duration=1024\npts=1024|duration=1024|skip_samples=2\n',
+                        'pts=0|duration=1024|discard_padding=2\npts=1024|duration=1024\n']:
+            self.assertFalse(self.scan(packets)['continuous'])
+        for packets in ['', 'pts=0|duration=-1\n', 'pts=0|duration=N/A\n', 'pts=0\n']:
+            with self.subTest(packets=packets), self.assertRaises(ToolError) as error:
+                self.scan(packets)
+            self.assertEqual(error.exception.code, 'media_timeline')
 
 
 @unittest.skipUnless(os.name == "nt" and (ROOT / "tools/ffmpeg.exe").exists(), "Pinned FFmpeg required")

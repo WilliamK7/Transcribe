@@ -11,7 +11,6 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from .api import Bailian, upload_limit
@@ -212,7 +211,7 @@ class Engine:
         previous_version = manifest.get("subtitle_version", 0)
         snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
         self.store.snapshot(job_id, snapshot)
-        for name in ["layout_planned", "layout_round", "layout_complete",
+        for name in ["layout_planned", "layout_round", "layout_complete", "mt_group_plan",
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                      "backup", "cue_count", "no_speech"]:
             manifest.pop(name, None)
@@ -783,48 +782,6 @@ class Engine:
     def render_subtitles(cues, settings):
         intervals, adjustments = plan_display_timing(cues)
         return render_srt(cues, settings, display_intervals=intervals), adjustments
-
-
-    def _translate_pending(self, job_id, tasks, *, done, total):
-        """Stop new work on failure or cancellation; save in-flight results before returning."""
-        errors = []
-        workers = self.config.settings.mt_workers
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            remaining = iter(tasks)
-            futures = {}
-            def schedule():
-                while (len(futures) < workers and not errors and not self.cancel.is_set()
-                       and not self.mt_control.stopping):
-                    item = next(remaining, None)
-                    if item is None:
-                        break
-                    members, run = item
-                    futures[executor.submit(run)] = members
-            try:
-                schedule()
-                while futures:
-                    self.mt_control.stopping  # Observe external cancellation even with silent requests.
-                    completed, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
-                    for future in completed:
-                        members = futures.pop(future)
-                        try:
-                            future.result()
-                            done += sum(not c['translated'] for c in members)
-                        except ToolError as e:
-                            if e.code != 'cancelled':
-                                self.mt_control.stop(e)
-                            errors.append(e)
-                        self.progress(job_id, 'subtitle_translating', done, total)
-                    schedule()
-            except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, Cancelled)):
-                    self.request_cancel(force=True)
-                else:
-                    self.mt_control.stop(ToolError('翻译阶段本地处理失败，进度已保存。', 'local_io'), force=True)
-                raise
-        check_cancel(self.cancel)
-        if errors:
-            raise errors[0]
 
     def cleanup_completed_audio(self, job_id, manifest, cache):
         if self.cleanup_audio(cache, best_effort=True):

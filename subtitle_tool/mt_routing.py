@@ -22,6 +22,10 @@ from .mt_backend import MTBackend, QINIU_FREE_MODEL, qiniu_free_active
 _SCOPES = frozenset({'entry', 'model', 'credential', 'endpoint', 'free_quota', 'model_quota', 'paid_account'})
 _FORMAT_FAILURE_THRESHOLD = 2
 _FORMAT_RETRY_SECONDS = 300.0
+_PERFORMANCE_WINDOW = 16
+_PERFORMANCE_PROBE_SECONDS = 60.0
+_MAX_CONCURRENCY = 4
+_PACING_SUCCESSES = 8
 _CATEGORIES = frozenset({
     'timeout', 'provider_unavailable', 'provider_overloaded', 'server', 'rate_limit_exceeded',
     'context_length_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded', 'string_too_long',
@@ -31,7 +35,7 @@ _CATEGORIES = frozenset({
     'unsupported_image_format', 'image_not_found', 'image_download_failed', 'network', 'deadline',
     'transport', 'response_too_large', 'http_transient', 'http_permanent', 'service_unknown',
     'generation_error', 'response_structure', 'shared_wait', 'quota_observed', 'quota_refresh_failed',
-    'quota_unknown', 'quota_exhausted', 'retry_after', 'format_exhausted', 'cancelled', 'local_error',
+    'quota_unknown', 'quota_exhausted', 'retry_after', 'format_exhausted', 'output_truncated', 'cancelled', 'local_error',
 })
 
 
@@ -73,12 +77,14 @@ class RouteFailure(ToolError):
     Leave it false for input-specific, transient and unknown errors.  A known
     Retry-After is shared at the selected scope, including across groups.
     """
-    def __init__(self, category, *, scope='entry', retryable=False, retry_after=None, disable=False):
+    def __init__(self, category, *, scope='entry', retryable=False, retry_after=None, disable=False,
+                 rate_limited=False):
         super().__init__('翻译候选请求失败。', 'mt_route_failure')
         self.category = category if category in _CATEGORIES else 'service_unknown'
         self.scope = scope if scope in _SCOPES else 'entry'
         self.retryable = bool(retryable)
         self.disable = bool(disable)
+        self.rate_limited = bool(rate_limited) or self.category == 'rate_limit_exceeded'
         self.retry_after = (float(retry_after) if not isinstance(retry_after, bool) and
                             isinstance(retry_after, (int, float)) and math.isfinite(retry_after) and
                             retry_after >= 0 else None)
@@ -98,6 +104,12 @@ class _Admission:
     started: int = 0
     pending: int = 0
     starts: deque = field(default_factory=deque)
+    dispatch_pending: object | None = None
+    concurrency: int = _MAX_CONCURRENCY
+    interval: float = 0.0
+    next_dispatch: float = 0.0
+    pacing_generation: int = 0
+    pacing_successes: int = 0
 
 
 @dataclass
@@ -110,11 +122,23 @@ class _Recovery:
 
 
 @dataclass
-class _FormatHealth:
+class _ResponseHealth:
     failures: int = 0
     retry_at: float = 0.0
     generation: int = 0
     probe_active: bool = False
+
+
+@dataclass
+class _StagePerformance:
+    samples: deque = field(default_factory=lambda: deque(maxlen=_PERFORMANCE_WINDOW))
+    selected_at: float | None = None
+
+    def cost(self):
+        if not self.samples:
+            return None
+        successes = sum(valid for _, valid in self.samples)
+        return sum(seconds for seconds, _ in self.samples) / successes if successes else math.inf
 
 
 @dataclass
@@ -125,9 +149,15 @@ class _Ticket:
     token: object = field(default_factory=object)
     started_at: float | None = None
     dispatched: bool = False
+    health_generations: dict = field(default_factory=dict)
+    health_probes: list = field(default_factory=list)
     format_key: tuple | None = None
-    format_generation: int = 0
-    format_probe: bool = False
+    truncation_key: tuple | None = None
+    performance_key: tuple | None = None
+    dispatched_at: float | None = None
+    selection: str = 'weighted'
+    entry_id: str = ''
+    pacing_generation: int = 0
 
 
 class _DispatchReservation:
@@ -150,8 +180,9 @@ class _DispatchReservation:
             # This is the short atomic dispatch boundary: after it returns the
             # transport hands its payload to the worker. Requests already
             # past this boundary remain in flight when a peer is disabled.
+            self.router._check_dispatch(self.entry, self.ticket)
             self.reservation.mark_sent()
-            self.ticket.dispatched = True
+            self.router._mark_dispatch(self.entry, self.ticket)
 
 
 def _backend_identity(entry):
@@ -182,6 +213,15 @@ def _applicable_keys(entry):
         # of how the caller labels the route's cost tier.
         scopes.append('model_quota')
     return tuple(_scope_key(entry, scope) for scope in scopes)
+
+
+def _response_keys(stage, entry_id, size_bucket):
+    if stage is None:
+        return ()
+    # A length limit observed for a smaller workload also applies as a soft
+    # preference to larger ones. A small successful reply cannot clear it.
+    return (('format', stage, entry_id),
+            *(('output', stage, entry_id, size) for size in range(size_bucket + 1)))
 
 
 class MTRouter:
@@ -216,13 +256,39 @@ class MTRouter:
         self.states = {entry.id: _Admission() for entry in self.entries}
         self.disabled = set()
         self.recoveries = {key: _Recovery() for entry in self.entries for key in _applicable_keys(entry)}
-        self._format_health = {}
+        self._response_health = {}
+        self._performance = {}
 
     def _available(self, entry):
         return (entry.backend.provider != 'qiniu' or entry.backend.model != QINIU_FREE_MODEL or
                 qiniu_free_active(self.utcnow()))
 
-    def _select(self, tier, counts, stopped, preferred, stage):
+    def _ranking(self, ready, stage, size_bucket, now):
+        """Called with the admission lock; observations never cross stage or size."""
+        def weighted(item):
+            entry, state, order = item
+            return state.inflight / entry.weight, state.started / entry.weight, order
+
+        history = {item[0].id: self._performance.get((stage, item[0].id, size_bucket)) for item in ready}
+        if stage is None or not any(value is not None and value.samples for value in history.values()):
+            return ready, weighted, 'weighted'
+        cold = [item for item in ready if item[1].inflight == 0 and history[item[0].id] is None]
+        if cold:
+            return cold, weighted, 'learning'
+        probes = [item for item in ready if item[1].inflight == 0 and history[item[0].id] is not None and
+                  now - history[item[0].id].selected_at >= _PERFORMANCE_PROBE_SECONDS]
+        if probes:
+            return probes, lambda item: (history[item[0].id].selected_at, *weighted(item)), 'probe'
+        costs = {name: value.cost() if value is not None else None for name, value in history.items()}
+        observed = [cost for cost in costs.values() if cost is not None and math.isfinite(cost)]
+        neutral = sum(observed) / len(observed) if observed else 5.0
+        def predicted(item):
+            entry, state, order = item
+            cost = costs[entry.id] if costs[entry.id] is not None else neutral
+            return (state.inflight + 1) * cost / entry.weight, state.started / entry.weight, order
+        return ready, predicted, 'performance'
+
+    def _select(self, tier, counts, stopped, preferred, stage, size_bucket):
         available = {entry.id for entry in self.entries if entry.tier == tier and self._available(entry)}
         priorities = {entry.id: self.priority(entry) for entry in self.entries if entry.id in available}
         with self.lock:
@@ -239,10 +305,14 @@ class MTRouter:
                 while state.starts and state.starts[0][0] + 61.0 <= now:
                     state.starts.popleft()
                 delay = max(0.0, *(self.recoveries[key].cooldown_until - now for key in keys))
+                if state.interval:
+                    delay = max(delay, state.next_dispatch - now)
+                    if state.inflight >= state.concurrency or state.dispatch_pending is not None:
+                        delay = max(delay, .1)
                 if any(self.recoveries[key].recovering and self.recoveries[key].probe_active for key in keys):
                     delay = max(delay, 0.1)
-                health = self._format_health.get((stage, entry.id)) if stage is not None else None
-                if health is not None and health.probe_active:
+                health = [self._response_health.get(key) for key in _response_keys(stage, entry.id, size_bucket)]
+                if any(item is not None and item.probe_active for item in health):
                     delay = max(delay, 0.1)
                 if entry.rpm and len(state.starts) + state.pending >= entry.rpm:
                     window_delay = (state.starts[-entry.rpm][0] + 61.0 - now
@@ -256,8 +326,9 @@ class MTRouter:
                 if stage is not None:
                     healthy = []
                     for item in ready:
-                        health = self._format_health.get((stage, item[0].id))
-                        if health is None or not health.retry_at or (health.retry_at <= now and not health.probe_active):
+                        health = [self._response_health.get(key) for key in _response_keys(stage, item[0].id, size_bucket)]
+                        if all(value is None or not value.retry_at or
+                               (value.retry_at <= now and not value.probe_active) for value in health):
                             healthy.append(item)
                     # Keep free-first routing: if the entire tier is unhealthy,
                     # continue trying it instead of moving early to paid routes.
@@ -266,14 +337,14 @@ class MTRouter:
                 other = [item for item in ready if item[0].id != preferred] if preferred is not None else []
                 if other:
                     ready = other
-                selected = min(ready, key=lambda item: (
-                    item[1].inflight / item[0].weight, item[1].started / item[0].weight, item[2]))
+                ranked, rank, selection = self._ranking(ready, stage, size_bucket, now)
+                selected = min(ranked, key=rank)
                 selected_priority = priorities.get(selected[0].id)
                 if selected_priority is not None:
                     group = selected_priority[0]
-                    comparable = [item for item in ready if priorities.get(item[0].id) is not None and
+                    comparable = [item for item in ranked if priorities.get(item[0].id) is not None and
                                   priorities[item[0].id][0] == group and
-                                  item[1].inflight / item[0].weight == selected[1].inflight / selected[0].weight]
+                                  rank(item)[0] == rank(selected)[0]]
                     selected = min(comparable, key=lambda item: (
                         priorities[item[0].id][1] if priorities[item[0].id][1] is not None else float('inf'),
                         item[1].started / item[0].weight, item[2]))
@@ -285,13 +356,23 @@ class MTRouter:
                 for key in probes:
                     self.recoveries[key].probe_active = True
                 ticket = _Ticket({key: self.recoveries[key].generation for key in keys}, probes, bool(entry.rpm))
+                ticket.selection = selection
+                ticket.entry_id, ticket.pacing_generation = entry.id, state.pacing_generation
+                if state.interval:
+                    # Only one selected request may prepare its dispatch at a
+                    # time; charge spacing when the payload is actually sent.
+                    state.dispatch_pending = ticket.token
                 if stage is not None:
-                    ticket.format_key = (stage, entry.id)
-                    health = self._format_health.get(ticket.format_key)
-                    if health is not None:
-                        ticket.format_generation = health.generation
-                        if health.retry_at and not health.probe_active:
-                            health.probe_active = ticket.format_probe = True
+                    response_keys = _response_keys(stage, entry.id, size_bucket)
+                    ticket.format_key, ticket.truncation_key = response_keys[0], response_keys[-1]
+                    for key in response_keys:
+                        health = self._response_health.get(key)
+                        ticket.health_generations[key] = health.generation if health is not None else 0
+                        if health is not None and health.retry_at:
+                            health.probe_active = True
+                            ticket.health_probes.append(key)
+                    ticket.performance_key = (stage, entry.id, size_bucket)
+                    self._performance.setdefault(ticket.performance_key, _StagePerformance()).selected_at = now
                 if entry.rpm:
                     state.pending += 1
                 return entry, ticket, None
@@ -301,6 +382,8 @@ class MTRouter:
         with self.lock:
             state = self.states[entry.id]
             state.inflight -= 1
+            if state.dispatch_pending is ticket.token:
+                state.dispatch_pending = None
             if ticket.pending:
                 state.pending -= 1
             if ticket.started_at is not None and not ticket.dispatched:
@@ -312,9 +395,9 @@ class MTRouter:
                 recovery = self.recoveries[key]
                 if ticket.generations[key] == recovery.generation:
                     recovery.probe_active = False
-            if ticket.format_probe:
-                health = self._format_health.get(ticket.format_key)
-                if health is not None and ticket.format_generation == health.generation:
+            for key in ticket.health_probes:
+                health = self._response_health.get(key)
+                if health is not None and ticket.health_generations[key] == health.generation:
                     health.probe_active = False
 
     def _confirm(self, entry, ticket):
@@ -325,6 +408,8 @@ class MTRouter:
             if any(key in self.disabled or self.recoveries[key].cooldown_until > now or
                    self.recoveries[key].generation != ticket.generations[key] for key in keys):
                 return False
+            if self.states[entry.id].pacing_generation != ticket.pacing_generation:
+                return False
             if ticket.pending:
                 state = self.states[entry.id]
                 state.pending -= 1
@@ -333,46 +418,100 @@ class MTRouter:
                 ticket.started_at = now
             return True
 
+    def _check_dispatch(self, entry, ticket):
+        """Caller holds the admission lock; late payloads cannot bunch together."""
+        state = self.states[entry.id]
+        if ticket.dispatched:
+            raise ValueError('Request already dispatched')
+        if state.pacing_generation != ticket.pacing_generation:
+            raise RouteFailure('shared_wait')
+        if state.interval and (state.dispatch_pending is not ticket.token or self.clock() < state.next_dispatch):
+            raise RouteFailure('shared_wait')
+
+    def _mark_dispatch(self, entry, ticket):
+        state = self.states[entry.id]
+        ticket.dispatched, ticket.dispatched_at = True, self.clock()
+        if state.dispatch_pending is ticket.token:
+            state.dispatch_pending = None
+        if state.interval:
+            state.next_dispatch = ticket.dispatched_at + state.interval
+
+    def _pacing_event(self, entry_id, reason):
+        state = self.states[entry_id]
+        return {'kind': 'route_pacing', 'entry': entry_id, 'reason': reason,
+                'concurrency': state.concurrency, 'interval_ms': round(state.interval * 1000)}
+
     def _record_failure(self, entry, ticket, failure):
+        pacing_event = None
         with self.lock:
-            if failure.category == 'format_exhausted' and ticket.dispatched and ticket.format_key is not None:
-                health = self._format_health.setdefault(ticket.format_key, _FormatHealth())
-                if ticket.format_generation == health.generation:
+            self._observe(ticket, False)
+            state = self.states[entry.id]
+            if ticket.dispatched and ticket.pacing_generation == state.pacing_generation:
+                state.pacing_successes = 0
+                if failure.rate_limited:
+                    state.concurrency = max(1, state.concurrency // 2)
+                    state.interval = min(15.0, max(1.0, state.interval * 2))
+                    state.next_dispatch = max(state.next_dispatch, self.clock() + state.interval)
+                    state.pacing_generation += 1
+                    pacing_event = self._pacing_event(entry.id, 'rate_limit')
+            key = (ticket.truncation_key if failure.category == 'output_truncated' else
+                   ticket.format_key if failure.category == 'format_exhausted' else None)
+            if key is not None and ticket.dispatched:
+                health = self._response_health.setdefault(key, _ResponseHealth())
+                if ticket.health_generations[key] == health.generation:
                     health.failures += 1
-                    if health.failures >= _FORMAT_FAILURE_THRESHOLD:
+                    if failure.category == 'output_truncated' or health.failures >= _FORMAT_FAILURE_THRESHOLD:
                         health.retry_at = self.clock() + _FORMAT_RETRY_SECONDS
                         health.generation += 1
                         health.probe_active = False
             key = _scope_key(entry, failure.scope)
             if failure.disable:
                 self.disabled.add(key)
-            if not failure.retryable and failure.retry_after is None:
-                return
-            now = self.clock()
-            recovery = self.recoveries.setdefault(key, _Recovery())
-            if ticket.generations.get(key, 0) == recovery.generation:
-                recovery.generation += 1
-                recovery.failures += 1
-                delay = (failure.retry_after if failure.retry_after is not None else
-                         min(60.0, 15.0 * 2 ** min(recovery.failures - 1, 2)))
-                recovery.cooldown_until = max(recovery.cooldown_until, now + delay)
-                recovery.recovering = True
-                recovery.probe_active = False
-            elif failure.retry_after is not None and now + failure.retry_after > recovery.cooldown_until:
-                # A late response with a newer Retry-After invalidates any current probe.
-                recovery.generation += 1
-                recovery.cooldown_until = now + failure.retry_after
-                recovery.recovering = True
-                recovery.probe_active = False
+            if failure.retryable or failure.retry_after is not None:
+                now = self.clock()
+                recovery = self.recoveries.setdefault(key, _Recovery())
+                if ticket.generations.get(key, 0) == recovery.generation:
+                    recovery.generation += 1
+                    recovery.failures += 1
+                    delay = (failure.retry_after if failure.retry_after is not None else
+                             min(60.0, 15.0 * 2 ** min(recovery.failures - 1, 2)))
+                    recovery.cooldown_until = max(recovery.cooldown_until, now + delay)
+                    recovery.recovering = True
+                    recovery.probe_active = False
+                elif failure.retry_after is not None and now + failure.retry_after > recovery.cooldown_until:
+                    # A late response with a newer Retry-After invalidates any current probe.
+                    recovery.generation += 1
+                    recovery.cooldown_until = now + failure.retry_after
+                    recovery.recovering = True
+                    recovery.probe_active = False
+        if pacing_event is not None:
+            self.on_event(pacing_event)
+
+    def _observe(self, ticket, valid):
+        """Caller holds the lock. Preparation, caches and cancellation are not samples."""
+        if ticket.performance_key is not None and ticket.dispatched_at is not None:
+            elapsed = max(.001, self.clock() - ticket.dispatched_at)
+            self._performance[ticket.performance_key].samples.append((elapsed, valid))
 
     def _record_success(self, ticket):
+        pacing_event = None
         with self.lock:
-            health = self._format_health.get(ticket.format_key)
-            if health is not None and ticket.format_generation == health.generation:
-                health.failures = 0
-                health.retry_at = 0.0
-                health.probe_active = False
-                health.generation += 1
+            self._observe(ticket, True)
+            state = self.states[ticket.entry_id]
+            if ticket.dispatched and state.interval and ticket.pacing_generation == state.pacing_generation:
+                state.pacing_successes += 1
+                if state.pacing_successes >= _PACING_SUCCESSES:
+                    state.pacing_successes = 0
+                    state.concurrency = min(_MAX_CONCURRENCY, state.concurrency + 1)
+                    state.interval = state.interval / 2 if state.interval > .125 else 0.0
+                    pacing_event = self._pacing_event(ticket.entry_id, 'recovered')
+            for key, generation in ticket.health_generations.items():
+                health = self._response_health.get(key)
+                if health is not None and generation == health.generation:
+                    health.failures = 0
+                    health.retry_at = 0.0
+                    health.probe_active = False
+                    health.generation += 1
             for key in ticket.probes:
                 recovery = self.recoveries[key]
                 if ticket.generations[key] == recovery.generation:
@@ -380,6 +519,8 @@ class MTRouter:
                     recovery.failures = 0
                     recovery.recovering = False
                     recovery.probe_active = False
+        if pacing_event is not None:
+            self.on_event(pacing_event)
 
     def cached_result(self, cache, *, prefer_other_than=None, deadline):
         """Check exact caches independently of permission to send new requests."""
@@ -397,13 +538,17 @@ class MTRouter:
                 return RouteResult(hit, entry, True, 0, 0.0, 0)
         return None
 
-    def run(self, invoke, *, cache=None, prefer_other_than=None, prepare=None, deadline_seconds=180.0, stage=None):
+    def run(self, invoke, *, cache=None, prefer_other_than=None, prepare=None, deadline_seconds=180.0,
+            stage=None, output_size=0):
         """Return a RouteResult; raise a content-free error when all routes fail."""
         if (isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, (int, float)) or
                 not math.isfinite(deadline_seconds) or not 0 <= deadline_seconds <= 180):
             raise ValueError('deadline_seconds must be between 0 and 180')
         if stage is not None and (not isinstance(stage, str) or not stage):
             raise ValueError('Invalid route stage')
+        if type(output_size) is not int or output_size < 0:
+            raise ValueError('Invalid output size')
+        size_bucket = sum(output_size > boundary for boundary in (512, 2048, 8192))
         deadline = self.clock() + deadline_seconds
         self.control.check_start()
         if cache is not None:
@@ -423,7 +568,7 @@ class MTRouter:
                 raise RouteExhausted(deadline=True, waited=waited)
             if tier == 'paid' and not self.paid_enabled:
                 raise RouteExhausted(waited=waited)
-            entry, ticket, delay = self._select(tier, counts, stopped, prefer_other_than, stage)
+            entry, ticket, delay = self._select(tier, counts, stopped, prefer_other_than, stage, size_bucket)
             if entry is None:
                 budget = self.free_wait_seconds - free_waited if tier == 'free' else remaining
                 if delay is None or budget <= 0:
@@ -450,7 +595,8 @@ class MTRouter:
                 attempt = counts.get(identity, 0) + 1
                 if previous is not None and previous != entry.id:
                     self.on_event({'kind': 'route_switch', 'from': previous, 'to': entry.id})
-                self.on_event({'kind': 'route_attempt', 'entry': entry.id, 'tier': tier, 'attempt': attempt})
+                self.on_event({'kind': 'route_attempt', 'entry': entry.id, 'tier': tier, 'attempt': attempt,
+                               'selection': ticket.selection, 'size_bucket': size_bucket})
                 self.control.check_start()
                 failure = None
                 with ExitStack() as context:
@@ -505,9 +651,11 @@ class MTRouter:
                         previous = entry.id
                         gated = reservation is not None
                         dispatch = _DispatchReservation(self, entry, ticket, reservation) if gated else reservation
-                        if not gated:
-                            ticket.dispatched = True
                         try:
+                            if not gated:
+                                with self.lock:
+                                    self._check_dispatch(entry, ticket)
+                                    self._mark_dispatch(entry, ticket)
                             value = (invoke(entry, min(60.0, remaining), attempt, dispatch) if prepare is not None
                                      else invoke(entry, min(60.0, remaining), attempt))
                         except Cancelled:
@@ -520,6 +668,8 @@ class MTRouter:
                         else:
                             self.control.check_inflight()
                             if self.clock() >= deadline:
+                                with self.lock:
+                                    self._observe(ticket, False)
                                 raise RouteExhausted(deadline=True, waited=waited)
                             self._record_success(ticket)
                             return RouteResult(value, entry, False, attempts, waited, switches, free_waited)
@@ -529,6 +679,7 @@ class MTRouter:
 
             self.control.check_start()
             self.on_event({'kind': 'route_failure', 'entry': entry.id, 'tier': tier,
-                           'category': failure.category, 'scope': failure.scope, 'attempt': attempt})
+                           'category': failure.category, 'scope': failure.scope, 'attempt': attempt,
+                           'dispatched': ticket.dispatched})
             if failure.disable or not failure.retryable:
                 stopped.add(identity)
