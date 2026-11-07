@@ -12,9 +12,8 @@ from unittest import mock
 from subtitle_tool.common import Cancelled
 from subtitle_tool.mt_backend import MTBackend, OPENROUTER_BASE_URL
 from subtitle_tool.mt_control import MTControl
-from subtitle_tool.mt_quota import OpenRouterQuota
-from subtitle_tool.mt_routing import CacheHit, MTRouter, RouteEntry, RouteFailure
-from subtitle_tool.mt_runtime import FreeQuota, reset_quota_for_resume
+from subtitle_tool.mt_quota import FreeQuota, OpenRouterQuota, reset_quota_for_resume
+from subtitle_tool.mt_routing import MTRouter, RouteEntry, RouteFailure
 from subtitle_tool.mt_transport import HTTPReply, TransportError
 
 
@@ -73,7 +72,7 @@ class QuotaTests(unittest.TestCase):
         router = MTRouter([self.free, paid], paid_enabled=True, control=self.control, clock=self.clock,
                           wait=self.clock.wait)
         result = router.run(lambda *args: self.fail('unexpected network'),
-                            cache=lambda route: CacheHit('cached') if route == paid else None,
+                            cache=lambda route: 'cached' if route == paid else None,
                             prepare=self.quota.reserve)
         self.assertEqual(result.value, 'cached')
         self.assertEqual(self.requests, [])
@@ -112,6 +111,32 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(self.ledger.remaining, 2)
         self.assertIn('quota_refresh_failed', [event.get('category') for event in self.events])
         self.assertNotIn('private response', repr(self.events))
+
+    def test_new_run_requires_its_own_observation_after_refresh_failure(self):
+        with self.quota.reserve(self.free, 15) as reservation:
+            reservation.claim()
+            reservation.mark_sent()
+        self.clock.now += 31
+        control = MTControl(threading.Event(), clock=self.clock)
+        newer = OpenRouterQuota(control, lambda entry: 'synthetic-key', clock=self.clock,
+                                transport=self.transport, ledger_for=lambda backend: self.ledger)
+        self.reply = HTTPReply(503, b'private response')
+        with self.assertRaises(RouteFailure) as unknown:
+            with newer.reserve(self.free, 15):
+                self.fail('a new run cannot trust an earlier run after a failed refresh')
+        self.assertEqual(unknown.exception.category, 'quota_unknown')
+        # The original run can still use its conservative same-day balance.
+        with self.quota.reserve(self.free, 15) as reservation:
+            reservation.claim()
+            reservation.mark_sent()
+        self.assertEqual(self.ledger.remaining, 2)
+        self.clock.now += 31
+        self.reply = quota_reply(4)
+        with newer.reserve(self.free, 15) as reservation:
+            reservation.claim()
+            reservation.mark_sent()
+        self.assertEqual(self.ledger.remaining, 1)
+        self.assertEqual(len(self.requests), 3)
 
     def test_refresh_subtracts_existing_and_new_inflight_requests(self):
         from contextlib import ExitStack
@@ -308,7 +333,7 @@ class QuotaTests(unittest.TestCase):
         transport = mock.Mock()
         transport.request.side_effect = [quota_reply(0), quota_reply(2)]
         quota = OpenRouterQuota(control, lambda entry: 'synthetic-key', transport=transport)
-        with mock.patch.dict('subtitle_tool.mt_runtime._QUOTAS', clear=True):
+        with mock.patch.dict('subtitle_tool.mt_quota._QUOTAS', clear=True):
             with self.assertRaises(RouteFailure) as exhausted:
                 with quota.reserve(self.free, 15):
                     self.fail('the empty observation must block requests')

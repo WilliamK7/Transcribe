@@ -24,16 +24,14 @@ uv pip compile requirements.in --python .venv\Scripts\python.exe --generate-hash
 uv pip sync requirements.lock --require-hashes --python .venv\Scripts\python.exe
 ```
 
-本机验证：
+离线回归：
 
 ```powershell
 .\scripts\test.ps1
-.\scripts\transcribe.ps1 --self-test --report ".build\self-test.json"
 ```
 
-测试用模拟 HTTP、真实 SQLite、合成媒体和 Windows 子进程验证行为；诊断使用隔离目录及假 Key，零云端调用。
-
+测试用模拟 HTTP、真实 SQLite、合成媒体和 Windows 子进程验证行为，不使用真实凭据。CLI 诊断见[本机检查](../README.md#本机检查)。
 
 百炼免费额度的 AK/SK 续期使用项目内 `subtitle_tool/mt_bailian_bridge.mjs`，复用 Windows npm 安装的官方 CLI，不额外安装 Node 依赖。CLI 及其 `bailian-cli-core`、`bailian-cli-commands`、`bailian-cli-runtime` 均锁定为 2.7.2；这些模块的导出和响应须随版本升级重新核对。Node 桥接测试使用本地合成模块，无真实凭据或网络请求。
 
-`scripts/transcribe.ps1` 保留调用者当前目录，相对媒体与报告路径按调用位置解释。运行数据位于项目 `data`，成功任务清理音频中间文件，保留任务库、转写和规范化字幕供恢复使用。
+`scripts/transcribe.ps1` 保留调用者当前目录，相对媒体与报告路径按调用位置解释。运行数据及恢复资料见[数据与恢复](API_CONTRACT.md#数据与恢复)。

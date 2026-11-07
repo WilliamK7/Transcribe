@@ -127,7 +127,7 @@ class FakeService:
 class TemporaryTest(unittest.TestCase):
     def setUp(self):
         # Each test represents an independent CLI process; clients within it share quota.
-        quota_scope = mock.patch.dict('subtitle_tool.mt_runtime._QUOTAS', clear=True)
+        quota_scope = mock.patch.dict('subtitle_tool.mt_quota._QUOTAS', clear=True)
         quota_scope.start()
         self.addCleanup(quota_scope.stop)
         transport = mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport)
@@ -187,7 +187,7 @@ class SavedResultFixture(TemporaryTest):
                             warnings=warnings)
             self.store.initialize_subtitles(self.job_id, sources, [make_fragment(s) for s in sources], manifest)
         else:
-            for name in ["normalized", "normalized_count", "normalized_version", "normalized_file",
+            for name in ["normalized", "normalized_count", "normalized_version",
                          "layout_planned", "layout_complete", "layout_round", "expected_srt_sha256", "publication_intent", "no_speech"]:
                 manifest.pop(name, None)
             self.store.initialize_subtitles(self.job_id, [], [], manifest)

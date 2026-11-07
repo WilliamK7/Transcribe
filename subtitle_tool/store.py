@@ -311,7 +311,7 @@ class Store:
             manifest = job["manifest"]
             for name in ["layout_planned", "layout_complete", "layout_round",
                          "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
-                         "no_speech", "cue_count", "output_settings"]:
+                         "no_speech", "cue_count"]:
                 manifest.pop(name, None)
             self._replace_records(job_id, cues)
             self.db.execute("UPDATE jobs SET manifest=?,updated=? WHERE id=?",

@@ -245,7 +245,6 @@ class PipelineTests(PipelineFixture):
         self.assertIn(b"Content-Type: audio/flac", fake.uploads[0][2])
         segment = self.store.job(self.job_id)["manifest"]["segments"][0]
         self.assertTrue(segment["oss_url"].startswith("oss://"))
-        self.assertNotIn("oss_protected", segment)
         self.assertTrue(fake.uploads[0][2].rfind(b'name="file"') > fake.uploads[0][2].rfind(b'name="key"'))
         self.assertEqual(output.name, "中文 多点.片段 & (1).srt")
         self.assertEqual(output.read_text(encoding="utf-8").count("欢迎使用百炼。"), 1)

@@ -258,7 +258,7 @@ class PoolPipelineTests(SavedResultFixture):
         control = MTControl(threading.Event())
         pipeline = SimpleNamespace(engine=SimpleNamespace(mt_control=control),
             snapshot={'quality': {'manual_glossary': {}}}, group_progress=None)
-        prefix = GlossaryPrefix(pipeline, 2, sources)
+        prefix = GlossaryPrefix(pipeline, sources)
         later = [{'source': 'cache', 'translation': '后出现的术语', 'sentence': '1'}]
         outcome, waiting = [], threading.Event()
         def run():
@@ -275,7 +275,7 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertFalse(worker.is_alive())
         self.assertEqual(first[0]['translation'], '先出现的术语')
         self.assertEqual(outcome[0][0]['translation'], '先出现的术语')
-        prefix = GlossaryPrefix(pipeline, 2, sources)
+        prefix = GlossaryPrefix(pipeline, sources)
         outcome.clear()
         waiting.clear()
         worker = threading.Thread(target=run)
@@ -285,6 +285,30 @@ class PoolPipelineTests(SavedResultFixture):
         worker.join(2)
         self.assertFalse(worker.is_alive())
         self.assertEqual(outcome, ['cancelled'])
+
+    def test_consumed_glossary_prefixes_do_not_accumulate_quadratic_memory(self):
+        import tracemalloc
+        from types import SimpleNamespace
+        from subtitle_tool.mt_control import MTControl
+        from subtitle_tool.mt_pipeline import GlossaryPrefix
+        count = 1024
+        sources = [{'sentence_id': str(i), 'text': f'术语{i:04}', 'decision': 'translate'}
+                   for i in range(count)]
+        pipeline = SimpleNamespace(engine=SimpleNamespace(mt_control=MTControl(threading.Event())),
+            snapshot={'quality': {'manual_glossary': {}}}, group_progress=None)
+        tracemalloc.start()
+        try:
+            prefix = GlossaryPrefix(pipeline, sources)
+            for i, source in enumerate(sources):
+                result = prefix.for_group(i, [{'source': source['text'], 'translation': '合成术语',
+                                               'sentence': source['sentence_id']}])
+                self.assertEqual(len(result), i + 1)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # One thousand terms fit comfortably; keeping every consumed prefix
+        # alone would retain more than 4 MiB of tuple references.
+        self.assertLess(peak, 2 * 1024 * 1024)
 
     def test_group_heartbeat_reports_activity_and_stops_after_scope(self):
         from subtitle_tool.mt_pipeline import GroupProgress
@@ -572,7 +596,7 @@ class PoolPipelineTests(SavedResultFixture):
     def test_budget_planning_ignores_expired_or_credential_mismatched_large_candidate(self):
         for reason in ('expired', 'credential'):
             with self.subTest(reason=reason):
-                from subtitle_tool.mt_runtime import _QUOTAS
+                from subtitle_tool.mt_quota import _QUOTAS
                 _QUOTAS.clear()
                 self.config.settings.mt_backends = [
                     {'id': 'qiniu_free', 'capabilities': {'input_bytes': 32768}},

@@ -12,7 +12,7 @@ from urllib.parse import quote, urlsplit
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
-from .common import (API_ROOTS, ASR_MODEL, MAX_UPLOAD_BYTES, SubmissionUnknown,
+from .common import (ASR_MODEL, MAX_UPLOAD_BYTES, SubmissionUnknown,
                      ToolError, check_cancel, connection_identity)
 
 
@@ -127,13 +127,12 @@ class Bailian:
                  *, workspace_id, access_mode="workspace"):
         identity = connection_identity({"region": region, "workspace_id": workspace_id, "access_mode": access_mode})
         self.base = f"https://{identity['workspace_id']}.cn-beijing.maas.aliyuncs.com"
-        self.upload_base = API_ROOTS["beijing"]
         self.headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
         self.http = Http(cancel, count, progress=progress)
         self.progress = progress
 
     def policy(self):
-        body = self.http.json("GET", self.upload_base + "/api/v1/uploads",
+        body = self.http.json("GET", "https://dashscope.aliyuncs.com/api/v1/uploads",
                               name="upload_policy", headers=self.headers,
                               params={"action": "getPolicy", "model": ASR_MODEL})
         policy = body.get("data", {})

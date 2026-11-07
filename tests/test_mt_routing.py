@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from subtitle_tool.common import Cancelled
 from subtitle_tool.mt_backend import MTBackend, QINIU_BASE_URL, QINIU_FREE_MODEL
 from subtitle_tool.mt_control import MTControl
-from subtitle_tool.mt_routing import CacheHit, MTRouter, RouteEntry, RouteExhausted, RouteFailure
+from subtitle_tool.mt_routing import MTRouter, RouteEntry, RouteExhausted, RouteFailure
 
 
 class FakeClock:
@@ -49,7 +49,7 @@ class RouterTests(unittest.TestCase):
         selected = [router.run(lambda e, timeout, attempt: e.id).value for _ in range(1000)]
         self.assertGreaterEqual(selected.count('a'), 650)
         self.assertLessEqual(selected.count('a'), 850)
-        self.assertEqual(router.run(lambda e, timeout, attempt: e.id, prefer_other_than=a).entry, b)
+        self.assertEqual(router.run(lambda e, timeout, attempt: e.id, prefer_other_than=a.id).entry, b)
 
     def test_format_failures_are_scoped_to_stage_and_cache_remains_available(self):
         bad, good = entry('bad', weight=3), entry('good')
@@ -63,20 +63,20 @@ class RouterTests(unittest.TestCase):
             return 'valid review'
 
         for _ in range(3):
-            self.assertEqual(router.run(review, stage='review', prefer_other_than=good).value, 'valid review')
+            self.assertEqual(router.run(review, stage='review', prefer_other_than=good.id).value, 'valid review')
         self.assertEqual(calls, ['bad', 'good', 'bad', 'good', 'good'])
         self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='draft',
-                                    prefer_other_than=good).value, 'bad')
+                                    prefer_other_than=good.id).value, 'bad')
         cached = router.run(lambda *args: self.fail('cached review must not dispatch'), stage='review',
-                            cache=lambda candidate: CacheHit('saved') if candidate == bad else None)
+                            cache=lambda candidate: 'saved' if candidate == bad else None)
         self.assertEqual(cached.value, 'saved')
         self.assertTrue(cached.cached)
 
         self.clock.now += 301
         self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
-                                    prefer_other_than=good).value, 'bad')
+                                    prefer_other_than=good.id).value, 'bad')
         self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
-                                    prefer_other_than=good).value, 'bad')
+                                    prefer_other_than=good.id).value, 'bad')
 
     def test_suspect_free_candidate_is_still_tried_before_paid_fallback(self):
         free, paid = entry('free'), entry('paid', 'paid')
@@ -103,7 +103,7 @@ class RouterTests(unittest.TestCase):
             return 'good'
 
         for _ in range(2):
-            router.run(fail_bad, stage='review', prefer_other_than=good)
+            router.run(fail_bad, stage='review', prefer_other_than=good.id)
         self.clock.now += 301
         entered, release = threading.Event(), threading.Event()
 
@@ -115,16 +115,16 @@ class RouterTests(unittest.TestCase):
             return candidate.id
 
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(router.run, probe, stage='review', prefer_other_than=good)
+            future = pool.submit(router.run, probe, stage='review', prefer_other_than=good.id)
             try:
                 self.assertTrue(entered.wait(5))
                 self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
-                                            prefer_other_than=good).value, 'good')
+                                            prefer_other_than=good.id).value, 'good')
             finally:
                 release.set()
             self.assertEqual(future.result(timeout=5).value, 'bad')
         self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
-                                    prefer_other_than=good).value, 'bad')
+                                    prefer_other_than=good.id).value, 'bad')
 
     def test_single_free_format_probe_respects_existing_wait_budget(self):
         for paid_enabled in (True, False):
@@ -279,16 +279,16 @@ class RouterTests(unittest.TestCase):
             return 'good'
 
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(router.run, old_request, stage='review', prefer_other_than=good)
+            future = pool.submit(router.run, old_request, stage='review', prefer_other_than=good.id)
             try:
                 self.assertTrue(entered.wait(5))
                 for _ in range(2):
-                    self.assertEqual(router.run(fail_bad, stage='review', prefer_other_than=good).value, 'good')
+                    self.assertEqual(router.run(fail_bad, stage='review', prefer_other_than=good.id).value, 'good')
             finally:
                 release.set()
             self.assertEqual(future.result(timeout=5).value, 'bad')
         self.assertEqual(router.run(lambda candidate, *args: candidate.id, stage='review',
-                                    prefer_other_than=good).value, 'good')
+                                    prefer_other_than=good.id).value, 'good')
 
     def test_expiration_preference_stays_within_equally_capable_bailian_candidates(self):
         later = entry('later', provider='bailian', model='qwen-later')
@@ -297,7 +297,7 @@ class RouterTests(unittest.TestCase):
         priorities = {'later': ('same', 20), 'sooner': ('same', 10), 'larger': ('large', 1)}
         router = self.router([later, sooner, larger], priority=lambda candidate: priorities[candidate.id])
         self.assertEqual(router.run(lambda e, timeout, attempt: e.id).entry, sooner)
-        self.assertEqual(router.run(lambda e, timeout, attempt: e.id, prefer_other_than=sooner).entry, later)
+        self.assertEqual(router.run(lambda e, timeout, attempt: e.id, prefer_other_than=sooner.id).entry, later)
 
     def test_expiration_preference_preserves_other_provider_selection(self):
         qiniu = entry('qiniu', provider='qiniu')
@@ -437,15 +437,16 @@ class RouterTests(unittest.TestCase):
         self.assertEqual((result.attempts, result.waited, result.free_waited), (1, 4, 4))
 
     def test_prepare_reservation_is_refunded_if_admission_invalidated_before_dispatch(self):
-        free, paid = entry('free'), entry('paid', 'paid')
-        available = {'free': True}
-        router = self.router([free, paid], availability=lambda candidate: available.get(candidate.id, True))
+        free = entry('free', provider='qiniu', model=QINIU_FREE_MODEL, url=QINIU_BASE_URL)
+        paid = entry('paid', 'paid')
+        router = self.router([free, paid])
+        clock = self.clock
         calls, state = [], {'reserved': 0, 'refunded': 0}
 
         class Reservation:
             def claim(self):
                 state['reserved'] += 1
-                available['free'] = False
+                clock.utc = datetime(2026, 12, 1, tzinfo=timezone.utc)
 
             def mark_sent(self):
                 self.sent = True
@@ -601,12 +602,12 @@ class RouterTests(unittest.TestCase):
 
         def cached(candidate):
             seen.append(candidate.id)
-            return CacheHit(None) if candidate == paid else None
+            return {'saved': True} if candidate == paid else None
 
         result = router.run(lambda *args: self.fail('network called'), cache=cached)
         self.assertIn('paid', seen)
         self.assertTrue(result.cached)
-        self.assertIsNone(result.value)
+        self.assertEqual(result.value, {'saved': True})
         self.assertEqual(result.entry, paid)
 
         seen.clear()
@@ -621,7 +622,7 @@ class RouterTests(unittest.TestCase):
         free, paid = entry('free'), entry('paid', 'paid')
         router = self.router([free, paid], paid_enabled=False)
         result = router.run(lambda *args: self.fail('network called'),
-                            cache=lambda candidate: CacheHit(candidate.id), prefer_other_than=free)
+                            cache=lambda candidate: candidate.id, prefer_other_than=free.id)
         self.assertEqual(result.entry, paid)
 
     def test_paid_disabled_forbids_network_even_after_free_failure(self):
@@ -881,7 +882,7 @@ class RouterTests(unittest.TestCase):
                 result = self.router([free, paid]).run(lambda candidate, timeout, attempt: candidate.id)
                 self.assertEqual(result.value, expected)
         result = self.router([free, paid]).run(lambda *args: self.fail('network called'),
-                                               cache=lambda candidate: CacheHit('cached') if candidate == free else None)
+                                               cache=lambda candidate: 'cached' if candidate == free else None)
         self.assertEqual((result.value, result.entry), ('cached', free))
 
     def test_max_two_attempts_per_backend_and_stage_deadline_includes_network(self):
@@ -920,30 +921,6 @@ class RouterTests(unittest.TestCase):
         for invalid in (-1, 181, float('inf'), True, '1'):
             with self.subTest(deadline=invalid), self.assertRaises(ValueError):
                 router.run(invoke, deadline_seconds=invalid)
-
-    def test_request_timeout_is_recomputed_after_slow_availability_check(self):
-        free = entry('free')
-
-        def available(candidate):
-            self.clock.now = 175
-            return True
-
-        router = self.router([free], availability=available)
-        self.assertEqual(router.run(lambda candidate, timeout, attempt: timeout).value, 5)
-
-    def test_expired_deadline_during_availability_check_never_starts_network(self):
-        free = entry('free')
-        calls = []
-
-        def available(candidate):
-            self.clock.now = 180
-            return True
-
-        router = self.router([free], availability=available)
-        with self.assertRaises(RouteExhausted) as error:
-            router.run(lambda *args: calls.append(args))
-        self.assertEqual(error.exception.code, 'mt_route_deadline')
-        self.assertEqual(calls, [])
 
     def test_cancel_prevents_new_requests_and_allows_only_timely_inflight_result(self):
         free, paid = entry('free'), entry('paid', 'paid')

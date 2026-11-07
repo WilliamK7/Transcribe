@@ -17,7 +17,7 @@ from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_i
 from .mt_pool import saved_route
 from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, make_stage_payload, parse_stage_response, plan_sentence_groups,
                          stage_cache_key, validate_glossary, validate_stage_value)
-from .mt_routing import CacheHit, MTRouter, RouteEntry, RouteFailure
+from .mt_routing import MTRouter, RouteEntry, RouteFailure
 from .mt_runtime import bailian_failure, service_failure
 from .mt_transport import TransportError
 from .review import decision_origin
@@ -78,10 +78,9 @@ class GroupProgress:
 
 class GlossaryPrefix:
     """Freeze each group's terminology from its source-ordered prefix."""
-    def __init__(self, pipeline, count, sources):
+    def __init__(self, pipeline, sources):
         self.pipeline, self.sources = pipeline, sources
         self.condition = threading.Condition()
-        self.results, self.prefixes = [None] * count, [None] * count
         self.next = 0
         self.terms, self.seen = [], set()
         self._add(validate_glossary([], sources, pipeline.snapshot['quality']['manual_glossary']))
@@ -97,19 +96,16 @@ class GlossaryPrefix:
 
     def for_group(self, index, extracted):
         with self.condition:
-            self.results[index] = extracted
-            while self.next < len(self.results) and self.results[self.next] is not None:
-                self._add(validate_glossary(self.results[self.next], self.sources, {}))
-                self.prefixes[self.next] = tuple(self.terms)
-                self.next += 1
-            self.condition.notify_all()
-            while self.prefixes[index] is None:
+            while index != self.next:
                 self.pipeline.engine.mt_control.check_start()
                 if self.pipeline.group_progress is not None:
                     self.pipeline.group_progress.set(index, 'waiting')
                 self.condition.wait(.1)
             self.pipeline.engine.mt_control.check_start()
-            return self.prefixes[index]
+            self._add(validate_glossary(extracted, self.sources, {}))
+            self.next += 1
+            self.condition.notify_all()
+            return tuple(self.terms)
 
 
 def _valid_usage(value):
@@ -434,7 +430,7 @@ class Pipeline:
                         not _valid_usage(record['usage'])):
                     raise ValueError()
                 value = validate_stage_value(name, record['value'], ids=ids, originals=originals)
-                return CacheHit({'value': value, 'actual_model': record['actual_model'], 'usage': None})
+                return {'value': value, 'actual_model': record['actual_model'], 'usage': None}
             except (ValueError, TypeError, KeyError, ToolError):
                 raise ToolError('翻译阶段缓存无效，未复用。', 'cache_mismatch') from None
 
@@ -485,8 +481,7 @@ class Pipeline:
                 category, scope, disable = failure.category, 'entry', False
                 if status == 401 or category == 'authentication':
                     category, scope, disable = 'authentication', 'credential', True
-                elif (entry.backend.provider == 'bailian' and category == 'quota_exhausted' and
-                      failure.quota_source == 'free_tier_only'):
+                elif entry.backend.provider == 'bailian' and category == 'quota_exhausted':
                     scope, disable = 'model_quota', True
                 elif entry.tier == 'paid' and (status == 402 or category == 'payment_required'):
                     category, scope, disable = 'payment_required', 'paid_account', True
@@ -499,7 +494,7 @@ class Pipeline:
             except BatchValidationError as error:
                 self.store.count(self.job_id, 'mt_invalid_response')
                 self.diagnostics.write({'kind': 'invalid_response', 'category': error.category,
-                    'stage': name, 'model': entry.backend.model, 'request_version': 5,
+                    'stage': name, 'model': entry.backend.model,
                     'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', ''),
                     'expected_count': len(ids), 'actual_count': error.actual_count,
                     **batch_response_metadata(body)})
@@ -753,7 +748,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             # Completed earlier groups still contribute their exact saved glossary
             # to the prefix used by later unfinished groups.
             groups = groups[:pending[-1] + 1]
-            prefix = GlossaryPrefix(pipeline, len(groups), sources)
+            prefix = GlossaryPrefix(pipeline, sources)
             progress = GroupProgress(engine, job_id)
             pipeline.group_progress = progress
             def run_group(index, group):

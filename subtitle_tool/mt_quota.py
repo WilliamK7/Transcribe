@@ -1,19 +1,89 @@
 """Bounded OpenRouter free-quota admission for one translation run.
 
-This shares the account ledger and parser but never wraps an HTTP
-translation or retries it.  The router owns the time budget and invokes the
-returned reservation immediately before dispatch.
+The account ledger, observation and reservation live together. The router
+owns retries and the time budget, and claims a reservation before dispatch.
 """
 from __future__ import annotations
 
+import json
 import math
+import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from .common import Cancelled, ToolError
+from .mt_backend import normalize_mt_url
 from .mt_routing import RouteFailure
-from .mt_runtime import ServiceError, quota_for
-from .mt_transport import ProcessTransport, TransportError
+from .mt_transport import HTTPReply, ProcessTransport, TransportError
+
+
+class FreeQuota:
+    """Process-local conservative ledger; all models using the same account share it."""
+    def __init__(self, *, clock=time.monotonic, utcnow=lambda: datetime.now(timezone.utc)):
+        self.clock, self.utcnow = clock, utcnow
+        self.condition = threading.Condition()
+        self.refreshing = False
+        self.last_attempt = None
+        self.day = None
+        self.remaining = 0
+        self.inflight = 0
+        self.reservations = 0
+        self.observed_monotonic = None
+
+    def trusted(self, control):
+        return (self.day == self.utcnow().date() and self.observed_monotonic is not None and
+                control.created <= self.observed_monotonic)
+
+    @staticmethod
+    def _read(reply: HTTPReply):
+        if reply.status != 200:
+            raise ValueError()
+        body = json.loads(reply.body)
+        value = body['data']['free_model_daily_requests']
+        if not isinstance(value, dict) or any(type(value.get(k)) is not int or value[k] < 0
+                                              for k in ('used', 'limit', 'remaining')):
+            raise ValueError()
+        return {k: value[k] for k in ('used', 'limit', 'remaining')}
+
+    def _finish_refresh(self, value, day, sent, active):
+        """Commit one observation and account for reservations made during its query."""
+        with self.condition:
+            observed = self.utcnow()
+            if value is not None and observed.date() == day:
+                remote = min(value['remaining'], max(0, value['limit'] - value['used']))
+                available = max(0, remote - active - (self.reservations - sent))
+                self.remaining = min(self.remaining, available) if self.day == day else available
+                self.day = day
+                self.observed_monotonic = self.clock()
+                category = 'quota_observed'
+            else:
+                category = 'quota_refresh_failed'
+            self.refreshing = False
+            self.condition.notify_all()
+        return category
+
+
+_QUOTAS = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def quota_for(backend):
+    account = (normalize_mt_url(backend.base_url), backend.key_fingerprint)
+    with _REGISTRY_LOCK:
+        return _QUOTAS.setdefault(account, FreeQuota())
+
+
+def reset_quota_for_resume(backend):
+    """Only explicit resume resets the observation; backend cooldown/RPM remain intact."""
+    account = (normalize_mt_url(backend.base_url), backend.key_fingerprint)
+    with _REGISTRY_LOCK:
+        ledger = _QUOTAS.get(account)
+        if ledger is not None:
+            with ledger.condition:
+                if ledger.inflight or ledger.refreshing:
+                    raise ToolError('翻译请求仍在执行，不能同时恢复任务。', 'instance_busy')
+            _QUOTAS.pop(account, None)
 
 
 class _NoopReservation:
@@ -36,15 +106,19 @@ class _Reservation:
     def claim(self):
         if self.claimed:
             raise ValueError('Quota reservation already claimed')
-        with self.ledger.condition:
-            try:
-                ready = self.ledger.try_reserve(self.control)
-            except ServiceError as error:
-                raise RouteFailure(error.category, scope='free_quota') from None
-            if not ready:
+        ledger = self.ledger
+        with ledger.condition:
+            self.control.check_start()
+            if (not ledger.trusted(self.control) or
+                    not ledger.refreshing and (ledger.last_attempt is None or ledger.clock() - ledger.last_attempt >= 30)):
                 raise RouteFailure('quota_unknown', scope='free_quota')
+            if ledger.remaining <= 0:
+                raise RouteFailure('quota_exhausted', scope='free_quota')
+            ledger.remaining -= 1
+            ledger.inflight += 1
+            ledger.reservations += 1
             self.claimed = True
-            self.day, self.observed = self.ledger.day, self.ledger.observed_monotonic
+            self.day, self.observed = ledger.day, ledger.observed_monotonic
 
     def mark_sent(self):
         if not self.claimed:
@@ -113,10 +187,7 @@ class OpenRouterQuota:
             self.control.check_start()
             with ledger.condition:
                 day, now = ledger.utcnow().date(), ledger.clock()
-                if (ledger.day == day and ledger.observed_monotonic is not None and
-                        self.control.created <= ledger.observed_monotonic):
-                    ledger.trusted.add(self.control)
-                trusted = ledger.day == day and self.control in ledger.trusted
+                trusted = ledger.trusted(self.control)
                 if trusted and ledger.remaining <= 0:
                     raise RouteFailure('quota_exhausted', scope='free_quota')
                 if ledger.refreshing:
@@ -131,7 +202,7 @@ class OpenRouterQuota:
                 if not due:
                     if trusted:
                         return
-                    if ledger.observation is None:
+                    if ledger.observed_monotonic is None:
                         raise RouteFailure('quota_unknown', scope='free_quota')
                     delay = min(.1, max(0.0, deadline - self.clock()), ledger.last_attempt + 30 - now)
                     if delay <= 0:
@@ -172,8 +243,8 @@ class OpenRouterQuota:
         except (TransportError, ValueError, KeyError, TypeError, RecursionError):
             pass
         finally:
-            event = ledger._finish_refresh(self.control, value, day, sent, active)
-            self.on_event({'kind': 'runtime_quota', 'category': event['category']})
+            category = ledger._finish_refresh(value, day, sent, active)
+            self.on_event({'kind': 'runtime_quota', 'category': category})
 
         self.control.check_start()
         if authentication:
@@ -181,7 +252,7 @@ class OpenRouterQuota:
         if self.clock() > deadline:
             raise RouteFailure('quota_unknown', scope='free_quota')
         with ledger.condition:
-            if ledger.day != ledger.utcnow().date() or self.control not in ledger.trusted:
+            if not ledger.trusted(self.control):
                 raise RouteFailure('quota_unknown', scope='free_quota')
             if ledger.remaining <= 0:
                 raise RouteFailure('quota_exhausted', scope='free_quota')

@@ -20,7 +20,7 @@ from subtitle_tool.mt_bailian_quota import (BailianQuota, CLIQuotaSource, QuotaS
                                             VerifiedIdentity, estimate_tokens, parse_observation)
 from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_diagnostics import MTDiagnostics
-from subtitle_tool.mt_routing import CacheHit, MTRouter, RouteEntry, RouteFailure
+from subtitle_tool.mt_routing import MTRouter, RouteEntry, RouteFailure
 
 
 class Clock:
@@ -356,7 +356,7 @@ class QuotaTests(unittest.TestCase):
 
     def test_cancel_and_cache_hit_make_no_network_request(self):
         router = MTRouter([self.route], paid_enabled=False, control=self.control, clock=self.clock)
-        result = router.run(lambda *args: self.fail('no request'), cache=lambda route: CacheHit('cached'),
+        result = router.run(lambda *args: self.fail('no request'), cache=lambda route: 'cached',
                             prepare=lambda route, wait: self.quota.reserve(route, wait, estimate=100))
         self.assertEqual(result.value, 'cached')
         self.source.query.assert_not_called()

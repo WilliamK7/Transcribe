@@ -15,8 +15,7 @@ class DiagnosticTests(TemporaryTest):
         job_id = 'a' * 32
         writers = [MTDiagnostics(self.path, job_id), MTDiagnostics(self.path, job_id)]
         event = {'kind': 'invalid_response', 'category': 'id_missing', 'expected_count': 3, 'actual_count': 1,
-                 'fragment_start': 0, 'fragment_end': 3, 'depth': 0, 'repair': False,
-                 'request_id': 'chatcmpl-' + 'a' * 32, 'group_key': 'f' * 64,
+                 'group_key': 'f' * 64,
                  'stage': 'align', 'text': 'private transcript', 'error': 'private exception',
                  'key': 'sk-private', 'url': 'https://private.example/signature'}
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -30,9 +29,9 @@ class DiagnosticTests(TemporaryTest):
 
     def test_unsafe_ids_and_fields_are_dropped_and_io_failure_is_best_effort(self):
         writer = MTDiagnostics(self.path, 'a' * 32)
-        for value in [None, [], {}, 'private text', 'sk-private', 'chatcmpl-sk-private',
-                      'https://private.example', 'chatcmpl-abc\nprivate']:
-            self.assertTrue(writer.write({'kind': 'invalid_response', 'request_id': value,
+        for value in [None, [], {}, 'private text', 'sk-private', 'bearer-private',
+                      'https://private.example', 'model\nprivate']:
+            self.assertTrue(writer.write({'kind': 'invalid_response', 'model': value,
                                           'actual_count': 'private', 'group_key': 'private'}))
         raw = writer.path.read_text(encoding='utf-8')
         self.assertNotIn('private', raw)

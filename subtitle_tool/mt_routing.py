@@ -56,11 +56,6 @@ class RouteEntry:
 
 
 @dataclass(frozen=True)
-class CacheHit:
-    value: object
-
-
-@dataclass(frozen=True)
 class RouteResult:
     value: object
     entry: RouteEntry
@@ -90,12 +85,10 @@ class RouteFailure(ToolError):
 
 
 class RouteExhausted(ToolError):
-    def __init__(self, *, deadline=False, failures=(), attempts=0, waited=0.0):
+    def __init__(self, *, deadline=False, waited=0.0):
         super().__init__('翻译阶段已超过时限，进度已保存。' if deadline else
                          '没有可用的翻译候选，进度已保存。',
                          'mt_route_deadline' if deadline else 'mt_route_exhausted')
-        self.failures = tuple(failures)
-        self.attempts = attempts
         self.waited = waited
 
 
@@ -200,7 +193,7 @@ class MTRouter:
     global concurrency, and must never hide its own retries inside ``invoke``.
     """
     def __init__(self, entries, *, paid_enabled, control, clock=time.monotonic,
-                 utcnow=lambda: datetime.now(timezone.utc), wait=None, availability=None,
+                 utcnow=lambda: datetime.now(timezone.utc), wait=None,
                  priority=None, on_event=lambda event: None, free_wait_seconds=15.0):
         self.entries = tuple(entries)
         if (not all(isinstance(entry, RouteEntry) for entry in self.entries) or
@@ -216,7 +209,6 @@ class MTRouter:
         self.free_wait_seconds = float(free_wait_seconds)
         self.clock, self.utcnow = clock, utcnow
         self.wait = wait if wait is not None else lambda control, seconds: control.wait(seconds)
-        self.availability = availability if availability is not None else lambda entry: True
         # Optional, nonblocking cached quota ordering: (capability group, date ordinal).
         self.priority = priority if priority is not None else lambda entry: None
         self.on_event = on_event
@@ -227,10 +219,8 @@ class MTRouter:
         self._format_health = {}
 
     def _available(self, entry):
-        if (entry.backend.provider == 'qiniu' and entry.backend.model == QINIU_FREE_MODEL and
-                not qiniu_free_active(self.utcnow())):
-            return False
-        return bool(self.availability(entry))
+        return (entry.backend.provider != 'qiniu' or entry.backend.model != QINIU_FREE_MODEL or
+                qiniu_free_active(self.utcnow()))
 
     def _select(self, tier, counts, stopped, preferred, stage):
         available = {entry.id for entry in self.entries if entry.tier == tier and self._available(entry)}
@@ -273,7 +263,7 @@ class MTRouter:
                     # continue trying it instead of moving early to paid routes.
                     if healthy:
                         ready = healthy
-                other = [item for item in ready if not _matches(item[0], preferred)] if preferred is not None else []
+                other = [item for item in ready if item[0].id != preferred] if preferred is not None else []
                 if other:
                     ready = other
                 selected = min(ready, key=lambda item: (
@@ -394,19 +384,17 @@ class MTRouter:
     def cached_result(self, cache, *, prefer_other_than=None, deadline):
         """Check exact caches independently of permission to send new requests."""
         ordered = sorted(enumerate(self.entries), key=lambda item: (
-            _matches(item[1], prefer_other_than), item[1].tier != 'free', item[0]))
+            item[1].id == prefer_other_than, item[1].tier != 'free', item[0]))
         for _, entry in ordered:
             self.control.check_start()
             if self.clock() >= deadline:
                 raise RouteExhausted(deadline=True)
             hit = cache(entry)
             if hit is not None:
-                if not isinstance(hit, CacheHit):
-                    raise TypeError('Cache callback must return CacheHit or None')
                 self.control.check_inflight()
                 if self.clock() >= deadline:
                     raise RouteExhausted(deadline=True)
-                return RouteResult(hit.value, entry, True, 0, 0.0, 0)
+                return RouteResult(hit, entry, True, 0, 0.0, 0)
         return None
 
     def run(self, invoke, *, cache=None, prefer_other_than=None, prepare=None, deadline_seconds=180.0, stage=None):
@@ -423,7 +411,7 @@ class MTRouter:
             if result is not None:
                 return result
 
-        counts, stopped, failures = {}, set(), []
+        counts, stopped = {}, set()
         attempts = switches = 0
         waited = free_waited = 0.0
         previous = None
@@ -432,9 +420,9 @@ class MTRouter:
             self.control.check_start()
             remaining = deadline - self.clock()
             if remaining <= 0:
-                raise RouteExhausted(deadline=True, failures=failures, attempts=attempts, waited=waited)
+                raise RouteExhausted(deadline=True, waited=waited)
             if tier == 'paid' and not self.paid_enabled:
-                raise RouteExhausted(failures=failures, attempts=attempts, waited=waited)
+                raise RouteExhausted(waited=waited)
             entry, ticket, delay = self._select(tier, counts, stopped, prefer_other_than, stage)
             if entry is None:
                 budget = self.free_wait_seconds - free_waited if tier == 'free' else remaining
@@ -442,7 +430,7 @@ class MTRouter:
                     if tier == 'free':
                         tier = 'paid'
                         continue
-                    raise RouteExhausted(failures=failures, attempts=attempts, waited=waited)
+                    raise RouteExhausted(waited=waited)
                 interval = min(delay, budget, remaining)
                 self.on_event({'kind': 'route_wait', 'tier': tier, 'seconds': interval})
                 before = self.clock()
@@ -457,7 +445,7 @@ class MTRouter:
                 self.control.check_start()
                 remaining = deadline - self.clock()
                 if remaining <= 0:
-                    raise RouteExhausted(deadline=True, failures=failures, attempts=attempts, waited=waited)
+                    raise RouteExhausted(deadline=True, waited=waited)
                 identity = _backend_identity(entry)
                 attempt = counts.get(identity, 0) + 1
                 if previous is not None and previous != entry.id:
@@ -492,7 +480,7 @@ class MTRouter:
                     self.control.check_start()
                     remaining = deadline - self.clock()
                     if remaining <= 0:
-                        raise RouteExhausted(deadline=True, failures=failures, attempts=attempts, waited=waited)
+                        raise RouteExhausted(deadline=True, waited=waited)
                     if tier == 'free' and free_waited > self.free_wait_seconds:
                         tier = 'paid'
                         continue
@@ -513,7 +501,7 @@ class MTRouter:
                             continue
                         remaining = deadline - self.clock()
                         if remaining <= 0:
-                            raise RouteExhausted(deadline=True, failures=failures, attempts=attempts, waited=waited)
+                            raise RouteExhausted(deadline=True, waited=waited)
                         counts[identity] = attempt
                         attempts += 1
                         if previous is not None and previous != entry.id:
@@ -536,7 +524,7 @@ class MTRouter:
                         else:
                             self.control.check_inflight()
                             if self.clock() >= deadline:
-                                raise RouteExhausted(deadline=True, failures=failures, attempts=attempts, waited=waited)
+                                raise RouteExhausted(deadline=True, waited=waited)
                             self._record_success(ticket)
                             return RouteResult(value, entry, False, attempts, waited, switches, free_waited)
                     self._record_failure(entry, ticket, failure)
@@ -544,16 +532,7 @@ class MTRouter:
                 self._release(entry, ticket)
 
             self.control.check_start()
-            failures.append((entry.id, failure.category, failure.scope, counts.get(identity, 0)))
             self.on_event({'kind': 'route_failure', 'entry': entry.id, 'tier': tier,
                            'category': failure.category, 'scope': failure.scope, 'attempt': attempt})
             if failure.disable or not failure.retryable:
                 stopped.add(identity)
-
-
-def _matches(entry, preferred):
-    if isinstance(preferred, RouteEntry):
-        return entry.backend == preferred.backend
-    if isinstance(preferred, MTBackend):
-        return entry.backend == preferred
-    return preferred is not None and entry.id == preferred

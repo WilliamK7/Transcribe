@@ -16,9 +16,6 @@ DISPLAY_TIMING_VERSION = 2
 MAX_LAYOUT_ROUNDS = 2
 MAX_UPLOAD_BYTES = 1_000_000_000
 MAX_ASR_SECONDS = 12 * 3600
-API_ROOTS = {
-    "beijing": "https://dashscope.aliyuncs.com",
-}
 
 
 def validate_workspace_id(value: str) -> str:

@@ -13,19 +13,19 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`；`
 
 上传使用返回策略，流式 multipart 的 `file` 字段最后；上传和结果下载不附带 ASR Authorization。容量取 1,000,000,000 字节和策略限制的较小值。提交 POST 不自动重试；超时、5xx、无有效任务 ID 时保留 `submission_unknown`，须绑定已知 ID 或明确接受重发风险。查询、下载失败沿用原 ID。
 
-所有翻译配置统一执行策略／请求契约 5。单模型快捷配置生成一个池入口；百炼默认 `qwen3.8-flash`，七牛默认 `qiniu/conatus-free`，兼容服务模型显式指定。多入口后备统一由池处理。
+所有翻译配置统一执行策略／请求契约 5，单模型快捷配置生成一个池入口。
 
 ## 翻译池请求契约 5
 
 池使用七牛 `https://api.qnaigc.com/v1`、OpenRouter `https://openrouter.ai/api/v1` 和原百炼工作空间根地址，分别读取独立七牛、OpenRouter 和百炼 Key。入口的 `credential_ref` 对应凭据来源：七牛和百炼使用固定平台地址，`openai_compatible` 使用显式配置的兼容根地址。缺少可选平台 Key 或禁用的入口在快照中以 `backend:null` 表示，不能借用其他平台 Key。
 
-新任务默认池为免费 `qiniu/conatus-free` 与 `openrouter/free`、付费 `deepseek/deepseek-v4.1-flash` 与 `qwen3.8-flash`；同等级分别按 3:1 加权。每个阶段先查匹配缓存，再尝试能承接当前请求的免费候选；自定义较小的输入预算可能使候选无法处理某些分组。免费候选排队、冷却及额度查询累计最多 15 秒，没有可用候选或等待耗尽后才尝试允许的付费候选。每个后端每阶段最多两次 HTTP 尝试，单次最多 60 秒，阶段总时限 180 秒；全部翻译工作并发最多 4。运行中的共享冷却、账户及模型失败范围按候选身份处理。池入口 RPM 冻结在快照中，使用 61 秒滚动窗口，0 表示不主动限流。
+默认模型和权重见[翻译池入口表](../README.md#七牛openrouter-翻译池)。每个阶段先查匹配缓存，再尝试能承接当前请求的免费候选。免费候选排队、冷却及额度查询累计最多 15 秒，候选或等待预算耗尽后尝试允许的付费候选。每个后端每阶段最多两次 HTTP 尝试，单次最多 60 秒，阶段总时限 180 秒；并发最多 4。共享冷却及失败范围按候选身份处理。入口 RPM 冻结在快照中，使用 61 秒滚动窗口，0 表示不主动限流。
 
 池的 OpenRouter 免费入口（`openrouter/free` 或 `:free` 模型）在缓存未命中且需要网络请求时，通过 `GET /key` 查询 [OpenRouter 免费额度](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key)，共享范围为地址和 Key 指纹。并发查询合并，发送前原子预占；实际发出的每次请求包括重试均占一份，确认未发送且额度观测未变化时归还，否则保守保留。首次额度未知、跨 UTC 日无法确认或明确耗尽时跳过该免费候选，可尝试其他允许的候选；同一 UTC 日本轮已有可信余额时，刷新失败可保守续用已有余额，不增加余量。额度查询计入免费等待和阶段总时限；七牛和付费入口不使用此查询，不猜测七牛额度。
 
 `--inspect-bailian-quota` 通过 Windows npm 安装的官方 CLI 2.7.2 查询北京地域额度，输出 `models`：模型、类型、余额、总额、到期日期、`auto_stop` 和 `observation_usable`。后者要求文本模型、有效总额与余量比例、正余额、有效日期及开关开启。CLI 只返回到期日期，工具从该北京日期开始视为不可用。查询失败使用 `mt_quota_unknown`。
 
-账户绑定及逐模型保护确认由用户提供，操作见 [README](../README.md#使用百炼免费额度)。`data/bailian-quota-binding.json` 固定原 ASR Key、北京工作空间及 CLI 认证上下文的指纹。浏览器会话绑定（版本 1）校验完整配置和控制台令牌；AK/SK 绑定（版本 2）校验 AK/SK、可选 STS、代理身份、地域、站点、工作空间、目录及 Profile，令牌续期和界面偏好变化保留确认。重新绑定清空模型确认，身份变化或观察到保护开关关闭时撤销相应确认。实际计费保护依赖云端“免费额度用完即停”生效。
+绑定及逐模型保护确认见 [README](../README.md#使用百炼免费额度)。`data/bailian-quota-binding.json` 保存 ASR Key、北京工作空间及 CLI 认证上下文的指纹。浏览器会话绑定（版本 1）校验完整配置和控制台令牌；AK/SK 绑定（版本 2）校验 AK/SK、可选 STS、代理身份、地域、站点、工作空间、目录及 Profile，令牌续期和界面偏好变化保留确认。重新绑定清空模型确认；身份变化或保护开关关闭撤销相应确认。实际计费保护依赖云端开关生效。
 
 版本 2 从同一份配置快照取得指纹和 AK/SK，经隐藏子进程的私有管道交给官方 CLI 模块；模块版本与维护见 [BUILD](BUILD.md)。只使用这些 AK/SK 生成的令牌，查询范围限于模型目录、免费额度和保护状态。令牌按绑定隔离并在内存复用，只有响应解析及前后身份检查通过才提交；不写入 CLI 配置或临时凭据文件。每次查询最多生成一次令牌，已有令牌仅在明确会话失效时续期。管道传输、生成及完整查询共用 15 秒上限、4 MiB 响应上限；取消／到期终止并回收子进程。日志排除原始异常与令牌。令牌生成依据[官方鉴权接口](https://help.aliyun.com/zh/model-studio/cli/installation)。
 
@@ -41,11 +41,11 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`；`
 
 `--mt-paid allow|deny` 只控制后续付费候选网络调用，不清除已完成的付费结果或缓存；通过身份校验且请求完全匹配的付费缓存可以复用。已有本任务阶段记录优先恢复；查找跨任务缓存时，对齐／复核／纠正优先选择不同于上一相关阶段后端的匹配结果，其次免费优先，此排序不产生新请求。上下文或术语裁剪后按新输入重新查缓存，输入未变时只查一次。不同候选的能力可能使分组或上下文裁剪改变，不能保证跨分组命中。每个请求使用 `stream:false`，模型能力档案的 `response_format` 分别决定发送 `json_object`、严格 `json_schema` 或不发送格式字段的 `text`；OpenRouter 附带参数要求及 Response Healing，百炼附带 `enable_thinking:false` 和 `temperature:0`。无论格式档案如何，本地仍校验响应结构、编号、非空译文和正常结束。
 
-策略 5 新任务及显式重排使用提示词版本 2：`json_object`／`text` 档案在提示词中明确完整输出 Schema；术语原句和复核片段编号限于输入集合，复核以跨片连读的最终字幕为对象。OpenRouter 动态免费路由 `openrouter/free` 使用 `reasoning.effort:low`（固定模型不推定支持），七牛精确模型 `deepseek/deepseek-v4.1-flash` 使用 `reasoning_effort:low`；其他七牛模型不添加该参数。推理与可见输出共享预算，降低推理量用于减少预算耗尽，但不保证模型延迟或语义效果，参见 [OpenRouter 推理参数](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)及[七牛聊天参数](https://developer.qiniu.com/aitokenapi/13390/chat-completions)。完整请求仍计入预算并接受原有本地校验。
+提示词版本 2 在 `json_object`／`text` 请求中提供完整输出 Schema；术语原句和复核片段编号限于输入集合，复核对象是跨片连读的最终字幕。仅 `openrouter/free` 使用 `reasoning.effort:low`，七牛 `deepseek/deepseek-v4.1-flash` 使用 `reasoning_effort:low`，减少与可见输出共享预算的推理开销。参数依据见 [OpenRouter](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)及[七牛](https://developer.qiniu.com/aitokenapi/13390/chat-completions)。
 
 同一运行中，入口在同一阶段连续两次返回不合法结构后，后续五分钟优先使用同等级中其他已就绪的候选；到期只放行一个恢复探测。其他阶段不受影响；同等级没有其他就绪候选时仍可尝试该入口，正在进行的恢复探测除外，其等待计入原有等待预算。该状态不持久化，不改变免费优先、付费许可或缓存优先顺序。
 
-策略 5 在同一组内依次执行术语提取、带上下文的整句翻译、片段对齐和自动复核；组间复用现有工作线程，不增加模型并发。新任务使用 `mt_glossary_schedule:prefix-v1`：按来源顺序累积术语，先出现的同名术语优先，人工术语优先于模型结果；每组只等待自己及前序组的术语结果，不等待全片术语完成。前缀与线程完成先后无关，等待可取消。开始运行时固定该调度方式。已有匹配术语结果可复用，终端显示术语处理进度。
+每组依次执行术语提取、带上下文的整句翻译、片段对齐和自动复核，共用工作线程。`mt_glossary_schedule:prefix-v1` 按来源顺序累积术语，人工术语优先，其次取最先出现的同名术语；每组等待自己及前序组的术语结果，等待可取消，结果不受线程完成顺序影响。匹配的术语结果可复用，终端显示处理进度。
 
 术语提取不可用可继续并报告警告；其请求身份对应的 `glossary_unavailable` 标记只存本任务，恢复时不因重试辅助术语而改变已保存草稿的输入，不写入跨任务缓存。取消和本机异常不生成此标记。每个完整字幕组完成后立即保存，终端每 15 秒报告活动组的阶段及等待时间。发现疑点时最多两轮纠正并再次复核；复核或纠正不可用、纠正后仍有疑点时保留已完成的完整译文并报告警告，必需草稿或对齐阶段无法得到完整合法结果时保存进度，不发布残缺字幕。复核是辅助检查，不保证语义正确。
 
@@ -104,7 +104,7 @@ ASR 模型为 `qwen3-asr-flash-filetrans`，输入为单数 `input.file_url`；`
 
 媒体版本 2 优先复制兼容压缩音轨，并验证包时间戳、编码延迟／填充、音频属性和时长。多声道仅明确选择首声道时可复制；需要处理声道或时间轴时转换为 16kHz 单声道 FLAC。超限按 PCM 样本精确切分后编码，逐段校验容量；单段最长 12 小时，规格见[ASR 音频说明](https://help.aliyun.com/zh/model-studio/asr-model)。MIME 随实际容器使用 `audio/mp4`、`audio/mpeg`、`audio/flac`、`audio/ogg`。
 
-`media_plan.extract_recipe_version` 仅支持 2。OGG 复制启用 `-fflags +bitexact`，重建核对完整 SHA、分段与时间轴；其他版本返回 `cache_version`。已知云端任务 ID 和完整本地转写优先复用。
+OGG 复制启用 `-fflags +bitexact`，重建核对完整 SHA、分段与时间轴。已知云端任务 ID 和完整本地转写优先复用；版本要求见[数据与恢复](#数据与恢复)。
 
 PCM 中间文件使用 RIFF WAV，数据容量上限为 `UINT32_MAX - 4096` 字节（PCM16／16kHz／单声道约 37.28 小时）。提取前按音轨时间范围预检，缺失时使用容器时长；提取后及切分前核对实际大小与 RIFF／data 声明范围，切分时核对读取样本数。容量超限返回 `media_pcm_limit`，须先分割输入；文件截断或声明不一致返回 `media`。
 

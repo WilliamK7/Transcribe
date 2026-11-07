@@ -72,19 +72,18 @@ class MTDiagnostics:
 
     def write_route(self, event):
         """Write only fixed route classifications and bounded, non-content metadata."""
-        from .mt_routing import _CATEGORIES
+        from .mt_routing import _CATEGORIES, _SCOPES
         try:
             if event.get('kind') not in {'route_attempt', 'route_failure', 'route_wait', 'route_switch',
                                          'route_complete', 'route_reply'}:
                 return False
             record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
-            for field in ['entry', 'from', 'to', 'model', 'actual_model']:
+            self._routing(record, event)
+            for field in ['entry', 'from', 'to']:
                 value = safe_model_id(event.get(field))
                 if value:
                     record[field] = value
-            for field, allowed in [('stage', {'glossary', 'draft', 'align', 'review', 'correct'}),
-                                   ('tier', {'free', 'paid'}),
-                                   ('scope', {'entry', 'model', 'credential', 'endpoint', 'free_quota', 'model_quota', 'paid_account'}),
+            for field, allowed in [('tier', {'free', 'paid'}), ('scope', _SCOPES),
                                    ('category', _CATEGORIES)]:
                 if event.get(field) in allowed:
                     record[field] = event[field]
@@ -94,10 +93,6 @@ class MTDiagnostics:
                     record[field] = value
             if type(event.get('cached')) is bool:
                 record['cached'] = event['cached']
-            for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}')]:
-                value = event.get(field)
-                if isinstance(value, str) and re.fullmatch(pattern, value):
-                    record[field] = value
             return self._append(record)
         except (OSError, ValueError, TypeError, OverflowError):
             return False
@@ -126,7 +121,7 @@ class MTDiagnostics:
                 value = event.get(key)
                 if type(value) is int and 0 <= value <= 2**63 - 1:
                     record[key] = value
-            if event['kind'] == 'invalid_response' and event.get('actual_count') is None:
+            if event.get('actual_count') is None:
                 record['actual_count'] = None
             if type(event.get('code_fence')) is bool:
                 record['code_fence'] = event['code_fence']

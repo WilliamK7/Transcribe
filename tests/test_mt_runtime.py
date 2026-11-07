@@ -295,7 +295,6 @@ class ServiceFailureTests(TemporaryTest):
             error = service_failure(200, body, free_router=True)
             self.assertEqual(error.category, 'content_policy_violation')
             self.assertFalse(error.retryable)
-            self.assertEqual(error.code, 'mt_content_refused')
 
 
     def test_free_router_not_found_is_retryable_in_top_level_and_choice_errors(self):

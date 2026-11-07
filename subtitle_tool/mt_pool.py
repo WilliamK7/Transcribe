@@ -100,20 +100,10 @@ def _quality(value):
             _fixed_integer(value['max_revisions'], 2) and _manual_glossary(value['manual_glossary']))
 
 
-def _official_url(provider, manifest):
-    if provider == 'qiniu':
-        return QINIU_BASE_URL
-    if provider == 'openai_compatible':
-        return OPENROUTER_BASE_URL
-    if provider == 'bailian':
-        return bailian_mt_url(manifest)
-    raise _invalid()
-
-
 def _base_url(provider, value, manifest):
     if provider == 'openai_compatible':
         return normalize_mt_url(value)
-    expected = _official_url(provider, manifest)
+    expected = QINIU_BASE_URL if provider == 'qiniu' else bailian_mt_url(manifest)
     if provider == 'bailian' and value is None:
         return expected
     # An explicit address must resolve to the selected provider's fixed credential domain.

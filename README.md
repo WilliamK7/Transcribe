@@ -1,6 +1,6 @@
 # 百炼命令行字幕工具
 
-Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans` 识别语音，用七牛／OpenRouter／百炼翻译池生成简体中文字幕，单模型同样使用翻译池执行。翻译池免费优先，默认允许付费后备。
+Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans` 识别语音，用七牛／OpenRouter／百炼翻译池生成简体中文字幕。翻译池免费优先，默认允许付费后备。
 
 ## 开始使用
 
@@ -40,9 +40,9 @@ Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans`
 | 付费 | `qiniu_paid` | `deepseek/deepseek-v4.1-flash` | 七牛 Key |
 | 付费 | `bailian_paid` | `qwen3.8-flash` | 百炼 Key 及原工作空间 |
 
-每个等级内默认权重为 3:1。缺少凭据的入口跳过；只配置百炼 Key 时可能直接使用百炼付费候选。免费候选累计等待最多 15 秒，然后尝试允许的付费候选。每阶段最多 180 秒，每后端最多 2 次请求，单次最多 60 秒，总并发默认 4。
+每个等级内默认权重为 3:1。缺少凭据的入口跳过；只配置百炼 Key 时可能直接使用百炼付费候选。免费候选累计等待最多 15 秒，然后尝试允许的付费候选；请求时限和重试规则见[翻译池契约](docs/API_CONTRACT.md#翻译池请求契约-5)。
 
-`--mt-paid deny` 禁止付费候选的新请求，`allow` 允许；新建、恢复和重排均可指定，恢复时保存新的许可状态。已有匹配缓存仍可复用。所有翻译配置统一使用此选项管理付费请求。
+`--mt-paid deny` 禁止付费候选的新请求，`allow` 允许；新建、恢复和重排均可指定，恢复时保存新的许可状态。已有匹配缓存仍可复用。
 
 七牛 Conatus 活动截至北京时间 **2026 年 11 月 30 日 23:59**，工具在活动结束后跳过该免费模型。实名认证、资格和额度见[官方活动页](https://www.qiniu.com/ai/free-models/conatus-2026)。
 
@@ -113,8 +113,6 @@ bl auth login --console
 | `mt_rpm` | `MT_RPM` | 兼容入口每分钟请求上限，0 表示不主动限流 |
 
 环境变量优先。兼容服务使用 `OPENAI_API_KEY` 或 `data/mt-key.txt`。七牛和百炼使用各自凭据；自定义兼容模型须支持所配置的结构化输出能力，可用完整池条目指定 `json_object`、`json_schema` 或 `text`。
-
-需要后备时将其他入口加入 `mt_backends`，用 `--mt-paid allow|deny` 管理付费请求。
 
 ## 右键“发送到”
 
@@ -201,6 +199,6 @@ bl auth login --console
 .\scripts\transcribe.ps1 --self-test --report ".build\self-test.json"
 ```
 
-使用隔离目录及合成音频检查凭据写入、独占锁、FFmpeg 和字幕输出，云端调用数为零。
+使用隔离目录及合成音频检查凭据写入、独占锁、FFmpeg 和字幕输出，云端调用数为零。离线回归与依赖维护见[环境维护](docs/BUILD.md)。
 
 [环境维护](docs/BUILD.md) · [接口与恢复契约](docs/API_CONTRACT.md) · [第三方组件](docs/THIRD_PARTY.txt) · [源码许可](LICENSE)

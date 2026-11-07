@@ -68,7 +68,7 @@ class Engine:
         manifest = self.store.job(job_id)['manifest']
         load_policy(manifest)
         from .mt_pool import saved_route
-        from .mt_runtime import reset_quota_for_resume
+        from .mt_quota import reset_quota_for_resume
         route = saved_route(manifest)
         if mt_paid is not None:
             route['routing']['paid_enabled'] = mt_paid == 'allow'
@@ -216,7 +216,7 @@ class Engine:
         for name in ["layout_planned", "layout_round", "layout_complete",
                      "mt_glossary_schedule",
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
-                     "backup", "cue_count", "output_settings", "normalized_file", "no_speech"]:
+                     "backup", "cue_count", "no_speech"]:
             manifest.pop(name, None)
         manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
                         mt_glossary_schedule="prefix-v1",
@@ -525,8 +525,6 @@ class Engine:
             manifest["contract"] = asr_contract()
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
-            from .mt_pool import saved_route
-            saved_route(manifest)
             self.mt_runtime_active = not bool(manifest.get('retime'))
             if manifest.get("normalized"):
                 self.verify_source_output(job_id, manifest, output)
@@ -627,7 +625,6 @@ class Engine:
                             position = 0
                             continue
                         segment["oss_url"] = oss_url
-                        segment.pop("oss_protected", None)
                         segment["upload_identity"] = scope
                         segment["upload_expires"] = time.time() + 48 * 3600
                         self.store.update(job_id, manifest=manifest)

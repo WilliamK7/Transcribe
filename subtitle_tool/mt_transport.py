@@ -29,7 +29,6 @@ class TransportError(ToolError):
             category = 'transport'
         self.category = category
         self.retryable = category in {'network', 'deadline'}
-        self.status = None
         super().__init__({'network': '翻译网络连接或读取失败。', 'deadline': '翻译请求超过总时限。',
                           'transport': '翻译网络子进程异常，进度已保存。',
                           'response_too_large': '翻译响应超过 4 MiB 上限，进度已保存。'}[category],
