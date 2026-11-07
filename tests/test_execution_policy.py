@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 from unittest import mock
 
 from subtitle_tool.common import ToolError
@@ -18,6 +19,8 @@ class ExecutionPolicyTests(SavedResultFixture):
         paths += [('execution_snapshot', field) for field in current_execution_snapshot()]
         paths += [('contract', 'normalizer'), ('media_plan', 'extract_recipe_version')]
         invalid = [(path, value) for path in paths for value in [0, 999, True, '2', None]]
+        invalid += [(('execution_snapshot', field), float(value))
+                    for field, value in current_execution_snapshot().items()]
         invalid.append((('mt_glossary_schedule',), 'unsupported'))
         for path, value in invalid:
             with self.subTest(path=path, value=value):
@@ -35,6 +38,36 @@ class ExecutionPolicyTests(SavedResultFixture):
                 self.assertIn("--reflow", job["error"])
                 self.assertEqual(fake.calls, [])
                 self.assertFalse(self.source.with_suffix(".srt").exists())
+
+    def test_unsupported_snapshot_stops_resume_and_retime_before_mutation(self):
+        self.save_result()
+        fake = FakeService(result(('Hello.', 'en')))
+        self.assertEqual(self.run_fake(fake), 'completed')
+        current = self.store.job(self.job_id)['manifest']
+        output = Path(self.store.job(self.job_id)['output'])
+        content = output.read_bytes()
+        cues, stages = self.store.cues(self.job_id), self.store.mt_stages(self.job_id)
+        engine = Engine(self.config, self.store)
+        for version in [None, 1]:
+            with self.subTest(version=version):
+                manifest = copy.deepcopy(current)
+                if version is None:
+                    manifest['execution_snapshot'].pop('alignment_version')
+                else:
+                    manifest['execution_snapshot']['alignment_version'] = version
+                self.store.update(self.job_id, manifest=manifest)
+                before = self.store.job(self.job_id)
+                with mock.patch('requests.request', side_effect=AssertionError('Unexpected network')):
+                    for operation in [lambda: engine.resume(self.job_id),
+                                      lambda: engine.retime(self.job_id, overwrite=True)]:
+                        with self.assertRaises(ToolError) as caught:
+                            operation()
+                        self.assertEqual(caught.exception.code, 'cache_version')
+                        self.assertEqual(self.store.job(self.job_id), before)
+                self.assertEqual(self.store.cues(self.job_id), cues)
+                self.assertEqual(self.store.mt_stages(self.job_id), stages)
+                self.assertEqual(output.read_bytes(), content)
+        self.assertFalse((self.config.root / '.build' / 'retime').exists())
 
     def test_reflow_refreshes_snapshot_only_after_successful_preparation(self):
         from subtitle_tool.policy import current_execution_snapshot

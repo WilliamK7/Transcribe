@@ -117,6 +117,14 @@ def plan_sentence_groups(sources):
     return groups
 
 
+def direct_draft_matches(sentences, fragments):
+    """A draft needs no redistribution only when every numbered target is identical."""
+    return bool(sentences) and len(sentences) == len(fragments) and all(
+        sentence['id'] == fragment['id'] == fragment['sentence'] == str(index) and
+        sentence['text'].strip() == fragment['text']
+        for index, (sentence, fragment) in enumerate(zip(sentences, fragments)))
+
+
 def _schema(stage, data):
     if stage == 'glossary':
         item = {'type': 'object', 'properties': {'source': {'type': 'string'}, 'translation': {'type': 'string'},
@@ -248,22 +256,24 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
         raise BatchValidationError('response_structure') from None
 
 
+def term_appears(term, text):
+    if not term.isascii():
+        return term.casefold() in text.casefold()
+    pattern = re.escape(term)
+    if term[0].isalnum() or term[0] == '_':
+        pattern = r'(?<![A-Za-z0-9_])' + pattern
+    if term[-1].isalnum() or term[-1] == '_':
+        pattern += r'(?![A-Za-z0-9_])'
+    return re.search(pattern, text, flags=re.IGNORECASE | re.ASCII) is not None
+
+
 def validate_glossary(extracted, sources, manual):
     """Keep only evidenced terms, with per-sentence evidence and manual priority."""
     by_id = {source['sentence_id']: source['text'] for source in sources if source['decision'] == 'translate'}
     result, seen = [], set()
-    def appears(term, text):
-        if not term.isascii():
-            return term.casefold() in text.casefold()
-        pattern = re.escape(term)
-        if term[0].isalnum() or term[0] == '_':
-            pattern = r'(?<![A-Za-z0-9_])' + pattern
-        if term[-1].isalnum() or term[-1] == '_':
-            pattern += r'(?![A-Za-z0-9_])'
-        return re.search(pattern, text, flags=re.IGNORECASE | re.ASCII) is not None
     def add(source, translation, sentence, origin):
         if (not isinstance(source, str) or not isinstance(translation, str) or not source.strip() or
-                not translation.strip() or sentence not in by_id or not appears(source, by_id[sentence])):
+                not translation.strip() or sentence not in by_id or not term_appears(source, by_id[sentence])):
             return
         identity = (sentence, source.casefold())
         if identity not in seen:

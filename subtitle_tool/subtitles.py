@@ -475,29 +475,22 @@ class _WordBreakIndex:
     """Index one source in O(characters + words); each range search scans its words."""
     def __init__(self, source):
         text, words = source["text"], source.get("words", [])
-        widths, space_ends, closing_ends = [0], [0], [0]
-        for at, char in enumerate(text):
+        widths = [0]
+        for char in text:
             width = (0 if unicodedata.category(char).startswith("M") or char in "\u200d\ufe0f" else
                      2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1)
             widths.append(widths[-1] + width)
-            space_ends.append(space_ends[-1] if char.isspace() else at + 1)
-            closing_ends.append(closing_ends[-1] if char in "\"'”’）)]}」』】»›" else at + 1)
-        next_nonspace = [len(text)] * (len(text) + 1)
-        for at in range(len(text) - 1, -1, -1):
-            next_nonspace[at] = next_nonspace[at + 1] if text[at].isspace() else at
         candidates = [None] * len(words)
         for at in range(1, len(words)):
             char = words[at - 1]["char_end"]
-            if not word_boundary(text, char):
+            if not word_boundary(text, char) or not legal_break(text, char):
                 continue
-            left, right = space_ends[char] - 1, next_nonspace[char]
-            # Same full-text legality as legal_break, without rescanning whitespace.
-            if (left < 0 or right >= len(text) or _opening_at(text, left) or _closing_at(text, right) or
-                    unicodedata.category(text[right]).startswith("M") or
-                    text[right] == "\u200d" or text[left] == "\u200d"):
-                continue
-            before_end = space_ends[char]
-            punctuation_end = closing_ends[before_end]
+            before_end = char
+            while before_end and text[before_end - 1].isspace():
+                before_end -= 1
+            punctuation_end = before_end
+            while punctuation_end and text[punctuation_end - 1] in "\"'”’）)]}」』】»›":
+                punctuation_end -= 1
             # A newline before closing quotes still leaves the preceding punctuation significant.
             if punctuation_end and text[punctuation_end - 1] == "\n":
                 punctuation_end -= 1
@@ -586,7 +579,7 @@ def split_mt_units(source, units, *, fits):
     return result
 
 
-def _context_neighbors(cue, sources, position):
+def source_context(sources, position):
     """Compatible neighbors ordered by proximity, distance and source position."""
     sentence_limit, gap_limit = 12, 15000
     source = sources[position]
@@ -596,6 +589,7 @@ def _context_neighbors(cue, sources, position):
         if not language:
             language = item.get('source_lang') if manual and item.get('source_lang') != 'auto' else item['sentence_id']
         return language, item['decision'], item.get('source_lang', 'auto'), manual
+    boundary = compatible(source)
     neighbors = []
     for direction in [-1, 1]:
         previous = source
@@ -606,18 +600,14 @@ def _context_neighbors(cue, sources, position):
             neighbor = sources[index]
             gap = (previous['begin_ms'] - neighbor['end_ms'] if direction < 0 else
                    neighbor['begin_ms'] - previous['end_ms'])
-            proximity = max(neighbor['begin_ms'] - cue['end_ms'], cue['begin_ms'] - neighbor['end_ms'], 0)
-            if (gap > gap_limit or compatible(neighbor) != compatible(source) or
+            proximity = max(neighbor['begin_ms'] - source['end_ms'], source['begin_ms'] - neighbor['end_ms'], 0)
+            if (gap > gap_limit or compatible(neighbor) != boundary or
                     proximity > 30000):
                 break
             neighbors.append((proximity, distance, index, neighbor))
             previous = neighbor
-    return [(index, neighbor) for _, _, index, neighbor in sorted(neighbors, key=lambda n: n[:3])]
-
-
-def source_context(sources, position):
     return [{'position': 'before' if index < position else 'after', 'text': neighbor['text']}
-            for index, neighbor in _context_neighbors(sources[position], sources, position)]
+            for _, _, index, neighbor in sorted(neighbors, key=lambda n: n[:3])]
 
 
 def validate_unit_coverage(source, units):
@@ -658,7 +648,7 @@ def revise_layout(cues, sources, settings, *, layout_round):
         revised.extend(parts)
     if not affected:
         return None
-    revised = [{**cue, 'translated': '', 'error': ''} if cue['sentence_id'] in affected else cue
+    revised = [{**cue, 'translated': ''} if cue['sentence_id'] in affected else cue
                for cue in revised]
     return revised
 

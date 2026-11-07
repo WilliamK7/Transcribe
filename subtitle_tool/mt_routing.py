@@ -485,10 +485,6 @@ class MTRouter:
                         tier = 'paid'
                         continue
                     if failure is None and reservation is not None:
-                        available = self._available(entry)
-                        self.control.check_start()
-                        if not available or not self._confirm(entry, ticket):
-                            continue
                         try:
                             reservation.claim()
                         except Cancelled:

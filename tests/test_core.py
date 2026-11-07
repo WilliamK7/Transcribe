@@ -272,7 +272,7 @@ class PipelineTests(PipelineFixture):
         fake.mt_failure.clear()
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
-        self.assertEqual(len(fake.named("/chat/completions")), 4)
+        self.assertEqual(len(fake.named("/chat/completions")), 3)
 
     def test_mt_failure_stops_scheduling_beyond_concurrency(self):
         fake = FakeService(result(*[(f"Sentence number {i}.", "en") for i in range(12)]))
@@ -414,7 +414,7 @@ class PipelineTests(PipelineFixture):
             self.config.set_key(key)
             self.job_id = enqueue_current(self.store, self.config, source, workspace_id=workspace)
             self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(len(fake.named("/chat/completions")), 12)
+        self.assertEqual(len(fake.named("/chat/completions")), 9)
 
 
     def test_resume_cli_channel_option_changes_unsubmitted_input(self):

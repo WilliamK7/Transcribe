@@ -101,8 +101,6 @@ class Progress:
             elif stage == 'mt_quota_login':
                 message = ('百炼额度查询的控制台会话失效，暂时跳过百炼免费候选；'
                            '请用 bl auth login --console 重新登录并更新本机绑定。')
-            elif stage == 'mt_glossary_progress':
-                message = f'术语分析／已处理 {done}/{total} 组'
             elif stage == 'mt_v5_progress':
                 names = {'glossary': '术语分析', 'waiting': '等待前序术语', 'draft': '整句翻译',
                          'align': '字幕对齐', 'review': '译文复核', 'correct': '译文修正'}

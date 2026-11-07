@@ -117,7 +117,6 @@ def validate_normalized(manifest, sources, cues):
             source = by_id.get(cue.get('sentence_id'))
             if source is None:
                 raise mismatch()
-            validate_fragment(source, cue)
             grouped.setdefault(source['sentence_id'], []).append(cue)
         for source in sources:
             validate_unit_coverage(source, sorted(grouped.get(source['sentence_id'], []), key=lambda c: c['char_start']))

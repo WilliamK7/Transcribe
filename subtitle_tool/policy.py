@@ -12,7 +12,8 @@ def current_execution_snapshot():
     return dict(format_version=1,
                 prompt_version=QUALITY_PROMPT_VERSION,
                 recovery_version=3,
-                context_version=1)
+                context_version=1,
+                alignment_version=2)
 
 
 def asr_contract():

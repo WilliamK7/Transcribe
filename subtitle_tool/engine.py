@@ -213,7 +213,6 @@ class Engine:
         snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
         self.store.snapshot(job_id, snapshot)
         for name in ["layout_planned", "layout_round", "layout_complete",
-                     "mt_glossary_schedule", "mt_snapshot",
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                      "backup", "cue_count", "no_speech"]:
             manifest.pop(name, None)
@@ -310,7 +309,7 @@ class Engine:
             raise ToolError("提交结果未知，不能准备显示校时；请先恢复原任务。", "submission_unknown")
         output = self.store.resolve_output(job, output_dir)
         self.store.check_republish_output(job_id, output, overwrite, operation="校时")
-        policy = load_policy(manifest, verify_execution=False)
+        policy = load_policy(manifest)
         settings = policy.settings(self.config.settings)
         self.identity(job_id, manifest, persist=False)
         self.validate_saved_subtitles(job_id, manifest)

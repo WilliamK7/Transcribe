@@ -25,6 +25,7 @@ class PoolPipelineTests(SavedResultFixture):
         self.calls = []
         self.review_failure = False
         self.review_issue = False
+        self.no_change_correction = False
         self.fail_stage = None
         self.cancel_after = None
         self.fail_second_group = False
@@ -62,8 +63,10 @@ class PoolPipelineTests(SavedResultFixture):
                 elif stage == 'draft':
                     value = {'translations': {item['id']: '完整句译文。' for item in data['sentences']}}
                 elif stage in {'align', 'correct'}:
-                    suffix = str(sum(call[0] == 'correct' for call in parent.calls)) if stage == 'correct' else ''
-                    value = {'translations': {item['id']: '字幕完整译文。' + suffix for item in data['fragments']}}
+                    suffix = (str(sum(call[0] == 'correct' for call in parent.calls))
+                              if stage == 'correct' and not parent.no_change_correction else '')
+                    value = {'translations': (dict(data['translations']) if stage == 'correct' and parent.no_change_correction
+                             else {item['id']: '字幕完整译文。' + suffix for item in data['fragments']})}
                 else:
                     value = {'issues': ([{'id': '0', 'category': 'number', 'evidence': '数字有疑点'}]
                                         if parent.review_issue else [])}
@@ -77,33 +80,16 @@ class PoolPipelineTests(SavedResultFixture):
              mock.patch('subtitle_tool.mt_backend.qiniu_free_active', return_value=True):
             return run() if run is not None else (engine or Engine(self.config, self.store, cancel)).run(self.job_id)
 
-    def install(self):
-        self.save_result(result(('A cache stores a result.', 'en'), ('The next call reuses it.', 'en')))
+    def install(self, *, split=False):
+        raw = result(('A cache stores a result.', 'en'), ('The next call reuses it.', 'en'))
+        if split:
+            raw = timed_raw(['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel'], word_ms=1000)
+            raw['transcripts'][0]['sentences'].append(
+                {'begin_time': 8500, 'end_time': 9400, 'text': 'A short ending.', 'language': 'en'})
+        self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id)
         manifest = self.store.job(self.job_id)['manifest']
         self.assertEqual(manifest['translation_strategy_version'], 5)
-
-    def test_unused_primary_copy_cannot_change_saved_stages_or_cache_keys(self):
-        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
-        self.install()
-        self.fail_stage = 'align'
-        self.assertEqual(self.run_pool(), 'failed')
-        stages = self.store.mt_stages(self.job_id)
-        self.assertEqual({row['stage'] for row in stages}, {'glossary', 'draft'})
-        cache = list(self.store.db.execute('SELECT key,text FROM mt_cache ORDER BY key'))
-        manifest = self.store.job(self.job_id)['manifest']
-        manifest['mt_snapshot'] = {'provider': 'obsolete', 'model': 'unused'}
-        self.store.update(self.job_id, manifest=manifest)
-        self.fail_stage = None
-        self.calls.clear()
-        Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertEqual([stage for stage, _, _ in self.calls], ['align', 'review'])
-        for row in stages:
-            self.assertEqual(self.store.mt_stage_entry(self.job_id, row['key']),
-                             {'stage': row['stage'], 'record': row['record']})
-        for key, value in cache:
-            self.assertEqual(self.store.cache_get(key), value)
 
     def test_unchanged_stage_reads_each_cache_miss_once(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
@@ -111,9 +97,9 @@ class PoolPipelineTests(SavedResultFixture):
         with mock.patch.object(self.store, 'cache_get', wraps=self.store.cache_get) as lookup:
             self.assertEqual(self.run_pool(), 'completed')
         keys = [call.args[0] for call in lookup.call_args_list]
-        self.assertEqual(len(self.calls), 4)
-        self.assertEqual(len(set(keys)), 4)
-        self.assertEqual(len(keys), 4)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(set(keys)), 3)
+        self.assertEqual(len(keys), 3)
 
     def test_cli_sigint_saves_inflight_draft_and_starts_no_later_stage(self):
         import _thread
@@ -216,17 +202,29 @@ class PoolPipelineTests(SavedResultFixture):
         names = [stage for stage, _, _ in self.calls]
         self.assertEqual(names.count('glossary'), 1)
         self.assertEqual(names.count('draft'), 1)
-        self.assertEqual(names.count('align'), 1)
+        self.assertEqual(names.count('align'), 0)
         self.assertEqual(names.count('review'), 1)
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
         self.assertTrue(all(item['record'].get('backend') for item in self.store.mt_stages(self.job_id)))
         for cue in self.store.cues(self.job_id):
             final = self.store.mt_stage_entry(self.job_id, cue['mt_stage_key'])['record']
             production = self.store.mt_stage_entry(self.job_id, final['production_stage_key'])
-            self.assertIn(production['stage'], {'align', 'correct'})
+            self.assertEqual(production['stage'], 'draft')
             self.assertEqual(final['backend'], cue['mt_origin'])
             self.assertEqual(final['actual_model'], production['record']['actual_model'])
             self.assertEqual(final['backend'], production['record']['backend'])
+
+    def test_direct_draft_review_prefers_another_available_backend(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}, {'id': 'openrouter_free'}]
+        self.install()
+        with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
+            self.assertEqual(self.run_pool(), 'completed')
+        models = {stage: data['_model'] for stage, _, data in self.calls}
+        self.assertNotEqual(models['draft'], models['review'])
+        self.assertNotIn('align', models)
+        for cue in self.store.cues(self.job_id):
+            final = self.store.mt_stage_entry(self.job_id, cue['mt_stage_key'])['record']
+            self.assertEqual(final['request_model'], models['draft'])
 
 
     def test_first_group_is_saved_while_later_glossary_request_is_blocked(self):
@@ -357,6 +355,31 @@ class PoolPipelineTests(SavedResultFixture):
         # alone would retain more than 4 MiB of tuple references.
         self.assertLess(peak, 2 * 1024 * 1024)
 
+    def test_glossary_prefix_matches_whole_terms_in_later_groups(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.config.settings.mt_workers = 1
+        self.config.settings.mt_quality = {'manual_glossary': {'RAM': '内存'}}
+        sentences = [('RAM stores data.', 'en')] + [('Wait.', 'en')] * 7 + [('The program runs.', 'en')]
+        self.save_result(result(*sentences))
+        Engine(self.config, self.store).reflow(self.job_id)
+        self.assertEqual(self.run_pool(), 'completed')
+        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        self.assertEqual(len(drafts), 2)
+        self.assertEqual([term['source'] for term in drafts[0]['glossary']], ['RAM'])
+        self.assertEqual(drafts[1]['glossary'], [])
+
+    def test_glossary_prefix_reuses_evidenced_terms_with_case_and_punctuation(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.config.settings.mt_workers = 1
+        self.config.settings.mt_quality = {'manual_glossary': {'RAM': '内存'}}
+        sentences = [('RAM stores data.', 'en')] + [('Wait.', 'en')] * 7 + [('Use (ram).', 'en')]
+        self.save_result(result(*sentences))
+        Engine(self.config, self.store).reflow(self.job_id)
+        self.assertEqual(self.run_pool(), 'completed')
+        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        self.assertEqual(len(drafts), 2)
+        self.assertEqual(drafts[1]['glossary'], drafts[0]['glossary'])
+
     def test_group_heartbeat_reports_activity_and_stops_after_scope(self):
         from subtitle_tool.mt_pipeline import GroupProgress
         from types import SimpleNamespace
@@ -436,8 +459,60 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
         self.assertTrue(any('复核' in warning for warning in self.store.job(self.job_id)['manifest']['warnings']))
 
-    def test_failed_group_saves_no_partial_cues_and_resume_reuses_completed_stages(self):
+    def test_unchanged_correction_stops_without_repeating_identical_stage_evidence(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
+        self.review_issue = self.no_change_correction = True
+        self.assertEqual(self.run_pool(), 'completed')
+        finals = [item['record'] for item in self.store.mt_stages(self.job_id) if item['stage'] == 'final']
+        self.assertEqual(len(finals), 1)
+        final = finals[0]
+        self.assertTrue(final['warning'])
+        self.assertEqual(len(final['review_stage_keys']), 1)
+        self.assertEqual(len(final['correction_stage_keys']), 1)
+        self.assertEqual(final['production_stage_key'], final['correction_stage_keys'][0])
+        self.assertTrue(all(cue['translated'] == '完整句译文。' for cue in self.store.cues(self.job_id)))
+        calls = len(self.calls)
+        Engine(self.config, self.store).retime(self.job_id, overwrite=True)
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertEqual(len(self.calls), calls)
+
+    def test_cancelled_unchanged_correction_resumes_with_its_saved_result(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        self.review_issue = self.no_change_correction = True
+        self.cancel_after = 'correct'
+        self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
+        self.assertFalse(any(cue['translated'] for cue in self.store.cues(self.job_id)))
+        self.assertIn('correct', [item['stage'] for item in self.store.mt_stages(self.job_id)])
+        self.calls.clear()
+        self.cancel_after = None
+        Engine(self.config, self.store).resume(self.job_id)
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertEqual(self.calls, [])
+        final = next(item['record'] for item in self.store.mt_stages(self.job_id) if item['stage'] == 'final')
+        self.assertEqual(len(final['review_stage_keys']), 1)
+        self.assertEqual(len(final['correction_stage_keys']), 1)
+
+    def test_correction_cycle_stops_before_replaying_an_earlier_review(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        self.review_issue = True
+        def cycle(stage, data):
+            if stage == 'correct' and sum(name == 'correct' for name, _, _ in self.calls) == 2:
+                self.no_change_correction = True
+                data['translations'] = dict(data['draft'])  # Return the original direct draft.
+        self.stage_hook = cycle
+        self.assertEqual(self.run_pool(), 'completed')
+        final = next(item['record'] for item in self.store.mt_stages(self.job_id) if item['stage'] == 'final')
+        self.assertTrue(final['warning'])
+        self.assertEqual(len(final['review_stage_keys']), 2)
+        self.assertEqual(len(final['correction_stage_keys']), 2)
+        self.assertEqual(final['production_stage_key'], final['correction_stage_keys'][-1])
+        self.assertTrue(all(cue['translated'] == '完整句译文。' for cue in self.store.cues(self.job_id)))
+
+    def test_failed_group_saves_no_partial_cues_and_resume_reuses_completed_stages(self):
+        self.install(split=True)
         self.fail_stage = 'align'
         self.assertEqual(self.run_pool(), 'failed')
         self.assertFalse(any(cue['translated'] for cue in self.store.cues(self.job_id)))
@@ -491,7 +566,7 @@ class PoolPipelineTests(SavedResultFixture):
              mock.patch('subtitle_tool.mt_bailian_quota.BailianQuota', side_effect=quota):
             self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertEqual(source.query.call_count, 1)
-        self.assertGreaterEqual(len(self.calls), 4)
+        self.assertEqual(len(self.calls), 3)
         self.assertTrue(all(data['_model'] == 'qwen-test' for _, _, data in self.calls))
 
     def test_cli_confirmed_binding_is_used_by_the_production_pipeline(self):
@@ -519,7 +594,7 @@ class PoolPipelineTests(SavedResultFixture):
                                    '--confirm-propagation-waited']), 0)
             self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertGreaterEqual(source.query.call_count, 2)
-        self.assertGreaterEqual(len(self.calls), 4)
+        self.assertEqual(len(self.calls), 3)
         self.assertTrue(all(data['_model'] == 'qwen3.8-27b' for _, _, data in self.calls))
         self.assertNotIn('synthetic-token', output.getvalue())
 
@@ -864,7 +939,7 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
 
     def test_tampered_saved_stage_metadata_blocks_reuse(self):
-        self.install()
+        self.install(split=True)
         self.fail_stage = 'align'
         self.assertEqual(self.run_pool(), 'failed')
         row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'draft')
@@ -879,7 +954,7 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
 
     def test_non_string_actual_model_cannot_be_accepted_from_saved_stage(self):
-        self.install()
+        self.install(split=True)
         self.fail_stage = 'align'
         self.assertEqual(self.run_pool(), 'failed')
         row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'draft')
@@ -893,7 +968,7 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
 
     def test_invalid_saved_values_block_stage_and_cross_task_cache_reuse(self):
-        self.install()
+        self.install(split=True)
         self.fail_stage = 'align'
         self.assertEqual(self.run_pool(), 'failed')
         row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'draft')

@@ -15,13 +15,14 @@ from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
 from .mt_backend import MTBackend
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
-from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, make_stage_payload, parse_stage_response, plan_sentence_groups,
-                         stage_cache_key, validate_glossary, validate_stage_value)
+from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, direct_draft_matches,
+                         make_stage_payload, parse_stage_response, plan_sentence_groups,
+                         stage_cache_key, term_appears, validate_glossary, validate_stage_value)
 from .mt_routing import MTRouter, RouteEntry, RouteFailure
 from .mt_runtime import bailian_failure, service_failure
 from .mt_transport import TransportError
 from .review import decision_origin
-from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, source_context, split_mt_units, validate_fragment,
+from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, source_context, split_mt_units,
                         validate_unit_coverage)
 
 
@@ -189,13 +190,22 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         set(final['value']['translations']) != {str(i) for i in range(len(final['cue_ids']))}):
                     raise ValueError()
                 proof = engine.store.mt_stage_entry(job_id, final['production_stage_key'])
-                if (not isinstance(proof, dict) or proof['stage'] not in {'align', 'correct'} or
+                if (not isinstance(proof, dict) or proof['stage'] not in {'draft', 'align', 'correct'} or
                         not isinstance(proof['record'], dict) or proof['record'].get('stage') != proof['stage'] or
                         proof['record'].get('backend') != final['backend'] or
                         proof['record'].get('request_model') != final['request_model'] or
                         proof['record'].get('actual_model') != final['actual_model'] or
                         proof['record'].get('value') != final['value']):
                     raise ValueError()
+                source_hashes = None
+                if proof['stage'] == 'draft':
+                    source_hashes = proof['record'].get('source_text_hashes')
+                    if (final['production_stage_key'] != final['draft_stage_key'] or
+                            final['correction_stage_keys'] or not isinstance(source_hashes, list) or
+                            len(source_hashes) != len(final['cue_ids']) or
+                            any(not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None
+                                for value in source_hashes)):
+                        raise ValueError()
                 for stage_name, keys in [('draft', [final['draft_stage_key']]),
                                          ('review', final['review_stage_keys']),
                                          ('correct', final['correction_stage_keys'])]:
@@ -206,11 +216,14 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         if (not isinstance(entry, dict) or entry['stage'] != stage_name or
                                 not isinstance(entry['record'], dict) or entry['record'].get('stage') != stage_name):
                             raise ValueError()
-                finals[key] = final
-            final = finals[key]
+                finals[key] = final, source_hashes
+            final, source_hashes = finals[key]
             if (final['backend'] != origin or final['request_model'] != profiles[origin]['backend']['model'] or
                     cue['cue_id'] not in final['cue_ids'] or
                     final['value']['translations'][str(final['cue_ids'].index(cue['cue_id']))] != cue['translated']):
+                raise ValueError()
+            if (source_hashes is not None and
+                    source_hashes[final['cue_ids'].index(cue['cue_id'])] != _digest(cue['text'].strip())):
                 raise ValueError()
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         raise ToolError('译文阶段来源与保存的翻译池不一致。', 'cache_mismatch') from None
@@ -370,6 +383,11 @@ class Pipeline:
         started = time.monotonic()
         work_key = self._work_key(name, data)
         self.context.stage, self.context.group_key = name, work_key
+        # Bind numbered draft outputs to source text, including on cross-task
+        # cache hits. Hashes allow partial layout replacement without retaining
+        # another copy of the transcript or binding reusable stages to cue IDs.
+        evidence = ({'source_text_hashes': [_digest(text.strip()) for text in originals]}
+                    if name == 'draft' else {})
         def saved_stage():
             try:
                 stored = self.store.mt_stage_entry(self.job_id, work_key)
@@ -380,7 +398,8 @@ class Pipeline:
             saved = stored['record']
             usage = saved.get('usage') if isinstance(saved, dict) else None
             if (stored['stage'] != name or not isinstance(saved, dict) or
-                    set(saved) != {'value', 'backend', 'request_model', 'actual_model', 'usage', 'stage'} or
+                    set(saved) != {'value', 'backend', 'request_model', 'actual_model', 'usage', 'stage'} | set(evidence) or
+                    any(saved[k] != value for k, value in evidence.items()) or
                     saved.get('stage') != name or not isinstance(saved.get('backend'), str) or
                     saved.get('backend') not in self.profiles or
                     self.profiles[saved['backend']]['backend'] is None or
@@ -528,7 +547,7 @@ class Pipeline:
             'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', '')})
         if result.waited:
             self.store.count(self.job_id, 'mt_route_wait_ms', round(result.waited * 1000))
-        record = {**result.value, 'backend': result.entry.id, 'request_model': result.entry.backend.model,
+        record = {**result.value, **evidence, 'backend': result.entry.id, 'request_model': result.entry.backend.model,
                   'stage': name}
         cache_key = stage_cache_key(name, data, result.entry.backend,
                                     capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.scope)
@@ -550,8 +569,10 @@ class Pipeline:
         base = {'sentences': sentences, 'draft': {item['id']: '译文' for item in sentences},
                 'fragments': fragments, 'glossary': []}
         samples = [('glossary', {'sentences': sentences, 'manual_glossary': []}),
-                   ('draft', {'sentences': sentences, 'context': [], 'glossary': []}),
-                   ('align', base), ('review', {**base, 'translations': {f['id']: '译文' for f in fragments}})]
+                   ('draft', {'sentences': sentences, 'context': [], 'glossary': []})]
+        if not direct_draft_matches(sentences, fragments):
+            samples.append(('align', base))
+        samples.append(('review', {**base, 'translations': {f['id']: '译文' for f in fragments}}))
         try:
             for stage, data in samples:
                 self._fit(stage, data, allow_guarded_fallback=allow_guarded_fallback)
@@ -638,14 +659,12 @@ class Pipeline:
                                            counts={'mt_glossary_unavailable': 1})
             return []
 
-    def group(self, group, glossary, sources):
+    def group(self, group, glossary, context):
         self.engine.mt_control.check_start()
         members = [cue for unit in group for cue in unit['cues']]
         if not members or all(cue['translated'] for cue in members):
             return
-        positions = {source['sentence_id']: index for index, source in enumerate(sources)}
-        context = source_context(sources, positions[group[0]['source']['sentence_id']])
-        relevant = [term for term in glossary if any(term['source'].casefold() in unit['text'].casefold() for unit in group)]
+        relevant = [term for term in glossary if any(term_appears(term['source'], unit['text']) for unit in group)]
         relevant.sort(key=lambda term: term['origin'] != 'manual')
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(group)]
         draft_data = {'sentences': sentences, 'context': context, 'glossary': relevant}
@@ -656,16 +675,25 @@ class Pipeline:
                      for i, cue in enumerate(members)]
         ids, originals = [f['id'] for f in fragments], [f['text'] for f in fragments]
         data = {'sentences': sentences, 'draft': draft['translations'], 'fragments': fragments, 'glossary': relevant}
-        aligned, origin, production = self.stage('align', data, ids=ids, originals=originals, prefer=draft_backend)
+        if direct_draft_matches(sentences, fragments):
+            aligned, origin, production = draft, draft_backend, draft_proof
+        else:
+            aligned, origin, production = self.stage('align', data, ids=ids, originals=originals, prefer=draft_backend)
         current = aligned['translations']
         warning = False
-        review_keys, correction_keys = [], []
+        review_keys, correction_keys, reviewed = [], [], []
         for round_number in range(self.snapshot['quality']['max_revisions'] + 1):
             self.engine.mt_control.check_start()
+            # Repeated subtitles have the same review request identity. A
+            # no-op correction or a cycle would only replay saved issues.
+            if current in reviewed:
+                warning = True
+                break
             review_data = {**data, 'translations': current}
             try:
                 review, reviewer, review_proof = self.stage('review', review_data, ids=ids, prefer=origin)
                 review_keys.append(review_proof['key'])
+                reviewed.append(current)
             except Cancelled:
                 raise
             except ToolError as error:
@@ -716,6 +744,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             raise ToolError('已完成排版缺少完整译文。', 'cache_mismatch')
         return
     source_ids = {source['sentence_id']: source for source in sources}
+    positions = {source['sentence_id']: index for index, source in enumerate(sources)}
     pipeline = Pipeline(engine, job_id, manifest, scope)
     if not manifest.get('layout_planned'):
         cues = []
@@ -734,14 +763,9 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         stage('subtitle_translating')
         cues = engine.store.cues(job_id)
         plan_display_timing(cues)
-        for cue in cues:
-            if cue.get('sentence_id') not in source_ids:
-                raise ToolError('字幕片段缺少完整句来源。', 'cache_mismatch')
-            validate_fragment(source_ids[cue['sentence_id']], cue)
         groups = pipeline.plan_groups(sources, cues)
         pending = [index for index, group in enumerate(groups)
                    if any(not cue['translated'] for unit in group for cue in unit['cues'])]
-        tasks = []
         if pending:
             # Completed earlier groups still contribute their exact saved glossary
             # to the prefix used by later unfinished groups.
@@ -754,9 +778,11 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                 progress.set(index, 'glossary')
                 try:
                     glossary = prefix.for_group(index, pipeline.glossary(group))
-                    pipeline.group(group, glossary, sources)
+                    context = source_context(sources, positions[group[0]['source']['sentence_id']])
+                    pipeline.group(group, glossary, context)
                 finally:
                     progress.finish(index)
+            tasks = []
             for index, group in enumerate(groups):
                 members = [cue for unit in group for cue in unit['cues']]
                 tasks.append((members, lambda index=index, group=group: run_group(index, group)))

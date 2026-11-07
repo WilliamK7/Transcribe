@@ -20,61 +20,49 @@ class ServiceFailure:
     retryable: bool = False
 
 
-def _service_errors(body):
-    """Extract independent errors and content-free shape counts from one envelope."""
+def service_failure(status, body, *, free_router=False):
     errors = []
-    shape = {'top_level_error': False, 'choice_error_count': 0, 'detail_free_error_finish_count': 0,
-             'content_filter_count': 0, 'message_refusal_count': 0,
-             'error_type_malformed_count': 0}
+    top_error = choice_error = finish_error = malformed_type = False
     if isinstance(body, dict):
         if 'error' in body:
-            shape['top_level_error'] = True
+            top_error = True
             errors.append(body['error'])
         choices = body.get('choices')
         if isinstance(choices, list):
             for choice in choices:
                 if not isinstance(choice, dict):
                     continue
-                if choice.get('finish_reason') == 'content_filter':
-                    shape['content_filter_count'] += 1
-                if isinstance(choice.get('message'), dict) and choice['message'].get('refusal'):
-                    shape['message_refusal_count'] += 1
+                if (choice.get('finish_reason') == 'content_filter' or
+                        isinstance(choice.get('message'), dict) and choice['message'].get('refusal')):
+                    return ServiceFailure('content_policy_violation')
                 if 'error' in choice:
-                    shape['choice_error_count'] += 1
+                    choice_error = True
                     errors.append(choice['error'])
                 elif choice.get('finish_reason') == 'error':
-                    shape['detail_free_error_finish_count'] += 1
+                    finish_error = True
     kinds = []
     for error in errors:
         metadata = error.get('metadata') if isinstance(error, dict) else None
         kind = metadata.get('error_type') if isinstance(metadata, dict) else None
         if isinstance(metadata, dict) and 'error_type' in metadata and not isinstance(kind, str):
-            shape['error_type_malformed_count'] += 1
+            malformed_type = True
         kinds.append(kind if isinstance(kind, str) else None)
-    if not shape['top_level_error']:
+    if finish_error and not top_error:
         # A top-level error explains its finish markers, but never an explicit choice.error.
-        kinds.extend([None] * shape['detail_free_error_finish_count'])
-    return kinds, shape, bool(shape['content_filter_count'] or shape['message_refusal_count'])
-
-
-def service_failure(status, body, *, free_router=False):
-    kinds, shape, content_refused = _service_errors(body)
-    if content_refused:
-        return ServiceFailure('content_policy_violation')
+        kinds.append(None)
     for kind in kinds:
         if kind in PERMANENT_TYPES and not (free_router and kind == 'not_found'):
             return ServiceFailure(kind)
     if status in {400, 401, 402, 403, 405, 413, 415, 422} or status == 404 and not free_router:
         return ServiceFailure('http_permanent')
-    if (shape['detail_free_error_finish_count'] and not shape['top_level_error'] and
-            not shape['choice_error_count']):
+    if finish_error and not top_error and not choice_error:
         retryable = (200 <= status < 300 or status in {408, 429} or 500 <= status <= 599 or
                      status == 404 and free_router)
         return ServiceFailure('generation_error', retryable)
     retryable_types = TRANSIENT_TYPES | {'not_found'} if free_router else TRANSIENT_TYPES
     untyped_choice = any(kind is None for kind in kinds) and (
-        shape['choice_error_count'] or shape['detail_free_error_finish_count'] and not shape['top_level_error'])
-    if (shape['error_type_malformed_count'] or untyped_choice or
+        choice_error or finish_error and not top_error)
+    if (malformed_type or untyped_choice or
             any(kind is not None and kind not in retryable_types for kind in kinds)):
         return ServiceFailure('service_unknown')
     if free_router and 'not_found' in kinds:

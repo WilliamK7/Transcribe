@@ -27,17 +27,10 @@ class StagePersistenceTests(SavedResultFixture):
         self.assertEqual(self.store.mt_stage_entry(self.job_id, 'a' * 64),
                          {'stage': 'align', 'record': record})
 
-    def test_stages_and_cues_survive_reopen_with_unused_columns(self):
+    def test_stages_and_cues_survive_reopen(self):
         self.save_result()
         cues = self.store.cues(self.job_id)
         self.store.commit_mt_stage(self.job_id, 'b' * 64, 'draft', {'text': 'private original'})
-        columns = {row['name'] for row in self.store.db.execute('PRAGMA table_info(cues)')}
-        with self.store.db:
-            if 'attempts' not in columns:
-                self.store.db.execute('ALTER TABLE cues ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0')
-            if 'error' not in columns:
-                self.store.db.execute("ALTER TABLE cues ADD COLUMN error TEXT NOT NULL DEFAULT ''")
-            self.store.db.execute("UPDATE cues SET attempts=7,error='unused status' WHERE job_id=?", (self.job_id,))
         self.store.close()
         from subtitle_tool.store import Store
         self.store = Store(self.config.data / 'jobs.sqlite')
