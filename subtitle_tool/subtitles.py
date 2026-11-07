@@ -588,22 +588,24 @@ def split_mt_units(source, units, *, fits):
     return result
 
 
-def source_context(sources, position):
-    """Compatible neighbors ordered by proximity, distance and source position."""
+def source_context(sources, position, last_position=None):
+    """Neighbors outside the whole target range, ordered for budget retention."""
     sentence_limit, gap_limit = 12, 15000
-    source = sources[position]
+    last_position = position if last_position is None else last_position
     def compatible(item):
         language = item['language'].lower().strip()
         manual = decision_origin(item) == 'manual'
         if not language:
             language = item.get('source_lang') if manual and item.get('source_lang') != 'auto' else item['sentence_id']
         return language, item['decision'], item.get('source_lang', 'auto'), manual
-    boundary = compatible(source)
     neighbors = []
     for direction in [-1, 1]:
+        edge = position if direction < 0 else last_position
+        source = sources[edge]
+        boundary = compatible(source)
         previous = source
         for distance in range(1, sentence_limit + 1):
-            index = position + direction * distance
+            index = edge + direction * distance
             if not 0 <= index < len(sources):
                 break
             neighbor = sources[index]
@@ -615,7 +617,8 @@ def source_context(sources, position):
                 break
             neighbors.append((proximity, distance, index, neighbor))
             previous = neighbor
-    return [{'position': 'before' if index < position else 'after', 'text': neighbor['text']}
+    return [{'position': 'before' if index < position else 'after', 'text': neighbor['text'],
+             'sentence_id': neighbor['sentence_id'], 'source_position': index}
             for _, _, index, neighbor in sorted(neighbors, key=lambda n: n[:3])]
 
 

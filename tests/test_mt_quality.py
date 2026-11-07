@@ -6,7 +6,7 @@ from subtitle_tool.common import ToolError
 from subtitle_tool.mt_backend import MTBackend, key_fingerprint
 from subtitle_tool.mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
                                       stage_cache_key, stage_output_size, estimate_stage_output, correction_stalled,
-                                      validate_glossary, BatchValidationError)
+                                      manual_terms, BatchValidationError)
 
 
 def source(index, *, language='en', decision='translate', origin='automatic', segment='0000', start=None):
@@ -62,11 +62,9 @@ class QualityContractTests(unittest.TestCase):
         groups = plan_sentence_groups([source(0, start=0), source(1, start=59001), source(2, start=60001)])
         self.assertEqual([len(group) for group in groups], [1, 2])
 
-    def test_extracted_terms_require_source_evidence_and_manual_terms_take_priority(self):
+    def test_manual_terms_require_source_evidence(self):
         records = [source(0)]
-        extracted = [{'source': 'cache', 'translation': '高速缓存', 'sentence': records[0]['sentence_id']},
-                     {'source': 'network', 'translation': '网络', 'sentence': records[0]['sentence_id']}]
-        terms = validate_glossary(extracted, records, {'cache': '缓存'})
+        terms = manual_terms(records, {'cache': '缓存', 'CACHE': '其他译法', 'network': '网络'})
         self.assertEqual(terms, [{'source': 'cache', 'translation': '缓存', 'sentence': records[0]['sentence_id'],
                                   'origin': 'manual'}])
 
@@ -176,7 +174,7 @@ class QualityContractTests(unittest.TestCase):
 
     def test_ascii_technical_terms_do_not_match_inside_unrelated_words(self):
         records = [{'sentence_id': '0000:00000000', 'text': 'The program runs.', 'decision': 'translate'}]
-        self.assertEqual(validate_glossary([], records, {'RAM': '内存'}), [])
+        self.assertEqual(manual_terms(records, {'RAM': '内存'}), [])
 
     def test_complete_payload_budget_includes_context_and_schema(self):
         data = {'sentences': [{'id': '0', 'text': 'Small.'}], 'context': ['x' * 33000], 'glossary': []}
@@ -198,7 +196,8 @@ class QualityContractTests(unittest.TestCase):
                                           ids=['0'], originals=['Example'])
         self.assertEqual(translated['translations']['0'], '繁体翻译')
         terms = parse_stage_response('glossary', body({'terms': [
-            {'source': 'cache', 'translation': '緩存', 'sentence': '0000:00000000'}]}))
+            {'source': 'cache', 'translation': '緩存', 'sentence': '0000:00000000'}]}),
+            ids=['0000:00000000'], originals=['A cache stores results.'])
         self.assertEqual(terms['terms'][0]['translation'], '缓存')
         data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
         self.assertNotEqual(stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope={'account': 'a'}),

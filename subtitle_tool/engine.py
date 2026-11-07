@@ -19,6 +19,7 @@ from .config import Config
 from .media import Media
 from .mt_control import MTControl
 from .mt_backend import MTBackend
+from .mt_quality import GLOSSARY_SCHEDULE
 from .store import TERMINAL, Store
 from .review import decision_origin
 from .policy import asr_contract, current_execution_snapshot, load_policy
@@ -216,7 +217,7 @@ class Engine:
                      "backup", "cue_count", "no_speech"]:
             manifest.pop(name, None)
         manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
-                        mt_glossary_schedule="prefix-v1",
+                        mt_glossary_schedule=GLOSSARY_SCHEDULE,
                         display_timing_version=DISPLAY_TIMING_VERSION,
                         execution_snapshot=current_execution_snapshot(),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
@@ -245,7 +246,7 @@ class Engine:
                     'account': hashlib.sha256(key.encode()).hexdigest(), 'processing_version': PROCESSING_VERSION,
                     'subtitle_version': SUBTITLE_VERSION, 'display_timing_version': DISPLAY_TIMING_VERSION,
                     'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot(),
-                    'mt_glossary_schedule': 'prefix-v1', 'contract': asr_contract(),
+                    'mt_glossary_schedule': GLOSSARY_SCHEDULE, 'contract': asr_contract(),
                     'overwrite': bool(overwrite), 'rebuilt_from_archive': job_id,
                     'subtitle_settings': {k: getattr(self.config.settings, k) for k in
                                          ['zh_line_width', 'other_line_width', 'chinese_first']}}

@@ -14,17 +14,18 @@ from types import SimpleNamespace
 from .api import retry_after_seconds
 from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
 from .mt_backend import MTBackend
+from .mt_context import group_context, sentence_context, target_span, trim_context, valid_context_subset
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
 from .mt_planning import make_unit, restore_group_plan, save_group_plan
-from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, correction_stalled, direct_draft_matches,
-                         estimate_stage_output, make_stage_payload, parse_stage_response, plan_sentence_groups,
-                         stage_cache_key, stage_output_size, term_appears, validate_glossary, validate_stage_value)
+from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION, correction_stalled, direct_draft_matches,
+                         estimate_stage_output, make_stage_payload, manual_terms, parse_stage_response, plan_sentence_groups,
+                         stage_cache_key, stage_output_size, term_appears, term_evidence, validate_stage_value)
 from .mt_routing import MTRouter, RouteEntry, RouteFailure
 from .mt_runtime import bailian_failure, service_failure
 from .mt_transport import TransportError
 from .review import decision_origin
-from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, source_context, split_mt_units,
+from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, split_mt_units,
                         validate_unit_coverage)
 
 
@@ -80,24 +81,33 @@ class GroupProgress:
 
 
 class GlossaryPrefix:
-    """Accumulate source-ordered terms on the scheduler thread."""
+    """Accumulate evidenced senses in source order, independent of worker completion."""
     def __init__(self, pipeline, sources):
-        self.pipeline, self.sources = pipeline, sources
-        self.terms, self.seen = [], set()
-        self._add(validate_glossary([], sources, pipeline.snapshot['quality']['manual_glossary']))
+        self.pipeline = pipeline
+        self.terms, self.indices, self.manual = [], {}, set()
+        by_id = {source['sentence_id']: source['text'] for source in sources}
+        self._add({**term, 'evidence': term_evidence(term['source'], by_id[term['sentence']])}
+                  for term in manual_terms(sources, pipeline.snapshot['quality']['manual_glossary']))
 
     def _add(self, terms):
-        # Manual entries are added first; among model entries the first source
-        # group wins, independently of the order in which workers finish.
         for term in terms:
-            identity = term['source'].casefold()
-            if identity not in self.seen:
+            name = term['source'].casefold()
+            if name in self.manual:
+                continue
+            if term['origin'] == 'manual':
+                self.manual.add(name)
+            # Distinct model translations are distinct senses. Repeated senses
+            # use their latest source evidence without mutating dispatched tuples.
+            identity = name, term['translation']
+            if identity in self.indices:
+                self.terms[self.indices[identity]] = term
+            else:
+                self.indices[identity] = len(self.terms)
                 self.terms.append(term)
-                self.seen.add(identity)
 
     def extend(self, extracted):
         self.pipeline.engine.mt_control.check_start()
-        self._add(validate_glossary(extracted, self.sources, {}))
+        self._add(extracted)
         return tuple(self.terms)
 
 
@@ -108,8 +118,22 @@ def _valid_usage(value):
 
 def _sentence(unit, identity):
     source = unit['source']
+    start, end = target_span(unit)
     return {'id': identity, 'text': unit['text'], 'asr_language': source.get('language', ''),
-            'source_language': source.get('source_lang', 'auto'), 'decision_origin': decision_origin(source)}
+            'source_language': source.get('source_lang', 'auto'), 'decision_origin': decision_origin(source),
+            'source_id': source['sentence_id'], 'char_start': start, 'char_end': end}
+
+
+def _group_samples(sentences, fragments, context, glossary):
+    """Stage skeletons used to select shared evidence before generating a draft."""
+    base = {'sentences': sentences, 'context': context, 'glossary': glossary,
+            'draft': {item['id']: '完整译文占位文本' for item in sentences}, 'fragments': fragments}
+    samples = [('draft', {'sentences': sentences, 'context': context, 'glossary': glossary})]
+    if not direct_draft_matches(sentences, fragments):
+        samples.append(('align', base))
+    review = {**base, 'translations': {item['id']: '完整译文占位文本' for item in fragments}}
+    samples.extend([('review', review), ('correct', {**review, 'issues': []})])
+    return samples
 
 
 def check_pool(config, identity, route, cancel):
@@ -122,7 +146,8 @@ def check_pool(config, identity, route, cancel):
                 'processing_version': 2, 'subtitle_version': 2, 'display_timing_version': 2,
                 'subtitle_settings': {k: asdict(config.settings)[k] for k in
                                       ['zh_line_width', 'other_line_width', 'chinese_first']},
-                'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot()}
+                 'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot(),
+                 'mt_glossary_schedule': GLOSSARY_SCHEDULE}
     scope = {**identity, 'processing_version': 2}
     store = Store(Path(':memory:'))
     try:
@@ -311,7 +336,7 @@ class Pipeline:
                 raise
             raise RouteFailure('local_error') from None
 
-    def _fit(self, stage, data, *, allow_guarded_fallback=True, output_budget=False):
+    def _fit(self, stage, data, *, allow_guarded_fallback=True, output_budget=False, fixed_semantics=False):
         """Drop far context first, then excess glossary; never truncate targets."""
         data = dict(data)
         candidates, guarded, cache_only = [], [], []
@@ -328,8 +353,7 @@ class Pipeline:
                 (guarded if self.bailian_quota.potential(entry) else cache_only).append(entry)
             else:
                 candidates.append(entry)
-        # If no model can currently be admitted, retain cache-only profiles so
-        # historical exact stage results can still be looked up and recovered.
+        # Retain cache-only profiles for recovery when network admission is unavailable.
         # A bound free Bailian model can still have an unknown/expired/empty
         # quota when a group is planned. Size to another available provider
         # first, so a later refusal does not strand an otherwise usable route.
@@ -357,9 +381,10 @@ class Pipeline:
                         raise
             if fits:
                 return data
-            if data.get('context'):
-                data['context'] = data['context'][:-1]
-            elif data.get('glossary'):
+            smaller_context = trim_context(data.get('context', [])) if not fixed_semantics else None
+            if smaller_context is not None:
+                data['context'] = smaller_context
+            elif data.get('glossary') and not fixed_semantics:
                 data['glossary'] = data['glossary'][:-1]
             else:
                 if allow_guarded_fallback:
@@ -376,8 +401,11 @@ class Pipeline:
         return _digest({'strategy': 5, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
                         'scope': self.scope, 'profiles': self.snapshot['entries']})
 
-    def stage(self, name, data, *, ids=(), originals=(), prefer=None, saved_only=False):
+    def stage(self, name, data, *, ids=(), originals=(), prefer=None, saved_only=False, fixed_semantics=False):
         self.engine.mt_control.check_start()
+        if name == 'glossary':
+            ids = [item['id'] for item in data['sentences']]
+            originals = [item['text'] for item in data['sentences']]
         group = getattr(self.context, 'group', None)
         if self.group_progress is not None and group is not None:
             self.group_progress.set(group, name)
@@ -389,6 +417,7 @@ class Pipeline:
         # another copy of the transcript or binding reusable stages to cue IDs.
         evidence = ({'source_text_hashes': [_digest(text.strip()) for text in originals]}
                     if name == 'draft' else {})
+        input_fields = {'context'} if name == 'glossary' else set()
         def saved_stage():
             try:
                 stored = self.store.mt_stage_entry(self.job_id, work_key)
@@ -399,7 +428,7 @@ class Pipeline:
             saved = stored['record']
             usage = saved.get('usage') if isinstance(saved, dict) else None
             if (stored['stage'] != name or not isinstance(saved, dict) or
-                    set(saved) != {'value', 'backend', 'request_model', 'actual_model', 'usage', 'stage'} | set(evidence) or
+                    set(saved) != {'value', 'backend', 'request_model', 'actual_model', 'usage', 'stage'} | set(evidence) | input_fields or
                     any(saved[k] != value for k, value in evidence.items()) or
                     saved.get('stage') != name or not isinstance(saved.get('backend'), str) or
                     saved.get('backend') not in self.profiles or
@@ -409,6 +438,8 @@ class Pipeline:
                     safe_model_id(saved['actual_model']) != saved['actual_model'] or
                     not _valid_usage(usage)):
                 raise ToolError('翻译阶段保存记录无效。', 'cache_mismatch')
+            if name == 'glossary' and not valid_context_subset(data.get('context', []), saved['context']):
+                raise ToolError('术语阶段保存的上下文无效。', 'cache_mismatch')
             entry = next((entry for entry in self.router.entries if entry.id == saved['backend']), None)
             if entry is not None:
                 try:
@@ -532,14 +563,14 @@ class Pipeline:
         result = self.router.cached_result(cached, prefer_other_than=prefer, deadline=started + 180.0)
         if result is None:
             try:
-                data = self._fit(name, data)
+                data = self._fit(name, data, fixed_semantics=fixed_semantics)
             except ToolError as error:
                 if saved_only and error.code == 'mt_input_budget':
                     return None
                 raise
             new_key = self._work_key(name, data)
             adapted = new_key != work_key
-            if adapted:
+            if adapted and name != 'glossary':
                 work_key = new_key
                 self.context.group_key = work_key
                 saved = saved_stage()
@@ -564,6 +595,11 @@ class Pipeline:
             self.store.count(self.job_id, 'mt_route_wait_ms', round(result.waited * 1000))
         record = {**result.value, **evidence, 'backend': result.entry.id, 'request_model': result.entry.backend.model,
                   'stage': name}
+        if name == 'glossary':
+            # Bind the accepted advisory result to its original source request,
+            # keeping its actual trimmed context for inspection and validation.
+            # Its cross-task cache still keys the exact fitted wire request.
+            record['context'] = data.get('context', [])
         cache_key = stage_cache_key(name, data, result.entry.backend,
                                     capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.scope)
         with self.engine.mt_control.lock:
@@ -581,15 +617,9 @@ class Pipeline:
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(units)]
         fragments = [{'id': str(n), 'sentence': str(i), 'text': cue['text']}
                      for n, (i, cue) in enumerate((i, cue) for i, unit in enumerate(units) for cue in unit['cues'])]
-        base = {'sentences': sentences, 'draft': {item['id']: '译文' for item in sentences},
-                'fragments': fragments, 'glossary': []}
-        samples = [('glossary', {'sentences': sentences, 'manual_glossary': []}),
-                   ('draft', {'sentences': sentences, 'context': [], 'glossary': []})]
-        if not direct_draft_matches(sentences, fragments):
-            samples.append(('align', base))
-        samples.append(('review', {**base, 'translations': {f['id']: '译文' for f in fragments}}))
-        if output_budget:
-            samples.append(('correct', {**samples[-1][1], 'issues': []}))
+        context = sentence_context(units)
+        samples = [('glossary', {'sentences': sentences, 'manual_glossary': [], 'context': context})]
+        samples.extend(_group_samples(sentences, fragments, context, []))
         try:
             for stage, data in samples:
                 self._fit(stage, data, allow_guarded_fallback=allow_guarded_fallback, output_budget=output_budget)
@@ -599,7 +629,7 @@ class Pipeline:
                 raise
             return False
 
-    def plan_groups(self, sources, cues, *, output_budget=True):
+    def plan_groups(self, sources, cues):
         """Reduce complete-sentence groups first; oversized sentences use reliable cue word boundaries."""
         by_sentence = {}
         for cue in cues:
@@ -612,7 +642,7 @@ class Pipeline:
                 validate_unit_coverage(source, members)
                 def split(start, end):
                     unit = make_unit(source, members, start, end)
-                    if self._fits_group([unit], output_budget=output_budget):
+                    if self._fits_group([unit], output_budget=True):
                         return [unit]
                     if end - start < 2 or not source.get('words'):
                         # Intact targets use input-only admission, including guarded models.
@@ -629,7 +659,7 @@ class Pipeline:
                     result.extend([[unit] for unit in units])
                     continue
                 unit = units[0]
-                if pending and not self._fits_group([*pending, unit], output_budget=output_budget):
+                if pending and not self._fits_group([*pending, unit], output_budget=True):
                     result.append(pending)
                     pending = []
                 pending.append(unit)
@@ -640,21 +670,19 @@ class Pipeline:
     def groups_for_layout(self, sources, cues, manifest):
         if 'mt_group_plan' in manifest:
             return restore_group_plan(manifest['mt_group_plan'], sources, cues, manifest['layout_round'])
-        # Existing current-contract stages were produced with the original
-        # input-only planner. Freeze those boundaries before applying new hints
-        # to fresh work, preserving their request identities on resume.
-        groups = self.plan_groups(sources, cues, output_budget=not self.store.has_mt_stages(self.job_id))
+        groups = self.plan_groups(sources, cues)
         candidate = copy.deepcopy(manifest)
         candidate['mt_group_plan'] = save_group_plan(groups, sources, cues, manifest['layout_round'])
         self.engine.commit_local(self.job_id, manifest, candidate, self.store.save_mt_group_plan)
         return groups
 
-    def glossary(self, group):
+    def glossary(self, group, context):
         manual = self.snapshot['quality']['manual_glossary']
         local = [{**unit['source'], 'text': unit['text']} for unit in group]
-        manual_evidence = validate_glossary([], local, manual)
+        manual_evidence = manual_terms(local, manual)
         data = {'sentences': [_sentence(unit, unit['source']['sentence_id']) for unit in group],
-                'manual_glossary': manual_evidence}
+                'manual_glossary': manual_evidence,
+                'context': context}
         # Advisory failures must remain part of this job's deterministic prefix:
         # otherwise a later retry could silently change an already saved draft's input.
         unavailable_key = _digest({'stage': 'glossary_unavailable', 'request': self._work_key('glossary', data)})
@@ -668,7 +696,9 @@ class Pipeline:
             return []
         try:
             result, _, _ = self.stage('glossary', data)
-            return result['terms']
+            targets = {item['id']: item['text'] for item in data['sentences']}
+            return [{**term, 'origin': 'model', 'evidence': term_evidence(term['source'], targets[term['sentence']])}
+                    for term in result['terms']]
         except Cancelled:
             raise
         except ToolError as error:
@@ -683,26 +713,58 @@ class Pipeline:
                                            counts={'mt_glossary_unavailable': 1})
             return []
 
+    def _semantic_input(self, sentences, fragments, context, glossary):
+        """Freeze evidence before the draft; resume must not reselect it by live capacity."""
+        original = {'sentences': sentences, 'fragments': fragments, 'context': context, 'glossary': glossary}
+        key = self._work_key('semantic_input', original)
+        try:
+            saved = self.store.mt_stage_entry(self.job_id, key)
+            if saved is not None:
+                record = saved['record']
+                if (saved['stage'] != 'semantic_input' or not isinstance(record, dict) or
+                        set(record) != {'stage', 'context', 'glossary'} or record['stage'] != 'semantic_input'):
+                    raise ValueError()
+                if any(not valid_context_subset(original[field], record[field]) for field in ('context', 'glossary')):
+                    raise ValueError()
+                return record['context'], record['glossary']
+        except (KeyError, TypeError, ValueError, RecursionError):
+            raise ToolError('保存的翻译语义输入与来源不一致。', 'cache_mismatch') from None
+        for name, sample in _group_samples(sentences, fragments, context, glossary):
+            fitted = self._fit(name, {**sample, 'context': context, 'glossary': glossary})
+            context, glossary = fitted['context'], fitted['glossary']
+        with self.engine.mt_control.lock:
+            self.engine.mt_control.check_start()
+            self.store.commit_mt_stage(self.job_id, key, 'semantic_input',
+                                       {'stage': 'semantic_input', 'context': context, 'glossary': glossary})
+        return context, glossary
+
     def group(self, group, glossary, context):
         self.engine.mt_control.check_start()
         members = [cue for unit in group for cue in unit['cues']]
         if not members or all(cue['translated'] for cue in members):
             return
         relevant = [term for term in glossary if any(term_appears(term['source'], unit['text']) for unit in group)]
-        relevant.sort(key=lambda term: term['origin'] != 'manual')
+        local_ids = {unit['source']['sentence_id'] for unit in group}
+        relevant.sort(key=lambda term: (term['origin'] != 'manual', term['sentence'] not in local_ids))
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(group)]
-        draft_data = {'sentences': sentences, 'context': context, 'glossary': relevant}
-        draft, draft_backend, draft_proof = self.stage('draft', draft_data, ids=[s['id'] for s in sentences],
-                                                       originals=[s['text'] for s in sentences])
         source_index = {cue['cue_id']: str(i) for i, unit in enumerate(group) for cue in unit['cues']}
         fragments = [{'id': str(i), 'sentence': source_index[cue['cue_id']], 'text': cue['text']}
                      for i, cue in enumerate(members)]
+        # Choose one shared subset that fits every stage skeleton. Actual output
+        # may still exceed the budget; later stages must not silently discard
+        # evidence on which the accepted draft was based.
+        context, relevant = self._semantic_input(sentences, fragments, context, relevant)
+        draft_data = {'sentences': sentences, 'context': context, 'glossary': relevant}
+        draft, draft_backend, draft_proof = self.stage('draft', draft_data, ids=[s['id'] for s in sentences],
+                                                       originals=[s['text'] for s in sentences], fixed_semantics=True)
         ids, originals = [f['id'] for f in fragments], [f['text'] for f in fragments]
-        data = {'sentences': sentences, 'draft': draft['translations'], 'fragments': fragments, 'glossary': relevant}
+        data = {'sentences': sentences, 'draft': draft['translations'], 'fragments': fragments,
+                'glossary': relevant, 'context': context}
         if direct_draft_matches(sentences, fragments):
             aligned, origin, production = draft, draft_backend, draft_proof
         else:
-            aligned, origin, production = self.stage('align', data, ids=ids, originals=originals, prefer=draft_backend)
+            aligned, origin, production = self.stage('align', data, ids=ids, originals=originals, prefer=draft_backend,
+                                                      fixed_semantics=True)
         current = aligned['translations']
         warning = False
         stalled = False
@@ -717,7 +779,8 @@ class Pipeline:
                 break
             review_data = {**data, 'translations': current}
             try:
-                review, reviewer, review_proof = self.stage('review', review_data, ids=ids, prefer=origin)
+                review, reviewer, review_proof = self.stage('review', review_data, ids=ids, prefer=origin,
+                                                           fixed_semantics=True)
                 review_keys.append(review_proof['key'])
                 reviewed.append(current)
             except Cancelled:
@@ -730,14 +793,14 @@ class Pipeline:
                 break
             if not review['issues']:
                 break
-            if round_number >= self.snapshot['quality']['max_revisions']:
+            if round_number == self.snapshot['quality']['max_revisions']:
                 warning = True
                 break
             try:
                 correction_data = {**review_data, 'issues': review['issues']}
                 stalled = correction_stalled(previous_correction, correction_data)
                 correction = self.stage('correct', correction_data, ids=ids, originals=originals,
-                                        prefer=reviewer, saved_only=stalled)
+                                        prefer=reviewer, saved_only=stalled, fixed_semantics=True)
                 if correction is None:
                     warning = True
                     break
@@ -855,7 +918,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
         engine.mt_control.check_start()
         pipeline.context.group = index
         progress.set(index, 'glossary')
-        result = pipeline.glossary(groups[index])
+        result = pipeline.glossary(groups[index], group_context(sources, groups[index], positions))
         progress.set(index, 'waiting')
         return result
 
@@ -863,7 +926,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
         engine.mt_control.check_start()
         pipeline.context.group = index
         group = groups[index]
-        context = source_context(sources, positions[group[0]['source']['sentence_id']])
+        context = group_context(sources, group, positions)
         pipeline.group(group, glossary, context)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:

@@ -5,14 +5,14 @@ from dataclasses import dataclass, replace
 from .common import (ASR_MODEL, DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
                      ToolError)
 from .media import EXTRACT_RECIPE_VERSION
-from .mt_quality import QUALITY_PROMPT_VERSION
+from .mt_quality import GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION
 
 
 def current_execution_snapshot():
     return dict(format_version=1,
                 prompt_version=QUALITY_PROMPT_VERSION,
-                recovery_version=3,
-                context_version=1,
+                recovery_version=4,
+                context_version=2,
                 alignment_version=2)
 
 
@@ -69,6 +69,6 @@ def load_policy(manifest, *, verify_execution=True):
     if verify_execution and (not isinstance(snapshot, dict) or set(snapshot) != set(current) or
             any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in current)):
         raise ToolError('任务执行版本已退役；请用 --reflow 从原始转写重建当前版本任务。', 'cache_version')
-    if verify_execution and manifest.get('mt_glossary_schedule', 'prefix-v1') != 'prefix-v1':
+    if verify_execution and manifest.get('mt_glossary_schedule') != GLOSSARY_SCHEDULE:
         raise ToolError('任务术语调度版本不受支持，请用 --reflow 从原始转写重建。', 'cache_version')
     return ExecutionPolicy(**saved_layout, display_timing_version=display_timing)

@@ -19,6 +19,7 @@ VALIDATION_CATEGORIES = {
     'response_structure': '响应外层结构异常', 'json_invalid': 'JSON 无效',
     'json_duplicate_key': 'JSON 重复键', 'id_missing': '编号缺失',
     'id_out_of_range': '编号越界',
+    'glossary_evidence': '术语缺少本次目标原文依据',
     'translation_invalid': '译文无效', 'unfinished': '非正常结束', 'output_truncated': '输出长度耗尽',
 }
 
@@ -71,7 +72,8 @@ def validate_translations(value, fragments):
     return {str(i): translated[str(i)] for i in range(len(fragments))}
 
 
-QUALITY_PROMPT_VERSION = 2
+QUALITY_PROMPT_VERSION = 3
+GLOSSARY_SCHEDULE = 'prefix-v2'
 INPUT_BUDGET = 32 * 1024
 OUTPUT_TOKENS = 4096
 ISSUE_CATEGORIES = ('omission', 'addition', 'terminology', 'number', 'negation', 'condition', 'repetition', 'meaning')
@@ -79,15 +81,15 @@ PROMPTS = {
     'glossary': ('从课程原文提取有原句依据的技术术语、缩写和定义，给出简体中文译法。'
                  '仅提取输入句中实际出现的术语；sentence 填其原句 id。人工术语优先；不要根据歧义机械统一。'
                  '没有可确定术语时返回空 terms 数组。仅返回 JSON。'),
-    'draft': ('逐个完整句译为准确自然的简体中文，以术语表和上下文消歧，忠实保留数字、单位、否定和条件。'
+    'draft': ('逐个目标译为准确自然的简体中文，以术语表和上下文消歧，忠实保留数字、单位、否定和条件。'
               '术语有语境歧义时不要机械替换。只翻译 sentences，不翻译上下文。'
               '返回 translations 对象，键与输入句的 id 一一对应，译文非空。仅返回 JSON。'),
-    'align': ('依据已完成的整句译文，把译文对齐到各字幕片段；保持完整含义，允许跨片连读，'
+    'align': ('依据已完成的整句译文，把简体中文译文对齐到各字幕片段；保持完整含义，允许跨片连读，'
               '不增删或跨片重复内容。返回 translations 对象，键与 fragments 的 id 一一对应，译文非空。仅返回 JSON。'),
-    'review': ('复核原句、完整译文和字幕片段：漏译、增译、术语、数字单位、否定条件和跨片重复。'
-               '只报告具体可定位的疑点，不要猜测；每个疑点含片段 id、类别及具体依据。'
-               '没有疑点返回空 issues 数组。仅返回 JSON。'),
-    'correct': ('根据给出的具体疑点修正整个字幕组，保持原文的完整含义和片段顺序。'
+    'review': ('复核最终 translations 的漏增译、术语、数字单位、否定条件和跨片重复。'
+               '结合原句及上下文；正常分片、同义表达、与 draft 措辞不同不算错误。'
+               '疑点含片段 id、类别及一句具体差异，去重；无疑点返回空 issues 数组。'),
+    'correct': ('根据给出的具体疑点修正整个简体中文字幕组，保持原文的完整含义和片段顺序。'
                 '返回 translations 对象，键与 fragments 的 id 一一对应，译文非空。仅返回 JSON。'),
 }
 
@@ -144,8 +146,8 @@ def correction_stalled(previous, current):
     """Detect repeated evidence with unchanged translations across affected sentences."""
     if previous is None or not current['issues']:
         return False
-    for key in ('sentences', 'draft', 'fragments', 'glossary'):
-        if previous[key] != current[key]:
+    for key in ('sentences', 'draft', 'fragments', 'glossary', 'context'):
+        if previous.get(key) != current.get(key):
             return False
     def issues(data):
         return {(item['id'], item['category'], item['evidence']) for item in data['issues']}
@@ -190,16 +192,36 @@ def make_stage_payload(stage, data, backend, *, capabilities):
         raise ToolError('翻译模型能力档案无效。', 'mt_config')
     prompt = PROMPTS[stage]
     prompt += '直接返回所需 JSON，不附解释、Markdown 或思考过程。'
-    if stage == 'review':
-        prompt += ('审核对象是 translations 中按 fragments 编号排列的最终字幕，结合完整原句和跨片连读判断。'
-                   '不要把正常分片、同义表达或与 draft 措辞不同本身当作错误。'
-                   '合并重复疑点，每条 evidence 用一句简短文字指出原文与译文的具体差异。')
+    if data.get('context'):
+        prompt += ('context 只供消歧，不翻译或提取术语；same_sentence 的 sentence 指目标编号，'
+                   '文字属于同句其他范围。')
+    if data.get('glossary'):
+        prompt += ('术语表中 manual 为人工指定译法；model 条目附原文 evidence，仅供对应语境参考，'
+                   '同词可有多个译法，按当前语境选择，不因较早出现而强制统一。')
     if capabilities['response_format'] != 'json_schema':
         prompt += '输出必须符合此 JSON Schema：' + json.dumps(
             _schema(stage, data), ensure_ascii=False, separators=(',', ':'))
+    # Retention priority is internal; model input always states the original order.
+    wire_data = dict(data)
+    if data.get('context'):
+        context = data['context']
+        if all(isinstance(item, dict) and 'source_position' in item for item in context):
+            context = sorted(context, key=lambda item: (item['source_position'], item.get('char_start', 0)))
+        targets = {item.get('source_id'): item['id'] for item in data.get('sentences', []) if item.get('source_id')}
+        wire_context = []
+        for item in context:
+            if not isinstance(item, dict):
+                wire_context.append(item)
+                continue
+            item = {key: value for key, value in item.items() if key not in {'required', 'source_position'}}
+            if item.get('kind') == 'same_sentence' and item.get('sentence_id') in targets:
+                item['sentence'] = targets[item.pop('sentence_id')]
+                item.pop('position', None)  # Character ranges already describe the side of this target.
+            wire_context.append(item)
+        wire_data['context'] = wire_context
     payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
                'messages': [{'role': 'system', 'content': prompt},
-                            {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}]}
+                             {'role': 'user', 'content': json.dumps(wire_data, ensure_ascii=False)}]}
     if capabilities['response_format'] == 'json_object':
         payload['response_format'] = {'type': 'json_object'}
     elif capabilities['response_format'] == 'json_schema':
@@ -274,6 +296,10 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
             raise ValueError()
         if len(value[key]) > 200:
             raise ValueError()
+        if stage == 'glossary':
+            if len(ids) != len(originals) or len(set(ids)) != len(ids):
+                raise ValueError()
+            targets = dict(zip(ids, originals))
         for item in value[key]:
             expected = {'source', 'translation', 'sentence'} if stage == 'glossary' else {'id', 'category', 'evidence'}
             if (not isinstance(item, dict) or set(item) != expected or
@@ -283,6 +309,9 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
                 raise ValueError()
             if stage == 'review' and (item['id'] not in ids or item['category'] not in ISSUE_CATEGORIES):
                 raise ValueError()
+            if stage == 'glossary' and (item['sentence'] not in targets or
+                    not term_appears(item['source'], targets[item['sentence']])):
+                raise BatchValidationError('glossary_evidence')
         if stage == 'glossary':
             cc = OpenCC('t2s')
             return {'terms': [{**item, 'translation': cc.convert(item['translation'])} for item in value['terms']]}
@@ -291,33 +320,34 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
         raise BatchValidationError('response_structure') from None
 
 
-def term_appears(term, text):
-    if not term.isascii():
-        return term.casefold() in text.casefold()
+def _ascii_term_pattern(term):
     pattern = re.escape(term)
     if term[0].isalnum() or term[0] == '_':
         pattern = r'(?<![A-Za-z0-9_])' + pattern
     if term[-1].isalnum() or term[-1] == '_':
         pattern += r'(?![A-Za-z0-9_])'
-    return re.search(pattern, text, flags=re.IGNORECASE | re.ASCII) is not None
+    return pattern
 
 
-def validate_glossary(extracted, sources, manual):
-    """Keep only evidenced terms, with per-sentence evidence and manual priority."""
-    by_id = {source['sentence_id']: source['text'] for source in sources if source['decision'] == 'translate'}
-    result, seen = [], set()
-    def add(source, translation, sentence, origin):
-        if (not isinstance(source, str) or not isinstance(translation, str) or not source.strip() or
-                not translation.strip() or sentence not in by_id or not term_appears(source, by_id[sentence])):
-            return
-        identity = (sentence, source.casefold())
-        if identity not in seen:
-            result.append({'source': source, 'translation': translation, 'sentence': sentence, 'origin': origin})
-            seen.add(identity)
-    for source, translation in manual.items():
-        for sentence in by_id:
-            add(source, translation, sentence, 'manual')
-    for item in extracted:
-        if isinstance(item, dict):
-            add(item.get('source'), item.get('translation'), item.get('sentence'), 'model')
-    return result
+def term_appears(term, text):
+    if not term.isascii():
+        return term.casefold() in text.casefold()
+    return re.search(_ascii_term_pattern(term), text, flags=re.IGNORECASE | re.ASCII) is not None
+
+
+def term_evidence(term, text):
+    pattern = _ascii_term_pattern(term) if term.isascii() else re.escape(term)
+    match = re.search(pattern, text, flags=re.IGNORECASE | (re.ASCII if term.isascii() else 0))
+    # Some Unicode case folds change length. Keeping the original source in that
+    # rare case avoids inventing character offsets for the evidence window.
+    return text[max(0, match.start() - 80):match.end() + 80] if match is not None else text
+
+
+def manual_terms(sources, glossary):
+    """Locate configured manual terms in translated targets, in configuration order."""
+    unique = {}
+    for term, translation in glossary.items():
+        unique.setdefault(term.casefold(), (term, translation))
+    return [{'source': term, 'translation': translation, 'sentence': source['sentence_id'], 'origin': 'manual'}
+            for term, translation in unique.values() for source in sources
+            if source['decision'] == 'translate' and term_appears(term, source['text'])]

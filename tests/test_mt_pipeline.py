@@ -49,7 +49,7 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.assertEqual(code, 130)
         self.assertEqual(self.store.job(self.job_id)['state'], 'cancelled')
         self.assertEqual([stage for stage, _, _ in self.calls], ['glossary', 'draft'])
-        self.assertEqual({row['stage'] for row in self.store.mt_stages(self.job_id)}, {'glossary', 'draft'})
+        self.assertEqual({row['stage'] for row in self.store.mt_stages(self.job_id)}, {'glossary', 'semantic_input', 'draft'})
 
     def test_review_cache_prefers_other_backend_even_when_paid_network_is_denied(self):
         from subtitle_tool.mt_pipeline import Pipeline
@@ -130,7 +130,8 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.assertEqual(names.count('align'), 0)
         self.assertEqual(names.count('review'), 1)
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
-        self.assertTrue(all(item['record'].get('backend') for item in self.store.mt_stages(self.job_id)))
+        self.assertTrue(all(item['record'].get('backend') for item in self.store.mt_stages(self.job_id)
+                            if item['stage'] != 'semantic_input'))
         for cue in self.store.cues(self.job_id):
             final = self.store.mt_stage_entry(self.job_id, cue['mt_stage_key'])['record']
             production = self.store.mt_stage_entry(self.job_id, final['production_stage_key'])
@@ -262,8 +263,10 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.assertEqual(len(drafts), 3)
         for data in drafts:
             index = group_index(data)
-            actual = {term['source']: term['translation'] for term in data['glossary']}
-            self.assertEqual(actual, {'Cache': '缓存0', **{f'Marker{i}': f'标记{i}' for i in range(0, index + 1, 8)}})
+            actual = {(term['source'], term['translation']) for term in data['glossary']}
+            self.assertEqual(actual, {pair for i in range(0, index + 1, 8)
+                                      for pair in [('Cache', f'缓存{i}'), (f'Marker{i}', f'标记{i}')]})
+            self.assertEqual(data['glossary'][0]['translation'], f'缓存{index}')
 
     def test_cancelling_at_prefix_dispatch_keeps_inflight_glossary(self):
         from subtitle_tool.mt_pipeline import GlossaryPrefix
@@ -807,7 +810,8 @@ class PoolPipelineTests(PoolPipelineFixture):
                 _QUOTAS.clear()
                 self.config.settings.mt_backends = [
                     {'id': 'qiniu_free', 'capabilities': {'input_bytes': 32768}},
-                    {'id': 'openrouter_free', 'capabilities': {'input_bytes': 3000}}]
+                    # The one-second minimum fragment also carries required same-sentence evidence.
+                    {'id': 'openrouter_free', 'capabilities': {'input_bytes': 3500}}]
                 self.config.settings.mt_workers = 1
                 prefix = 'e' if reason == 'expired' else 'c'
                 raw = timed_raw([f'{prefix}cache{i:03}' for i in range(400)], word_ms=20)

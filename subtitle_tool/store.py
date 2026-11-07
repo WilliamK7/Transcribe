@@ -12,6 +12,7 @@ from .config import Settings
 from .review import ReviewDecision, decision_origin
 from .policy import current_execution_snapshot
 from .mt_pool import saved_route
+from .mt_quality import GLOSSARY_SCHEDULE
 
 TERMINAL = {"completed", "skipped", "cancelled", "archived"}
 STATES = {
@@ -109,7 +110,7 @@ class Store:
             manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
                             display_timing_version=DISPLAY_TIMING_VERSION,
                             execution_snapshot=current_execution_snapshot(),
-                            mt_glossary_schedule='prefix-v1',
+                            mt_glossary_schedule=GLOSSARY_SCHEDULE,
                             subtitle_settings={k: getattr(settings, k) for k in
                                                ["zh_line_width", "other_line_width", "chinese_first"]})
             self.db.execute("INSERT INTO jobs(id,source,output,output_key,state,manifest,created,updated) "
@@ -269,10 +270,6 @@ class Store:
         with self.lock, self.db:
             self.db.execute('UPDATE jobs SET manifest=? WHERE id=?', (json.dumps(manifest, ensure_ascii=False), job_id))
 
-    def has_mt_stages(self, job_id):
-        with self.lock:
-            return self.db.execute('SELECT 1 FROM mt_stages WHERE job_id=? LIMIT 1', (job_id,)).fetchone() is not None
-
     def sources(self, job_id):
         with self.lock:
             rows = [json.loads(r[0]) for r in self.db.execute("SELECT record FROM subtitle_sources WHERE job_id=?", (job_id,))]
@@ -337,7 +334,7 @@ class Store:
                         cache_key=None, cache_value=None):
         """Persist a complete private stage and, when present, all cue updates in one transaction."""
         if (not isinstance(key, str) or len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or
-                stage not in {'glossary', 'glossary_unavailable', 'draft', 'align', 'review', 'correct', 'final'} or not isinstance(record, dict) or
+                stage not in {'glossary', 'glossary_unavailable', 'semantic_input', 'draft', 'align', 'review', 'correct', 'final'} or not isinstance(record, dict) or
                 (cache_key is None) != (cache_value is None) or
                 translations is not None and (not translations or
                     any(not isinstance(text, str) or not text.strip() for text in translations.values()))):

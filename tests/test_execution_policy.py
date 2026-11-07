@@ -22,6 +22,7 @@ class ExecutionPolicyTests(SavedResultFixture):
         invalid += [(('execution_snapshot', field), float(value))
                     for field, value in current_execution_snapshot().items()]
         invalid.append((('mt_glossary_schedule',), 'unsupported'))
+        invalid.append((('mt_glossary_schedule',), None))
         for path, value in invalid:
             with self.subTest(path=path, value=value):
                 manifest = copy.deepcopy(original)

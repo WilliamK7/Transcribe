@@ -17,7 +17,8 @@ _CUE_INPUTS = ('cue_id', 'sentence_id', 'text', 'begin_ms', 'end_ms', 'char_star
 def make_unit(source, members, start, end):
     first = 0 if start == 0 else members[start - 1]['char_end']
     last = len(source['text']) if end == len(members) else members[end - 1]['char_end']
-    return {'source': source, 'text': source['text'][first:last], 'cues': members[start:end]}
+    return {'source': source, 'text': source['text'][first:last], 'cues': members[start:end],
+            'char_start': first, 'char_end': last}
 
 
 def _fingerprint(sources, cues, groups, layout_round):

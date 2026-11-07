@@ -104,24 +104,24 @@ class OutputPlanningTests(PoolPipelineFixture):
                 self.assertGreater(len(groups), 1)
                 self.config.set_qiniu_key('synthetic-qiniu')
 
-    def test_existing_current_contract_stages_without_plan_keep_original_group_targets(self):
+    def test_new_layout_uses_output_budget_with_previous_stage_records(self):
         from subtitle_tool.mt_pipeline import Pipeline
         self.install_many()
-        original_plan = Pipeline.plan_groups
-        def input_only(pipeline, sources, cues, **kwargs):
-            return original_plan(pipeline, sources, cues, output_budget=False)
         self.cancel_after = 'draft'
-        with mock.patch.object(Pipeline, 'plan_groups', new=input_only):
-            self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
+        self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
+        stages = self.store.mt_stages(self.job_id)
+        self.assertTrue(stages)
         manifest = self.store.job(self.job_id)['manifest']
-        self.assertEqual(len(manifest.pop('mt_group_plan')['groups']), 1)
-        self.store.update(self.job_id, manifest=manifest)
-        self.calls.clear()
-        self.cancel_after = None
-        Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertEqual([stage for stage, _, _ in self.calls], ['review'])
-        self.assertEqual(len(self.store.job(self.job_id)['manifest']['mt_group_plan']['groups']), 1)
+        manifest['layout_round'] += 1
+        cues, sources = self.store.cues(self.job_id), self.store.sources(self.job_id)
+        self.store.save_layout(self.job_id, cues, manifest)
+        engine = Engine(self.config, self.store)
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        groups = Pipeline(engine, self.job_id, manifest, scope).groups_for_layout(sources, cues, manifest)
+        self.assertGreater(len(groups), 1)
+        self.assertEqual(self.store.mt_stages(self.job_id), stages)
+        self.assertEqual([cue['cue_id'] for group in groups for unit in group for cue in unit['cues']],
+                         [cue['cue_id'] for cue in cues])
 
     def test_interrupt_before_or_after_group_plan_commit_preserves_confirmed_state(self):
         for after_commit in (False, True):
@@ -136,7 +136,7 @@ class OutputPlanningTests(PoolPipelineFixture):
                 self.assertEqual(self.run_pool(), 'failed')
             self.assertEqual('mt_group_plan' in self.store.job(self.job_id)['manifest'], after_commit)
             self.assertEqual(self.calls, [])
-            self.assertFalse(self.store.has_mt_stages(self.job_id))
+            self.assertEqual(self.store.mt_stages(self.job_id), [])
         Engine(self.config, self.store).resume(self.job_id)
         self.assertEqual(self.run_pool(), 'completed')
 
@@ -235,7 +235,7 @@ class OutputPlanningTests(PoolPipelineFixture):
         with mock.patch.object(self.store, '_replace_records', side_effect=OSError()), self.assertRaises(OSError):
             self.store.apply_review(self.job_id, cue['cue_id'], ReviewDecision('original'))
         self.assertEqual(self.store.job(self.job_id)['manifest'], before)
-        self.assertTrue(self.store.has_mt_stages(self.job_id))
+        self.assertTrue(self.store.mt_stages(self.job_id))
         self.store.apply_review(self.job_id, cue['cue_id'], ReviewDecision('original'))
         self.assertNotIn('mt_group_plan', self.store.job(self.job_id)['manifest'])
-        self.assertFalse(self.store.has_mt_stages(self.job_id))
+        self.assertEqual(self.store.mt_stages(self.job_id), [])
