@@ -11,7 +11,7 @@ from unittest import mock
 
 from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config
-from subtitle_tool.mt_backend import MTBackend, key_fingerprint, qiniu_free_active, saved_mt
+from subtitle_tool.mt_backend import MTBackend, key_fingerprint, qiniu_free_active
 from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_transport import HTTPReply, ProcessTransport
 from tests.fixtures import configured_backend, TemporaryTest
@@ -46,8 +46,6 @@ class QiniuContractTests(TemporaryTest):
         with mock.patch.dict(os.environ, {'QINIU_API_KEY': '', 'OPENAI_API_KEY': '', 'DASHSCOPE_API_KEY': ''}):
             backend = configured_backend(config, manifest)
             self.assertEqual(backend.credential(config), 'qiniu-synthetic')
-            self.assertEqual(saved_mt({**manifest, 'mt_snapshot': backend.snapshot(),
-                                       'translation_strategy_version': 5}), backend)
             config.set_qiniu_key('changed-qiniu-synthetic')
             with self.assertRaises(ToolError) as error:
                 backend.credential(config)

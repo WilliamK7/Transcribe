@@ -83,6 +83,28 @@ class PoolPipelineTests(SavedResultFixture):
         manifest = self.store.job(self.job_id)['manifest']
         self.assertEqual(manifest['translation_strategy_version'], 5)
 
+    def test_unused_primary_copy_cannot_change_saved_stages_or_cache_keys(self):
+        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+        self.install()
+        self.fail_stage = 'align'
+        self.assertEqual(self.run_pool(), 'failed')
+        stages = self.store.mt_stages(self.job_id)
+        self.assertEqual({row['stage'] for row in stages}, {'glossary', 'draft'})
+        cache = list(self.store.db.execute('SELECT key,text FROM mt_cache ORDER BY key'))
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['mt_snapshot'] = {'provider': 'obsolete', 'model': 'unused'}
+        self.store.update(self.job_id, manifest=manifest)
+        self.fail_stage = None
+        self.calls.clear()
+        Engine(self.config, self.store).resume(self.job_id)
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertEqual([stage for stage, _, _ in self.calls], ['align', 'review'])
+        for row in stages:
+            self.assertEqual(self.store.mt_stage_entry(self.job_id, row['key']),
+                             {'stage': row['stage'], 'record': row['record']})
+        for key, value in cache:
+            self.assertEqual(self.store.cache_get(key), value)
+
     def test_unchanged_stage_reads_each_cache_miss_once(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.install()
@@ -162,6 +184,31 @@ class PoolPipelineTests(SavedResultFixture):
         self.assertEqual(origin, 'qiniu_free')
         self.assertEqual(self.store.counts(self.job_id), {'mt_v5_draft_cache_hit': 1})
         self.assertTrue(data['context'])
+
+    def test_input_trimming_preserves_caller_data_on_success_and_failure(self):
+        import copy
+        from subtitle_tool.mt_pipeline import Pipeline
+        self.config.settings.mt_backends = [{'id': 'qiniu_free', 'capabilities': {'input_bytes': 3000}}]
+        self.install()
+        manifest = self.store.job(self.job_id)['manifest']
+        engine = Engine(self.config, self.store)
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
+        for text, succeeds in [('Cache.', True), ('Target text. ' * 1000, False)]:
+            data = {'sentences': [{'id': '0', 'text': text}],
+                    'context': [{'text': 'Background. ' * 1000}],
+                    'glossary': [{'source': 'Cache', 'translation': 'synthetic term ' * 1000}]}
+            original = copy.deepcopy(data)
+            with self.subTest(succeeds=succeeds), \
+                    mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=True):
+                if succeeds:
+                    fitted = pipeline._fit('draft', data)
+                    self.assertEqual(fitted, {'sentences': data['sentences'], 'context': [], 'glossary': []})
+                else:
+                    with self.assertRaises(ToolError) as error:
+                        pipeline._fit('draft', data)
+                    self.assertEqual(error.exception.code, 'mt_input_budget')
+                self.assertEqual(data, original)
 
     def test_stages_complete_and_record_private_provenance(self):
         self.install()

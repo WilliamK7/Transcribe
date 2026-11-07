@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from .api import retry_after_seconds
 from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
-from .mt_backend import saved_mt
+from .mt_backend import MTBackend
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
 from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION, make_stage_payload, parse_stage_response, plan_sentence_groups,
@@ -124,9 +124,8 @@ def check_pool(config, identity, route, cancel):
     from .mt_control import MTControl
     from .store import Store
     from .policy import current_execution_snapshot
-    primary = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
     from dataclasses import asdict
-    manifest = {**identity, 'mt_snapshot': primary, 'mt_route_snapshot': route,
+    manifest = {**identity, 'mt_route_snapshot': route,
                 'processing_version': 2, 'subtitle_version': 2, 'display_timing_version': 2,
                 'subtitle_settings': {k: asdict(config.settings)[k] for k in
                                       ['zh_line_width', 'other_line_width', 'chinese_first']},
@@ -170,7 +169,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                     not isinstance(key, str) or re.fullmatch(r'[0-9a-f]{64}', key) is None):
                 raise ValueError()
             if verify_credentials and origin not in checked:
-                saved_mt({**manifest, 'mt_snapshot': profiles[origin]['backend']}).credential(engine.config)
+                MTBackend.from_snapshot(profiles[origin]['backend']).credential(engine.config)
                 checked.add(origin)
             if key not in finals:
                 saved = engine.store.mt_stage_entry(job_id, key)
@@ -250,7 +249,7 @@ class Pipeline:
         for profile in self.snapshot['entries']:
             if profile['backend'] is None:
                 continue
-            backend = saved_mt({**manifest, 'mt_snapshot': profile['backend'], 'translation_strategy_version': 5})
+            backend = MTBackend.from_snapshot(profile['backend'])
             entries.append(RouteEntry(profile['id'], backend, profile['tier'], profile['weight'], profile['rpm']))
         routing = self.snapshot['routing']
         self.router = MTRouter(entries, paid_enabled=routing['paid_enabled'], control=engine.mt_control,
@@ -309,7 +308,7 @@ class Pipeline:
 
     def _fit(self, stage, data, *, allow_guarded_fallback=True):
         """Drop far context first, then excess glossary; never truncate targets."""
-        data = copy.deepcopy(data)
+        data = dict(data)
         candidates, guarded, cache_only = [], [], []
         for entry in self.router.entries:
             if entry.tier == 'paid' and not self.router.paid_enabled:
@@ -344,9 +343,9 @@ class Pipeline:
             if fits:
                 return data
             if data.get('context'):
-                data['context'].pop()
+                data['context'] = data['context'][:-1]
             elif data.get('glossary'):
-                data['glossary'].pop()
+                data['glossary'] = data['glossary'][:-1]
             else:
                 if allow_guarded_fallback:
                     for entry in fallback:
@@ -369,7 +368,6 @@ class Pipeline:
         if self.group_progress is not None and group is not None:
             self.group_progress.set(group, name)
         started = time.monotonic()
-        data = copy.deepcopy(data)
         work_key = self._work_key(name, data)
         self.context.stage, self.context.group_key = name, work_key
         def saved_stage():

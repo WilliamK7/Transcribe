@@ -195,17 +195,19 @@ def summary(store, job_id):
             "translation_strategy_version": manifest.get("translation_strategy_version", 0),
             "layout_round": manifest.get("layout_round", 0), "warnings": manifest.get("warnings", []),
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
-    mt = manifest.get("mt_snapshot", {})
-    item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", manifest.get("contract", {}).get("mt"))}
-    item["mt_provider"] = mt.get("provider", "bailian")
     if 'mt_route_snapshot' in manifest and not manifest.get('archived'):
         from .mt_pool import saved_route
         route = saved_route(manifest)
+        mt = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
         item['mt_route'] = {'paid_enabled': route['routing']['paid_enabled'],
                             'entries': [{'id': entry['id'], 'tier': entry['tier'],
                                          'available': entry['backend'] is not None,
                                          'model': entry['backend']['model'] if entry['backend'] else None}
                                         for entry in route['entries']]}
+    else:
+        mt = manifest.get("mt_snapshot", {})
+    item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", manifest.get("contract", {}).get("mt"))}
+    item["mt_provider"] = mt.get("provider", "bailian")
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
     counts = item["counts"]
     item["timings"] = {"run_seconds": counts.get("run_ms", 0) / 1000,
@@ -464,10 +466,9 @@ def main(argv=None):
             identity = {'region': 'beijing', 'workspace_id': workspace, 'access_mode': 'workspace', 'account': account}
             from .mt_pool import configured_route
             route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
-            snapshot = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
             for source in args.files:
                 job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
-                                       workspace_id=workspace, account=account, settings=config.settings, mt_snapshot=snapshot,
+                                       workspace_id=workspace, account=account, settings=config.settings,
                                        mt_route_snapshot=route)
                 engine.select_input(job_id, args.track, args.channel)
                 if job_id not in ids:

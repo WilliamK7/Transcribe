@@ -57,9 +57,7 @@ class MTPoolConfigTests(unittest.TestCase):
                          'account': key_fingerprint(self.config.keys['bailian'])}
 
     def manifest_with(self, route):
-        primary = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
-        return {**self.manifest, 'translation_strategy_version': 5, 'mt_snapshot': copy.deepcopy(primary),
-                'mt_route_snapshot': copy.deepcopy(route)}
+        return {**self.manifest, 'translation_strategy_version': 5, 'mt_route_snapshot': copy.deepcopy(route)}
 
     def test_select_official_free_models_preserves_existing_pool_and_paid_fallback(self):
         self.config.settings.mt_backends = [{'id': 'qiniu_free', 'weight': 5}, {'id': 'bailian_paid'}]
@@ -243,7 +241,6 @@ class MTPoolConfigTests(unittest.TestCase):
         mutations.append(changed)
         changed = copy.deepcopy(original)
         changed['mt_route_snapshot']['entries'][0]['backend']['base_url'] = 'https://untrusted.example/v1'
-        changed['mt_snapshot'] = copy.deepcopy(changed['mt_route_snapshot']['entries'][0]['backend'])
         mutations.append(changed)
         for changed in mutations:
             with self.subTest(index=mutations.index(changed)), self.assertRaises(ToolError):
@@ -295,6 +292,27 @@ class MTPoolConfigTests(unittest.TestCase):
             changed = copy.deepcopy(baseline)
             changed['mt_route_snapshot'][section][field] = value
             with self.subTest(section=section, field=field, value=value), self.assertRaises(ToolError):
+                saved_route(changed)
+
+    def test_malformed_backend_fields_are_rejected(self):
+        baseline = self.manifest_with(configured_route(self.config, self.manifest))
+        cases = [('format_version', True), ('format_version', 2), ('request_version', 4),
+                 ('request_version', 5.0), ('provider', []), ('provider', 'unknown'),
+                 ('model', ''), ('model', 'a b'), ('model', 'a\u202eb'), ('model', 'x' * 501),
+                 ('key_fingerprint', None), ('key_fingerprint', 'f' * 63),
+                 ('base_url', None), ('base_url', 'https://API.QNAIGC.COM/v1'),
+                 ('base_url', 'https://untrusted.example/v1'), ('extra', 'unsupported')]
+        for field, value in cases:
+            changed = copy.deepcopy(baseline)
+            backend = changed['mt_route_snapshot']['entries'][0]['backend']
+            backend[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ToolError) as error:
+                saved_route(changed)
+            self.assertEqual(error.exception.code, 'mt_config')
+        for field in baseline['mt_route_snapshot']['entries'][0]['backend']:
+            changed = copy.deepcopy(baseline)
+            del changed['mt_route_snapshot']['entries'][0]['backend'][field]
+            with self.subTest(missing=field), self.assertRaises(ToolError):
                 saved_route(changed)
 
     def test_glossary_validation_is_equally_strict_for_config_and_snapshot(self):

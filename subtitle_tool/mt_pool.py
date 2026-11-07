@@ -8,7 +8,7 @@ import unicodedata
 from .common import ToolError
 from .mt_backend import (MTBackend, OPENROUTER_BASE_URL, QINIU_BASE_URL, QINIU_FREE_MODEL,
                          STRUCTURED_BAILIAN_MODEL, bailian_mt_url, key_fingerprint,
-                         normalize_mt_url, saved_mt)
+                         normalize_mt_url)
 
 
 # Defaults are a template for new tasks only. A saved route is validated from its
@@ -307,14 +307,15 @@ def saved_route(manifest):
                 not isinstance(saved['provider'], str) or saved['provider'] not in _PROVIDER_REFS or
                 _PROVIDER_REFS[saved['provider']] != ref or not _model(saved['model']) or
                 not isinstance(saved['base_url'], str) or not isinstance(saved['key_fingerprint'], str) or
-                re.fullmatch(r'[0-9a-f]{64}', saved['key_fingerprint']) is None):
+                re.fullmatch(r'[0-9a-f]{64}', saved['key_fingerprint']) is None or
+                saved['provider'] == 'bailian' and saved['key_fingerprint'] != manifest.get('account')):
             raise _invalid()
         try:
             if _base_url(saved['provider'], saved['base_url'], manifest) != saved['base_url']:
                 raise _invalid()
-            backend = saved_mt({**manifest, 'mt_snapshot': saved, 'translation_strategy_version': 5})
         except ToolError:
             raise _invalid() from None
+        backend = MTBackend.from_snapshot(saved)
         backend_identity = (backend.provider, backend.base_url, backend.model, backend.key_fingerprint,
                             backend.request_version)
         if backend_identity in backends or ref in fingerprints and fingerprints[ref] != backend.key_fingerprint:
@@ -322,9 +323,8 @@ def saved_route(manifest):
         backends.add(backend_identity)
         fingerprints[ref] = backend.key_fingerprint
 
-    primary = next((entry['backend'] for entry in snapshot['entries'] if entry['backend'] is not None), None)
-    if (primary is None or manifest.get('mt_snapshot') != primary or not any(
+    if not any(
             entry['backend'] is not None and (entry['tier'] == 'free' or snapshot['routing']['paid_enabled'])
-            for entry in snapshot['entries'])):
+            for entry in snapshot['entries']):
         raise _invalid()
     return snapshot

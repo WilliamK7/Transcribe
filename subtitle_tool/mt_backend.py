@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
-import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -90,6 +89,11 @@ class MTBackend:
     def snapshot(self):
         return {"format_version": 1, **asdict(self)}
 
+    @classmethod
+    def from_snapshot(cls, saved):
+        """Construct an identity from an entry validated by saved_route()."""
+        return cls(**{key: value for key, value in saved.items() if key != 'format_version'})
+
 
     def credential(self, config):
         key = (config.get_qiniu_key() if self.provider == 'qiniu' else
@@ -97,31 +101,3 @@ class MTBackend:
         if key_fingerprint(key) != self.key_fingerprint:
             raise ToolError("此任务的翻译 Key 已变更；请恢复原 MT Key 后 --resume，或用 --reflow 显式切换翻译配置。", "mt_account_changed")
         return key
-
-
-def saved_mt(manifest):
-    """Validate the current pool backend identity."""
-    if 'mt_snapshot' not in manifest:
-        raise ToolError('任务缺少当前翻译快照。', 'cache_version')
-    saved = manifest["mt_snapshot"]
-    required = {"format_version", "provider", "base_url", "model", "key_fingerprint", "request_version"}
-    if (not isinstance(saved, dict) or set(saved) != required or
-            type(saved["format_version"]) is not int or saved["format_version"] != 1 or
-            type(saved["request_version"]) is not int or saved["request_version"] != 5):
-        raise ToolError("任务的翻译请求契约不受支持，请用 --reflow 显式重排。", "cache_version")
-    backend = MTBackend(**{k: v for k, v in saved.items() if k != "format_version"})
-    if (not isinstance(backend.key_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", backend.key_fingerprint) or
-            not isinstance(backend.model, str) or not backend.model.strip() or
-            backend.model != backend.model.strip() or any(ord(c) < 32 for c in backend.model)):
-        raise ToolError("任务的翻译身份快照无效。", "cache_mismatch")
-    if backend.provider == "bailian":
-        if backend.base_url != bailian_mt_url(manifest) or backend.key_fingerprint != manifest.get("account"):
-            raise ToolError("任务的百炼翻译身份与原账户范围不一致。", "cache_mismatch")
-    elif backend.provider in {"openai_compatible", "qiniu"}:
-        if normalize_mt_url(backend.base_url) != backend.base_url:
-            raise ToolError("任务的翻译地址快照无效。", "cache_mismatch")
-    else:
-        raise ToolError("任务的翻译后端不受支持，请用 --reflow 显式重排。", "cache_version")
-    if type(manifest.get('translation_strategy_version')) is not int or manifest['translation_strategy_version'] != 5:
-        raise ToolError('翻译策略已退役，请从归档重建。', 'cache_version')
-    return backend

@@ -35,13 +35,31 @@ class PoolSnapshotTests(TemporaryTest):
         self.assertEqual(route['routing']['stage_deadline_seconds'], 180)
         self.assertTrue(route['routing']['paid_enabled'])
         self.assertNotIn('synthetic-qiniu', str(route))
-        primary = entries[0]['backend']
-        loaded = saved_route({**self.manifest, 'translation_strategy_version': 5, 'mt_snapshot': primary,
-                              'mt_route_snapshot': route})
+        loaded = saved_route({**self.manifest, 'translation_strategy_version': 5, 'mt_route_snapshot': route})
         self.assertEqual(loaded, route)
 
     def test_new_install_defaults_to_the_pool(self):
         self.assertEqual(Config(self.path / 'fresh').settings.mt_provider, 'pool')
+
+    def test_enqueue_and_report_use_the_saved_route(self):
+        from subtitle_tool.main import summary
+        route = configured_route(self.config, self.manifest)
+        media = self.path / 'synthetic.mp4'
+        media.write_bytes(b'not-real-media')
+        store = Store(self.config.data / 'jobs.sqlite')
+        try:
+            options = dict(workspace_id='space', account=self.manifest['account'], mt_route_snapshot=route)
+            job_id = store.enqueue(media, **options)
+            manifest = store.job(job_id)['manifest']
+            self.assertEqual(saved_route(manifest), route)
+            primary = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
+            report = summary(store, job_id)
+            self.assertEqual((report['mt_provider'], report['models']['mt']),
+                             (primary['provider'], primary['model']))
+            self.assertEqual(store.enqueue(media, **options), job_id)
+            self.assertEqual(summary(store, job_id), report)
+        finally:
+            store.close()
 
     def test_missing_key_is_saved_as_unavailable_not_replaced_by_other_account(self):
         (self.config.data / 'qiniu-key.txt').unlink()
@@ -62,10 +80,9 @@ class PoolSnapshotTests(TemporaryTest):
         media = self.path / 'synthetic.mp4'
         media.write_bytes(b'not-real-media')
         store = Store(self.config.data / 'jobs.sqlite')
-        primary = next(e['backend'] for e in route['entries'] if e['backend'])
         try:
             job_id = store.enqueue(media, workspace_id='space', account=self.manifest['account'],
-                                   mt_snapshot=primary, mt_route_snapshot=route)
+                                   mt_route_snapshot=route)
             saved = store.job(job_id)['manifest']
             self.assertEqual(saved['translation_strategy_version'], 5)
             self.assertEqual(saved_route(saved), route)
@@ -74,7 +91,7 @@ class PoolSnapshotTests(TemporaryTest):
             changed = configured_route(self.config, self.manifest)
             with self.assertRaises(ToolError) as error:
                 store.enqueue(media, workspace_id='space', account=self.manifest['account'],
-                              mt_snapshot=primary, mt_route_snapshot=changed)
+                              mt_route_snapshot=changed)
             self.assertEqual(error.exception.code, 'mt_config_changed')
         finally:
             store.close()

@@ -11,7 +11,7 @@ from .common import DISPLAY_TIMING_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION
 from .config import Settings
 from .review import ReviewDecision, decision_origin
 from .policy import current_execution_snapshot
-from .mt_backend import saved_mt
+from .mt_pool import saved_route
 
 TERMINAL = {"completed", "skipped", "cancelled", "archived"}
 STATES = {
@@ -23,6 +23,8 @@ STATES = {
     "needs_review": "需要确认",
     "subtitle_translating": "字幕翻译", "layout_adjusting": "排版调整",
 }
+_CUE_COLUMNS = ("cue_id", "begin_ms", "end_ms", "text", "language", "decision", "reason",
+                "translated", "source_lang")
 
 
 class Store:
@@ -46,7 +48,6 @@ class Store:
                 begin_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, text TEXT NOT NULL,
                 language TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
                 translated TEXT NOT NULL DEFAULT '', source_lang TEXT NOT NULL DEFAULT 'auto',
-                attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
                 metadata TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(job_id, cue_id));
             CREATE TABLE IF NOT EXISTS mt_cache (key TEXT PRIMARY KEY, text TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS mt_stages (
@@ -62,8 +63,7 @@ class Store:
         self.db.commit()
 
     def enqueue(self, source: Path, region: str = "beijing", overwrite=False, output_dir: Path | None = None,
-                *, workspace_id="", account="", settings=None, mt_snapshot=None,
-                mt_route_snapshot=None):
+                *, workspace_id="", account="", settings=None, mt_route_snapshot=None):
         if region != "beijing":
             raise ToolError("新任务只支持北京工作空间。", "config")
         workspace_id = validate_workspace_id(workspace_id)
@@ -85,10 +85,10 @@ class Store:
                     previous = json.loads(row["manifest"])
                     if (previous.get("access_mode"), previous.get("workspace_id"), previous.get("account", "")) != ("workspace", workspace_id, account):
                         raise ToolError("该文件已有其他账号或接入方式的任务，请用 --resume 原任务 ID；不能自动迁移工作空间。", "cache_mismatch")
-                    if mt_snapshot is not None and saved_mt(previous).snapshot() != mt_snapshot:
-                        raise ToolError("该文件已有不同翻译配置的未完成任务；请用 --resume 沿原后端恢复，或用 --reflow 显式切换。", "mt_config_changed")
                     if previous.get('mt_route_snapshot') != mt_route_snapshot:
                         raise ToolError('该文件已有不同翻译池配置的未完成任务；请用 --resume 或 --reflow。', 'mt_config_changed')
+                    if mt_route_snapshot is not None:
+                        saved_route(previous)
                     if reusable is None:
                         reusable = row
             if reusable is not None:
@@ -102,14 +102,8 @@ class Store:
             manifest = {"region": region, "workspace_id": workspace_id, "access_mode": "workspace",
                         "processing_version": PROCESSING_VERSION, "account": account,
                         "overwrite": bool(overwrite), "segments": [], "warnings": []}
-            if mt_snapshot is not None:
-                manifest["mt_snapshot"] = mt_snapshot
             if mt_route_snapshot is not None:
                 manifest['mt_route_snapshot'] = mt_route_snapshot
-            if mt_snapshot is not None:
-                saved_mt({**manifest, "translation_strategy_version": 5})
-            if mt_route_snapshot is not None:
-                from .mt_pool import saved_route
                 saved_route({**manifest, 'translation_strategy_version': 5})
             settings = settings or Settings()
             manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
@@ -203,12 +197,11 @@ class Store:
             self._replace_records(job_id, cues)
 
     def _replace_records(self, job_id, records):
-        columns = ["cue_id", "begin_ms", "end_ms", "text", "language", "decision", "reason",
-                   "translated", "source_lang", "attempts", "error"]
-        defaults = {"translated": "", "source_lang": "auto", "attempts": 0, "error": ""}
+        columns = _CUE_COLUMNS
+        defaults = {"translated": "", "source_lang": "auto"}
         rows = []
         for record in records:
-            metadata = {k: v for k, v in record.items() if k not in columns + ["job_id", "metadata"]}
+            metadata = {k: v for k, v in record.items() if k not in (*columns, "job_id", "metadata")}
             if not record.get('translated'):
                 metadata.pop('mt_origin', None)
                 metadata.pop('mt_stage_key', None)
@@ -279,7 +272,8 @@ class Store:
     def cues(self, job_id):
         with self.lock:
             result = []
-            for row in self.db.execute("SELECT * FROM cues WHERE job_id=? ORDER BY begin_ms,end_ms,cue_id", (job_id,)):
+            for row in self.db.execute("SELECT job_id," + ",".join(_CUE_COLUMNS) +
+                                       ",metadata FROM cues WHERE job_id=? ORDER BY begin_ms,end_ms,cue_id", (job_id,)):
                 values = dict(row)
                 metadata = json.loads(values.pop("metadata"))
                 record = {**metadata, **values}
@@ -306,7 +300,7 @@ class Store:
             for item in cues:
                 if item.get("sentence_id") == source["sentence_id"]:
                     item.update(decision.values())
-                item.update(translated="", error="")
+                item.update(translated="")
             self.db.execute('DELETE FROM mt_stages WHERE job_id=?', (job_id,))
             manifest = job["manifest"]
             for name in ["layout_planned", "layout_complete", "layout_round",
@@ -316,11 +310,6 @@ class Store:
             self._replace_records(job_id, cues)
             self.db.execute("UPDATE jobs SET manifest=?,updated=? WHERE id=?",
                             (json.dumps(manifest, ensure_ascii=False), time.time(), job_id))
-
-    def translation_error(self, job_id, cue_ids, error):
-        with self.lock, self.db:
-            self.db.executemany('UPDATE cues SET error=? WHERE job_id=? AND cue_id=?',
-                                [(error, job_id, cue_id) for cue_id in cue_ids])
 
     def mt_stages(self, job_id):
         with self.lock:
@@ -354,7 +343,7 @@ class Store:
                 # JSON merge-patch replaces the stage link and removes a stale origin when null.
                 metadata = json.dumps({'mt_origin': origin, 'mt_stage_key': key}, ensure_ascii=False)
                 for cue_id, text in translations.items():
-                    changed = self.db.execute("UPDATE cues SET translated=?,error='',metadata=json_patch(metadata,?) "
+                    changed = self.db.execute("UPDATE cues SET translated=?,metadata=json_patch(metadata,?) "
                                               "WHERE job_id=? AND cue_id=?", (text, metadata, job_id, cue_id))
                     if changed.rowcount != 1:
                         raise ToolError('批量翻译的字幕记录不完整，结果未保存。', 'cache_mismatch')

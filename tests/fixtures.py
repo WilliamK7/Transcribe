@@ -244,7 +244,6 @@ def enqueue_current(store, config, source, **kwargs):
     identity = {'region': 'beijing', 'access_mode': 'workspace', 'workspace_id': workspace, 'account': account}
     route = configured_route(config, identity)
     return store.enqueue(source, workspace_id=workspace, account=account, settings=config.settings,
-                         mt_snapshot=next(e['backend'] for e in route['entries'] if e['backend'] is not None),
                          mt_route_snapshot=route, **kwargs)
 
 
@@ -264,8 +263,9 @@ class FakeTransport:
 
 
 def configured_backend(config, identity):
-    from subtitle_tool.mt_pool import configured_route
-    from subtitle_tool.mt_backend import key_fingerprint, saved_mt
+    from subtitle_tool.mt_pool import configured_route, saved_route
+    from subtitle_tool.mt_backend import key_fingerprint, MTBackend
     manifest = {**identity, 'account': key_fingerprint(config.get_key()), 'translation_strategy_version': 5}
     route = configured_route(config, manifest)
-    return saved_mt({**manifest, 'mt_snapshot': next(e['backend'] for e in route['entries'] if e['backend'] is not None)})
+    route = saved_route({**manifest, 'mt_route_snapshot': route})
+    return MTBackend.from_snapshot(next(e['backend'] for e in route['entries'] if e['backend'] is not None))

@@ -19,7 +19,7 @@ from .common import DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION
 from .config import Config
 from .media import Media
 from .mt_control import MTControl
-from .mt_backend import saved_mt
+from .mt_backend import MTBackend
 from .store import TERMINAL, Store
 from .review import decision_origin
 from .policy import asr_contract, current_execution_snapshot, load_policy
@@ -76,7 +76,7 @@ class Engine:
             self.store.update(job_id, manifest=manifest)
         for entry in route['entries']:
             if entry['tier'] == 'free' and entry['backend'] is not None:
-                backend = saved_mt({**manifest, 'mt_snapshot': entry['backend']})
+                backend = MTBackend.from_snapshot(entry['backend'])
                 if backend.free_quota:
                     reset_quota_for_resume(backend)
         self.select_input(job_id, track, channel)
@@ -182,7 +182,6 @@ class Engine:
         self.config.settings.validate()
         from .mt_pool import configured_route
         route = configured_route(self.config, manifest, paid_enabled=None if mt_paid is None else mt_paid == 'allow')
-        mt_snapshot = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
         contract = asr_contract()
         cache = self.config.data / "cache" / job_id
         offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
@@ -214,14 +213,13 @@ class Engine:
         snapshot = self.config.root / ".build" / "reflow" / job_id / (token + ".json")
         self.store.snapshot(job_id, snapshot)
         for name in ["layout_planned", "layout_round", "layout_complete",
-                     "mt_glossary_schedule",
+                     "mt_glossary_schedule", "mt_snapshot",
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                      "backup", "cue_count", "no_speech"]:
             manifest.pop(name, None)
         manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
                         mt_glossary_schedule="prefix-v1",
                         display_timing_version=DISPLAY_TIMING_VERSION,
-                        mt_snapshot=mt_snapshot,
                         execution_snapshot=current_execution_snapshot(),
                         subtitle_settings={k: getattr(self.config.settings, k) for k in
                                            ["zh_line_width", "other_line_width", "chinese_first"]},
@@ -254,8 +252,7 @@ class Engine:
                     'subtitle_settings': {k: getattr(self.config.settings, k) for k in
                                          ['zh_line_width', 'other_line_width', 'chinese_first']}}
         route = configured_route(self.config, manifest, paid_enabled=None if mt_paid is None else mt_paid == 'allow')
-        manifest.update(mt_route_snapshot=route,
-                        mt_snapshot=next(e['backend'] for e in route['entries'] if e['backend'] is not None))
+        manifest['mt_route_snapshot'] = route
         for name in ['fingerprint', 'media', 'track', 'channel']:
             if name in old:
                 manifest[name] = old[name]
@@ -564,7 +561,7 @@ class Engine:
                     manifest["audio_offset_ms"] = manifest["media_plan"]["audio_offset_ms"]
                 manifest.setdefault("channel", settings.channel)
             self.store.update(job_id, manifest=manifest)
-            if not manifest["segments"] and not manifest.get("normalized"):
+            if not manifest["segments"]:
                 stage("uploading")
                 policy = client().policy()
                 limit = upload_limit(policy)
@@ -680,21 +677,20 @@ class Engine:
                     if self.cancel.wait(settings.poll_seconds):
                         check_cancel(self.cancel)
                 position += 1
-            if not manifest.get("normalized"):
-                stage("segmenting")
-                candidate = copy.deepcopy(manifest)
-                cues = []
-                for segment in manifest["segments"]:
-                    raw = json.loads((cache / ("raw-" + segment["id"] + ".json")).read_text(encoding="utf-8"))
-                    items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
-                                                duration_ms=segment.get("duration_ms"))
-                    cues.extend(items)
-                    candidate["warnings"].extend(warnings)
-                cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
-                candidate.update(normalized=True, normalized_count=len(cues),
-                                 normalized_version=NORMALIZER_VERSION)
-                sources, fragments = cues, [make_fragment(s) for s in cues]
-                self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, sources, fragments)
+            stage("segmenting")
+            candidate = copy.deepcopy(manifest)
+            cues = []
+            for segment in manifest["segments"]:
+                raw = json.loads((cache / ("raw-" + segment["id"] + ".json")).read_text(encoding="utf-8"))
+                items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
+                                            duration_ms=segment.get("duration_ms"))
+                cues.extend(items)
+                candidate["warnings"].extend(warnings)
+            cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
+            candidate.update(normalized=True, normalized_count=len(cues),
+                             normalized_version=NORMALIZER_VERSION)
+            sources, fragments = cues, [make_fragment(s) for s in cues]
+            self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, sources, fragments)
             return self.finish_subtitles(job_id, manifest, settings, scope, stage, output, cache)
         except LocalStateUnavailable:
             # Never let a generic handler persist an unconfirmed in-memory state.
@@ -818,7 +814,6 @@ class Engine:
                         except ToolError as e:
                             if e.code != 'cancelled':
                                 self.mt_control.stop(e)
-                            self.store.translation_error(job_id, [c["cue_id"] for c in members], str(e))
                             errors.append(e)
                         self.progress(job_id, 'subtitle_translating', done, total)
                     schedule()

@@ -463,7 +463,7 @@ def make_fragment(source, lo=0, hi=None, *, layout_round=0):
     cue["decision_origin"] = decision_origin(source)
     cue.update(cue_id=fragment_id(source["sentence_id"], lo, hi, char_start, char_end),
                begin_ms=begin, end_ms=end, text=source["text"][char_start:char_end].strip(),
-               source_lang=source.get("source_lang", "auto"), translated="", attempts=0, error="",
+               source_lang=source.get("source_lang", "auto"), translated="",
                char_start=char_start, char_end=char_end, word_start=lo, word_end=hi, layout_round=layout_round)
     for name in ["asr_sentence_indices", "timing_adjustments"]:
         if name in source:
