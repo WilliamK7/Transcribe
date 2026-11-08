@@ -10,10 +10,9 @@ from tests.mt_fixtures import PoolPipelineFixture
 
 
 class OutputPlanningTests(PoolPipelineFixture):
-    def install_many(self, *, output_tokens=512):
+    def install_many(self):
         self.config.settings.mt_workers = 1
-        self.config.settings.mt_backends = [{'id': 'qiniu_free', 'capabilities': {'output_tokens': output_tokens}}]
-        self.save_result(result(*[(f'Synthetic sentence {i} ' + 'explains a cache. ' * 8, 'en') for i in range(8)]))
+        self.save_result(result(*[(f'Synthetic sentence {i} ' + 'explains a cache. ' * 80, 'en') for i in range(8)]))
         Engine(self.config, self.store).reflow(self.job_id)
 
     def test_small_output_budget_reduces_groups_before_any_request(self):
@@ -31,8 +30,7 @@ class OutputPlanningTests(PoolPipelineFixture):
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
 
     def test_unsplittable_target_is_preserved_despite_conservative_estimate(self):
-        self.config.settings.mt_backends = [{'id': 'qiniu_free', 'capabilities': {'output_tokens': 32}}]
-        text = 'An unsplittable synthetic sentence. ' * 20
+        text = 'An unsplittable synthetic sentence. ' * 140
         self.save_result(result((text, 'en')))
         Engine(self.config, self.store).reflow(self.job_id)
         self.assertEqual(self.run_pool(), 'completed')
@@ -42,8 +40,7 @@ class OutputPlanningTests(PoolPipelineFixture):
 
     def test_long_sentence_uses_existing_reliable_cue_boundaries_without_losing_text(self):
         self.config.settings.mt_workers = 1
-        self.config.settings.mt_backends = [{'id': 'qiniu_free', 'capabilities': {'output_tokens': 256}}]
-        raw = timed_raw([f'cache{i:03}' for i in range(160)], word_ms=50)
+        raw = timed_raw([f'cache{i:03}' for i in range(800)], word_ms=10)
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id)
         self.assertEqual(self.run_pool(), 'completed')
@@ -52,22 +49,11 @@ class OutputPlanningTests(PoolPipelineFixture):
         self.assertEqual(''.join(sentence['text'] for data in drafts for sentence in data['sentences']),
                          raw['transcripts'][0]['sentences'][0]['text'])
 
-    def test_large_denied_paid_profile_does_not_hide_small_free_output_budget(self):
-        self.install_many()
-        self.config.settings.mt_backends.append({'id': 'qiniu_paid', 'capabilities': {'output_tokens': 32768}})
-        Engine(self.config, self.store).reflow(self.job_id, mt_paid='deny')
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertGreater(sum(stage == 'draft' for stage, _, _ in self.calls), 1)
-        self.assertTrue(all(data['_model'] == 'qiniu/conatus-free' for _, _, data in self.calls))
 
     def test_output_planning_uses_same_candidate_for_input_and_output_and_honors_global_cap(self):
         from subtitle_tool.mt_pipeline import Pipeline
         from subtitle_tool.subtitles import make_fragment
         self.install_many()
-        self.config.settings.mt_backends = [
-            {'id': 'qiniu_free', 'capabilities': {'input_bytes': 32768, 'output_tokens': 512}},
-            {'id': 'qiniu_paid', 'tier': 'free', 'capabilities': {'input_bytes': 1, 'output_tokens': 32768}}]
-        Engine(self.config, self.store).reflow(self.job_id)
         engine = Engine(self.config, self.store)
         manifest = self.store.job(self.job_id)['manifest']
         _, scope = engine.identity(self.job_id, manifest, persist=False)
@@ -75,7 +61,7 @@ class OutputPlanningTests(PoolPipelineFixture):
         sources = self.store.sources(self.job_id)
         groups = pipeline.plan_groups(sources, [make_fragment(source) for source in sources])
         self.assertGreater(len(groups), 1)
-        profile = pipeline.profiles['qiniu_free']
+        profile = pipeline.profiles['magpie_free']
         profile['capabilities']['output_tokens'] = 32768
         data = {'sentences': [{'id': '0', 'text': 'Word ' * 1000}], 'context': [], 'glossary': []}
         self.assertEqual(pipeline._fit('draft', data), data)
@@ -83,26 +69,6 @@ class OutputPlanningTests(PoolPipelineFixture):
             pipeline._fit('draft', data, output_budget=True)
         self.assertEqual(error.exception.code, 'mt_input_budget')
 
-    def test_expired_or_changed_large_candidate_cannot_supply_output_capacity(self):
-        from subtitle_tool.mt_pipeline import Pipeline
-        from subtitle_tool.subtitles import make_fragment
-        for reason in ('expired', 'credential'):
-            with self.subTest(reason=reason):
-                self.install_many()
-                self.config.settings.mt_backends = [
-                    {'id': 'qiniu_free'}, {'id': 'openrouter_free', 'capabilities': {'output_tokens': 512}}]
-                Engine(self.config, self.store).reflow(self.job_id)
-                if reason == 'credential':
-                    self.config.set_qiniu_key('changed-synthetic-key')
-                manifest = self.store.job(self.job_id)['manifest']
-                engine = Engine(self.config, self.store)
-                _, scope = engine.identity(self.job_id, manifest, persist=False)
-                sources = self.store.sources(self.job_id)
-                pipeline = Pipeline(engine, self.job_id, manifest, scope)
-                with mock.patch('subtitle_tool.mt_routing.qiniu_free_active', return_value=reason != 'expired'):
-                    groups = pipeline.plan_groups(sources, [make_fragment(source) for source in sources])
-                self.assertGreater(len(groups), 1)
-                self.config.set_qiniu_key('synthetic-qiniu')
 
     def test_new_layout_uses_output_budget_with_previous_stage_records(self):
         from subtitle_tool.mt_pipeline import Pipeline

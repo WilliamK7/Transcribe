@@ -22,10 +22,10 @@ def body(value):
 
 class QualityContractTests(unittest.TestCase):
     def setUp(self):
-        self.qiniu = MTBackend('qiniu', 'https://api.qnaigc.com/v1', 'qiniu/conatus-free', key_fingerprint('q'), 5)
-        self.router = MTBackend('openai_compatible', 'https://openrouter.ai/api/v1', 'openrouter/free', key_fingerprint('o'), 5)
-        self.qiniu_caps = {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}
-        self.router_caps = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
+        self.free = MTBackend('magpie', 'http://127.0.0.1:3425/v1', 'group/transcribe-free', key_fingerprint('gateway'), 5)
+        self.paid = MTBackend('magpie', 'http://127.0.0.1:3425/v1', 'group/transcribe', key_fingerprint('gateway'), 5)
+        self.free_caps = {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}
+        self.paid_caps = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
         self.scope = {'account': 'synthetic'}
 
     def test_stalled_correction_requires_exact_issues_and_unchanged_affected_sentences(self):
@@ -68,17 +68,6 @@ class QualityContractTests(unittest.TestCase):
         self.assertEqual(terms, [{'source': 'cache', 'translation': '缓存', 'sentence': records[0]['sentence_id'],
                                   'origin': 'manual'}])
 
-    def test_qiniu_and_openrouter_stage_wire_profiles_stay_separate(self):
-        data = {'sentences': [{'id': '0', 'text': 'A cache stores a result.'}], 'glossary': []}
-        q = make_stage_payload('draft', data, self.qiniu, capabilities=self.qiniu_caps)
-        r = make_stage_payload('draft', data, self.router, capabilities=self.router_caps)
-        self.assertEqual(q['response_format'], {'type': 'json_object'})
-        self.assertNotIn('provider', q)
-        self.assertNotIn('plugins', q)
-        self.assertNotIn('enable_thinking', q)
-        self.assertEqual(q['max_tokens'], 4096)
-        self.assertEqual(r['response_format']['type'], 'json_schema')
-        self.assertEqual(r['provider'], {'require_parameters': True})
 
     def test_review_requires_specific_numbered_evidence_and_never_echoes_text_in_error(self):
         valid = {'issues': [{'id': '0', 'category': 'number', 'evidence': 'The value differs.'}]}
@@ -124,43 +113,27 @@ class QualityContractTests(unittest.TestCase):
     def test_json_object_review_supplies_the_fields_and_categories_it_validates(self):
         from subtitle_tool.mt_quality import ISSUE_CATEGORIES
         data = {'fragments': [{'id': '0', 'text': 'The value is two.'}]}
-        payload = make_stage_payload('review', data, self.qiniu, capabilities=self.qiniu_caps)
+        payload = make_stage_payload('review', data, self.free, capabilities=self.free_caps)
         instruction = payload['messages'][0]['content']
         for field in ('issues', 'id', 'category', 'evidence', *ISSUE_CATEGORIES):
             self.assertIn('"' + field + '"', instruction)
 
     def test_review_schema_limits_evidence_to_actual_fragment_ids(self):
         data = {'fragments': [{'id': '0', 'text': 'One.'}, {'id': '1', 'text': 'Two.'}]}
-        payload = make_stage_payload('review', data, self.router, capabilities=self.router_caps)
+        payload = make_stage_payload('review', data, self.paid, capabilities=self.paid_caps)
         schema = payload['response_format']['json_schema']['schema']
         self.assertEqual(schema['properties']['issues']['items']['properties']['id']['enum'], ['0', '1'])
 
-    def test_new_prompt_leaves_output_budget_for_json_on_slow_reasoning_routes(self):
-        from dataclasses import replace
-        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
-        deepseek = replace(self.qiniu, model='deepseek/deepseek-v4.1-flash')
-        for backend, capabilities, field, value in [
-                (self.router, self.router_caps, 'reasoning', {'effort': 'low'}),
-                (deepseek, self.qiniu_caps, 'reasoning_effort', 'low')]:
-            with self.subTest(provider=backend.provider):
-                current = make_stage_payload('draft', data, backend, capabilities=capabilities)
-                self.assertEqual(current[field], value)
-        custom = replace(self.qiniu, model='custom-model')
-        payload = make_stage_payload('draft', data, custom, capabilities=self.qiniu_caps)
-        self.assertNotIn('reasoning_effort', payload)
-        fixed = replace(self.router, model='vendor/non-reasoning-model')
-        payload = make_stage_payload('draft', data, fixed, capabilities=self.router_caps)
-        self.assertNotIn('reasoning', payload)
 
     def test_stage_cache_identity_covers_prompt_glossary_context_and_backend(self):
         data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': []}
-        original = stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope=self.scope)
+        original = stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope=self.scope)
         self.assertNotEqual(original, stage_cache_key('draft', {**data, 'glossary': [{'source': 'cache'}]},
-                                                     self.qiniu, capabilities=self.qiniu_caps, scope=self.scope))
+                                                     self.free, capabilities=self.free_caps, scope=self.scope))
         self.assertNotEqual(original, stage_cache_key('draft', {**data, 'context': ['different']},
-                                                     self.qiniu, capabilities=self.qiniu_caps, scope=self.scope))
-        self.assertNotEqual(original, stage_cache_key('draft', data, self.router,
-                                                     capabilities=self.qiniu_caps, scope=self.scope))
+                                                     self.free, capabilities=self.free_caps, scope=self.scope))
+        self.assertNotEqual(original, stage_cache_key('draft', data, self.paid,
+                                                     capabilities=self.free_caps, scope=self.scope))
 
     def test_review_rejects_choice_error_refusal_and_unicode_surrogates(self):
         for extra in ({'error': {'code': 'synthetic'}}, {'message': {'content': '{"issues":[]}', 'refusal': 'denied'}}):
@@ -179,17 +152,17 @@ class QualityContractTests(unittest.TestCase):
     def test_complete_payload_budget_includes_context_and_schema(self):
         data = {'sentences': [{'id': '0', 'text': 'Small.'}], 'context': ['x' * 33000], 'glossary': []}
         with self.assertRaises(ToolError) as error:
-            make_stage_payload('draft', data, self.router, capabilities=self.router_caps)
+            make_stage_payload('draft', data, self.paid, capabilities=self.paid_caps)
         self.assertEqual(error.exception.code, 'mt_input_budget')
 
     def test_explicit_capability_controls_wire_format_and_size(self):
         data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'glossary': []}
         caps = {'response_format': 'text', 'input_bytes': 2000, 'output_tokens': 512}
-        payload = make_stage_payload('draft', data, self.qiniu, capabilities=caps)
+        payload = make_stage_payload('draft', data, self.free, capabilities=caps)
         self.assertNotIn('response_format', payload)
         self.assertEqual(payload['max_tokens'], 512)
-        self.assertNotEqual(stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope=self.scope),
-                            stage_cache_key('draft', data, self.qiniu, capabilities=caps, scope=self.scope))
+        self.assertNotEqual(stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope=self.scope),
+                            stage_cache_key('draft', data, self.free, capabilities=caps, scope=self.scope))
 
     def test_stage_texts_are_simplified_before_use_and_cache_identity_includes_scope(self):
         translated = parse_stage_response('draft', body({'translations': {'0': '繁體翻譯'}}),
@@ -200,8 +173,8 @@ class QualityContractTests(unittest.TestCase):
             ids=['0000:00000000'], originals=['A cache stores results.'])
         self.assertEqual(terms['terms'][0]['translation'], '缓存')
         data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
-        self.assertNotEqual(stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope={'account': 'a'}),
-                            stage_cache_key('draft', data, self.qiniu, capabilities=self.qiniu_caps, scope={'account': 'b'}))
+        self.assertNotEqual(stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope={'account': 'a'}),
+                            stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope={'account': 'b'}))
 
     def test_translation_mapping_rejects_duplicate_missing_extra_and_empty_results(self):
         invalid = ['{"translations":{"0":"甲","0":"乙","1":"丙"}}',

@@ -20,7 +20,7 @@ from .review import MT_LANGUAGES, ReviewDecision
 
 
 def parser():
-    result = argparse.ArgumentParser(description="百炼命令行视频字幕工具（北京工作空间）")
+    result = argparse.ArgumentParser(description="命令行字幕工具（magpie 网关／北京百炼 ASR）")
     result.add_argument("files", nargs="*", help="本地视频／音频文件，逐个处理")
     actions = result.add_mutually_exclusive_group()
     actions.add_argument("--resume", metavar="JOB_ID", help="恢复本地任务")
@@ -32,26 +32,10 @@ def parser():
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
     actions.add_argument("--configure", action="store_true", help="配置 Workspace ID 和隐藏输入 Key")
     actions.add_argument("--configure-key", action="store_true", help="隐藏输入 Key，明文保存到 data/key.txt")
-    actions.add_argument('--configure-mt', choices=['qiniu'], help='隐藏输入七牛 Key，保存到 data/qiniu-key.txt')
-    actions.add_argument('--check-mt', nargs='?', const='configured', choices=['configured', 'qiniu'],
-                         help='用合成文本在线检查当前翻译服务；可指定 qiniu')
-    actions.add_argument('--inspect-bailian-quota', action='store_true',
-                         help='只读查询百炼 CLI 的免费额度和保护配置')
-    actions.add_argument('--configure-mt-pool', action='store_true',
-                         help='为新任务启用翻译池，可追加已核实的百炼免费模型')
-    actions.add_argument('--bind-bailian-account', action='store_true',
-                         help='将已确认同主账户的 CLI 与当前 ASR 工作空间绑定')
-    actions.add_argument('--confirm-bailian-protection', action='append',
-                         choices=['qwen3.8-27b', 'qwen3.8-max-0902'], metavar='MODEL',
-                         help='记录指定模型的保护生效确认，可重复指定模型')
+    actions.add_argument('--configure-mt', choices=['magpie', 'qiniu'], help='选择 magpie 字幕组并备份设置；qiniu 录入迁移凭据')
+    actions.add_argument('--check-mt', nargs='?', const='configured', choices=['configured', 'magpie'],
+                         help='用合成文本在线检查当前翻译服务；指定 magpie 要求已选择网关配置')
     actions.add_argument("--self-test", action="store_true", help="仅执行本机诊断，不访问云端")
-    result.add_argument('--bailian-free-model', action='append',
-                        choices=['qwen3.8-27b', 'qwen3.8-max-0902'], metavar='MODEL',
-                        help='配合 --configure-mt-pool 追加已核实模型，可重复指定')
-    result.add_argument('--confirm-same-account', action='store_true',
-                        help='确认 CLI 所选 AK/SK（未配置时为控制台登录）与当前北京 ASR 工作空间属于同一主账户')
-    result.add_argument('--confirm-propagation-waited', action='store_true',
-                        help='确认已开启所选模型的额度用尽停用并已等待其生效')
     result.add_argument("--workspace-id", help="本次新任务使用的北京 Workspace ID（域名标签）")
     result.add_argument("--bind-task-id", help="给提交未知的任务绑定已知云端 ID，需 --resume")
     result.add_argument("--allow-resubmit", action="store_true", help="明确接受未知提交可能重复计费的重发，需 --resume")
@@ -61,7 +45,7 @@ def parser():
     result.add_argument("--output-dir", type=Path, help="显式选择输出目录，默认视频同目录")
     result.add_argument("--non-interactive", action="store_true", help="不询问；遇歧义持久化待复核状态并非零退出")
     result.add_argument('--mt-paid', choices=['allow', 'deny'],
-                        help='翻译池是否允许付费候选；新任务默认 allow')
+                        help='是否允许网关使用付费模型；新任务默认 allow')
     result.add_argument("--report", type=Path, help="保存结构化结果，不包含 Key、上传链接或转写文字")
     return result
 
@@ -98,9 +82,6 @@ class Progress:
                 message = f"音频：{method}，{done['codec']}/{done['container']}，{done['segments']} 段，{done['bytes']:,} 字节；{done['reason']}"
             elif stage == "retry":
                 message = f"网络重试 {done}/{total}，有限退避"
-            elif stage == 'mt_quota_login':
-                message = ('百炼额度查询的控制台会话失效，暂时跳过百炼免费候选；'
-                           '请用 bl auth login --console 重新登录并更新本机绑定。')
             elif stage == 'mt_v5_progress':
                 names = {'glossary': '术语分析', 'waiting': '等待前序术语', 'draft': '整句翻译',
                          'align': '字幕对齐', 'review': '译文复核', 'correct': '译文修正'}
@@ -197,6 +178,10 @@ def summary(store, job_id):
         from .mt_pool import saved_route
         route = saved_route(manifest)
         mt = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
+        permitted = 'paid' if route['routing']['paid_enabled'] else 'free'
+        mt = next((entry['backend'] for entry in route['entries']
+                   if entry['tier'] == permitted and entry['backend'] is not None), mt)
+        item['gateway_session'] = 'transcribe-' + job_id
         item['mt_route'] = {'paid_enabled': route['routing']['paid_enabled'],
                             'entries': [{'id': entry['id'], 'tier': entry['tier'],
                                          'available': entry['backend'] is not None,
@@ -244,17 +229,8 @@ def main(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
     action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.cancel or args.configure or
-              args.configure_key or args.configure_mt or args.check_mt or args.inspect_bailian_quota or args.self_test or
-              args.configure_mt_pool or args.bind_bailian_account or args.confirm_bailian_protection or args.export_archive)
-    if args.confirm_same_account != bool(args.bind_bailian_account):
-        raise ToolError('绑定百炼 CLI 时必须明确附带 --confirm-same-account。', 'input')
-    if args.confirm_propagation_waited != bool(args.confirm_bailian_protection):
-        raise ToolError('确认保护时必须明确附带 --confirm-propagation-waited。', 'input')
-    if args.bailian_free_model and not args.configure_mt_pool:
-        raise ToolError('--bailian-free-model 必须配合 --configure-mt-pool。', 'input')
-    if args.workspace_id is not None and (args.configure_mt_pool or args.bind_bailian_account or
-                                          args.confirm_bailian_protection):
-        raise ToolError('翻译池配置与账户绑定使用已保存的 ASR 工作空间，不能指定 --workspace-id。', 'input')
+              args.configure_key or args.configure_mt or args.check_mt or args.self_test or
+              args.export_archive)
     if not args.files and not action:
         argument_parser.print_help()
         return 0
@@ -282,89 +258,37 @@ def main(argv=None):
     previous_signal = None
     processing = False
     try:
-        if args.inspect_bailian_quota:
-            from .mt_bailian_binding import LocalBailianBinding
-            from .mt_bailian_quota import QuotaSourceError, beijing_today, parse_observation
-            from .mt_control import MTControl
-            try:
-                binding = LocalBailianBinding(config.data, get_key=config.get_key,
-                                              get_scope=lambda: (config.settings.workspace_id, config.settings.region))
-                proof = binding.current_proof()
-                if proof is None:
-                    raw = binding.source.query(control=MTControl(cancel), timeout=15.0)
-                else:
-                    raw = binding.source.query(control=MTControl(cancel), timeout=15.0, proof=proof)
-                rows = parse_observation(raw)
-                if proof is not None:
-                    binding.observe(proof, rows)
-            except (QuotaSourceError, ValueError):
-                raise ToolError('无法读取百炼 CLI 免费额度；请检查官方 CLI 版本、AK/SK 权限或控制台登录。', 'mt_quota_unknown') from None
-            models = [{'model': row.model, 'type': row.kind, 'remaining': row.remaining, 'total': row.total,
-                       'expires': row.expires.isoformat() if row.expires else None, 'auto_stop': row.auto_stop,
-                       'observation_usable': row.usable(beijing_today()) and row.remaining > 0}
-                      for row in sorted(rows.values(), key=lambda row: (row.expires is None, row.expires, row.model))]
-            print(json.dumps({'models': models}, ensure_ascii=False))
-            return 0
-        if args.bind_bailian_account or args.confirm_bailian_protection:
-            from .mt_backend import key_fingerprint
-            from .mt_bailian_binding import LocalBailianBinding
-            from .mt_control import MTControl
-            if config.settings.region != 'beijing':
-                raise ToolError('百炼免费额度绑定需要已保存的北京 ASR 工作空间。', 'mt_config')
-            binding = LocalBailianBinding(config.data, get_key=config.get_key,
-                                          get_scope=lambda: (config.settings.workspace_id, config.settings.region))
-            if args.bind_bailian_account:
-                binding.confirm_identity(key_fingerprint=key_fingerprint(config.get_key()),
-                                         workspace=validate_workspace_id(config.settings.workspace_id))
-                print(json.dumps({'status': 'bound', 'source': 'user_confirmed'}, ensure_ascii=False))
-            else:
-                if len(args.confirm_bailian_protection) != len(set(args.confirm_bailian_protection)):
-                    raise ToolError('保护确认的模型不能重复。', 'input')
-                binding.confirm_protection(args.confirm_bailian_protection, control=MTControl(cancel), timeout=15.0)
-                print(json.dumps({'status': 'confirmed', 'models': args.confirm_bailian_protection,
-                                  'source': 'user_confirmed'}, ensure_ascii=False))
-            return 0
-        if args.configure_mt_pool:
-            from .mt_backend import key_fingerprint
-            from .mt_pool import configured_route, with_bailian_free_models
-            workspace = validate_workspace_id(config.settings.workspace_id)
-            identity = {'region': 'beijing', 'workspace_id': workspace, 'access_mode': 'workspace',
-                        'account': key_fingerprint(config.get_key())}
-            entries = with_bailian_free_models(config, identity, args.bailian_free_model or [])
-            old_provider, old_entries = config.settings.mt_provider, config.settings.mt_backends
-            try:
-                config.settings.mt_provider, config.settings.mt_backends = 'pool', entries
-                configured_route(config, identity)
-                config.save()
-            except Exception:
-                config.settings.mt_provider, config.settings.mt_backends = old_provider, old_entries
-                raise
-            print(json.dumps({'status': 'configured', 'provider': 'pool',
-                              'added_bailian_free_models': args.bailian_free_model or []}, ensure_ascii=False))
-            return 0
         if args.configure_mt:
+            if args.configure_mt == 'magpie':
+                config.configure_magpie()
+                print(json.dumps({'status': 'configured', 'provider': 'magpie',
+                                  'model': config.settings.mt_model,
+                                  'free_model': config.settings.mt_free_model}, ensure_ascii=False))
+                return 0
             if not interactive:
                 raise ToolError('请在交互终端配置七牛 Key；也可设置 QINIU_API_KEY。', 'credentials')
             config.set_qiniu_key(getpass.getpass('七牛 API Key（隐藏输入）：', stream=sys.stderr))
             config.settings.mt_provider = 'pool'
             config.save()
-            print('七牛 Key 已明文保存到 data/qiniu-key.txt，并选择翻译池；环境变量 QINIU_API_KEY 仍优先。', file=sys.stderr)
+            print('七牛迁移凭据已保存到 data/qiniu-key.txt；请运行 magpie_migration 导入网关。QINIU_API_KEY 环境变量仍优先。', file=sys.stderr)
             return 0
         if args.check_mt:
-            from dataclasses import replace
             from .mt_backend import key_fingerprint
             from .mt_pool import configured_route
             from .mt_pipeline import check_pool
+            if args.check_mt == 'magpie' and config.mt_settings().mt_provider != 'magpie':
+                raise ToolError('当前有效翻译配置未选择 magpie；请先迁移或运行 --configure-mt magpie，'
+                                '并检查 MT_PROVIDER 环境覆盖。', 'mt_config')
             identity = {'region': 'beijing', 'workspace_id': validate_workspace_id(config.settings.workspace_id),
                         'access_mode': 'workspace', 'account': key_fingerprint(config.get_key())}
-            if args.check_mt == 'qiniu':
-                config.settings = replace(config.settings, mt_provider='pool', mt_backends=[{'id': 'qiniu_free'}])
             route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
             if route['routing']['paid_enabled']:
-                print('在线检查可能使用付费翻译候选；可用 --mt-paid deny 禁止付费请求。', file=sys.stderr)
+                print('在线检查可能使用网关付费模型；可用 --mt-paid deny 禁止付费请求。', file=sys.stderr)
             print(json.dumps(check_pool(config, identity, route, cancel), ensure_ascii=False))
             return 0
         if args.configure or args.configure_key:
+            if config.settings.asr_provider == 'magpie':
+                raise ToolError('百炼 Key 现由 magpie 管理；请在 magpie 更新对应入口，工作空间需与原任务一致。', 'config')
             if not interactive:
                 raise ToolError("请在交互终端配置 Workspace ID／Key；非交互运行请预先配置或使用环境变量。", "credentials")
             if args.configure:
@@ -486,7 +410,7 @@ def main(argv=None):
                     print('仅校时：使用本地已保存的字幕和译文，无需调用云端。',
                           file=sys.stderr, flush=True)
                 elif manifest.get('mt_route_snapshot', {}).get('routing', {}).get('paid_enabled'):
-                    print('已启用翻译池付费候选，可能产生费用；可用 --mt-paid deny 禁止付费请求。',
+                    print('已允许网关使用付费模型，可能产生费用；可用 --mt-paid deny 禁止付费请求。',
                           file=sys.stderr, flush=True)
                 state = run_job(job_id)
             while state == "needs_review" and interactive and not cancel.is_set():

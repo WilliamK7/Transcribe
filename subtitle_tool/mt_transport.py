@@ -20,7 +20,6 @@ MAX_RESPONSE = 4 * 1024 * 1024
 class HTTPReply:
     status: int
     body: bytes
-    retry_after: str = ''
 
 
 class TransportError(ToolError):
@@ -28,7 +27,6 @@ class TransportError(ToolError):
         if category not in {'network', 'deadline', 'transport', 'response_too_large'}:
             category = 'transport'
         self.category = category
-        self.retryable = category in {'network', 'deadline'}
         super().__init__({'network': '翻译网络连接或读取失败。', 'deadline': '翻译请求超过总时限。',
                           'transport': '翻译网络子进程异常，进度已保存。',
                           'response_too_large': '翻译响应超过 4 MiB 上限，进度已保存。'}[category],
@@ -39,11 +37,11 @@ class ProcessTransport:
     def request(self, method, url, *, headers, json=None, control, timeout=120.0, drain=True, on_dispatch=None):
         control.check_start()
         deadline = time.monotonic() + timeout
-        payload = jsonlib.dumps({'method': method, 'url': url, 'headers': headers, 'json': json},
+        payload = jsonlib.dumps({'method': method, 'url': url, 'headers': headers, 'json': json, 'timeout': timeout},
                                 ensure_ascii=False).encode('utf-8')
         # Do not pass account credentials via inherited environment variables either.
         environment = {k: v for k, v in os.environ.items()
-                       if k.upper() not in {'DASHSCOPE_API_KEY', 'OPENAI_API_KEY', 'QINIU_API_KEY'}}
+                       if k.upper() not in {'DASHSCOPE_API_KEY', 'OPENAI_API_KEY', 'QINIU_API_KEY', 'MAGPIE_API_KEY'}}
         process = None
         try:
             control.check_start()
@@ -81,10 +79,10 @@ class ProcessTransport:
                 body = base64.b64decode(reply['body'], validate=True)
                 if len(body) > MAX_RESPONSE:
                     raise TransportError('response_too_large')
-                status, retry_after = reply['status'], reply.get('retry_after', '')
-                if type(status) is not int or not 100 <= status <= 599 or not isinstance(retry_after, str):
+                status = reply['status']
+                if type(status) is not int or not 100 <= status <= 599:
                     raise ValueError()
-                return HTTPReply(status, body, retry_after[:128])
+                return HTTPReply(status, body)
             except (ValueError, KeyError, TypeError, RecursionError):
                 raise TransportError('transport') from None
         except OSError:

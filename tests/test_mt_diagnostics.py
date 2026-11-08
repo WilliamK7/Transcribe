@@ -11,40 +11,19 @@ from tests.fixtures import TemporaryTest
 
 
 class DiagnosticTests(TemporaryTest):
-    def test_pacing_diagnostics_keep_only_bounded_safe_fields(self):
+    def test_gateway_route_diagnostics_keep_only_bounded_safe_fields(self):
         writer = MTDiagnostics(self.path, 'a' * 32)
-        self.assertTrue(writer.write_route({'kind': 'route_pacing', 'entry': 'synthetic',
-            'reason': 'rate_limit', 'concurrency': 2, 'interval_ms': 1000, 'error': 'private exception'}))
-        self.assertTrue(writer.write_route({'kind': 'route_pacing', 'reason': 'private text',
-                                           'concurrency': 100, 'interval_ms': 99999}))
-        self.assertTrue(writer.write_route({'kind': 'route_failure', 'dispatched': False}))
-        self.assertTrue(writer.write_route({'kind': 'route_failure', 'dispatched': 'private value'}))
-        raw = writer.path.read_text(encoding='utf-8')
-        first, second, rejected, invalid = [json.loads(line) for line in raw.splitlines()]
-        self.assertEqual((first['reason'], first['concurrency'], first['interval_ms']), ('rate_limit', 2, 1000))
-        self.assertEqual(set(second), {'time', 'kind'})
-        self.assertIs(rejected['dispatched'], False)
-        self.assertNotIn('dispatched', invalid)
-        self.assertNotIn('private', raw)
-
-    def test_adaptive_selection_and_truncation_metadata_remain_content_free(self):
-        writer = MTDiagnostics(self.path, 'a' * 32)
-        for selection, size in [('weighted', 0), ('learning', 1), ('performance', 2), ('probe', 3),
-                                ('private-value', 9000)]:
-            self.assertTrue(writer.write_route({'kind': 'route_attempt', 'entry': 'synthetic',
-                'selection': selection, 'size_bucket': size, 'text': 'private-source', 'key': 'private-key'}))
+        self.assertTrue(writer.write_route({'kind': 'route_reply', 'entry': 'synthetic',
+            'status': 429, 'duration_ms': 1000, 'error': 'private exception'}))
+        self.assertTrue(writer.write_route({'kind': 'route_reply', 'status': 'private text', 'duration_ms': -1}))
         self.assertTrue(writer.write_route({'kind': 'route_failure', 'category': 'output_truncated',
-                                          'text': 'private-generated-text'}))
-        self.assertTrue(writer.write({'kind': 'invalid_response', 'category': 'output_truncated',
-                                      'finish_reason': 'length', 'content': 'private-generated-text'}))
+                                           'dispatched': False, 'content': 'private response'}))
         raw = writer.path.read_text(encoding='utf-8')
-        records = [json.loads(line) for line in raw.splitlines()]
-        self.assertEqual([row['selection'] for row in records[:4]], ['weighted', 'learning', 'performance', 'probe'])
-        self.assertEqual([row['size_bucket'] for row in records[:4]], [0, 1, 2, 3])
-        self.assertNotIn('selection', records[4])
-        self.assertNotIn('size_bucket', records[4])
-        self.assertEqual(records[-2]['category'], 'output_truncated')
-        self.assertEqual(records[-1]['category'], 'output_truncated')
+        first, second, failure = [json.loads(line) for line in raw.splitlines()]
+        self.assertEqual((first['status'], first['duration_ms']), (429, 1000))
+        self.assertEqual(set(second), {'time', 'kind'})
+        self.assertEqual(failure['category'], 'output_truncated')
+        self.assertIs(failure['dispatched'], False)
         self.assertNotIn('private', raw)
 
     def test_concurrent_whitelisted_content_free_diagnostics(self):

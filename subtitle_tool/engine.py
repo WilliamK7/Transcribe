@@ -18,7 +18,6 @@ from .common import DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION
 from .config import Config
 from .media import Media
 from .mt_control import MTControl
-from .mt_backend import MTBackend
 from .mt_quality import GLOSSARY_SCHEDULE
 from .store import TERMINAL, Store
 from .review import decision_origin
@@ -68,17 +67,12 @@ class Engine:
         manifest = self.store.job(job_id)['manifest']
         load_policy(manifest)
         from .mt_pool import saved_route
-        from .mt_quota import reset_quota_for_resume
         route = saved_route(manifest)
         if mt_paid is not None:
             route['routing']['paid_enabled'] = mt_paid == 'allow'
             manifest['mt_route_snapshot'] = route
             self.store.update(job_id, manifest=manifest)
-        for entry in route['entries']:
-            if entry['tier'] == 'free' and entry['backend'] is not None:
-                backend = MTBackend.from_snapshot(entry['backend'])
-                if backend.free_quota:
-                    reset_quota_for_resume(backend)
+
         self.select_input(job_id, track, channel)
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped"}:
@@ -472,11 +466,13 @@ class Engine:
 
         def client():
             nonlocal api
+            gateway = self.config.asr_gateway(manifest)
             if api is None:
                 api = Bailian(key, manifest["region"], self.cancel,
                     count=lambda name: self.store.count(job_id, name),
                     progress=lambda name, done, total: self.progress(job_id, name, done, total),
-                    workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"])
+                    workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"],
+                    gateway=gateway)
             return api
 
         def save_failure(state, error, code, request_id=""):

@@ -227,16 +227,6 @@ def make_stage_payload(stage, data, backend, *, capabilities):
     elif capabilities['response_format'] == 'json_schema':
         payload['response_format'] = {'type': 'json_schema', 'json_schema': {
             'name': 'subtitle_' + stage, 'strict': True, 'schema': _schema(stage, data)}}
-    if backend.is_openrouter:
-        payload.update(provider={'require_parameters': True}, plugins=[{'id': 'response-healing'}])
-        if backend.model == 'openrouter/free':
-            # Reasoning shares max_tokens with visible JSON; leave room for the result.
-            payload['reasoning'] = {'effort': 'low'}
-    elif backend.provider == 'bailian':
-        payload.update(enable_thinking=False, temperature=0)
-    elif (backend.provider == 'qiniu' and
-          backend.model == 'deepseek/deepseek-v4.1-flash'):
-        payload['reasoning_effort'] = 'low'
     try:
         size = len(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
     except (TypeError, UnicodeError, ValueError):

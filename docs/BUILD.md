@@ -32,6 +32,8 @@ uv pip sync requirements.lock --require-hashes --python .venv\Scripts\python.exe
 
 测试用模拟 HTTP、真实 SQLite、合成媒体和 Windows 子进程验证行为，不使用真实凭据。CLI 诊断见[本机检查](../README.md#本机检查)。
 
-百炼免费额度的 AK/SK 续期使用项目内 `subtitle_tool/mt_bailian_bridge.mjs`，复用 Windows npm 安装的官方 CLI，不额外安装 Node 依赖。CLI 及其 `bailian-cli-core`、`bailian-cli-commands`、`bailian-cli-runtime` 均锁定为 2.7.2；这些模块的导出和响应须随版本升级重新核对。Node 桥接测试使用本地合成模块，无真实凭据或网络请求。
-
 `scripts/transcribe.ps1` 保留调用者当前目录，相对媒体与报告路径按调用位置解释。运行数据及恢复资料见[数据与恢复](API_CONTRACT.md#数据与恢复)。
+
+运行时连接常驻 magpie 网关，当前核对版本为 Windows 便携版 0.1.3323。迁移与本机地址配置见 [README](../README.md#迁移到-magpie)。
+
+迁移工具仅支持具有 `.portable` 标记、同目录 `data` 的 Windows 便携版，以核对 CLI 实际写入位置。升级 magpie 后应重新核对原生 POST 单次转发及组费用隔离；真实检查使用合成短句和只读上传策略请求，不等同于真实长视频 ASR 或人工字幕质量检查。

@@ -126,17 +126,13 @@ class FakeService:
 
 class TemporaryTest(unittest.TestCase):
     def setUp(self):
-        # Each test represents an independent CLI process; clients within it share quota.
-        quota_scope = mock.patch.dict('subtitle_tool.mt_quota._QUOTAS', clear=True)
-        quota_scope.start()
-        self.addCleanup(quota_scope.stop)
         transport = mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport)
         transport.start()
         self.addCleanup(transport.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
         os.environ.pop("DASHSCOPE_API_KEY", None)
-        for name in ["OPENAI_API_KEY", "QINIU_API_KEY", "MT_PROVIDER", "MT_BASE_URL", "MT_MODEL", "MT_RPM"]:
+        for name in ["OPENAI_API_KEY", "QINIU_API_KEY", "MAGPIE_API_KEY", "MT_PROVIDER", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL", "MT_RPM"]:
             os.environ.pop(name, None)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP)
         self.path = Path(self.temp.name)
@@ -156,7 +152,6 @@ class SavedResultFixture(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
-        self.config.settings.mt_provider = 'bailian'  # One-model pool fixture.
         self.config.settings.workspace_id = "offline-space"
         self.config.set_key("offline-test-key-no-cloud-authorization")
         self.source = self.path / "saved.mkv"
@@ -218,7 +213,6 @@ class PipelineFixture(TemporaryTest):
         self.media_tools = mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe"))
         self.media_tools.start()
         self.config = Config(self.path)
-        self.config.settings.mt_provider = 'bailian'  # One-model pool fixture.
         self.config.settings.workspace_id = "offline-space"
         self.config.set_key("offline-test-key-no-cloud-authorization")
         self.source = self.path / "中文 多点.片段 & (1).mkv"
@@ -259,7 +253,7 @@ class FakeTransport:
             dispatch()
         control.check_start()
         reply = requests.request(method, url, **kwargs)
-        return HTTPReply(reply.status_code, reply.content, reply.headers.get('Retry-After', ''))
+        return HTTPReply(reply.status_code, reply.content)
 
 
 def configured_backend(config, identity):

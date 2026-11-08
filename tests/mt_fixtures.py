@@ -1,58 +1,24 @@
 """Shared synthetic transport and deterministic routing fixtures."""
 import json
-import threading
-import unittest
-from datetime import datetime, timezone
 from unittest import mock
 
 from subtitle_tool.engine import Engine
-from subtitle_tool.mt_backend import MTBackend
-from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_quality import PROMPTS
-from subtitle_tool.mt_routing import MTRouter, RouteEntry
 from subtitle_tool.mt_transport import HTTPReply
 from tests.fixtures import SavedResultFixture, result, timed_raw
-
-
-class FakeClock:
-    def __init__(self):
-        self.now = 0.0
-        self.waits = []
-        self.utc = datetime(2026, 10, 25, tzinfo=timezone.utc)
-
-    def __call__(self):
-        return self.now
-
-    def wait(self, control, seconds):
-        control.check_start()
-        self.waits.append(seconds)
-        self.now += seconds
-
-
-def entry(name, tier='free', weight=1, *, model=None, key='key-a', url='https://a.example/v1',
-          provider='openai_compatible', rpm=0):
-    return RouteEntry(name, MTBackend(provider, url, model or name, key, 5), tier,
-                      weight=weight, rpm=rpm)
-
-
-class RouterFixture(unittest.TestCase):
-    def setUp(self):
-        self.clock = FakeClock()
-        self.control = MTControl(threading.Event(), clock=self.clock)
-        self.events = []
-
-    def router(self, entries, *, paid_enabled=True, **kwargs):
-        return MTRouter(entries, paid_enabled=paid_enabled, control=self.control, clock=self.clock,
-                        utcnow=lambda: self.clock.utc, wait=self.clock.wait,
-                        on_event=kwargs.pop('on_event', self.events.append), **kwargs)
 
 
 class PoolPipelineFixture(SavedResultFixture):
     def setUp(self):
         super().setUp()
-        self.config.set_qiniu_key('synthetic-qiniu')
-        (self.config.data / 'mt-key.txt').write_text('synthetic-openrouter', encoding='utf-8')
-        self.config.settings.mt_provider = 'pool'
+        self.config.settings.mt_routing = {'paid_enabled': False}
+        registry = self.path / 'gateway'
+        registry.mkdir()
+        self.config.settings.magpie_data_dir = str(registry)
+        (registry / 'providers.json').write_text(json.dumps({'providers': [
+            {'id': 'free', 'chat': 'https://openrouter.ai/api/v1'}],
+            'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
+                       {'id': 'transcribe', 'members': ['group/transcribe-free']}]}), encoding='utf-8')
         self.config.settings.mt_workers = 2
         self.calls = []
         self.review_failure = False
@@ -61,8 +27,6 @@ class PoolPipelineFixture(SavedResultFixture):
         self.fail_stage = None
         self.cancel_after = None
         self.fail_second_group = False
-        self.quota_remaining = 1000
-        self.quota_queries = 0
         self.stage_hook = None
         self.glossary_terms = lambda data: []
         self.corrected_translations = None
@@ -71,11 +35,8 @@ class PoolPipelineFixture(SavedResultFixture):
         parent = self
         class Transport:
             def request(self, method, url, **kwargs):
-                if method == 'GET':
-                    parent.quota_queries += 1
-                    quota = {'data': {'free_model_daily_requests': {'used': 1000 - parent.quota_remaining,
-                                                                    'limit': 1000, 'remaining': parent.quota_remaining}}}
-                    return HTTPReply(200, json.dumps(quota).encode('utf-8'))
+                if method != 'POST':
+                    raise AssertionError('Translation must use the gateway POST endpoint')
                 if kwargs.get('on_dispatch') is not None:
                     kwargs['on_dispatch']()
                 payload = kwargs['json']
@@ -112,8 +73,7 @@ class PoolPipelineFixture(SavedResultFixture):
                 if stage == parent.cancel_after and cancel is not None:
                     cancel.set()
                 return HTTPReply(200, json.dumps(response, ensure_ascii=False).encode('utf-8'))
-        with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()), \
-             mock.patch('subtitle_tool.mt_backend.qiniu_free_active', return_value=True):
+        with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
             return run() if run is not None else (engine or Engine(self.config, self.store, cancel)).run(self.job_id)
 
     def install(self, *, split=False):

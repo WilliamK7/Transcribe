@@ -73,19 +73,6 @@ class MTBackend:
     request_version: int = 5
 
 
-    @property
-    def is_openrouter(self):
-        return self.provider == 'openai_compatible' and self.base_url == OPENROUTER_BASE_URL
-
-    @property
-    def free_router(self):
-        return self.is_openrouter and self.model == 'openrouter/free'
-
-    @property
-    def free_quota(self):
-        return self.is_openrouter and (self.model == 'openrouter/free' or self.model.endswith(':free'))
-
-
     def snapshot(self):
         return {"format_version": 1, **asdict(self)}
 
@@ -96,8 +83,7 @@ class MTBackend:
 
 
     def credential(self, config):
-        key = (config.get_qiniu_key() if self.provider == 'qiniu' else
-               config.get_mt_key() if self.provider == "openai_compatible" else config.get_key())
+        key = config.get_magpie_key(self.base_url)
         if key_fingerprint(key) != self.key_fingerprint:
             raise ToolError("此任务的翻译 Key 已变更；请恢复原 MT Key 后 --resume，或用 --reflow 显式切换翻译配置。", "mt_account_changed")
         return key

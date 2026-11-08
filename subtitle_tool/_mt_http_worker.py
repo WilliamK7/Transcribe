@@ -17,16 +17,19 @@ def main():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         request = json.loads(sys.stdin.buffer.read(128 * 1024))
+        # magpie may queue and try other members before any response bytes.
+        # The parent enforces the full-response deadline and cancellation;
+        # retain a socket bound as well if the parent exits unexpectedly.
+        timeout = request['timeout']
         with requests.request(request['method'], request['url'], headers=request['headers'],
-                              json=request.get('json'), timeout=(15, 90),
+                              json=request.get('json'), timeout=(min(15, timeout), timeout),
                               allow_redirects=False, stream=True) as response:
             body = bytearray()
             for chunk in response.iter_content(8192):
                 if len(body) + len(chunk) > MAX_RESPONSE:
                     return {'error': 'response_too_large'}
                 body.extend(chunk)
-            return {'status': response.status_code, 'body': base64.b64encode(body).decode('ascii'),
-                    'retry_after': response.headers.get('Retry-After', '')[:128]}
+            return {'status': response.status_code, 'body': base64.b64encode(body).decode('ascii')}
     except requests.RequestException:
         return {'error': 'network'}
     except Exception:

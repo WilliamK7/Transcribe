@@ -90,15 +90,13 @@ class CliTests(TemporaryTest):
         super().tearDown()
 
 
-    def test_pool_progress_describes_active_stages_and_login_action(self):
+    def test_pool_progress_describes_active_stages(self):
         progress = Progress()
         with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
             progress('offline-job', 'mt_v5_progress', {'stages': {'glossary': 1, 'draft': 2}, 'elapsed': 15})
-            progress('offline-job', 'mt_quota_login')
         self.assertIn('术语分析 1 组', output.getvalue())
         self.assertIn('整句翻译 2 组', output.getvalue())
         self.assertIn('15 秒', output.getvalue())
-        self.assertIn('bl auth login --console', output.getvalue())
 
 
     def test_no_arguments_displays_help_without_creating_store(self):
@@ -107,76 +105,62 @@ class CliTests(TemporaryTest):
         self.assertIn("--configure", output.getvalue())
         self.assertFalse((self.config.data / "jobs.sqlite").exists())
 
-    def test_inspect_bailian_quota_displays_only_safe_fields_without_asserting_identity(self):
-        raw = json.dumps([{'model': 'qwen-test', 'type': 'Text', 'remaining': 12000, 'total': 20000,
-                           'expires': '2099-12-31', 'autoStop': True, 'remainingPercent': 60,
-                           'credential': 'synthetic-secret'}]).encode()
-        with mock.patch('subtitle_tool.mt_bailian_quota.CLIQuotaSource.query', return_value=raw) as query, \
-             mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-            self.assertEqual(main(['--inspect-bailian-quota']), 0)
-        result = json.loads(output.getvalue())
-        self.assertEqual(result['models'][0]['model'], 'qwen-test')
-        self.assertTrue(result['models'][0]['auto_stop'])
-        self.assertEqual(set(result), {'models'})
-        self.assertNotIn('synthetic-secret', output.getvalue())
-        self.assertEqual(query.call_count, 1)
-        self.assertFalse((self.config.data / 'jobs.sqlite').exists())
+    def test_check_magpie_rejects_legacy_selection_before_resolving_route(self):
+        for source in ('settings', 'environment'):
+            for gateway_key in ('', 'synthetic-gateway'):
+                with self.subTest(source=source, gateway_key=bool(gateway_key)):
+                    self.config.settings.mt_provider = 'openai_compatible' if source == 'settings' else 'magpie'
+                    self.config.settings.mt_base_url = 'https://openrouter.ai/api/v1'
+                    self.config.settings.mt_model = 'openrouter/free'
+                    self.config.save()
+                    previous = vars(self.config.settings).copy()
+                    saved = (self.config.data / 'settings.json').read_bytes()
+                    environment = {'MAGPIE_API_KEY': gateway_key}
+                    if source == 'environment':
+                        environment['MT_PROVIDER'] = 'openai_compatible'
+                    with mock.patch.dict(os.environ, environment), \
+                            mock.patch('subtitle_tool.mt_pool.configured_route',
+                                       return_value={'routing': {'paid_enabled': False}}) as route, \
+                            mock.patch('subtitle_tool.mt_pipeline.check_pool', return_value={}) as check, \
+                            mock.patch('sys.stdout', new_callable=io.StringIO), \
+                            self.assertRaisesRegex(ToolError, '--configure-mt magpie') as error:
+                        main(['--check-mt', 'magpie'])
+                    self.assertEqual(error.exception.code, 'mt_config')
+                    route.assert_not_called()
+                    check.assert_not_called()
+                    self.assertEqual(vars(self.config.settings), previous)
+                    self.assertEqual((self.config.data / 'settings.json').read_bytes(), saved)
 
-    def test_inspect_reconciles_off_observations_only_with_current_bound_context(self):
-        raw = json.dumps([{'model': 'qwen3.8-27b', 'type': 'Text', 'remaining': 10000, 'total': 10000,
-                           'expires': '2099-12-31', 'autoStop': False, 'remainingPercent': 100}]).encode()
-        with mock.patch('subtitle_tool.mt_bailian_binding.LocalBailianBinding') as factory, \
-             mock.patch('sys.stdout', new_callable=io.StringIO):
-            binding = factory.return_value
-            binding.current_proof.return_value = proof = object()
-            binding.source.query.return_value = raw
-            self.assertEqual(main(['--inspect-bailian-quota']), 0)
-            self.assertIs(binding.source.query.call_args.kwargs['proof'], proof)
-            observed_proof, rows = binding.observe.call_args.args
-            self.assertIs(observed_proof, proof)
-            self.assertFalse(rows['qwen3.8-27b'].auto_stop)
-            binding.reset_mock()
-            binding.current_proof.return_value = None
-            self.assertEqual(main(['--inspect-bailian-quota']), 0)
-            self.assertNotIn('proof', binding.source.query.call_args.kwargs)
-            binding.observe.assert_not_called()
+    def test_check_magpie_preserves_effective_gateway_and_groups(self):
+        for source in ('settings', 'environment'):
+            with self.subTest(source=source):
+                self.config.settings.mt_provider = 'magpie' if source == 'settings' else 'openai_compatible'
+                self.config.settings.mt_base_url = 'https://gateway.example/v1'
+                self.config.settings.mt_model = 'group/custom'
+                self.config.settings.mt_free_model = 'group/custom-free'
+                self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
+                environment = {'MAGPIE_API_KEY': 'synthetic-gateway'}
+                if source == 'environment':
+                    environment.update(MT_PROVIDER='magpie', MT_BASE_URL='https://gateway.example/v1',
+                                       MT_MODEL='group/custom', MT_FREE_MODEL='group/custom-free')
+                    self.config.settings.mt_base_url = 'https://openrouter.ai/api/v1'
+                    self.config.settings.mt_model = 'openrouter/free'
+                self.config.save()
+                previous = vars(self.config.settings).copy()
+                saved = (self.config.data / 'settings.json').read_bytes()
+                with mock.patch.dict(os.environ, environment), \
+                        mock.patch('subtitle_tool.mt_pipeline.check_pool', return_value={}) as check, \
+                        mock.patch('sys.stdout', new_callable=io.StringIO):
+                    self.assertEqual(main(['--check-mt', 'magpie', '--mt-paid', 'deny']), 0)
+                route = check.call_args.args[2]
+                self.assertFalse(route['routing']['paid_enabled'])
+                self.assertEqual([(entry['backend']['provider'], entry['backend']['base_url'],
+                                   entry['backend']['model']) for entry in route['entries']],
+                                 [('magpie', 'https://gateway.example/v1', 'group/custom-free'),
+                                  ('magpie', 'https://gateway.example/v1', 'group/custom')])
+                self.assertEqual(vars(self.config.settings), previous)
+                self.assertEqual((self.config.data / 'settings.json').read_bytes(), saved)
 
-    def test_explicit_pool_configuration_preserves_previous_settings_and_selects_models(self):
-        self.config.settings.mt_provider = 'openai_compatible'
-        self.config.settings.mt_model = 'openrouter/free'
-        self.config.settings.mt_backends = [{'id': 'openrouter_free'}, {'id': 'bailian_paid'}]
-        self.config.save()
-        with mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-            self.assertEqual(main(['--configure-mt-pool', '--bailian-free-model', 'qwen3.8-27b',
-                                   '--bailian-free-model', 'qwen3.8-max-0902']), 0)
-        settings = Config(self.path).settings
-        self.assertEqual(settings.mt_provider, 'pool')
-        self.assertEqual(settings.mt_model, 'openrouter/free')
-        self.assertEqual(settings.mt_backends[:2], [{'id': 'openrouter_free'}, {'id': 'bailian_paid'}])
-        self.assertEqual([item.get('model') for item in settings.mt_backends[2:]],
-                         ['qwen3.8-27b', 'qwen3.8-max-0902'])
-        self.assertNotIn('offline-cli-key', output.getvalue())
-
-    def test_bailian_cli_binding_requires_explicit_confirmations(self):
-        with mock.patch('subtitle_tool.mt_bailian_binding.LocalBailianBinding') as binding:
-            for args in (['--bind-bailian-account'],
-                         ['--confirm-bailian-protection', 'qwen3.8-27b'],
-                         ['--confirm-same-account'], ['--confirm-propagation-waited'],
-                         ['--bailian-free-model', 'qwen3.8-27b']):
-                with self.subTest(args=args), self.assertRaises(ToolError):
-                    main(args)
-            binding.assert_not_called()
-            with mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-                self.assertEqual(main(['--bind-bailian-account', '--confirm-same-account']), 0)
-                self.assertEqual(main(['--confirm-bailian-protection', 'qwen3.8-27b',
-                                       '--confirm-propagation-waited']), 0)
-            instance = binding.return_value
-            instance.confirm_identity.assert_called_once()
-            self.assertEqual(instance.confirm_identity.call_args.kwargs['workspace'], 'offline-space')
-            instance.confirm_protection.assert_called_once()
-            self.assertEqual(instance.confirm_protection.call_args.args[0], ['qwen3.8-27b'])
-            self.assertNotIn('offline-cli-key', output.getvalue())
-        self.assertFalse((self.config.data / 'jobs.sqlite').exists())
 
     def test_jobs_cancel_and_noninteractive_review(self):
         store = Store(self.config.data / "jobs.sqlite")

@@ -1,120 +1,77 @@
-# 百炼命令行字幕工具
+# magpie 字幕工具
 
-Windows x64 本地 CLI。通过北京工作空间的 `qwen3-asr-flash-filetrans` 识别语音，用七牛／OpenRouter／百炼翻译池生成简体中文字幕。翻译池免费优先，默认允许付费后备。
+Windows x64 本地 CLI。语音识别使用北京百炼 `qwen3-asr-flash-filetrans`，翻译使用 magpie 字幕专用组。上游 Key、模型和故障切换由常驻 magpie 管理，字幕分组、校验、取消与恢复保留在项目内。
 
 ## 开始使用
 
-在可写项目目录中打开 PowerShell：
+已完成迁移的机器，保持 magpie 运行，直接处理视频：
 
 ```powershell
-.\scripts\setup.ps1
-.\scripts\transcribe.ps1 --configure
+.\scripts\transcribe.ps1 --check-mt --mt-paid deny
 .\scripts\transcribe.ps1 "D:\Videos\课程.mkv"
 ```
 
-环境使用 Python 3.12.10 x64、锁定依赖和项目 FFmpeg。已有解释器可传 `setup.ps1 -PythonPath "C:\Python312\python.exe"`。无参数或 `--help` 显示帮助；多个文件顺序处理。
+`--check-mt` 发送合成短句。`--mt-paid deny` 只使用已核验的免费组；默认允许免费服务不可用时使用付费后备。无参数或 `--help` 显示帮助；多个文件顺序处理。
 
-`--configure` 填写北京 Workspace ID 并隐藏输入 Key；`--configure-key` 只更新 Key。Key 明文保存到 `data/key.txt`，环境变量 `DASHSCOPE_API_KEY` 优先。`data` 还保存任务、转写和缓存，应留在本机。`--workspace-id ID` 可为新任务指定工作空间。
+`--check-mt magpie` 要求当前有效 `mt_provider` 为 `magpie`，并检查该配置的地址与组名。旧直连配置需先完成迁移或运行 `--configure-mt magpie`；环境变量覆盖同样参与检查，冲突时在发送请求前报错。
 
-## 选择翻译后端
+首次准备环境运行 `.\scripts\setup.ps1`，使用 Python 3.12.10 x64、锁定依赖和项目 FFmpeg。已有解释器可传 `-PythonPath "C:\Python312\python.exe"`。环境维护见 [BUILD](docs/BUILD.md)。
 
-默认 `mt_provider:"pool"`；已有设置明确选择其他后端时沿用该设置。ASR 始终使用百炼账户。翻译配置用于新任务和 `--reflow`；`--resume` 沿用任务保存的翻译身份和策略。
+## 迁移到 magpie
 
-### 七牛／OpenRouter 翻译池
-
-配置七牛 Key 并检查免费模型：
+适用于已有七牛、OpenRouter、百炼直连配置和 Windows 便携版 magpie。启动 magpie 后，先查看计划，再执行：
 
 ```powershell
-.\scripts\transcribe.ps1 --configure-mt qiniu
-.\scripts\transcribe.ps1 --check-mt qiniu
-.\scripts\transcribe.ps1 --check-mt --mt-paid deny
-.\scripts\transcribe.ps1 --mt-paid deny "D:\Videos\课程.mkv"
+.\.venv\Scripts\python.exe -m subtitle_tool.magpie_migration --magpie "D:\Program Files\magpie\magpie.com" --data-dir "D:\Program Files\magpie\data"
+.\.venv\Scripts\python.exe -m subtitle_tool.magpie_migration --magpie "D:\Program Files\magpie\magpie.com" --data-dir "D:\Program Files\magpie\data" --apply
 ```
 
-`--configure-mt qiniu` 隐藏输入 Key，明文保存到 `data/qiniu-key.txt` 并选择翻译池；`QINIU_API_KEY` 优先。`--check-mt` 检查当前配置，使用合成短句，首个候选成功后报告入口和模型。检查会联网，启用付费候选时可能产生费用。
+迁移读取原配置的服务地址与凭据，使用 magpie 官方 CLI 创建 `transcribe-*` 入口及字幕组。先备份至 `data/migrations/magpie-*`，成功核对入口后才切换项目设置；中断可重跑，已完成迁移时重跑不覆盖后续手工调整。原 Key 文件、任务、转写、缓存、字幕及归档保留用于恢复。备份含凭据，留在本机。
 
-| 等级 | 入口 ID | 默认模型 | 凭据 |
-| --- | --- | --- | --- |
-| 免费 | `qiniu_free` | `qiniu/conatus-free` | `QINIU_API_KEY` 或 `data/qiniu-key.txt` |
-| 免费 | `openrouter_free` | `openrouter/free` | `OPENAI_API_KEY` 或 `data/mt-key.txt` |
-| 付费 | `qiniu_paid` | `deepseek/deepseek-v4.1-flash` | 七牛 Key |
-| 付费 | `bailian_paid` | `qwen3.8-flash` | 百炼 Key 及原工作空间 |
+全新安装可先用 `--configure` 录入北京工作空间及百炼 Key、`--configure-mt qiniu` 录入七牛 Key，再执行上面的导入。已有 magpie 入口只需设置下表字段；`--configure-mt magpie` 会备份设置并清除旧池选择，使用默认字幕组，不导入上游 Key。
 
-同等级候选默认权重为 3:1，运行中按实际响应速度和校验成功率调整选择。缺少凭据的入口跳过；只配置百炼 Key 时可能直接使用百炼付费候选。免费候选累计等待最多 15 秒，再尝试允许的付费候选。
+## magpie 字幕组
 
-限流后自动降低并发和发送频率，连续成功后逐步恢复；格式失败或输出截断后优先尝试其他可用入口。调度、等待与重试规则见[翻译池契约](docs/API_CONTRACT.md#翻译池请求契约-5)。
+| 组 | 成员与顺序 |
+| --- | --- |
+| `group/transcribe-free` | 七牛 `qiniu/conatus-free` → OpenRouter `openrouter/free` |
+| `group/transcribe` | 免费组 → 七牛 `deepseek/deepseek-v4.1-flash` → 百炼 `qwen3.8-flash` |
 
-`--mt-paid deny` 禁止付费候选的新请求，`allow` 允许；新建、恢复和重排均可指定，恢复时保存新的许可状态。已有匹配缓存仍可复用。
+表中是原默认池迁移后的配置；自定义模型沿用原地址、凭据与模型。免费组采用顺序路由，总组采用 magpie 的「免费优先」（`routing=free`），两组均关闭会话黏着，避免一次付费回退后继续黏在付费服务。免费入口无服务商级付费回退；OpenRouter 入口默认限制 20 RPM，已配置更严格限制时沿用。
 
-七牛 Conatus 活动截至北京时间 **2026 年 11 月 30 日 23:59**，工具在活动结束后跳过该免费模型。实名认证、资格和额度见[官方活动页](https://www.qiniu.com/ai/free-models/conatus-2026)。
+项目按费用许可选一次组：`--mt-paid deny` 只请求免费组；允许付费时直接请求总组，由 magpie 先尝试免费成员。每阶段最多向网关提交一次，新任务的完整响应时限为 180 秒，包含网关排队与回退。网关故障或输出校验失败时保存进度，通过 `--resume` 继续。
 
-### 使用百炼免费额度
+| 职责 | 负责方 |
+| --- | --- |
+| 上游 Key、模型成员、免费优先、RPM、冷却、故障切换、上游用量与费用记录 | magpie |
+| 字幕语义、术语、完整 ID 校验、排版、阶段缓存、断点恢复、取消与总时限 | 本项目 |
+| 禁止付费、免费活动到期、ASR 账户与工作空间隔离 | 项目保留边界检查；magpie 的免费标签和估算费用不能代替云端保证 |
 
-百炼免费额度按地域、模型及快照核算，用完或到期后默认转付费。为免费入口开启“免费额度用完即停”，等待生效后再使用，详见[官方额度规则](https://help.aliyun.com/zh/model-studio/new-free-quota)。
+请求携带 `X-Magpie-Session: transcribe-<任务ID>`。在 magpie 的 Routing 页面按会话查看成员尝试及回退，Usage 页面查看实际用量；本地任务报告和 `--check-mt` 返回 `gateway_session`，响应的实际成员模型也保存到阶段记录。
 
-使用 Windows npm 安装的官方 CLI **2.7.2**，确保 PATH 可找到 `bl.cmd` 和 Node.js。可登录控制台会话：
+七牛活动截至北京时间 **2026 年 11 月 30 日 23:59**。之后首次翻译会通过 magpie CLI 停用迁移创建的 `transcribe-qiniu-free`，继续使用 OpenRouter 免费服务；停用失败则停止相关路由，避免活动结束后按免费使用。自定义同类入口需在 magpie 停用或移出组。活动资格以[官方规则](https://www.qiniu.com/ai/free-models/conatus-2026)为准。
 
-```powershell
-bl auth login --console
-.\scripts\transcribe.ps1 --inspect-bailian-quota
-```
+百炼试用模型按额度、到期和“用完即停”开关决定是否免费。迁移保留原模型到已关闭的 `transcribe-bailian-trial`，不把试用额度当成无条件免费。当前免费组只接受七牛上述活动模型及 OpenRouter 的 `openrouter/free`／`:free` 模型；百炼试用须另行接入可验证的网关额度保护。
 
-检查只读查询余额、到期日期及 `auto_stop`，从到期日零点起跳过模型。`observation_usable` 表示额度字段有效，账户绑定和保护确认另行检查。`bl auth status` 只显示本地凭据状态；实际可用性以额度查询为准。
+## 项目配置
 
-长期运行可在 CLI 所选配置中保存 OpenAPI AK/SK，工具用它生成并续期查询令牌；已有 AK/SK 且 `bl usage free` 查询成功时，无需再登录浏览器。AK/SK 登录与 RAM 用户权限见[官方鉴权说明](https://help.aliyun.com/zh/model-studio/cli/installation)和[权限管理](https://help.aliyun.com/zh/model-studio/permission-management-overview)。`BailianGateway.Team.NotAuthorised` 需要由主账号将 RAM 用户加入对应百炼团队并授权，重复登录不能替代授权。
+迁移自动填写 `data/settings.json`；更换地址或组名时修改相应字段：
 
-确认 CLI 所选 AK/SK（未配置时为控制台登录账户）与工具的北京工作空间、Key 属于同一主账号，然后添加模型并绑定：
+| 设置 | 默认值或用途 |
+| --- | --- |
+| `mt_provider` | `magpie` |
+| `mt_base_url` / `magpie_base_url` | `http://127.0.0.1:3425/v1`，分别用于翻译和 ASR |
+| `mt_free_model` | `group/transcribe-free`，免费组 |
+| `mt_model` | `group/transcribe`，允许付费时的组 |
+| `magpie_data_dir` | 本机常驻 magpie 的 `data` 目录，用于核对账户及免费边界 |
+| `asr_provider` | 迁移后为 `magpie`；未迁移旧配置为 `bailian` |
+| `magpie_asr_provider` / `magpie_upload_provider` | `transcribe-bailian` / `transcribe-upload` |
 
-```powershell
-.\scripts\transcribe.ps1 --configure-mt-pool --bailian-free-model qwen3.8-27b --bailian-free-model qwen3.8-max-0902
-.\scripts\transcribe.ps1 --bind-bailian-account --confirm-same-account
-```
+翻译支持 `MT_PROVIDER`、`MT_BASE_URL`、`MT_MODEL`、`MT_FREE_MODEL` 环境覆盖。本机默认用 `Bearer magpie-transcribe` 标记用量；需要网关认证时使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，不借用上游 Key。远程翻译网关必须配置自己的凭据；无法核验免费组时不会发送免费等级请求；本机注册表不能为另一个网关提供免费保证。端口修改需同步 magpie 的保存设置。
 
-在[百炼控制台](https://bailian.console.aliyun.com/)为这两个精确模型开启“免费额度用完即停”，等待生效，再记录确认：
+ASR 提交、查询、上传策略均通过 magpie 原生代理；OSS 文件上传和签名结果下载仍直接访问存储，不附带 API Key。项目只读取 magpie 中的百炼 Key 来保持原账户指纹，网络只发送网关凭据。更换百炼 Key 要同时更新 ASR 与上传入口；两个入口必须属于相同账户、原北京工作空间。
 
-```powershell
-.\scripts\transcribe.ps1 --confirm-bailian-protection qwen3.8-27b --confirm-bailian-protection qwen3.8-max-0902 --confirm-propagation-waited
-.\scripts\transcribe.ps1 --mt-paid deny "D:\Videos\课程.mkv"
-```
-
-添加模型保留已有池条目；默认池没有百炼免费入口。命令使用已保存的北京工作空间，新入口用于新任务，旧任务通过 `--reflow` 应用。
-
-配置 AK/SK 后，重新绑定并确认模型保护一次即可启用自动续期。Key、AK/SK、工作空间或 CLI 认证身份改变时重新确认；单纯的令牌续期保留确认。观察到保护开关关闭时撤销对应模型确认。绑定记录只保存指纹，详见[额度与绑定契约](docs/API_CONTRACT.md#翻译池请求契约-5)。
-
-只使用浏览器登录时，会话失效后重新登录、绑定并确认模型保护，再 `--resume`。使用 AK/SK 时由工具自动续期；凭据被撤销或权限不足时修正相应配置。查询失败会跳过百炼免费候选，其他允许的候选继续使用。
-
-### 自定义翻译池
-
-在 `data/settings.json` 合并以下设置，保留 Workspace ID 等其他配置：
-
-```json
-{
-  "mt_provider": "pool",
-  "mt_backends": [
-    {"id": "qiniu_free"},
-    {"id": "openrouter_free", "rpm": 20},
-    {"id": "qiniu_paid"},
-    {"id": "bailian_paid"}
-  ],
-  "mt_routing": {"paid_enabled": false, "free_wait_seconds": 15},
-  "mt_quality": {"manual_glossary": {"idempotency": "幂等性"}}
-}
-```
-
-`mt_provider:pool` 且 `mt_backends` 为 `null` 或省略时使用默认池；显式列表完整替换默认列表。默认 ID 可只写覆盖项，自定义入口须填写完整身份和能力。字段范围及示例见[池配置契约](docs/API_CONTRACT.md#翻译池配置)。
-
-### 单模型
-
-只使用一个模型时，可配置只有一个入口的 `mt_backends` 列表。保留 `mt_backends:null` 时，`mt_provider` 仍可选择 `bailian`、`qiniu` 或 `openai_compatible`，程序将其转换为一个池入口，统一执行术语、整句翻译、对齐和复核。
-
-| 设置 | 环境变量 | 用途 |
-| --- | --- | --- |
-| `mt_provider` | `MT_PROVIDER` | `pool` 或上述单模型快捷配置 |
-| `mt_base_url` | `MT_BASE_URL` | 兼容接口根地址，保留服务商路径前缀 |
-| `mt_model` | `MT_MODEL` | 兼容服务必填；七牛默认 `qiniu/conatus-free`，百炼默认 `qwen3.8-flash` |
-| `mt_rpm` | `MT_RPM` | 兼容入口每分钟请求上限，0 表示不主动限流 |
-
-环境变量优先。兼容服务使用 `OPENAI_API_KEY` 或 `data/mt-key.txt`。七牛和百炼使用各自凭据；自定义兼容模型须支持所配置的结构化输出能力，可用完整池条目指定 `json_object`、`json_schema` 或 `text`。
+新配置用于新任务和 `--reflow`。`--resume` 使用原任务冻结的翻译地址、组名、凭据指纹和能力；历史任务需通过 `--reflow` 从原始转写重建。magpie 组内成员可在网关调整，每次响应的实际模型另行记录。要让旧任务改走网关，从原始转写显式执行 `--reflow`。详细契约见 [API_CONTRACT](docs/API_CONTRACT.md)。
 
 ## 右键“发送到”
 
@@ -130,8 +87,8 @@ bl auth login --console
 ## 字幕与音频
 
 - 默认输出 `视频名.srt`，外语原文在上、简体中文译文在下；中文／粤语保留原文。无语音时完成任务且不生成字幕。
-- 翻译池按组完成术语、整句翻译、必要的片段对齐和自动复核；原文与字幕片段一一对应时省去对齐请求。草稿、对齐、复核和纠正共享保存的上下文与术语，拆句时保留同句前后证据；自动术语允许同词多义，人工术语优先。最多两轮纠正，译文重复，或疑点及所涉译文均未变化时提前结束。每组完成即保存，每 15 秒报告活动阶段；复核不可用或仍有疑点时保留完整译文并提示人工检查。
-- 输入预算不足时裁剪上下文，再按可靠词时间拆分。实际译文使后续请求超预算时保存进度并返回 `mt_input_budget`；可配置更大输入能力的候选后重排，全局上限为 32768 字节。
+- 翻译按组完成术语、整句翻译、必要的片段对齐和自动复核；原文与字幕片段一一对应时省去对齐请求。草稿、对齐、复核和纠正共享保存的上下文与术语，拆句时保留同句前后证据；自动术语允许同词多义，人工术语优先。最多两轮纠正，译文重复，或疑点及所涉译文均未变化时提前结束。每组完成即保存，每 15 秒报告活动阶段；复核不可用或仍有疑点时保留完整译文并提示人工检查。
+- 输入预算不足时裁剪上下文，再按可靠词时间拆分。实际译文使后续请求超预算时保存进度并返回 `mt_input_budget`；无法继续拆分时需缩短输入后新建任务，全局上限为 32768 字节。
 - 根据模型输入与输出容量调整每组句数，长句沿可靠片段边界分组。分组方案随任务保存，恢复时继续使用；重排及人工语种复核后重新规划。
 - 原文和译文各以两行为目标，超长字幕按可靠词时间拆分。无法继续拆分时保留完整内容并记录警告。可修整的小幅句间重叠自动收短，其他冲突返回 `timeline`；规则见[时间轴与字幕](docs/API_CONTRACT.md#时间轴与字幕)。
 - 已有 SRT 默认跳过；`--overwrite` 先备份再覆盖。同名不同扩展媒体可指定不同输出目录。
@@ -175,7 +132,7 @@ bl auth login --console
 ```powershell
 # 原字节导出，不需要 Key，不访问云端；文件名为任务 ID.srt
 .\scripts\transcribe.ps1 --export-archive 旧任务ID --output-dir "D:\Subtitles\Archive"
-# 从归档转写创建新任务；不重新识别，必要时按当前池配置重新翻译
+# 从归档转写创建新任务；不重新识别，必要时按当前网关配置重新翻译
 .\scripts\transcribe.ps1 --reflow 旧任务ID --output-dir "D:\Subtitles\Rebuilt"
 ```
 

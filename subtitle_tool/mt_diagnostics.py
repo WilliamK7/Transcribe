@@ -74,12 +74,11 @@ class MTDiagnostics:
         """Write only fixed route classifications and bounded, non-content metadata."""
         from .mt_routing import _CATEGORIES, _SCOPES
         try:
-            if event.get('kind') not in {'route_attempt', 'route_failure', 'route_wait', 'route_switch',
-                                         'route_complete', 'route_reply', 'route_pacing'}:
+            if event.get('kind') not in {'route_attempt', 'route_failure', 'route_complete', 'route_reply'}:
                 return False
             record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
             self._routing(record, event)
-            for field in ['entry', 'from', 'to']:
+            for field in ['entry']:
                 value = safe_model_id(event.get(field))
                 if value:
                     record[field] = value
@@ -87,7 +86,7 @@ class MTDiagnostics:
                                    ('category', _CATEGORIES)]:
                 if event.get(field) in allowed:
                     record[field] = event[field]
-            for field in ['attempt', 'status', 'duration_ms', 'wait_ms', 'planned_wait_ms', 'switches']:
+            for field in ['attempt', 'status', 'duration_ms']:
                 value = event.get(field)
                 if type(value) is int and 0 <= value <= 2**63 - 1:
                     record[field] = value
@@ -95,32 +94,10 @@ class MTDiagnostics:
                 record['cached'] = event['cached']
             if type(event.get('dispatched')) is bool:
                 record['dispatched'] = event['dispatched']
-            if event.get('selection') in {'weighted', 'learning', 'performance', 'probe'}:
-                record['selection'] = event['selection']
-            if type(event.get('size_bucket')) is int and 0 <= event['size_bucket'] <= 3:
-                record['size_bucket'] = event['size_bucket']
-            if event.get('kind') == 'route_pacing':
-                if event.get('reason') in {'rate_limit', 'recovered'}:
-                    record['reason'] = event['reason']
-                if type(event.get('concurrency')) is int and 1 <= event['concurrency'] <= 4:
-                    record['concurrency'] = event['concurrency']
-                if type(event.get('interval_ms')) is int and 0 <= event['interval_ms'] <= 15000:
-                    record['interval_ms'] = event['interval_ms']
             return self._append(record)
         except (OSError, ValueError, TypeError, OverflowError):
             return False
 
-    def write_quota(self, event):
-        try:
-            if event.get('kind') != 'runtime_quota':
-                return False
-            category = event.get('category')
-            if category not in {'quota_observed', 'quota_refresh_failed', 'quota_console_session_invalid'}:
-                return False
-            return self._append({'time': datetime.now(timezone.utc).isoformat(),
-                                 'kind': 'runtime_quota', 'category': category})
-        except (OSError, ValueError, TypeError):
-            return False
 
     def write(self, event):
         try:
@@ -154,7 +131,8 @@ class MTDiagnostics:
                 record[field] = model
         if event.get('stage') in {'glossary', 'draft', 'align', 'review', 'correct'}:
             record['stage'] = event['stage']
-        for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}')]:
+        for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}'),
+                               ('gateway_session', r'transcribe-[0-9a-f]{32}')]:
             value = event.get(field)
             if isinstance(value, str) and re.fullmatch(pattern, value):
                 record[field] = value

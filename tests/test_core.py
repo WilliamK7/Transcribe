@@ -259,20 +259,21 @@ class PipelineTests(PipelineFixture):
         self.assertTrue(output.index("First sentence.") < output.index("繁体译文"))
         for call in fake.named("/chat/completions"):
             body = call[2]["json"]
-            self.assertEqual(body["model"], 'qwen3.8-flash')
+            self.assertEqual(body["model"], 'group/transcribe')
             self.assertEqual(len(body['messages']), 2)
             self.assertEqual(body['messages'][0]['role'], 'system')
 
-    def test_partial_mt_failure_retries_only_failed_cue(self):
+    def test_resume_reuses_asr_and_saved_glossary_failure(self):
         fake = FakeService(result(("First sentence.", "en"), ("Second sentence.", "en")))
         fake.mt_failure.add("Second sentence.")
         self.assertEqual(self.run_fake(fake), "failed")
         self.assertFalse(self.source.with_suffix(".srt").exists())
         self.assertFalse(any(c["translated"] for c in self.store.cues(self.job_id)))
+        before_resume = len(fake.named("/chat/completions"))
         fake.mt_failure.clear()
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
-        self.assertEqual(len(fake.named("/chat/completions")), 3)
+        self.assertEqual(len(fake.named("/chat/completions")) - before_resume, 2)
 
     def test_mt_failure_stops_scheduling_beyond_concurrency(self):
         fake = FakeService(result(*[(f"Sentence number {i}.", "en") for i in range(12)]))
@@ -287,6 +288,7 @@ class PipelineTests(PipelineFixture):
         raw = self.config.data / "cache" / self.job_id / "raw-0000.json"
         raw.unlink()
         fake.query_failure = True
+        before_resume = len(fake.named("/chat/completions"))
         fake.mt_failure.clear()
         before = self.store.counts(self.job_id).get("asr_query", 0)
         self.assertEqual(self.run_fake(fake), "completed")

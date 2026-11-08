@@ -7,11 +7,11 @@ import json
 import re
 import time
 import threading
+from contextlib import nullcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 
-from .api import retry_after_seconds
 from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
 from .mt_backend import MTBackend
 from .mt_context import group_context, sentence_context, target_span, trim_context, valid_context_subset
@@ -20,9 +20,9 @@ from .mt_pool import saved_route
 from .mt_planning import make_unit, restore_group_plan, save_group_plan
 from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION, correction_stalled, direct_draft_matches,
                          estimate_stage_output, make_stage_payload, manual_terms, parse_stage_response, plan_sentence_groups,
-                         stage_cache_key, stage_output_size, term_appears, term_evidence, validate_stage_value)
-from .mt_routing import MTRouter, RouteEntry, RouteFailure
-from .mt_runtime import bailian_failure, service_failure
+                         stage_cache_key, term_appears, term_evidence, validate_stage_value)
+from .mt_routing import MagpieRoute, RouteEntry, RouteFailure
+from .mt_runtime import service_failure
 from .mt_transport import TransportError
 from .review import decision_origin
 from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, split_mt_units,
@@ -163,10 +163,11 @@ def check_pool(config, identity, route, cancel):
         data = {'sentences': [{'id': '0', 'text': sentence, 'asr_language': 'en',
                               'source_language': 'English', 'decision_origin': 'automatic'}],
                 'context': [], 'glossary': []}
-        _, origin, _ = pipeline.stage('draft', data, ids=['0'], originals=[sentence])
+        _, origin, proof = pipeline.stage('draft', data, ids=['0'], originals=[sentence])
         entry = pipeline.profiles[origin]
         return {'status': 'ok', 'backend': origin, 'provider': entry['backend']['provider'],
-                'model': entry['backend']['model']}
+                'model': entry['backend']['model'], 'actual_model': proof['actual_model'],
+                'gateway_session': 'transcribe-' + job_id}
     finally:
         store.close()
 
@@ -243,7 +244,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                     source_hashes[final['cue_ids'].index(cue['cue_id'])] != _digest(cue['text'].strip())):
                 raise ValueError()
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        raise ToolError('译文阶段来源与保存的翻译池不一致。', 'cache_mismatch') from None
+        raise ToolError('译文阶段来源与保存的网关组不一致。', 'cache_mismatch') from None
 
 
 class Pipeline:
@@ -255,24 +256,8 @@ class Pipeline:
         self.context = threading.local()
         self.group_progress = None
         self.diagnostics = MTDiagnostics(engine.config.root, job_id)
-        self.quota_warning_lock = threading.Lock()
-        self.quota_warning_sent = False
         from . import mt_transport
-        from .mt_bailian_quota import BailianQuota
-        from .mt_bailian_binding import LocalBailianBinding
-        from .mt_quota import OpenRouterQuota
         self.transport = mt_transport.ProcessTransport()
-        self.quota = OpenRouterQuota(engine.mt_control, lambda entry: entry.backend.credential(engine.config),
-                             transport=self.transport, on_event=self._quota_event)
-        # The saved, explicitly user-confirmed binding is rechecked against the
-        # current credentials and CLI login context before every admission.
-        binding = LocalBailianBinding(engine.config.data, get_key=engine.config.get_key,
-                                      get_scope=lambda: (engine.config.settings.workspace_id,
-                                                         engine.config.settings.region))
-        self.bailian_quota = BailianQuota(engine.mt_control, identity=binding.identity,
-                                          protection=binding.protection, source=binding.source,
-                                          observation=binding.observe,
-                                          on_event=self._quota_event)
         self.snapshot = saved_route(manifest)
         self.profiles = {profile['id']: profile for profile in self.snapshot['entries']}
         entries = []
@@ -280,52 +265,25 @@ class Pipeline:
             if profile['backend'] is None:
                 continue
             backend = MTBackend.from_snapshot(profile['backend'])
-            entries.append(RouteEntry(profile['id'], backend, profile['tier'], profile['weight'], profile['rpm']))
+            entries.append(RouteEntry(profile['id'], backend, profile['tier']))
         routing = self.snapshot['routing']
-        self.router = MTRouter(entries, paid_enabled=routing['paid_enabled'], control=engine.mt_control,
-                               free_wait_seconds=routing['free_wait_seconds'], priority=self._priority,
-                               on_event=self._event)
+        self.router = MagpieRoute(entries, paid_enabled=routing['paid_enabled'], control=engine.mt_control,
+                                  on_event=self._event)
 
     def _event(self, event):
         event = dict(event)
-        if event.get('kind') == 'route_wait' and isinstance(event.get('seconds'), (int, float)):
-            event['planned_wait_ms'] = max(0, round(event['seconds'] * 1000))
+        event['gateway_session'] = 'transcribe-' + self.job_id
         self.diagnostics.write_route({**event, 'stage': getattr(self.context, 'stage', ''),
                                       'group_key': getattr(self.context, 'group_key', ''),
                                       'run_id': getattr(self.engine, 'run_id', '')})
-        if event.get('kind') == 'route_switch':
-            self.store.count(self.job_id, 'mt_route_switch')
-        elif event.get('kind') == 'route_failure':
+        if event.get('kind') == 'route_failure':
             self.store.count(self.job_id, 'mt_v5_' + getattr(self.context, 'stage', 'unknown') + '_failure')
 
-    def _quota_event(self, event):
-        if event.get('kind') == 'quota_query':
-            self.store.count(self.job_id, 'mt_quota_query')
-        else:
-            self.diagnostics.write_quota(event)
-            if event.get('category') == 'quota_console_session_invalid':
-                with self.quota_warning_lock:
-                    progress = getattr(self.engine, 'progress', None)
-                    if not self.quota_warning_sent and callable(progress):
-                        self.quota_warning_sent = True
-                        progress(self.job_id, 'mt_quota_login', None, None)
-
-    def _priority(self, entry):
-        if entry.tier == 'free' and entry.backend.provider == 'bailian':
-            capabilities = self.profiles[entry.id]['capabilities']
-            expires = self.bailian_quota.priority(entry)
-            response_mode = 'json' if capabilities['response_format'] in {'json_object', 'json_schema'} else 'text'
-            group = ('bailian', response_mode, capabilities['input_bytes'],
-                     capabilities['output_tokens'])
-            return group, expires.toordinal() if expires is not None else None
-        return None
-
-    def _reserve_quota(self, entry, wait_budget, stage, data):
-        if entry.tier == 'free' and entry.backend.provider == 'bailian':
-            from .mt_bailian_quota import estimate_tokens
-            payload = self._request_payload(stage, data, entry)
-            return self.bailian_quota.reserve(entry, wait_budget, estimate=estimate_tokens(payload))
-        return self.quota.reserve(entry, wait_budget)
+    def _prepare_gateway(self, entry):
+        from .magpie import validate_group
+        validate_group(self.engine.config.settings, entry.backend.model,
+                       free_only=entry.tier == 'free', base_url=entry.backend.base_url)
+        return nullcontext()
 
     def _request_payload(self, stage, data, entry):
         try:
@@ -336,10 +294,10 @@ class Pipeline:
                 raise
             raise RouteFailure('local_error') from None
 
-    def _fit(self, stage, data, *, allow_guarded_fallback=True, output_budget=False, fixed_semantics=False):
+    def _fit(self, stage, data, *, output_budget=False, fixed_semantics=False):
         """Drop far context first, then excess glossary; never truncate targets."""
         data = dict(data)
-        candidates, guarded, cache_only = [], [], []
+        candidates = []
         for entry in self.router.entries:
             if entry.tier == 'paid' and not self.router.paid_enabled:
                 continue
@@ -349,20 +307,7 @@ class Pipeline:
                 entry.backend.credential(self.engine.config)
             except ToolError:
                 continue
-            if entry.tier == 'free' and entry.backend.provider == 'bailian':
-                (guarded if self.bailian_quota.potential(entry) else cache_only).append(entry)
-            else:
-                candidates.append(entry)
-        # Retain cache-only profiles for recovery when network admission is unavailable.
-        # A bound free Bailian model can still have an unknown/expired/empty
-        # quota when a group is planned. Size to another available provider
-        # first, so a later refusal does not strand an otherwise usable route.
-        fallback = guarded if candidates else []
-        candidates = candidates or guarded or cache_only
-        if output_budget:
-            # Avoid choosing group sizes that depend on a paid model while a
-            # usable, smaller free profile is the first network choice.
-            candidates = [entry for entry in candidates if entry.tier == 'free'] or candidates
+            candidates.append(entry)
         output_estimate = estimate_stage_output(stage, data) if output_budget else None
         def payload_fits(entry):
             capabilities = self.profiles[entry.id]['capabilities']
@@ -387,14 +332,6 @@ class Pipeline:
             elif data.get('glossary') and not fixed_semantics:
                 data['glossary'] = data['glossary'][:-1]
             else:
-                if allow_guarded_fallback:
-                    for entry in fallback:
-                        try:
-                            payload_fits(entry)
-                            return data
-                        except ToolError as error:
-                            if error.code != 'mt_input_budget':
-                                raise
                 raise ToolError('翻译阶段完整请求超过所有可用模型的输入预算。', 'mt_input_budget')
 
     def _work_key(self, name, data):
@@ -483,26 +420,26 @@ class Pipeline:
             except (ValueError, TypeError, KeyError, ToolError):
                 raise ToolError('翻译阶段缓存无效，未复用。', 'cache_mismatch') from None
 
-        def invoke(entry, timeout, attempt, reservation):
+        def invoke(entry, timeout, attempt):
             self.engine.mt_control.check_start()
             try:
                 key = entry.backend.credential(self.engine.config)
             except ToolError:
-                raise RouteFailure('authentication', scope='credential', disable=True) from None
+                raise RouteFailure('authentication', scope='credential') from None
             payload = self._request_payload(name, data, entry)
             def dispatch():
-                reservation.mark_sent()
                 self.store.count(self.job_id, 'mt')
                 self.store.count(self.job_id, 'mt_v5_' + entry.id + '_' + name + '_request')
             try:
                 request_started = time.monotonic()
                 reply = self.transport.request('POST', entry.backend.base_url + '/chat/completions',
-                    headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'},
+                    headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
+                             'User-Agent': 'Transcribe/1', 'X-Magpie-Response-Model': 'member',
+                             'X-Magpie-Session': 'transcribe-' + self.job_id},
                     json=payload, control=self.engine.mt_control, timeout=timeout,
                     on_dispatch=dispatch)
             except TransportError as error:
-                raise RouteFailure(error.category, scope='endpoint' if error.category == 'network' else 'entry',
-                                   retryable=error.retryable) from None
+                raise RouteFailure(error.category, scope='endpoint' if error.category == 'network' else 'entry') from None
             try:
                 body = json.loads(reply.body)
             except (ValueError, UnicodeError, RecursionError):
@@ -513,31 +450,27 @@ class Pipeline:
                     type(raw_usage.get('completion_tokens')) is int and raw_usage['prompt_tokens'] >= 0 and
                     raw_usage['completion_tokens'] >= 0):
                 usage = {'input_tokens': raw_usage['prompt_tokens'], 'output_tokens': raw_usage['completion_tokens']}
-                if entry.tier == 'free' and entry.backend.provider == 'bailian':
-                    reservation.settle(usage)
             else:
                 usage = None
             self.diagnostics.write_route({'kind': 'route_reply', 'stage': name, 'entry': entry.id,
                 'model': entry.backend.model, 'status': status, 'duration_ms': round((time.monotonic() - request_started) * 1000),
+                'gateway_session': 'transcribe-' + self.job_id,
                 'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', '')})
             if 200 <= status < 300:
                 self.store.count(self.job_id, 'mt_success')
             if status == 429:
                 self.store.count(self.job_id, 'mt_429')
-            failure = (bailian_failure(status, body) if entry.backend.provider == 'bailian' else
-                       service_failure(status, body, free_router=entry.backend.free_router))
+            failure = service_failure(status, body)
             if failure is not None:
-                category, scope, disable = failure.category, 'entry', False
+                category = failure.category
+                scope = 'entry'
                 if status == 401 or category == 'authentication':
-                    category, scope, disable = 'authentication', 'credential', True
-                elif entry.backend.provider == 'bailian' and category == 'quota_exhausted':
-                    scope, disable = 'model_quota', True
+                    category, scope = 'authentication', 'credential'
                 elif entry.tier == 'paid' and (status == 402 or category == 'payment_required'):
-                    category, scope, disable = 'payment_required', 'paid_account', True
-                elif status == 404 and not entry.backend.free_router:
-                    scope, disable = 'model', True
-                raise RouteFailure(category, scope=scope, retryable=failure.retryable, rate_limited=status == 429,
-                                   retry_after=retry_after_seconds(reply.retry_after), disable=disable) from None
+                    category, scope = 'payment_required', 'paid_account'
+                elif status == 404:
+                    scope = 'model'
+                raise RouteFailure(category, scope=scope) from None
             try:
                 value = parse_stage_response(name, body, ids=ids, originals=originals)
             except BatchValidationError as error:
@@ -584,15 +517,14 @@ class Pipeline:
             else:
                 remaining = max(0.0, 180.0 - (time.monotonic() - started))
                 result = self.router.run(invoke, cache=cached if adapted else None, prefer_other_than=prefer,
-                                         prepare=lambda entry, wait: self._reserve_quota(entry, wait, name, data),
-                                         deadline_seconds=remaining, stage=name, output_size=stage_output_size(name, data))
+                                         prepare=self._prepare_gateway,
+                                         deadline_seconds=remaining)
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
             'model': result.entry.backend.model, 'actual_model': result.value['actual_model'],
-            'duration_ms': round((time.monotonic() - started) * 1000), 'wait_ms': round(result.waited * 1000),
-            'attempt': result.attempts, 'switches': result.switches, 'cached': result.cached,
+            'gateway_session': 'transcribe-' + self.job_id,
+            'duration_ms': round((time.monotonic() - started) * 1000),
+            'attempt': result.attempts, 'cached': result.cached,
             'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', '')})
-        if result.waited:
-            self.store.count(self.job_id, 'mt_route_wait_ms', round(result.waited * 1000))
         record = {**result.value, **evidence, 'backend': result.entry.id, 'request_model': result.entry.backend.model,
                   'stage': name}
         if name == 'glossary':
@@ -611,7 +543,7 @@ class Pipeline:
         return record['value'], record['backend'], {'key': work_key, 'actual_model': record['actual_model'],
                                                     'request_model': record['request_model']}
 
-    def _fits_group(self, units, *, allow_guarded_fallback=False, output_budget=False):
+    def _fits_group(self, units, *, output_budget=False):
         if units[-1]['cues'][-1]['end_ms'] - units[0]['cues'][0]['begin_ms'] > 60000:
             return False
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(units)]
@@ -622,7 +554,7 @@ class Pipeline:
         samples.extend(_group_samples(sentences, fragments, context, []))
         try:
             for stage, data in samples:
-                self._fit(stage, data, allow_guarded_fallback=allow_guarded_fallback, output_budget=output_budget)
+                self._fit(stage, data, output_budget=output_budget)
             return True
         except ToolError as error:
             if error.code != 'mt_input_budget':
@@ -646,7 +578,7 @@ class Pipeline:
                         return [unit]
                     if end - start < 2 or not source.get('words'):
                         # Intact targets use input-only admission, including guarded models.
-                        if self._fits_group([unit], allow_guarded_fallback=True):
+                        if self._fits_group([unit]):
                             return [unit]
                         raise ToolError('完整句超过模型预算且没有可用的可靠词时间边界。', 'mt_input_budget')
                     middle = (start + end) // 2
@@ -851,7 +783,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             parts = plan_fragments(source, settings)
             if source['decision'] == 'translate':
                 parts = split_mt_units(source, parts, fits=lambda cue: pipeline._fits_group(
-                    [{'source': source, 'text': cue['text'], 'cues': [cue]}], allow_guarded_fallback=True))
+                    [{'source': source, 'text': cue['text'], 'cues': [cue]}]))
             cues.extend(parts)
         plan_display_timing(cues)
         candidate = copy.deepcopy(manifest)
