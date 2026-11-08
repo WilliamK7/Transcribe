@@ -468,7 +468,7 @@ class Engine:
             nonlocal api
             gateway = self.config.asr_gateway(manifest)
             if api is None:
-                api = Bailian(key, manifest["region"], self.cancel,
+                api = Bailian(manifest["region"], self.cancel,
                     count=lambda name: self.store.count(job_id, name),
                     progress=lambda name, done, total: self.progress(job_id, name, done, total),
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"],

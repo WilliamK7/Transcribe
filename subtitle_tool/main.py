@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import hashlib
 import json
 import signal
@@ -30,11 +29,7 @@ def parser():
     actions.add_argument("--jobs", action="store_true", help="列出任务（每行 JSON）")
     actions.add_argument("--export-archive", metavar="JOB_ID", help="校验并导出归档字幕，须指定 --output-dir")
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
-    actions.add_argument("--configure", action="store_true", help="配置 Workspace ID 和隐藏输入 Key")
-    actions.add_argument("--configure-key", action="store_true", help="隐藏输入 Key，明文保存到 data/key.txt")
-    actions.add_argument('--configure-mt', choices=['magpie', 'qiniu'], help='选择 magpie 字幕组并备份设置；qiniu 录入迁移凭据')
-    actions.add_argument('--check-mt', nargs='?', const='configured', choices=['configured', 'magpie'],
-                         help='用合成文本在线检查当前翻译服务；指定 magpie 要求已选择网关配置')
+    actions.add_argument('--check-mt', action='store_true', help='用合成文本在线检查 magpie 字幕组')
     actions.add_argument("--self-test", action="store_true", help="仅执行本机诊断，不访问云端")
     result.add_argument("--workspace-id", help="本次新任务使用的北京 Workspace ID（域名标签）")
     result.add_argument("--bind-task-id", help="给提交未知的任务绑定已知云端 ID，需 --resume")
@@ -166,8 +161,8 @@ def summary(store, job_id):
     item = {"job_id": job_id, "state": job["state"], "source": job["source"], "output": job["output"],
             "counts": store.counts(job_id), "error_code": job["error_code"], "request_id": job["request_id"],
             "region": manifest["region"], "workspace_id": manifest.get("workspace_id", ""),
-            "access_mode": manifest.get("access_mode", "legacy_public"),
-            "processing_version": manifest.get("processing_version", 1), "cue_count": len(store.cues(job_id)),
+            "access_mode": manifest.get("access_mode"),
+            "processing_version": manifest.get("processing_version"), "cue_count": len(store.cues(job_id)),
             "subtitle_version": manifest.get("subtitle_version", 0),
             "display_timing_version": manifest.get("display_timing_version", 0),
             "display_timing_adjustments": manifest.get("display_timing_adjustments", []),
@@ -176,21 +171,26 @@ def summary(store, job_id):
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
     if 'mt_route_snapshot' in manifest and not manifest.get('archived'):
         from .mt_pool import saved_route
-        route = saved_route(manifest)
-        mt = next(entry['backend'] for entry in route['entries'] if entry['backend'] is not None)
-        permitted = 'paid' if route['routing']['paid_enabled'] else 'free'
-        mt = next((entry['backend'] for entry in route['entries']
-                   if entry['tier'] == permitted and entry['backend'] is not None), mt)
-        item['gateway_session'] = 'transcribe-' + job_id
-        item['mt_route'] = {'paid_enabled': route['routing']['paid_enabled'],
-                            'entries': [{'id': entry['id'], 'tier': entry['tier'],
-                                         'available': entry['backend'] is not None,
-                                         'model': entry['backend']['model'] if entry['backend'] else None}
-                                        for entry in route['entries']]}
+        try:
+            route = saved_route(manifest)
+        except ToolError:
+            # Historical results remain listable for explicit reflow.
+            mt = {'provider': None, 'model': None}
+            item['mt_route_status'] = 'reflow_required'
+        else:
+            permitted = 'paid' if route['routing']['paid_enabled'] else 'free'
+            mt = next(entry['backend'] for entry in route['entries'] if entry['tier'] == permitted)
+            item['mt_route_status'] = 'current'
+            item['mt_policy_version'] = mt['policy_version']
+            item['gateway_session_prefix'] = 'transcribe-' + job_id + '-'
+            item['mt_route'] = {'paid_enabled': route['routing']['paid_enabled'],
+                                'entries': [{'id': entry['id'], 'tier': entry['tier'],
+                                             'model': entry['backend']['model']}
+                                            for entry in route['entries']]}
     else:
         mt = manifest.get("mt_snapshot", {})
     item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", manifest.get("contract", {}).get("mt"))}
-    item["mt_provider"] = mt.get("provider", "bailian")
+    item["mt_provider"] = mt.get("provider")
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
     counts = item["counts"]
     item["timings"] = {"run_seconds": counts.get("run_ms", 0) / 1000,
@@ -228,8 +228,8 @@ def hint(store, job_id):
 def main(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.cancel or args.configure or
-              args.configure_key or args.configure_mt or args.check_mt or args.self_test or
+    action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.cancel or
+              args.check_mt or args.self_test or
               args.export_archive)
     if not args.files and not action:
         argument_parser.print_help()
@@ -258,47 +258,16 @@ def main(argv=None):
     previous_signal = None
     processing = False
     try:
-        if args.configure_mt:
-            if args.configure_mt == 'magpie':
-                config.configure_magpie()
-                print(json.dumps({'status': 'configured', 'provider': 'magpie',
-                                  'model': config.settings.mt_model,
-                                  'free_model': config.settings.mt_free_model}, ensure_ascii=False))
-                return 0
-            if not interactive:
-                raise ToolError('请在交互终端配置七牛 Key；也可设置 QINIU_API_KEY。', 'credentials')
-            config.set_qiniu_key(getpass.getpass('七牛 API Key（隐藏输入）：', stream=sys.stderr))
-            config.settings.mt_provider = 'pool'
-            config.save()
-            print('七牛迁移凭据已保存到 data/qiniu-key.txt；请运行 magpie_migration 导入网关。QINIU_API_KEY 环境变量仍优先。', file=sys.stderr)
-            return 0
         if args.check_mt:
             from .mt_backend import key_fingerprint
             from .mt_pool import configured_route
             from .mt_pipeline import check_pool
-            if args.check_mt == 'magpie' and config.mt_settings().mt_provider != 'magpie':
-                raise ToolError('当前有效翻译配置未选择 magpie；请先迁移或运行 --configure-mt magpie，'
-                                '并检查 MT_PROVIDER 环境覆盖。', 'mt_config')
             identity = {'region': 'beijing', 'workspace_id': validate_workspace_id(config.settings.workspace_id),
                         'access_mode': 'workspace', 'account': key_fingerprint(config.get_key())}
             route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
             if route['routing']['paid_enabled']:
                 print('在线检查可能使用网关付费模型；可用 --mt-paid deny 禁止付费请求。', file=sys.stderr)
             print(json.dumps(check_pool(config, identity, route, cancel), ensure_ascii=False))
-            return 0
-        if args.configure or args.configure_key:
-            if config.settings.asr_provider == 'magpie':
-                raise ToolError('百炼 Key 现由 magpie 管理；请在 magpie 更新对应入口，工作空间需与原任务一致。', 'config')
-            if not interactive:
-                raise ToolError("请在交互终端配置 Workspace ID／Key；非交互运行请预先配置或使用环境变量。", "credentials")
-            if args.configure:
-                workspace = args.workspace_id or ask("北京 Workspace ID（不能填完整 URL）：")
-                config.settings.workspace_id = validate_workspace_id(workspace)
-                config.settings.region = "beijing"
-            key = getpass.getpass("北京百炼 API Key（隐藏输入）：", stream=sys.stderr)
-            config.set_key(key)
-            config.save()
-            print("配置已保存；Key 明文位于 data/key.txt，环境变量 DASHSCOPE_API_KEY 仍优先。", file=sys.stderr)
             return 0
         if args.self_test:
             from .diagnostics import self_test

@@ -391,7 +391,8 @@ class PoolPipelineTests(PoolPipelineFixture):
         events = [json.loads(line) for line in log.splitlines()]
         invalid = [event for event in events if event['kind'] == 'invalid_response']
         self.assertEqual([(event['category'], event['actual_count']) for event in invalid],
-                         [(category, count) for _, _, category, count in cases])
+                         [(category, count) for _, finish, category, count in cases
+                          for _ in range(2 if finish == 'stop' else 1)])
         self.assertTrue(all(event['stage'] == 'draft' and event['expected_count'] == 1 for event in invalid))
         self.assertEqual(self.store.counts(self.job_id)['mt_output_truncated'], 2)
         failures = [event for event in events if event['kind'] == 'route_failure']
@@ -656,12 +657,6 @@ class PoolPipelineTests(PoolPipelineFixture):
             Engine(self.config, self.store).retime(self.job_id, overwrite=True)
         self.assertEqual(error.exception.code, 'cache_mismatch')
 
-    def test_retime_ignores_unused_direct_provider_key(self):
-        self.install()
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertTrue(all(cue['mt_origin'] == 'magpie_free' for cue in self.store.cues(self.job_id)))
-        self.config.set_qiniu_key('changed-unused-qiniu')
-        Engine(self.config, self.store).retime(self.job_id, overwrite=True)
 
     def test_retime_rejects_changed_used_key_before_saving_or_publishing(self):
         self.install()

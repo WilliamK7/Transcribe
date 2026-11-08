@@ -12,13 +12,6 @@ class PoolPipelineFixture(SavedResultFixture):
     def setUp(self):
         super().setUp()
         self.config.settings.mt_routing = {'paid_enabled': False}
-        registry = self.path / 'gateway'
-        registry.mkdir()
-        self.config.settings.magpie_data_dir = str(registry)
-        (registry / 'providers.json').write_text(json.dumps({'providers': [
-            {'id': 'free', 'chat': 'https://openrouter.ai/api/v1'}],
-            'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
-                       {'id': 'transcribe', 'members': ['group/transcribe-free']}]}), encoding='utf-8')
         self.config.settings.mt_workers = 2
         self.calls = []
         self.review_failure = False

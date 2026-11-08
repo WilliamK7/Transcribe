@@ -4,14 +4,14 @@ from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config
 from subtitle_tool.mt_backend import key_fingerprint
 from subtitle_tool.mt_pool import configured_route, saved_route
-from tests.fixtures import TemporaryTest
+from tests.fixtures import set_asr_account, TemporaryTest
 
 
 class GatewaySnapshotValidationTests(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
-        self.config.set_key('synthetic-asr')
+        set_asr_account(self.config, 'synthetic-asr')
         self.manifest = {'region': 'beijing', 'access_mode': 'workspace', 'workspace_id': 'space',
                          'account': key_fingerprint('synthetic-asr')}
 
@@ -57,6 +57,16 @@ class GatewaySnapshotValidationTests(TemporaryTest):
         changed = copy.deepcopy(original)
         changed['mt_route_snapshot']['format_version'] = True
         mutations.append(changed)
+        for backend in (None, {}):
+            changed = copy.deepcopy(original)
+            changed['mt_route_snapshot']['entries'][0]['backend'] = backend
+            mutations.append(changed)
+        changed = copy.deepcopy(original)
+        changed['mt_route_snapshot']['entries'].pop()
+        mutations.append(changed)
+        changed = copy.deepcopy(original)
+        changed['mt_route_snapshot']['entries'][1]['tier'] = 'free'
+        mutations.append(changed)
         for key, value in [('response_format', 'bogus'), ('input_bytes', True), ('input_bytes', 0),
                            ('output_tokens', -1), ('output_tokens', 32769)]:
             changed = copy.deepcopy(original)
@@ -100,7 +110,7 @@ class GatewaySnapshotValidationTests(TemporaryTest):
 
     def test_malformed_backend_fields_are_rejected(self):
         baseline = self.manifest_with(configured_route(self.config, self.manifest))
-        cases = [('format_version', True), ('format_version', 2), ('request_version', 4),
+        cases = [('format_version', True), ('format_version', 3), ('request_version', 4),
                  ('request_version', 5.0), ('provider', []), ('provider', 'unknown'),
                  ('model', ''), ('model', 'a b'), ('model', 'a\u202eb'), ('model', 'x' * 501),
                  ('key_fingerprint', None), ('key_fingerprint', 'f' * 63),

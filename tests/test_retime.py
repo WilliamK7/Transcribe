@@ -11,7 +11,7 @@ import subtitle_tool.engine as engine_module
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main, summary
-from tests.fixtures import FakeService, SavedResultFixture, overlapping_raw, srt_intervals
+from tests.fixtures import set_asr_account, FakeService, SavedResultFixture, overlapping_raw, srt_intervals
 
 
 class RetimeTests(SavedResultFixture):
@@ -104,7 +104,7 @@ class RetimeTests(SavedResultFixture):
 
     def test_identity_is_checked_before_reusing_saved_translations(self):
         self.prepare_completed()
-        self.config.set_key("another-offline-account")
+        set_asr_account(self.config, "another-offline-account")
         with self.assertRaises(ToolError) as caught:
             Engine(self.config, self.store).retime(self.job_id, overwrite=True)
         self.assertEqual(caught.exception.code, "account_changed")

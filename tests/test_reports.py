@@ -11,7 +11,7 @@ from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main
 from subtitle_tool.store import Store
-from tests.fixtures import enqueue_current, ROOT, TemporaryTest
+from tests.fixtures import set_asr_account, enqueue_current, ROOT, TemporaryTest
 
 
 class ReportProtectionTests(TemporaryTest):
@@ -19,7 +19,8 @@ class ReportProtectionTests(TemporaryTest):
         super().setUp()
         self.config = Config(self.path)
         self.config.settings.workspace_id = "offline-space"
-        self.config.set_key("offline-report-key")
+        set_asr_account(self.config, "offline-report-key")
+        (self.config.data / 'magpie-key.txt').write_text('offline-gateway-key', encoding='utf-8')
         self.source = self.path / "source.mkv"
         self.source.write_bytes(b"original media")
         self.store = Store(self.config.data / "jobs.sqlite")
@@ -65,7 +66,7 @@ class ReportProtectionTests(TemporaryTest):
         manifest = self.store.job(self.job_id)["manifest"]
         manifest["backup"] = str(backup)
         self.store.update(self.job_id, manifest=manifest)
-        for path in [output, backup, cache, snapshot, retime_snapshot, self.config.data / "key.txt",
+        for path in [output, backup, cache, snapshot, retime_snapshot, self.config.data / "magpie-key.txt",
                      self.config.data / "jobs.sqlite", self.config.data / "future.json",
                      self.path / ".build" / "reflow" / "future.json", self.path / ".build" / "retime" / "future.json"]:
             with self.subTest(path=path.name):
@@ -86,7 +87,7 @@ class ReportProtectionTests(TemporaryTest):
 
     def test_hardlinks_case_and_directory_aliases(self):
         alias = self.path / "report.json"
-        for protected in [self.source, self.config.data / "key.txt"]:
+        for protected in [self.source, self.config.data / "magpie-key.txt"]:
             os.link(protected, alias)
             try:
                 self.assert_conflict(["--jobs"], alias)
@@ -98,7 +99,7 @@ class ReportProtectionTests(TemporaryTest):
             junction = self.path / "data-alias"
             _winapi.CreateJunction(str(self.config.data), str(junction))
             try:
-                self.assert_conflict(["--jobs"], junction / "key.txt")
+                self.assert_conflict(["--jobs"], junction / "magpie-key.txt")
             finally:
                 junction.rmdir()
 
@@ -164,7 +165,7 @@ class ReportProtectionTests(TemporaryTest):
 
     def test_selftest_default_exception_does_not_allow_hardlink_to_credentials(self):
         target = self.config.data / "self-test.json"
-        os.link(self.config.data / "key.txt", target)
+        os.link(self.config.data / "magpie-key.txt", target)
         self.assert_conflict(["--self-test"], target)
 
     def test_selftest_default_and_external_reports_do_not_recover_or_read_key(self):

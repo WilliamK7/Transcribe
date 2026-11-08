@@ -25,7 +25,7 @@ class QualityContractTests(unittest.TestCase):
         self.free = MTBackend('magpie', 'http://127.0.0.1:3425/v1', 'group/transcribe-free', key_fingerprint('gateway'), 5)
         self.paid = MTBackend('magpie', 'http://127.0.0.1:3425/v1', 'group/transcribe', key_fingerprint('gateway'), 5)
         self.free_caps = {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}
-        self.paid_caps = {'response_format': 'json_schema', 'input_bytes': 32768, 'output_tokens': 4096}
+        self.paid_caps = dict(self.free_caps)
         self.scope = {'account': 'synthetic'}
 
     def test_stalled_correction_requires_exact_issues_and_unchanged_affected_sentences(self):
@@ -121,7 +121,7 @@ class QualityContractTests(unittest.TestCase):
     def test_review_schema_limits_evidence_to_actual_fragment_ids(self):
         data = {'fragments': [{'id': '0', 'text': 'One.'}, {'id': '1', 'text': 'Two.'}]}
         payload = make_stage_payload('review', data, self.paid, capabilities=self.paid_caps)
-        schema = payload['response_format']['json_schema']['schema']
+        schema = json.loads(payload['messages'][0]['content'].split('输出必须符合此 JSON Schema：', 1)[1])
         self.assertEqual(schema['properties']['issues']['items']['properties']['id']['enum'], ['0', '1'])
 
 
@@ -155,11 +155,11 @@ class QualityContractTests(unittest.TestCase):
             make_stage_payload('draft', data, self.paid, capabilities=self.paid_caps)
         self.assertEqual(error.exception.code, 'mt_input_budget')
 
-    def test_explicit_capability_controls_wire_format_and_size(self):
+    def test_saved_capability_controls_request_size_and_cache_identity(self):
         data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'glossary': []}
-        caps = {'response_format': 'text', 'input_bytes': 2000, 'output_tokens': 512}
+        caps = {'response_format': 'json_object', 'input_bytes': 2000, 'output_tokens': 512}
         payload = make_stage_payload('draft', data, self.free, capabilities=caps)
-        self.assertNotIn('response_format', payload)
+        self.assertEqual(payload['response_format'], {'type': 'json_object'})
         self.assertEqual(payload['max_tokens'], 512)
         self.assertNotEqual(stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope=self.scope),
                             stage_cache_key('draft', data, self.free, capabilities=caps, scope=self.scope))

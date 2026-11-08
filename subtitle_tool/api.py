@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import math
 import random
 import re
 import threading
 import time
 import uuid
 from pathlib import Path
-from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -28,25 +26,8 @@ def upload_limit(policy):
     return limit
 
 
-def retry_after_seconds(value):
-    """Accept finite nonnegative seconds or an HTTP date; invalid headers use fallback."""
-    if not value:
-        return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        try:
-            date = parsedate_to_datetime(value)
-            if date.tzinfo is None:
-                return None
-            seconds = max(0.0, date.timestamp() - time.time())
-        except (TypeError, ValueError, OverflowError):
-            return None
-    return seconds if math.isfinite(seconds) and seconds >= 0 else None
-
-
 class Http:
-    """No automatic retries of ASR POST. No response bodies or URLs in logs."""
+    """Bounded retries for reads; a single dispatch for ASR submission."""
     def __init__(self, cancel: threading.Event, count=lambda name: None, attempts=4, progress=lambda *args: None):
         self.cancel, self.count, self.attempts, self.progress = cancel, count, attempts, progress
 
@@ -124,36 +105,31 @@ class Http:
 
 
 class Bailian:
-    def __init__(self, key: str, region: str, cancel: threading.Event,
+    def __init__(self, region: str, cancel: threading.Event,
                  count=lambda name: None, progress=lambda *args: None,
-                 *, workspace_id, access_mode="workspace", gateway=None):
-        identity = connection_identity({"region": region, "workspace_id": workspace_id, "access_mode": access_mode})
-        self.base = f"https://{identity['workspace_id']}.cn-beijing.maas.aliyuncs.com"
-        self.upload_policy_url = "https://dashscope.aliyuncs.com/api/v1/uploads"
-        if gateway is not None:
-            error = ToolError('magpie ASR 网关配置无效。', 'config')
-            if (not isinstance(gateway, dict) or
-                    set(gateway) != {'base_url', 'asr_provider', 'upload_provider', 'key'}):
+                 *, workspace_id, gateway, access_mode="workspace"):
+        connection_identity({"region": region, "workspace_id": workspace_id, "access_mode": access_mode})
+        error = ToolError('magpie ASR 网关配置无效。', 'config')
+        if (not isinstance(gateway, dict) or
+                set(gateway) != {'base_url', 'asr_provider', 'upload_provider', 'key'}):
+            raise error
+        for field in ('asr_provider', 'upload_provider'):
+            value = gateway[field]
+            if (not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', value) or
+                    value in {'.', '..'}):
                 raise error
-            for field in ('asr_provider', 'upload_provider'):
-                value = gateway[field]
-                if (not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', value) or
-                        value in {'.', '..'}):
-                    raise error
-            gateway_key = gateway['key']
-            if (not isinstance(gateway_key, str) or not gateway_key or
-                    any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in gateway_key)):
-                raise error
-            try:
-                base = normalize_mt_url(gateway['base_url']) + '/magpie/native/'
-            except ToolError:
-                raise error from None
-            self.base = base + gateway['asr_provider']
-            self.upload_policy_url = base + gateway['upload_provider'] + '/api/v1/uploads'
-            key = gateway_key
-        self.headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-        if gateway is not None:
-            self.headers['User-Agent'] = 'Transcribe/1'
+        gateway_key = gateway['key']
+        if (not isinstance(gateway_key, str) or not gateway_key or
+                any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in gateway_key)):
+            raise error
+        try:
+            base = normalize_mt_url(gateway['base_url']) + '/magpie/native/'
+        except ToolError:
+            raise error from None
+        self.base = base + gateway['asr_provider']
+        self.upload_policy_url = base + gateway['upload_provider'] + '/api/v1/uploads'
+        self.headers = {"Authorization": "Bearer " + gateway_key, "Content-Type": "application/json",
+                        "User-Agent": "Transcribe/1"}
         self.http = Http(cancel, count, progress=progress)
         self.progress = progress
 

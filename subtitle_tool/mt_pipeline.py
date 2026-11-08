@@ -7,6 +7,7 @@ import json
 import re
 import time
 import threading
+import uuid
 from contextlib import nullcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -152,7 +153,7 @@ def check_pool(config, identity, route, cancel):
     store = Store(Path(':memory:'))
     try:
         now = time.time()
-        job_id = '0' * 32
+        job_id = uuid.uuid4().hex
         with store.db:
             store.db.execute('INSERT INTO jobs(id,source,output,output_key,state,manifest,created,updated) '
                              'VALUES(?,?,?,?,?,?,?,?)',
@@ -167,7 +168,8 @@ def check_pool(config, identity, route, cancel):
         entry = pipeline.profiles[origin]
         return {'status': 'ok', 'backend': origin, 'provider': entry['backend']['provider'],
                 'model': entry['backend']['model'], 'actual_model': proof['actual_model'],
-                'gateway_session': 'transcribe-' + job_id}
+                'gateway_session': proof['gateway_session'], 'request_id': proof['request_id'],
+                'policy_version': entry['backend']['policy_version']}
     finally:
         store.close()
 
@@ -184,7 +186,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                     raise ValueError()
                 continue
             origin, key = cue.get('mt_origin'), cue.get('mt_stage_key')
-            if (not isinstance(origin, str) or origin not in profiles or profiles[origin]['backend'] is None or
+            if (not isinstance(origin, str) or origin not in profiles or
                     not isinstance(key, str) or re.fullmatch(r'[0-9a-f]{64}', key) is None):
                 raise ValueError()
             if verify_credentials and origin not in checked:
@@ -262,8 +264,6 @@ class Pipeline:
         self.profiles = {profile['id']: profile for profile in self.snapshot['entries']}
         entries = []
         for profile in self.snapshot['entries']:
-            if profile['backend'] is None:
-                continue
             backend = MTBackend.from_snapshot(profile['backend'])
             entries.append(RouteEntry(profile['id'], backend, profile['tier']))
         routing = self.snapshot['routing']
@@ -272,7 +272,10 @@ class Pipeline:
 
     def _event(self, event):
         event = dict(event)
-        event['gateway_session'] = 'transcribe-' + self.job_id
+        if event['kind'] == 'route_attempt':
+            self.context.request_id = self.context.gateway_session = None
+        event['request_id'] = getattr(self.context, 'request_id', None)
+        event['gateway_session'] = getattr(self.context, 'gateway_session', None)
         self.diagnostics.write_route({**event, 'stage': getattr(self.context, 'stage', ''),
                                       'group_key': getattr(self.context, 'group_key', ''),
                                       'run_id': getattr(self.engine, 'run_id', '')})
@@ -285,17 +288,121 @@ class Pipeline:
                        free_only=entry.tier == 'free', base_url=entry.backend.base_url)
         return nullcontext()
 
-    def _request_payload(self, stage, data, entry):
+    def _request_payload(self, stage, data, entry, *, repair=False):
         try:
             return make_stage_payload(stage, data, entry.backend,
-                                      capabilities=self.profiles[entry.id]['capabilities'])
+                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair)
         except ToolError as error:
             if error.code != 'mt_input_budget':
                 raise
             raise RouteFailure('local_error') from None
 
+    def _invoke_stage(self, name, data, ids, originals, work_key, entry, timeout, attempt):
+        """One HTTP request, with content-free evidence even when validation fails."""
+        self.engine.mt_control.check_start()
+        started = time.monotonic()
+        try:
+            key = entry.backend.credential(self.engine.config)
+        except ToolError:
+            raise RouteFailure('authentication', scope='credential') from None
+        payload = self._request_payload(name, data, entry, repair=attempt == 2)
+        request_id = uuid.uuid4().hex
+        session = 'transcribe-' + self.job_id + '-' + request_id
+        self.context.request_id, self.context.gateway_session = request_id, session
+        event = {'stage': name, 'entry': entry.id, 'model': entry.backend.model,
+                 'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', ''),
+                 'request_id': request_id, 'gateway_session': session, 'attempt': attempt,
+                 'policy_version': entry.backend.policy_version, 'dispatched': False}
+        outcome = 'local_error'
+
+        def dispatch():
+            self.store.count(self.job_id, 'mt')
+            self.store.count(self.job_id, 'mt_v5_' + entry.id + '_' + name + '_request')
+            if attempt == 2:
+                self.store.count(self.job_id, 'mt_format_repair_request')
+            event['dispatched'] = True
+            self.diagnostics.write_route({'kind': 'request_start', **event})
+
+        try:
+            try:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise TransportError('deadline')
+                reply = self.transport.request('POST', entry.backend.base_url + '/chat/completions',
+                    headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
+                             'User-Agent': 'Transcribe/1', 'X-Magpie-Response-Model': 'member',
+                             'X-Magpie-Session': session},
+                    json=payload, control=self.engine.mt_control, timeout=remaining, on_dispatch=dispatch)
+            except TransportError as error:
+                outcome, event['category'] = 'transport_error', error.category
+                raise RouteFailure(error.category, scope='endpoint' if error.category == 'network' else 'entry') from None
+            try:
+                body = json.loads(reply.body)
+            except (ValueError, UnicodeError, RecursionError):
+                body = None
+            status = reply.status
+            event['status'] = status
+            event['actual_model'] = safe_model_id(body.get('model')) if isinstance(body, dict) else ''
+            raw_usage = body.get('usage') if isinstance(body, dict) else None
+            if (isinstance(raw_usage, dict) and type(raw_usage.get('prompt_tokens')) is int and
+                    type(raw_usage.get('completion_tokens')) is int and
+                    0 <= raw_usage['prompt_tokens'] <= 2**31 - 1 and 0 <= raw_usage['completion_tokens'] <= 2**31 - 1):
+                usage = {'input_tokens': raw_usage['prompt_tokens'], 'output_tokens': raw_usage['completion_tokens']}
+                event.update(usage)
+                for field, amount in usage.items():
+                    self.store.count(self.job_id, 'mt_response_' + field, amount)
+            else:
+                usage = None
+                self.store.count(self.job_id, 'mt_response_usage_unknown')
+            if 200 <= status < 300:
+                self.store.count(self.job_id, 'mt_success')
+            if status == 429:
+                self.store.count(self.job_id, 'mt_429')
+            failure = service_failure(status, body)
+            if failure is not None:
+                category, scope = failure.category, 'entry'
+                if status == 401 or category == 'authentication':
+                    category, scope = 'authentication', 'credential'
+                elif entry.tier == 'paid' and (status == 402 or category == 'payment_required'):
+                    category, scope = 'payment_required', 'paid_account'
+                elif status == 404:
+                    scope = 'model'
+                outcome, event['category'] = 'service_error', category
+                raise RouteFailure(category, scope=scope) from None
+            try:
+                value = parse_stage_response(name, body, ids=ids, originals=originals)
+            except BatchValidationError as error:
+                outcome, event['validation_category'] = 'invalid', error.category
+                self.store.count(self.job_id, 'mt_invalid_response')
+                if error.category == 'output_truncated':
+                    self.store.count(self.job_id, 'mt_output_truncated')
+                metadata = batch_response_metadata(body)
+                self.diagnostics.write({'kind': 'invalid_response', **event, 'category': error.category,
+                    'expected_count': len(ids), 'actual_count': error.actual_count, **metadata})
+                # Regenerate a normally completed response from original
+                # evidence when local format validation fails.
+                repairable = (name in {'draft', 'align'} and metadata['finish_reason'] == 'stop' and
+                              metadata['content_type'] == 'string')
+                raise RouteFailure('output_truncated' if error.category == 'output_truncated' else
+                                   'format_exhausted', repairable=repairable) from None
+            if usage is None:
+                self.store.count(self.job_id, 'mt_usage_unknown')
+            else:
+                for field, amount in usage.items():
+                    self.store.count(self.job_id, 'mt_' + field, amount)
+            if attempt == 2:
+                self.store.count(self.job_id, 'mt_format_repair_success')
+            outcome = 'valid'
+            return {'value': value, 'actual_model': event['actual_model'], 'usage': usage}
+        except Cancelled:
+            outcome = 'cancelled'
+            raise
+        finally:
+            self.diagnostics.write_route({'kind': 'request_end', **event, 'outcome': outcome,
+                'duration_ms': max(0, round((time.monotonic() - started) * 1000))})
+
     def _fit(self, stage, data, *, output_budget=False, fixed_semantics=False):
-        """Drop far context first, then excess glossary; never truncate targets."""
+        """Fit context and glossary to the budget while preserving targets."""
         data = dict(data)
         candidates = []
         for entry in self.router.entries:
@@ -313,7 +420,10 @@ class Pipeline:
             capabilities = self.profiles[entry.id]['capabilities']
             if output_budget and output_estimate > min(4096, capabilities['output_tokens']) * 3 // 4:
                 raise ToolError('翻译组预计输出超过规划余量。', 'mt_input_budget')
-            make_stage_payload(stage, data, entry.backend, capabilities=capabilities)
+            # Reserve the fixed repair instruction without dropping evidence
+            # between the initial request and its possible regeneration.
+            make_stage_payload(stage, data, entry.backend, capabilities=capabilities,
+                               repair=stage in {'draft', 'align'})
         while True:
             fits = False
             for entry in candidates:
@@ -349,6 +459,7 @@ class Pipeline:
         started = time.monotonic()
         work_key = self._work_key(name, data)
         self.context.stage, self.context.group_key = name, work_key
+        self.context.request_id = self.context.gateway_session = None
         # Bind numbered draft outputs to source text, including on cross-task
         # cache hits. Hashes allow partial layout replacement without retaining
         # another copy of the transcript or binding reusable stages to cue IDs.
@@ -369,7 +480,6 @@ class Pipeline:
                     any(saved[k] != value for k, value in evidence.items()) or
                     saved.get('stage') != name or not isinstance(saved.get('backend'), str) or
                     saved.get('backend') not in self.profiles or
-                    self.profiles[saved['backend']]['backend'] is None or
                     saved.get('request_model') != self.profiles[saved['backend']]['backend']['model'] or
                     not isinstance(saved.get('actual_model'), str) or
                     safe_model_id(saved['actual_model']) != saved['actual_model'] or
@@ -421,75 +531,7 @@ class Pipeline:
                 raise ToolError('翻译阶段缓存无效，未复用。', 'cache_mismatch') from None
 
         def invoke(entry, timeout, attempt):
-            self.engine.mt_control.check_start()
-            try:
-                key = entry.backend.credential(self.engine.config)
-            except ToolError:
-                raise RouteFailure('authentication', scope='credential') from None
-            payload = self._request_payload(name, data, entry)
-            def dispatch():
-                self.store.count(self.job_id, 'mt')
-                self.store.count(self.job_id, 'mt_v5_' + entry.id + '_' + name + '_request')
-            try:
-                request_started = time.monotonic()
-                reply = self.transport.request('POST', entry.backend.base_url + '/chat/completions',
-                    headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
-                             'User-Agent': 'Transcribe/1', 'X-Magpie-Response-Model': 'member',
-                             'X-Magpie-Session': 'transcribe-' + self.job_id},
-                    json=payload, control=self.engine.mt_control, timeout=timeout,
-                    on_dispatch=dispatch)
-            except TransportError as error:
-                raise RouteFailure(error.category, scope='endpoint' if error.category == 'network' else 'entry') from None
-            try:
-                body = json.loads(reply.body)
-            except (ValueError, UnicodeError, RecursionError):
-                body = None
-            status = reply.status
-            raw_usage = body.get('usage') if isinstance(body, dict) else None
-            if (isinstance(raw_usage, dict) and type(raw_usage.get('prompt_tokens')) is int and
-                    type(raw_usage.get('completion_tokens')) is int and raw_usage['prompt_tokens'] >= 0 and
-                    raw_usage['completion_tokens'] >= 0):
-                usage = {'input_tokens': raw_usage['prompt_tokens'], 'output_tokens': raw_usage['completion_tokens']}
-            else:
-                usage = None
-            self.diagnostics.write_route({'kind': 'route_reply', 'stage': name, 'entry': entry.id,
-                'model': entry.backend.model, 'status': status, 'duration_ms': round((time.monotonic() - request_started) * 1000),
-                'gateway_session': 'transcribe-' + self.job_id,
-                'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', '')})
-            if 200 <= status < 300:
-                self.store.count(self.job_id, 'mt_success')
-            if status == 429:
-                self.store.count(self.job_id, 'mt_429')
-            failure = service_failure(status, body)
-            if failure is not None:
-                category = failure.category
-                scope = 'entry'
-                if status == 401 or category == 'authentication':
-                    category, scope = 'authentication', 'credential'
-                elif entry.tier == 'paid' and (status == 402 or category == 'payment_required'):
-                    category, scope = 'payment_required', 'paid_account'
-                elif status == 404:
-                    scope = 'model'
-                raise RouteFailure(category, scope=scope) from None
-            try:
-                value = parse_stage_response(name, body, ids=ids, originals=originals)
-            except BatchValidationError as error:
-                self.store.count(self.job_id, 'mt_invalid_response')
-                if error.category == 'output_truncated':
-                    self.store.count(self.job_id, 'mt_output_truncated')
-                self.diagnostics.write({'kind': 'invalid_response', 'category': error.category,
-                    'stage': name, 'model': entry.backend.model,
-                    'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', ''),
-                    'expected_count': len(ids), 'actual_count': error.actual_count,
-                    **batch_response_metadata(body)})
-                raise RouteFailure('output_truncated' if error.category == 'output_truncated' else
-                                   'format_exhausted') from None
-            if usage is None:
-                self.store.count(self.job_id, 'mt_usage_unknown')
-            else:
-                self.store.count(self.job_id, 'mt_input_tokens', usage['input_tokens'])
-                self.store.count(self.job_id, 'mt_output_tokens', usage['output_tokens'])
-            return {'value': value, 'actual_model': safe_model_id(body.get('model')), 'usage': usage}
+            return self._invoke_stage(name, data, ids, originals, work_key, entry, timeout, attempt)
 
         # Preserve the exact originally requested context and glossary for both
         # free and paid cache lookup before adapting to permitted network models.
@@ -521,7 +563,7 @@ class Pipeline:
                                          deadline_seconds=remaining)
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
             'model': result.entry.backend.model, 'actual_model': result.value['actual_model'],
-            'gateway_session': 'transcribe-' + self.job_id,
+            'gateway_session': self.context.gateway_session, 'request_id': self.context.request_id,
             'duration_ms': round((time.monotonic() - started) * 1000),
             'attempt': result.attempts, 'cached': result.cached,
             'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', '')})
@@ -540,8 +582,10 @@ class Pipeline:
                 cache_key=None if result.cached else cache_key,
                 cache_value=None if result.cached else json.dumps(result.value, ensure_ascii=False),
                 counts={'mt_v5_' + name + ('_cache_hit' if result.cached else '_completed'): 1})
-        return record['value'], record['backend'], {'key': work_key, 'actual_model': record['actual_model'],
-                                                    'request_model': record['request_model']}
+        proof = {'key': work_key, 'actual_model': record['actual_model'], 'request_model': record['request_model']}
+        if not result.cached:
+            proof.update(request_id=self.context.request_id, gateway_session=self.context.gateway_session)
+        return record['value'], record['backend'], proof
 
     def _fits_group(self, units, *, output_budget=False):
         if units[-1]['cues'][-1]['end_ms'] - units[0]['cues'][0]['begin_ms'] > 60000:

@@ -37,5 +37,5 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg preparation failed.' }
     & (Join-Path $PSScriptRoot 'install-sendto.ps1')
     if ($LASTEXITCODE -ne 0) { throw 'SendTo shortcut installation failed.' }
-    Write-Output 'Local CLI environment ready. Run scripts\transcribe.ps1 --configure.'
+    Write-Output 'Local CLI environment ready. Configure magpie and data/settings.json as described in README.md.'
 } finally { Pop-Location }

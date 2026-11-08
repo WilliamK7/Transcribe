@@ -7,13 +7,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-from .common import ToolError, connection_identity
+from .common import ToolError
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 QINIU_BASE_URL = "https://api.qnaigc.com/v1"
 QINIU_FREE_MODEL = "qiniu/conatus-free"
-STRUCTURED_BAILIAN_MODEL = "qwen3.8-flash"
 
 
 def qiniu_free_active(now=None):
@@ -58,12 +57,6 @@ def normalize_mt_url(value):
         raise error from None
 
 
-def bailian_mt_url(manifest):
-    identity = connection_identity(manifest)
-    base = f"https://{identity['workspace_id']}.cn-beijing.maas.aliyuncs.com"
-    return base + "/compatible-mode/v1"
-
-
 @dataclass(frozen=True)
 class MTBackend:
     provider: str
@@ -71,10 +64,11 @@ class MTBackend:
     model: str
     key_fingerprint: str
     request_version: int = 5
+    policy_version: int = 1
 
 
     def snapshot(self):
-        return {"format_version": 1, **asdict(self)}
+        return {"format_version": 2, **asdict(self)}
 
     @classmethod
     def from_snapshot(cls, saved):

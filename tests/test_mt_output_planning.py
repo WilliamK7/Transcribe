@@ -122,7 +122,6 @@ class OutputPlanningTests(PoolPipelineFixture):
 
     def test_saved_group_plan_does_not_cross_language_boundaries(self):
         from subtitle_tool.mt_planning import _fingerprint, restore_group_plan
-        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.save_result(result(('First sentence.', 'en'), ('Une autre phrase.', 'fr')))
         Engine(self.config, self.store).reflow(self.job_id)
         self.cancel_after = 'draft'

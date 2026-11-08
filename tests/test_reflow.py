@@ -13,7 +13,7 @@ from subtitle_tool.engine import Engine
 from subtitle_tool.main import main, summary
 from subtitle_tool.subtitles import normalize, plan_fragments, wrap
 from subtitle_tool.config import Settings
-from tests.fixtures import FakeService, PipelineFixture, result, timed_raw
+from tests.fixtures import set_asr_account, FakeService, PipelineFixture, result, timed_raw
 
 
 class ZeroDurationWordTests(unittest.TestCase):
@@ -241,7 +241,7 @@ class ReflowTests(PipelineFixture):
     def test_account_change_blocks_reflow_before_mutation(self):
         self.complete_old_job()
         before = self.store.job(self.job_id)
-        self.config.set_key('offline-other-account')
+        set_asr_account(self.config, 'offline-other-account')
         with self.assertRaises(ToolError) as error:
             Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         self.assertEqual(error.exception.code, 'account_changed')

@@ -27,8 +27,9 @@ def self_test(config: Config, report: Path):
     with tempfile.TemporaryDirectory(prefix="selftest-", dir=config.data) as directory:
         temporary = Path(directory)
         isolated = Config(temporary)
-        isolated.set_key("diagnostic-placeholder-not-an-api-key")
-        assert (isolated.data / "key.txt").read_bytes() == b"diagnostic-placeholder-not-an-api-key"
+        isolated.settings.workspace_id = "diagnostic-workspace"
+        isolated.save()
+        assert Config(temporary).settings == isolated.settings
         first, second = ProcessLock(isolated.data), ProcessLock(isolated.data)
         try:
             assert first.acquire()
@@ -58,7 +59,7 @@ def self_test(config: Config, report: Path):
               "version": __version__, "kind": "local_cli_smoke_only", "passed": True, "cloud_calls": 0,
               "python": platform.python_version(), "architecture": platform.machine(),
               "platform": platform.platform(), "media_tools": versions,
-              "checks": ["隔离目录原子明文 Key 保存", "任务库独占锁",
+              "checks": ["隔离目录配置原子保存与读取", "任务库独占锁",
                          "固定 ffprobe 检查合成媒体", "AAC 音轨复制及时间轴校验", "特殊字符路径",
                          "独立显示区间规划与小重叠收尾",
                          "规范化和同名 UTF-8 CRLF SRT 原子写入"]}

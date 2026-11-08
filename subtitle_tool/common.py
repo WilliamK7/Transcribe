@@ -20,7 +20,7 @@ MAX_ASR_SECONDS = 12 * 3600
 
 def validate_workspace_id(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", value):
-        raise ToolError("Workspace ID 必须是 1～63 位域名标签（字母、数字、内部连字符），不能填写完整 URL。请运行 --configure。", "workspace_id")
+        raise ToolError("Workspace ID 必须是 1～63 位域名标签（字母、数字、内部连字符），不能填写完整 URL。请检查 data/settings.json 的 workspace_id。", "workspace_id")
     return value.lower()
 
 

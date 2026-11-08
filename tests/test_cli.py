@@ -3,20 +3,19 @@ from __future__ import annotations
 import io
 import json
 import os
-import threading
 from unittest import mock
 
-from subtitle_tool.api import Bailian
 from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config, Settings, validate_workspace_id
 from subtitle_tool.instance import ProcessLock
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import Progress, main
 from subtitle_tool.store import Store
-from tests.fixtures import TemporaryTest, response
+from tests.fixtures import set_asr_account, TemporaryTest
 
 
 class ConfigTests(TemporaryTest):
+
     def test_line_width_defaults_and_saved_overrides(self):
         config = Config(self.path)
         self.assertEqual((config.settings.zh_line_width, config.settings.other_line_width), (44, 84))
@@ -42,16 +41,6 @@ class ConfigTests(TemporaryTest):
                             settings.validate()
                         self.assertEqual(error.exception.code, 'config')
 
-    def test_plaintext_key_atomic_and_environment_precedence(self):
-        config = Config(self.path)
-        with mock.patch.dict(os.environ, {}, clear=True):
-            config.set_key("offline-local-key")
-            self.assertEqual((config.data / "key.txt").read_text(), "offline-local-key")
-            self.assertEqual(config.get_key(), "offline-local-key")
-            self.assertFalse(list(config.data.glob("*.tmp")))
-        with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "offline-env-key"}):
-            self.assertEqual(config.get_key(), "offline-env-key")
-
 
     def test_workspace_is_one_dns_label(self):
         self.assertEqual(validate_workspace_id("Abc-123"), "abc-123")
@@ -59,26 +48,13 @@ class ConfigTests(TemporaryTest):
             with self.subTest(value=value), self.assertRaises(ToolError):
                 validate_workspace_id(value)
 
-    def test_workspace_endpoints_and_public_upload_policy(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event(), workspace_id="space-a", access_mode="workspace")
-        with mock.patch("requests.request", return_value=response({"output": {"task_id": "offline-id"}})) as request:
-            cloud.submit("oss://offline/a.flac")
-            self.assertEqual(request.call_args.args[1], "https://space-a.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/asr/transcription")
-        with mock.patch("requests.request", return_value=response({"output": {"task_status": "PENDING"}})) as request:
-            cloud.query("offline-id")
-            self.assertIn("https://space-a.cn-beijing.maas.aliyuncs.com/api/v1/tasks/", request.call_args.args[1])
-        with mock.patch.object(cloud.http, "json", return_value={"data": {}}) as request:
-            with self.assertRaises(ToolError):
-                cloud.policy()
-            self.assertEqual(request.call_args.args[1], "https://dashscope.aliyuncs.com/api/v1/uploads")
-
 
 class CliTests(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
         self.config.settings.workspace_id = "offline-space"
-        self.config.set_key("offline-cli-key")
+        set_asr_account(self.config, "offline-cli-key")
         self.config.save()
         self.config_patch = mock.patch("subtitle_tool.main.Config", return_value=self.config)
         self.config_patch.start()
@@ -102,46 +78,19 @@ class CliTests(TemporaryTest):
     def test_no_arguments_displays_help_without_creating_store(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(main([]), 0)
-        self.assertIn("--configure", output.getvalue())
+        self.assertIn("--check-mt", output.getvalue())
         self.assertFalse((self.config.data / "jobs.sqlite").exists())
 
-    def test_check_magpie_rejects_legacy_selection_before_resolving_route(self):
-        for source in ('settings', 'environment'):
-            for gateway_key in ('', 'synthetic-gateway'):
-                with self.subTest(source=source, gateway_key=bool(gateway_key)):
-                    self.config.settings.mt_provider = 'openai_compatible' if source == 'settings' else 'magpie'
-                    self.config.settings.mt_base_url = 'https://openrouter.ai/api/v1'
-                    self.config.settings.mt_model = 'openrouter/free'
-                    self.config.save()
-                    previous = vars(self.config.settings).copy()
-                    saved = (self.config.data / 'settings.json').read_bytes()
-                    environment = {'MAGPIE_API_KEY': gateway_key}
-                    if source == 'environment':
-                        environment['MT_PROVIDER'] = 'openai_compatible'
-                    with mock.patch.dict(os.environ, environment), \
-                            mock.patch('subtitle_tool.mt_pool.configured_route',
-                                       return_value={'routing': {'paid_enabled': False}}) as route, \
-                            mock.patch('subtitle_tool.mt_pipeline.check_pool', return_value={}) as check, \
-                            mock.patch('sys.stdout', new_callable=io.StringIO), \
-                            self.assertRaisesRegex(ToolError, '--configure-mt magpie') as error:
-                        main(['--check-mt', 'magpie'])
-                    self.assertEqual(error.exception.code, 'mt_config')
-                    route.assert_not_called()
-                    check.assert_not_called()
-                    self.assertEqual(vars(self.config.settings), previous)
-                    self.assertEqual((self.config.data / 'settings.json').read_bytes(), saved)
 
     def test_check_magpie_preserves_effective_gateway_and_groups(self):
         for source in ('settings', 'environment'):
             with self.subTest(source=source):
-                self.config.settings.mt_provider = 'magpie' if source == 'settings' else 'openai_compatible'
                 self.config.settings.mt_base_url = 'https://gateway.example/v1'
                 self.config.settings.mt_model = 'group/custom'
                 self.config.settings.mt_free_model = 'group/custom-free'
-                self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
                 environment = {'MAGPIE_API_KEY': 'synthetic-gateway'}
                 if source == 'environment':
-                    environment.update(MT_PROVIDER='magpie', MT_BASE_URL='https://gateway.example/v1',
+                    environment.update(MT_BASE_URL='https://gateway.example/v1',
                                        MT_MODEL='group/custom', MT_FREE_MODEL='group/custom-free')
                     self.config.settings.mt_base_url = 'https://openrouter.ai/api/v1'
                     self.config.settings.mt_model = 'openrouter/free'
@@ -151,7 +100,7 @@ class CliTests(TemporaryTest):
                 with mock.patch.dict(os.environ, environment), \
                         mock.patch('subtitle_tool.mt_pipeline.check_pool', return_value={}) as check, \
                         mock.patch('sys.stdout', new_callable=io.StringIO):
-                    self.assertEqual(main(['--check-mt', 'magpie', '--mt-paid', 'deny']), 0)
+                    self.assertEqual(main(['--check-mt', '--mt-paid', 'deny']), 0)
                 route = check.call_args.args[2]
                 self.assertFalse(route['routing']['paid_enabled'])
                 self.assertEqual([(entry['backend']['provider'], entry['backend']['base_url'],
@@ -272,13 +221,6 @@ class CliTests(TemporaryTest):
             self.assertEqual(main(["--review", job_id]), 0)
         self.assertEqual(prompt.call_count, 1)
 
-    def test_configure_uses_hidden_key_input_and_saves_workspace(self):
-        with mock.patch("sys.stdin", new=mock.Mock(isatty=lambda: True)), mock.patch("builtins.input", return_value="SPACE-NEW"), mock.patch("getpass.getpass", return_value="offline-hidden-key") as hidden, mock.patch("sys.stderr", new_callable=io.StringIO) as output:
-            self.assertEqual(main(["--configure"]), 0)
-        hidden.assert_called_once()
-        self.assertNotIn("offline-hidden-key", output.getvalue())
-        self.assertEqual(json.loads((self.config.data / "settings.json").read_text())["workspace_id"], "space-new")
-        self.assertEqual((self.config.data / "key.txt").read_text(), "offline-hidden-key")
 
     def test_workspace_override_cannot_move_saved_job(self):
         job_id = self.add_review_job()

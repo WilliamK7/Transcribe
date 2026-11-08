@@ -24,7 +24,7 @@ class SemanticValidationTests(unittest.TestCase):
         context = source_context(sources, 2)
         original = copy.deepcopy(context)
         data = {'sentences': [{'id': '0', 'text': sources[2]['text']}], 'context': context, 'glossary': []}
-        backend = MTBackend('qiniu', 'https://api.qnaigc.com/v1', 'synthetic', 'synthetic')
+        backend = MTBackend('magpie', 'http://127.0.0.1:3425/v1', 'group/transcribe-free', 'synthetic')
         payload = make_stage_payload('draft', data, backend,
                                      capabilities={'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096})
         wire = json.loads(payload['messages'][1]['content'])['context']
@@ -103,7 +103,6 @@ class SemanticValidationTests(unittest.TestCase):
 class SemanticPipelineTests(PoolPipelineFixture):
     def setUp(self):
         super().setUp()
-        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
         self.config.settings.mt_workers = 1
 
     def test_alignment_review_and_corrections_receive_the_draft_context(self):
@@ -126,9 +125,12 @@ class SemanticPipelineTests(PoolPipelineFixture):
                 self.assertEqual(data.get('context'), draft['context'])
 
     def test_split_requests_keep_neighboring_parts_and_explicit_target_ranges(self):
-        self.config.settings.mt_backends[0]['capabilities'] = {'input_bytes': 4000}
         self.save_result(timed_raw([f'word{i:03}' for i in range(400)], word_ms=20))
         Engine(self.config, self.store).reflow(self.job_id)
+        manifest = self.store.job(self.job_id)['manifest']
+        for entry in manifest['mt_route_snapshot']['entries']:
+            entry['capabilities']['input_bytes'] = 4000
+        self.store.update(self.job_id, manifest=manifest)
         self.assertEqual(self.run_pool(), 'completed')
         drafts = [data for stage, _, data in self.calls if stage == 'draft']
         self.assertGreater(len(drafts), 1)
@@ -246,7 +248,6 @@ class SemanticPipelineTests(PoolPipelineFixture):
     def test_trimmed_glossary_stays_saved_when_paid_permission_changes(self):
         from subtitle_tool.mt_backend import MTBackend
         from subtitle_tool.mt_quality import make_stage_payload
-        self.config.settings.mt_backends = [{'id': 'qiniu_free'}, {'id': 'qiniu_paid'}]
         self.install()
         manifest = self.store.job(self.job_id)['manifest']
         data = {'sentences': [{'id': 'source', 'text': 'A cache stores results.'}], 'manual_glossary': [],

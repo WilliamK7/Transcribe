@@ -9,7 +9,8 @@ import unittest
 import venv
 from pathlib import Path
 
-from tests.fixtures import ROOT, TemporaryTest
+from subtitle_tool.config import Config
+from tests.fixtures import ROOT, TemporaryTest, set_asr_account
 
 
 POWERSHELL = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -295,10 +296,9 @@ class SendToTests(TemporaryTest):
             "from subtitle_tool.main import entry\nentry()\n",
             encoding="utf-8",
         )
-        data = self.project / "data"
-        data.mkdir()
-        (data / "settings.json").write_text('{"workspace_id":"offline-space"}', encoding="utf-8")
-        (data / "key.txt").write_text("offline-key", encoding="utf-8")
+        config = Config(self.project)
+        set_asr_account(config, 'offline-key')
+        config.save()
         for media in self.media:
             media.with_suffix(".srt").write_bytes(b"keep existing subtitle")
         result = self.run_script(self.scripts / "sendto.ps1", *self.media)

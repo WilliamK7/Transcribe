@@ -74,7 +74,8 @@ class MTDiagnostics:
         """Write only fixed route classifications and bounded, non-content metadata."""
         from .mt_routing import _CATEGORIES, _SCOPES
         try:
-            if event.get('kind') not in {'route_attempt', 'route_failure', 'route_complete', 'route_reply'}:
+            if event.get('kind') not in {'route_attempt', 'route_failure', 'route_complete',
+                                       'request_start', 'request_end'}:
                 return False
             record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
             self._routing(record, event)
@@ -83,10 +84,12 @@ class MTDiagnostics:
                 if value:
                     record[field] = value
             for field, allowed in [('tier', {'free', 'paid'}), ('scope', _SCOPES),
-                                   ('category', _CATEGORIES)]:
+                                   ('category', _CATEGORIES), ('validation_category', VALIDATION_CATEGORIES),
+                                   ('outcome', {'valid', 'invalid', 'service_error', 'transport_error',
+                                                'cancelled', 'local_error'})]:
                 if event.get(field) in allowed:
                     record[field] = event[field]
-            for field in ['attempt', 'status', 'duration_ms']:
+            for field in ['status', 'duration_ms']:
                 value = event.get(field)
                 if type(value) is int and 0 <= value <= 2**63 - 1:
                     record[field] = value
@@ -125,6 +128,11 @@ class MTDiagnostics:
 
     @staticmethod
     def _routing(record, event):
+        for field, minimum, maximum in [('attempt', 0, 2), ('policy_version', 1, 2**31 - 1),
+                                        ('input_tokens', 0, 2**31 - 1), ('output_tokens', 0, 2**31 - 1)]:
+            value = event.get(field)
+            if type(value) is int and minimum <= value <= maximum:
+                record[field] = value
         for field in ['model', 'actual_model']:
             model = safe_model_id(event.get(field))
             if model:
@@ -132,7 +140,8 @@ class MTDiagnostics:
         if event.get('stage') in {'glossary', 'draft', 'align', 'review', 'correct'}:
             record['stage'] = event['stage']
         for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}'),
-                               ('gateway_session', r'transcribe-[0-9a-f]{32}')]:
+                               ('request_id', r'[0-9a-f]{32}'),
+                               ('gateway_session', r'transcribe-[0-9a-f]{32}-[0-9a-f]{32}')]:
             value = event.get(field)
             if isinstance(value, str) and re.fullmatch(pattern, value):
                 record[field] = value

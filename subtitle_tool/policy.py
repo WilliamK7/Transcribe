@@ -11,7 +11,7 @@ from .mt_quality import GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION
 def current_execution_snapshot():
     return dict(format_version=1,
                 prompt_version=QUALITY_PROMPT_VERSION,
-                recovery_version=4,
+                recovery_version=5,
                 context_version=2,
                 alignment_version=2)
 

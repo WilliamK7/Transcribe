@@ -6,7 +6,7 @@ from unittest import mock
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media
 
-from tests.fixtures import FakeService, SavedResultFixture, result, timed_raw
+from tests.fixtures import set_asr_account, FakeService, SavedResultFixture, result, timed_raw
 
 
 class SavedRecoveryTests(SavedResultFixture):
@@ -93,7 +93,7 @@ class SavedRecoveryTests(SavedResultFixture):
         self.save_result(result(("保留原文。", "zh")))
         Engine(self.config, self.store).identity(self.job_id, self.store.job(self.job_id)["manifest"])
         self.source.unlink()
-        self.config.set_key("offline-different-key")
+        set_asr_account(self.config, "offline-different-key")
         self.assertEqual(self.run_fake(FakeService(result())), "failed")
         self.assertEqual(self.store.job(self.job_id)["error_code"], "account_changed")
 

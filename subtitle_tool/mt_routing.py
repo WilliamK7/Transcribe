@@ -1,4 +1,4 @@
-"""Single gateway dispatch and exact stage-cache recovery."""
+"""Gateway dispatch with one locally authorized format repair and exact caches."""
 from __future__ import annotations
 
 import re
@@ -44,10 +44,11 @@ class RouteResult:
 
 
 class RouteFailure(ToolError):
-    def __init__(self, category, *, scope='entry'):
+    def __init__(self, category, *, scope='entry', repairable=False):
         super().__init__('翻译网关请求失败。', 'mt_route_failure')
         self.category = category if category in _CATEGORIES else 'service_unknown'
         self.scope = scope if scope in _SCOPES else 'entry'
+        self.repairable = repairable
 
 
 class RouteExhausted(ToolError):
@@ -79,11 +80,9 @@ class MagpieRoute:
         self.entries = tuple(entries)
         self.paid_enabled, self.control = paid_enabled, control
         self.timeout, self.on_event, self.clock = 180.0, on_event, clock
-        # Both profiles remain available for exact caches and an explicit fee
-        # permission change on resume. Only one group admits network requests.
-        self.selected = next((entry for entry in self.entries if entry.tier == 'paid'), None) if paid_enabled else None
-        if self.selected is None:
-            self.selected = next((entry for entry in self.entries if entry.tier == 'free'), None)
+        # Reuse either group's saved results; fee permission selects new requests.
+        tier = 'paid' if paid_enabled else 'free'
+        self.selected = next(entry for entry in self.entries if entry.tier == tier)
 
     def _available(self, entry):
         return entry == self.selected
@@ -100,26 +99,28 @@ class MagpieRoute:
             if result is not None:
                 return result
         entry = self.selected
-        if entry is None:
-            raise RouteExhausted()
-        if self.clock() >= deadline:
-            raise RouteExhausted(deadline=True)
-        try:
-            with prepare(entry):
-                self.control.check_start()
-                remaining = deadline - self.clock()
-                if remaining <= 0:
-                    raise RouteExhausted(deadline=True)
-                self.on_event({'kind': 'route_attempt', 'entry': entry.id, 'tier': entry.tier, 'attempt': 1})
-                value = invoke(entry, min(self.timeout, remaining), 1)
-        except RouteFailure as failure:
+        for attempt in (1, 2):
             self.control.check_start()
-            self.on_event({'kind': 'route_failure', 'entry': entry.id, 'tier': entry.tier,
-                           'category': failure.category, 'scope': failure.scope, 'attempt': 1})
-            # Gateway failures already include upstream fallback/recovery. A
-            # second POST here would multiply requests and possibly charges.
-            raise RouteExhausted(deadline=failure.category in {'deadline', 'timeout'}) from None
-        self.control.check_inflight()
-        if self.clock() >= deadline:
-            raise RouteExhausted(deadline=True)
-        return RouteResult(value, entry, False, 1)
+            if self.clock() >= deadline:
+                raise RouteExhausted(deadline=True)
+            try:
+                with prepare(entry):
+                    self.control.check_start()
+                    remaining = deadline - self.clock()
+                    if remaining <= 0:
+                        raise RouteExhausted(deadline=True)
+                    self.on_event({'kind': 'route_attempt', 'entry': entry.id, 'tier': entry.tier, 'attempt': attempt})
+                    value = invoke(entry, min(self.timeout, remaining), attempt)
+            except RouteFailure as failure:
+                self.control.check_start()
+                self.on_event({'kind': 'route_failure', 'entry': entry.id, 'tier': entry.tier,
+                               'category': failure.category, 'scope': failure.scope, 'attempt': attempt})
+                # Only the subtitle validator can authorize a second request.
+                # Transport, HTTP, refusal and uncertain responses never do.
+                if attempt == 1 and failure.repairable:
+                    continue
+                raise RouteExhausted(deadline=failure.category in {'deadline', 'timeout'}) from None
+            self.control.check_inflight()
+            if self.clock() >= deadline:
+                raise RouteExhausted(deadline=True)
+            return RouteResult(value, entry, False, attempt)

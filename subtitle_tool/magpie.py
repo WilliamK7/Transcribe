@@ -38,7 +38,7 @@ def bound_gateway(settings, base_url):
 
 def asr_providers(settings, workspace):
     """Retain account/workspace checks even though magpie signs the requests."""
-    error = ToolError('magpie 的百炼／上传入口与当前账户或工作空间不一致；请检查迁移配置。', 'magpie_identity')
+    error = ToolError('magpie 的百炼／上传入口与当前账户或工作空间不一致；请检查网关配置。', 'magpie_identity')
     try:
         if not bound_gateway(settings, settings.magpie_base_url):
             raise error
@@ -76,7 +76,7 @@ def known_free_model(base_url, model):
 
 
 def _pause_expired_promotion(settings, identity, provider):
-    """Disable only the migration-owned promotional endpoint through magpie."""
+    """Disable only the designated promotional endpoint through magpie."""
     from .mt_backend import QINIU_BASE_URL, QINIU_FREE_MODEL
     folder = Path(settings.magpie_data_dir)
     executable = folder.parent / 'magpie.com'
@@ -100,8 +100,8 @@ def _pause_expired_promotion(settings, identity, provider):
 def validate_group(settings, model, *, free_only, base_url=None):
     """Check the local fee boundary; routing and credentials stay in magpie.
 
-    Remote gateways are administered by their owner. A local migration has a
-    registry and can detect accidental paid fallback or an expired promotion.
+    Remote gateways are administered by their owner. A local registry can
+    detect accidental paid fallback or an expired promotion.
     """
     from .mt_backend import QINIU_FREE_MODEL, qiniu_free_active
     error = ToolError('magpie 字幕组不可用或包含未获免费保证的回退；请在 magpie 检查组成员和活动有效期。', 'magpie_group')

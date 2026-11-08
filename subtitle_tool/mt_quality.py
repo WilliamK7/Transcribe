@@ -182,11 +182,11 @@ def _schema(stage, data):
             'required': ['translations'], 'additionalProperties': False}
 
 
-def make_stage_payload(stage, data, backend, *, capabilities):
+def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
     if stage not in PROMPTS:
         raise ValueError('Unknown translation stage')
     if (not isinstance(capabilities, dict) or set(capabilities) != {'response_format', 'input_bytes', 'output_tokens'} or
-            capabilities['response_format'] not in {'json_object', 'json_schema', 'text'} or
+            capabilities['response_format'] != 'json_object' or
             type(capabilities['input_bytes']) is not int or not 1 <= capabilities['input_bytes'] <= 1048576 or
             type(capabilities['output_tokens']) is not int or not 1 <= capabilities['output_tokens'] <= 32768):
         raise ToolError('翻译模型能力档案无效。', 'mt_config')
@@ -198,9 +198,13 @@ def make_stage_payload(stage, data, backend, *, capabilities):
     if data.get('glossary'):
         prompt += ('术语表中 manual 为人工指定译法；model 条目附原文 evidence，仅供对应语境参考，'
                    '同词可有多个译法，按当前语境选择，不因较早出现而强制统一。')
-    if capabilities['response_format'] != 'json_schema':
-        prompt += '输出必须符合此 JSON Schema：' + json.dumps(
-            _schema(stage, data), ensure_ascii=False, separators=(',', ':'))
+    if repair:
+        if stage not in {'draft', 'align'}:
+            raise ValueError('Only draft and alignment allow format repair')
+        prompt += ('上次响应未通过格式或编号校验。请从本次原始任务重新生成完整 JSON：'
+                   '每个目标编号恰好一次，译文完整且非空，不添加其他编号或说明。')
+    prompt += '输出必须符合此 JSON Schema：' + json.dumps(
+        _schema(stage, data), ensure_ascii=False, separators=(',', ':'))
     # Retention priority is internal; model input always states the original order.
     wire_data = dict(data)
     if data.get('context'):
@@ -222,11 +226,7 @@ def make_stage_payload(stage, data, backend, *, capabilities):
     payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
                'messages': [{'role': 'system', 'content': prompt},
                              {'role': 'user', 'content': json.dumps(wire_data, ensure_ascii=False)}]}
-    if capabilities['response_format'] == 'json_object':
-        payload['response_format'] = {'type': 'json_object'}
-    elif capabilities['response_format'] == 'json_schema':
-        payload['response_format'] = {'type': 'json_schema', 'json_schema': {
-            'name': 'subtitle_' + stage, 'strict': True, 'schema': _schema(stage, data)}}
+    payload['response_format'] = {'type': 'json_object'}
     try:
         size = len(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
     except (TypeError, UnicodeError, ValueError):

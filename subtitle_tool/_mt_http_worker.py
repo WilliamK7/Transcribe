@@ -1,4 +1,4 @@
-"""Private networking child. No task imports, database, retries, logs or files."""
+"""Perform one HTTP request in an isolated child process."""
 from __future__ import annotations
 
 import base64

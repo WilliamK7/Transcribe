@@ -1,4 +1,4 @@
-"""Offline gateway identity, fee isolation and migration regressions."""
+"""Offline gateway identity, fee isolation and request regressions."""
 from datetime import datetime, timezone
 from subtitle_tool.mt_backend import qiniu_free_active
 import json
@@ -9,32 +9,29 @@ from subtitle_tool.common import ToolError, atomic_json
 from subtitle_tool.config import Config
 from subtitle_tool.mt_backend import MTBackend, key_fingerprint, normalize_mt_url
 from subtitle_tool.mt_pool import configured_route, saved_route
-from tests.fixtures import TemporaryTest
+from tests.fixtures import set_asr_account, TemporaryTest
 
 
 class MagpieTests(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
-        self.config.set_key('synthetic-asr')
+        set_asr_account(self.config, 'synthetic-asr')
         self.config.settings.workspace_id = 'offline-space'
         self.identity = {'region': 'beijing', 'workspace_id': 'offline-space',
                          'access_mode': 'workspace', 'account': key_fingerprint('synthetic-asr')}
 
-    def test_gateway_default_never_borrows_upstream_credentials(self):
-        with mock.patch.dict(os.environ, {'OPENAI_API_KEY': 'private-router', 'QINIU_API_KEY': 'private-qiniu'}):
-            self.assertEqual(self.config.settings.mt_provider, 'magpie')
-            route = configured_route(self.config, self.identity)
-            for entry in route['entries']:
-                backend = MTBackend.from_snapshot(entry['backend'])
-                self.assertEqual(backend.provider, 'magpie')
-                self.assertEqual(backend.base_url, 'http://127.0.0.1:3425/v1')
-                self.assertEqual(backend.credential(self.config), 'magpie-transcribe')
-            self.assertEqual(saved_route({**self.identity, 'translation_strategy_version': 5,
-                                          'mt_route_snapshot': route}), route)
+    def test_gateway_defaults_and_saved_identity(self):
+        route = configured_route(self.config, self.identity)
+        for entry in route['entries']:
+            backend = MTBackend.from_snapshot(entry['backend'])
+            self.assertEqual(backend.provider, 'magpie')
+            self.assertEqual(backend.base_url, 'http://127.0.0.1:3425/v1')
+            self.assertEqual(backend.credential(self.config), 'magpie-transcribe')
+        self.assertEqual(saved_route({**self.identity, 'translation_strategy_version': 5,
+                                      'mt_route_snapshot': route}), route)
 
-    def test_explicit_gateway_selection_overrides_previous_pool(self):
-        self.config.settings.mt_backends = [{'id': 'qiniu_free'}, {'id': 'bailian_paid'}]
+    def test_free_permission_selects_the_saved_gateway_group(self):
         route = configured_route(self.config, self.identity, paid_enabled=False)
         self.assertFalse(route['routing']['paid_enabled'])
         self.assertEqual([(e['tier'], e['backend']['model']) for e in route['entries']],
@@ -67,13 +64,11 @@ class MagpieTests(TemporaryTest):
         ]
         atomic_json(registry / 'providers.json', {'providers': rows})
         self.config.settings.magpie_data_dir = str(registry)
-        self.config.settings.asr_provider = 'magpie'
         self.identity['account'] = key_fingerprint('central-asr')
-        with mock.patch.dict(os.environ, {'DASHSCOPE_API_KEY': 'obsolete-local-key'}):
-            self.assertEqual(self.config.get_key(), 'central-asr')
-            gateway = self.config.asr_gateway(self.identity)
-            self.assertEqual(gateway['key'], 'magpie-transcribe')
-            self.assertEqual(gateway['asr_provider'], 'transcribe-bailian')
+        self.assertEqual(self.config.get_key(), 'central-asr')
+        gateway = self.config.asr_gateway(self.identity)
+        self.assertEqual(gateway['key'], 'magpie-transcribe')
+        self.assertEqual(gateway['asr_provider'], 'transcribe-bailian')
         self.config.settings.magpie_base_url = 'https://another.example/v1'
         with self.assertRaises(ToolError):
             self.config.asr_gateway(self.identity)
@@ -95,18 +90,6 @@ class MagpieTests(TemporaryTest):
         with self.assertRaises(ToolError):
             self.config.asr_gateway(self.identity)
 
-    def test_configuration_preserves_backup_and_clears_old_pool(self):
-        self.config.settings.mt_provider = 'pool'
-        self.config.settings.mt_backends = [{'id': 'qiniu_free'}]
-        self.config.save()
-        before = (self.config.data / 'settings.json').read_bytes()
-        backup = self.config.configure_magpie()
-        self.assertEqual(backup.read_bytes(), before)
-        restored = Config(self.path)
-        self.assertEqual(restored.settings.mt_provider, 'magpie')
-        self.assertIsNone(restored.settings.mt_backends)
-        self.assertEqual(restored.get_key(), 'synthetic-asr')
-        self.assertNotIn('synthetic-asr', json.dumps(restored.settings.__dict__))
 
     def test_local_free_group_cannot_gain_a_paid_fallback_or_expired_promotion(self):
         from subtitle_tool.magpie import validate_group
@@ -140,15 +123,10 @@ class MagpieTests(TemporaryTest):
             raw['groups'][0]['off'] = ['free/qiniu/conatus-free']
             check()
 
-    def test_configure_replaces_legacy_scheduler_settings_and_preserves_fee_permission(self):
-        self.config.settings.mt_routing = {'paid_enabled': False, 'free_wait_seconds': 15}
-        self.config.configure_magpie()
-        route = configured_route(self.config, self.identity)
-        self.assertFalse(route['routing']['paid_enabled'])
-        self.assertEqual(self.config.settings.mt_routing, {'paid_enabled': False})
 
     def test_unverifiable_free_group_is_not_sent(self):
         from subtitle_tool.magpie import validate_group
+        self.config.settings.magpie_data_dir = ''
         with self.assertRaises(ToolError):
             validate_group(self.config.settings, 'group/transcribe-free', free_only=True)
 
@@ -228,15 +206,16 @@ class MagpiePipelineTests(PoolPipelineFixture):
         super().setUp()
         registry = self.path / 'gateway'
         registry.mkdir(exist_ok=True)
+        asr_key = self.config.get_key()
         self.config.settings.magpie_data_dir = str(registry)
         atomic_json(registry / 'providers.json', {'providers': [
             {'id': 'free', 'chat': 'https://openrouter.ai/api/v1', 'countFree': True},
             {'id': 'paid', 'chat': 'https://api.qnaigc.com/v1'}],
             'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
                        {'id': 'transcribe', 'members': ['group/transcribe-free', 'paid/paid-model']}]})
+        set_asr_account(self.config, asr_key)
 
     def test_all_stages_use_gateway_and_resume_keeps_saved_group(self):
-        self.config.settings.mt_provider = 'magpie'
         self.config.settings.mt_routing = {'paid_enabled': False}
         self.install()
         self.assertEqual(self.run_pool(), 'completed')
@@ -250,18 +229,17 @@ class MagpiePipelineTests(PoolPipelineFixture):
     def test_paid_permission_selects_mixed_group_once(self):
         self.config.settings.mt_routing = {'paid_enabled': True}
         from subtitle_tool.main import summary
-        self.config.settings.mt_provider = 'magpie'
         self.install()
         self.assertEqual(self.run_pool(), 'completed')
         self.assertEqual({data['_model'] for _, _, data in self.calls}, {'group/transcribe'})
         report = summary(self.store, self.job_id)
         self.assertEqual(report['models']['mt'], 'group/transcribe')
-        self.assertEqual(report['gateway_session'], 'transcribe-' + self.job_id)
+        self.assertEqual(report['gateway_session_prefix'], 'transcribe-' + self.job_id + '-')
+        self.assertEqual(report['mt_policy_version'], 1)
 
     def test_paid_cache_remains_reusable_with_paid_network_denied(self):
         from subtitle_tool.mt_pipeline import Pipeline
         from subtitle_tool.engine import Engine
-        self.config.settings.mt_provider = 'magpie'
         self.config.settings.mt_routing = {'paid_enabled': False}
         self.install()
         engine = Engine(self.config, self.store)
@@ -281,7 +259,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
     def test_cancel_saves_inflight_work_and_resume_uses_it(self):
         import threading
         from subtitle_tool.engine import Engine
-        self.config.settings.mt_provider = 'magpie'
         self.install()
         cancel = threading.Event()
         self.cancel_after = 'draft'
@@ -297,7 +274,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
         from subtitle_tool.mt_routing import RouteExhausted
         from subtitle_tool.mt_transport import HTTPReply, TransportError
         from subtitle_tool.engine import Engine
-        self.config.settings.mt_provider = 'magpie'
         self.install()
         engine = Engine(self.config, self.store)
         manifest = self.store.job(self.job_id)['manifest']
@@ -320,7 +296,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
 
     def test_resume_can_change_fee_permission_without_repeating_saved_stages(self):
         from subtitle_tool.engine import Engine
-        self.config.settings.mt_provider = 'magpie'
         self.config.settings.mt_routing = {'paid_enabled': False}
         self.fail_stage = 'draft'
         self.install()
@@ -333,9 +308,7 @@ class MagpiePipelineTests(PoolPipelineFixture):
         self.assertEqual({data['_model'] for _, _, data in self.calls}, {'group/transcribe'})
 
     def test_gateway_failure_never_falls_back_to_direct_provider(self):
-        self.config.settings.mt_provider = 'magpie'
         self.config.settings.mt_routing = {'paid_enabled': False}
-        self.config.settings.mt_backends = [{'id': 'bailian_paid'}]
         self.fail_stage = 'draft'
         self.install()
         self.assertEqual(self.run_pool(), 'failed')
@@ -347,7 +320,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
         from subtitle_tool.mt_pipeline import check_pool
         from subtitle_tool.mt_transport import HTTPReply
         import threading
-        self.config.settings.mt_provider = 'magpie'
         identity = {'region': 'beijing', 'workspace_id': self.config.settings.workspace_id,
                     'access_mode': 'workspace', 'account': key_fingerprint(self.config.get_key())}
         route = configured_route(self.config, identity, paid_enabled=False)
@@ -362,6 +334,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
             transport.return_value.request.side_effect = request
             report = check_pool(self.config, identity, route, threading.Event())
         self.assertEqual(calls[0].get('X-Magpie-Response-Model'), 'member')
-        self.assertRegex(calls[0].get('X-Magpie-Session', ''), r'^transcribe-[0-9a-f]{32}$')
+        self.assertRegex(calls[0].get('X-Magpie-Session', ''), r'^transcribe-[0-9a-f]{32}-[0-9a-f]{32}$')
         self.assertEqual(report['gateway_session'], calls[0]['X-Magpie-Session'])
         self.assertEqual(report['actual_model'], 'free/openrouter/free')

@@ -27,7 +27,7 @@ POLICY = {
 
 class MagpieASRTests(TemporaryTest):
     def cloud(self, gateway=GATEWAY):
-        return Bailian('synthetic-upstream-key', 'beijing', threading.Event(),
+        return Bailian('beijing', threading.Event(),
                        workspace_id='offline-space', gateway=gateway)
 
     def test_policy_submit_query_use_native_routes_and_only_gateway_credentials(self):
@@ -61,7 +61,7 @@ class MagpieASRTests(TemporaryTest):
         self.assertEqual(cloud.base, 'https://localhost/prefix/v1/magpie/native/transcribe-bailian')
 
     def test_invalid_gateway_is_rejected_without_network_or_configuration_values(self):
-        cases = [False, [], 'private-value', {}, {**GATEWAY, 'extra': 'private-value'}]
+        cases = [None, False, [], 'private-value', {}, {**GATEWAY, 'extra': 'private-value'}]
         cases += [{key: value for key, value in GATEWAY.items() if key != missing} for missing in GATEWAY]
         cases += [dict(GATEWAY, **{field: value})
                   for field in ('asr_provider', 'upload_provider')
@@ -120,11 +120,3 @@ class MagpieASRTests(TemporaryTest):
         self.assertIsNone(request.call_args.kwargs['headers'])
         self.assertNotIn(GATEWAY['key'], str(upload.call_args))
         self.assertNotIn(GATEWAY['key'], str(request.call_args))
-
-    def test_omitted_gateway_keeps_direct_workspace_contract(self):
-        cloud = Bailian('synthetic-upstream-key', 'beijing', threading.Event(), workspace_id='offline-space')
-        self.assertEqual(cloud.base, 'https://offline-space.cn-beijing.maas.aliyuncs.com')
-        with mock.patch('requests.request', return_value=response({'data': POLICY})) as request:
-            cloud.policy()
-        self.assertEqual(request.call_args.args, ('GET', 'https://dashscope.aliyuncs.com/api/v1/uploads'))
-        self.assertEqual(request.call_args.kwargs['headers']['Authorization'], 'Bearer synthetic-upstream-key')

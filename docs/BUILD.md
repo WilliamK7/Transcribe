@@ -14,7 +14,7 @@
 
 `scripts/prepare_assets.py` 按 `scripts/release-assets.json` 下载并校验 FFmpeg 归档，只提取 `ffmpeg.exe`、`ffprobe.exe`、`LICENSE` 和 `README.txt` 到 `tools`。程序使用这些本地工具的绝对路径。
 
-环境准备成功后自动安装“发送到”入口，管理命令见 [README](../README.md#右键发送到)。
+环境准备成功后自动安装“发送到”入口，管理命令见 [README](../README.md#字幕与交互)。
 
 依赖维护：
 
@@ -34,6 +34,4 @@ uv pip sync requirements.lock --require-hashes --python .venv\Scripts\python.exe
 
 `scripts/transcribe.ps1` 保留调用者当前目录，相对媒体与报告路径按调用位置解释。运行数据及恢复资料见[数据与恢复](API_CONTRACT.md#数据与恢复)。
 
-运行时连接常驻 magpie 网关，当前核对版本为 Windows 便携版 0.1.3323。迁移与本机地址配置见 [README](../README.md#迁移到-magpie)。
-
-迁移工具仅支持具有 `.portable` 标记、同目录 `data` 的 Windows 便携版，以核对 CLI 实际写入位置。升级 magpie 后应重新核对原生 POST 单次转发及组费用隔离；真实检查使用合成短句和只读上传策略请求，不等同于真实长视频 ASR 或人工字幕质量检查。
+运行时连接常驻 magpie 网关，配置见 [README](../README.md#配置-magpie)。升级 magpie 后核对原生 POST 单次转发、组费用隔离及会话关联；可用合成短句和只读上传策略请求检查接入。真实长视频识别与人工字幕质量另行验证。

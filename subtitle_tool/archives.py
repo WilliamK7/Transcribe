@@ -1,4 +1,4 @@
-"""Read immutable local archives; historical executors are not required."""
+"""Read and verify immutable local archives."""
 from __future__ import annotations
 
 import hashlib

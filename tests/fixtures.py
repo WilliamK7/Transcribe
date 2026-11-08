@@ -25,6 +25,28 @@ TEMP = ROOT / ".build" / "test-temp"
 TEMP.mkdir(parents=True, exist_ok=True)
 
 
+GATEWAY = {'base_url': 'http://127.0.0.1:3425/v1', 'asr_provider': 'transcribe-bailian',
+           'upload_provider': 'transcribe-upload', 'key': 'synthetic-gateway-key'}
+
+
+def set_asr_account(config, key):
+    """Write a synthetic central registry while retaining its current MT groups."""
+    workspace = config.settings.workspace_id or 'offline-space'
+    config.settings.workspace_id = workspace
+    registry = Path(config.settings.magpie_data_dir) if config.settings.magpie_data_dir else config.root / 'magpie'
+    config.settings.magpie_data_dir = str(registry)
+    path = registry / 'providers.json'
+    raw = json.loads(path.read_bytes()) if path.exists() else {
+        'providers': [{'id': 'free', 'chat': 'https://openrouter.ai/api/v1'}],
+        'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
+                   {'id': 'transcribe', 'members': ['group/transcribe-free']}]}
+    ids = (config.settings.magpie_asr_provider, config.settings.magpie_upload_provider)
+    raw['providers'] = [row for row in raw['providers'] if row['id'] not in ids] + [
+        {'id': ids[0], 'chat': f'https://{workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'key': key},
+        {'id': ids[1], 'chat': 'https://dashscope.aliyuncs.com/compatible-mode/v1', 'key': key}]
+    atomic_json(path, raw)
+
+
 def result(*sentences):
     return {"file_url": "oss://test/audio.wav", "audio_info": {"format": "wav", "sample_rate": 16000},
             "transcripts": [{"channel_id": 0, "sentences": [
@@ -131,8 +153,7 @@ class TemporaryTest(unittest.TestCase):
         self.addCleanup(transport.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
-        os.environ.pop("DASHSCOPE_API_KEY", None)
-        for name in ["OPENAI_API_KEY", "QINIU_API_KEY", "MAGPIE_API_KEY", "MT_PROVIDER", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL", "MT_RPM"]:
+        for name in ["MAGPIE_API_KEY", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL"]:
             os.environ.pop(name, None)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP)
         self.path = Path(self.temp.name)
@@ -153,7 +174,7 @@ class SavedResultFixture(TemporaryTest):
         super().setUp()
         self.config = Config(self.path)
         self.config.settings.workspace_id = "offline-space"
-        self.config.set_key("offline-test-key-no-cloud-authorization")
+        set_asr_account(self.config, "offline-test-key-no-cloud-authorization")
         self.source = self.path / "saved.mkv"
         self.source.write_bytes(b"saved source identity only")
         self.store = Store(self.config.data / "jobs.sqlite")
@@ -214,7 +235,7 @@ class PipelineFixture(TemporaryTest):
         self.media_tools.start()
         self.config = Config(self.path)
         self.config.settings.workspace_id = "offline-space"
-        self.config.set_key("offline-test-key-no-cloud-authorization")
+        set_asr_account(self.config, "offline-test-key-no-cloud-authorization")
         self.source = self.path / "中文 多点.片段 & (1).mkv"
         shutil.copyfile(self.fixture, self.source)
         self.store = Store(self.config.data / "jobs.sqlite")

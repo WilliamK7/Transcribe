@@ -9,9 +9,8 @@ from .common import ToolError
 from .mt_backend import MTBackend, key_fingerprint, normalize_mt_url
 
 
-_FORMATS = {'json_object', 'json_schema', 'text'}
 _ENTRY_FIELDS = {'id', 'tier', 'credential_ref', 'backend', 'capabilities'}
-_BACKEND_FIELDS = {'format_version', 'provider', 'base_url', 'model', 'key_fingerprint', 'request_version'}
+_BACKEND_FIELDS = {'format_version', 'provider', 'base_url', 'model', 'key_fingerprint', 'request_version', 'policy_version'}
 _CAPABILITY_FIELDS = {'response_format', 'input_bytes', 'output_tokens'}
 _ROUTING_FIELDS = {'paid_enabled'}
 _QUALITY_FIELDS = {'input_bytes', 'output_tokens', 'max_revisions', 'manual_glossary'}
@@ -57,7 +56,7 @@ def _manual_glossary(value):
 
 def _capabilities(value):
     return (isinstance(value, dict) and set(value) == _CAPABILITY_FIELDS and
-            isinstance(value['response_format'], str) and value['response_format'] in _FORMATS and
+            value['response_format'] == 'json_object' and
             _integer(value['input_bytes'], 1, 1048576) and _integer(value['output_tokens'], 1, 32768))
 
 
@@ -77,8 +76,8 @@ def configured_route(config, manifest, *, paid_enabled=None):
     if not isinstance(manifest, dict):
         raise _invalid()
     settings = config.mt_settings()
-    if settings.mt_provider != 'magpie':
-        raise ToolError('请先迁移或运行 --configure-mt magpie，并检查 MT_PROVIDER 环境覆盖。', 'mt_config')
+    if not _integer(settings.mt_policy_version, 1, 2**31 - 1):
+        raise ToolError('mt_policy_version 必须是 1～2147483647 的整数；更换翻译策略时递增。', 'mt_config')
     base = normalize_mt_url(settings.mt_base_url)
     models = [('magpie_free', 'free', settings.mt_free_model),
               ('magpie', 'paid', settings.mt_model or 'group/transcribe')]
@@ -104,41 +103,42 @@ def configured_route(config, manifest, *, paid_enabled=None):
         raise ToolError('翻译的百炼账户与任务不一致。', 'cache_mismatch')
     fingerprint = _fingerprint(config.get_magpie_key(base))
     entries = [{'id': identity, 'tier': tier, 'credential_ref': 'magpie',
-                'backend': MTBackend('magpie', base, model, fingerprint).snapshot(),
+                'backend': MTBackend('magpie', base, model, fingerprint,
+                                     policy_version=settings.mt_policy_version).snapshot(),
                 'capabilities': {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}}
                for identity, tier, model in models]
-    return {'format_version': 2, 'entries': entries, 'routing': routing, 'quality': quality}
+    return {'format_version': 3, 'entries': entries, 'routing': routing, 'quality': quality}
 
 
 def saved_route(manifest):
-    """Validate only the saved contract and frozen identities, independent of defaults."""
+    """Validate saved gateway groups and frozen task identities."""
     if not isinstance(manifest, dict):
         raise _invalid()
     snapshot = manifest.get('mt_route_snapshot')
     if (not isinstance(snapshot, dict) or set(snapshot) != {'format_version', 'entries', 'routing', 'quality'} or
-            type(snapshot['format_version']) is not int or snapshot['format_version'] != 2 or
+            type(snapshot['format_version']) is not int or snapshot['format_version'] != 3 or
             type(manifest.get('translation_strategy_version')) is not int or
             manifest['translation_strategy_version'] != 5 or not isinstance(snapshot['entries'], list) or
-            not snapshot['entries'] or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):
+            len(snapshot['entries']) != 2 or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):
         raise _invalid()
 
     snapshot = copy.deepcopy(snapshot)
-    identities, backends, fingerprints = set(), set(), {}
+    identities, backends, fingerprints, versions, tiers = set(), set(), {}, set(), set()
     for entry in snapshot['entries']:
         if not isinstance(entry, dict) or set(entry) != _ENTRY_FIELDS:
             raise _invalid()
         identity, ref = entry['id'], entry['credential_ref']
         if (not _identifier(identity) or identity in identities or not isinstance(ref, str) or
                 ref != 'magpie' or not isinstance(entry['tier'], str) or
-                entry['tier'] not in {'free', 'paid'} or not _capabilities(entry['capabilities'])):
+                entry['tier'] not in {'free', 'paid'} or entry['tier'] in tiers or not _capabilities(entry['capabilities'])):
             raise _invalid()
         identities.add(identity)
+        tiers.add(entry['tier'])
         saved = entry['backend']
-        if saved is None:
-            continue
         if (not isinstance(saved, dict) or set(saved) != _BACKEND_FIELDS or
-                type(saved['format_version']) is not int or saved['format_version'] != 1 or
+                type(saved['format_version']) is not int or saved['format_version'] != 2 or
                 type(saved['request_version']) is not int or saved['request_version'] != 5 or
+                not _integer(saved['policy_version'], 1, 2**31 - 1) or
                 saved['provider'] != 'magpie' or not _model(saved['model']) or
                 not isinstance(saved['base_url'], str) or not isinstance(saved['key_fingerprint'], str) or
                 re.fullmatch(r'[0-9a-f]{64}', saved['key_fingerprint']) is None):
@@ -150,14 +150,13 @@ def saved_route(manifest):
             raise _invalid() from None
         backend = MTBackend.from_snapshot(saved)
         backend_identity = (backend.provider, backend.base_url, backend.model, backend.key_fingerprint,
-                            backend.request_version)
+                            backend.request_version, backend.policy_version)
         if backend_identity in backends or ref in fingerprints and fingerprints[ref] != backend.key_fingerprint:
             raise _invalid()
         backends.add(backend_identity)
         fingerprints[ref] = backend.key_fingerprint
+        versions.add(backend.policy_version)
 
-    if not any(
-            entry['backend'] is not None and (entry['tier'] == 'free' or snapshot['routing']['paid_enabled'])
-            for entry in snapshot['entries']):
+    if len(versions) != 1:
         raise _invalid()
     return snapshot

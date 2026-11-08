@@ -3,7 +3,7 @@
 from subtitle_tool.common import ToolError
 from subtitle_tool.mt_backend import key_fingerprint
 from subtitle_tool.mt_pool import configured_route, saved_route
-from tests.fixtures import TemporaryTest
+from tests.fixtures import set_asr_account, TemporaryTest
 from subtitle_tool.config import Config
 from subtitle_tool.store import Store
 from subtitle_tool.policy import load_policy
@@ -13,15 +13,11 @@ class PoolSnapshotTests(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
-        self.config.set_key('synthetic-bailian')
-        self.config.set_qiniu_key('synthetic-qiniu')
-        (self.config.data / 'mt-key.txt').write_text('synthetic-openrouter', encoding='utf-8')
+        set_asr_account(self.config, 'synthetic-bailian')
         self.manifest = {'region': 'beijing', 'access_mode': 'workspace', 'workspace_id': 'space',
                          'account': key_fingerprint('synthetic-bailian')}
 
 
-    def test_new_install_defaults_to_magpie(self):
-        self.assertEqual(Config(self.path / 'fresh').settings.mt_provider, 'magpie')
 
     def test_enqueue_and_report_use_the_saved_route(self):
         from subtitle_tool.main import summary

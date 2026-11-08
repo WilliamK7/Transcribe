@@ -27,7 +27,7 @@ class ReportWriter:
             database.stat()
         except FileNotFoundError:
             return []
-        # Self-test and preflight must not recover jobs, migrate schemas or read the Key.
+        # Preflight reads task paths through a read-only connection.
         with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
             return connection.execute("SELECT id,source,output,json_extract(manifest,'$.backup'),"
                                       "json_extract(manifest,'$.publication_intent.backup') FROM jobs").fetchall()

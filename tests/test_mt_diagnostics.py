@@ -13,9 +13,12 @@ from tests.fixtures import TemporaryTest
 class DiagnosticTests(TemporaryTest):
     def test_gateway_route_diagnostics_keep_only_bounded_safe_fields(self):
         writer = MTDiagnostics(self.path, 'a' * 32)
-        self.assertTrue(writer.write_route({'kind': 'route_reply', 'entry': 'synthetic',
+        self.assertTrue(writer.write_route({'kind': 'request_end', 'entry': 'synthetic',
             'status': 429, 'duration_ms': 1000, 'error': 'private exception'}))
-        self.assertTrue(writer.write_route({'kind': 'route_reply', 'status': 'private text', 'duration_ms': -1}))
+        self.assertTrue(writer.write_route({'kind': 'request_end', 'status': 'private text', 'duration_ms': -1,
+            'request_id': 'private', 'gateway_session': 'private', 'actual_model': 'sk-private',
+            'input_tokens': True, 'output_tokens': 2**63, 'policy_version': -1, 'outcome': 'private',
+            'validation_category': 'private'}))
         self.assertTrue(writer.write_route({'kind': 'route_failure', 'category': 'output_truncated',
                                            'dispatched': False, 'content': 'private response'}))
         raw = writer.path.read_text(encoding='utf-8')

@@ -22,7 +22,7 @@ from subtitle_tool.subtitles import normalize, render_srt, route
 from subtitle_tool.publication import write_srt
 from subtitle_tool.review import ReviewDecision
 
-from tests.fixtures import enqueue_current, ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
+from tests.fixtures import GATEWAY, set_asr_account, enqueue_current, ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
 
 
 class SubtitleTests(TemporaryTest):
@@ -159,7 +159,7 @@ class SubtitleTests(TemporaryTest):
 
 class HttpTests(unittest.TestCase):
     def test_submit_malformed_output_or_missing_id_is_unknown(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event(), workspace_id="offline-space")
+        cloud = Bailian("beijing", threading.Event(), workspace_id="offline-space", gateway=GATEWAY)
         for body in [{}, {"output": None}, {"output": []}, {"output": {"task_id": ""}}]:
             with self.subTest(body=body), mock.patch("requests.request", return_value=response(body)) as request:
                 with self.assertRaises(SubmissionUnknown):
@@ -167,14 +167,14 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(request.call_count, 1)
 
     def test_submit_timeout_is_never_retried(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event(), workspace_id="offline-space")
+        cloud = Bailian("beijing", threading.Event(), workspace_id="offline-space", gateway=GATEWAY)
         with mock.patch("requests.request", side_effect=requests.Timeout()) as request:
             with self.assertRaises(SubmissionUnknown):
                 cloud.submit("oss://test/a.wav")
             self.assertEqual(request.call_count, 1)
 
     def test_submit_5xx_is_unknown_but_403_is_explicit_rejection(self):
-        cloud = Bailian("offline-key", "beijing", threading.Event(), workspace_id="offline-space")
+        cloud = Bailian("beijing", threading.Event(), workspace_id="offline-space", gateway=GATEWAY)
         with mock.patch("requests.request", return_value=response({}, 503)) as request:
             with self.assertRaises(SubmissionUnknown):
                 cloud.submit("oss://test/a.wav")
@@ -240,8 +240,9 @@ class PipelineTests(PipelineFixture):
         self.assertEqual(request["headers"]["X-DashScope-OssResourceResolve"], "enable")
         self.assertEqual(fake.named("/uploads")[0][2]["params"]["model"], ASR_MODEL)
         self.assertNotIn("Authorization", fake.uploads[0][1])
-        self.assertEqual(fake.named("/asr/transcription")[0][1], "https://offline-space.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/asr/transcription")
-        self.assertEqual(fake.named("/uploads")[0][1], "https://dashscope.aliyuncs.com/api/v1/uploads")
+        self.assertEqual(fake.named("/asr/transcription")[0][1], "http://127.0.0.1:3425/v1/magpie/native/transcribe-bailian/api/v1/services/audio/asr/transcription")
+        self.assertEqual(fake.named("/uploads")[0][1], "http://127.0.0.1:3425/v1/magpie/native/transcribe-upload/api/v1/uploads")
+        self.assertEqual(request['headers']['Authorization'], 'Bearer magpie-transcribe')
         self.assertIn(b"Content-Type: audio/flac", fake.uploads[0][2])
         segment = self.store.job(self.job_id)["manifest"]["segments"][0]
         self.assertTrue(segment["oss_url"].startswith("oss://"))
@@ -400,7 +401,7 @@ class PipelineTests(PipelineFixture):
         cue = self.store.cues(self.job_id)[0]
         self.store.apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
         before = len(fake.calls)
-        self.config.set_key("offline-other-account")
+        set_asr_account(self.config, "offline-other-account")
         self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(self.store.job(self.job_id)["error_code"], "account_changed")
         self.assertEqual(len(fake.calls), before)
@@ -413,7 +414,8 @@ class PipelineTests(PipelineFixture):
                                                 ("offline-space", "offline-other-key")]):
             source = self.path / f"other-{index}.mkv"
             shutil.copyfile(self.fixture, source)
-            self.config.set_key(key)
+            self.config.settings.workspace_id = workspace
+            set_asr_account(self.config, key)
             self.job_id = enqueue_current(self.store, self.config, source, workspace_id=workspace)
             self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(len(fake.named("/chat/completions")), 9)
