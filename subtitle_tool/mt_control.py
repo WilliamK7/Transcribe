@@ -11,7 +11,6 @@ class MTControl:
     def __init__(self, cancel, *, clock=time.monotonic, drain_seconds=5.0):
         self.cancel = cancel
         self.clock = clock
-        self.created = clock()
         self.drain_seconds = drain_seconds
         self.lock = threading.RLock()
         self.deadline = None
@@ -67,12 +66,3 @@ class MTControl:
             self._observe()
             if self.deadline is not None and (not drain or self.clock() >= self.deadline):
                 self._raise()
-
-    def wait(self, seconds):
-        until = self.clock() + seconds
-        while True:
-            self.check_start()
-            remaining = until - self.clock()
-            if remaining <= 0:
-                return
-            self.cancel.wait(min(remaining, .1))

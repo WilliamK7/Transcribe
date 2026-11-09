@@ -63,6 +63,10 @@
 
 ## 数据与恢复
 
+任务状态、操作事件和恢复提示由 `subtitle_tool/lifecycle.py` 定义。Store 同事务校验状态转移与写入，非法转移返回 `invalid_transition`；停止、完成和未知提交通过各自的恢复入口继续。运行阶段是可跳步、可循环的检查点，恢复还需校验保存证据。`--jobs` 只读最后记录，保留状态、错误和请求 ID；状态不表示此刻有进程在执行。
+
+`--state-machine` 直接输出版本化 JSON：`states` 包含名称、中文 `label`、`kind` 和运行阶段的 `auto_recover` 标记，`events` 包含每个操作的 `from`、`to` 和 `guards`。规则从执行代码生成，无需配置、任务库、凭据或网络。
+
 运行时只接受当前执行契约：媒体处理 2、提取配方 2、字幕格式 2、规范化 4、显示时间 2、翻译策略／请求契约 5、提示词 3、响应恢复标识 5、上下文 2、对齐策略 `execution_snapshot.alignment_version:2`、术语调度 `prefix-v2`。版本字段必须是整数且精确匹配，术语调度字段也必须存在。`--resume` 和 `--retime` 均先核对契约，缺少字段或版本不匹配时返回 `cache_version`，须用 `--reflow` 从完整转写重建。线程数与轮询等待使用当前设置，排版、模型、能力和账户身份沿任务快照。
 
 翻译路线快照为版本 3，身份保存在版本 2 的 `mt_route_snapshot.entries[].backend`，包含独立的 `policy_version`；它是用户管理的策略修订号，不等于固定的运行契约版本。magpie 报告中的模型是费用许可选定的组，并提供 `mt_policy_version`。需要重建的路线在列表中标记 `mt_route_status:reflow_required`，通过 `--reflow` 显式重建。项目记录阶段、校验及提交网关的次数；上游尝试、回退及完整费用统计由 magpie 记录。
@@ -116,6 +120,8 @@ PCM 中间文件使用 RIFF WAV，数据容量上限为 `UINT32_MAX - 4096` 字�
 ## 报告字段
 
 stdout 每行 JSON，stderr 显示进度；报告不包含 Key、签名链接、转写和译文。报告路径在执行前和写入前检查输入、输出、备份、data 及恢复快照，覆盖路径别名和 Windows 备用数据流。归档也位于受保护的 data 内。
+
+任务结果中的 `lifecycle` 包含 `version`、中文 `label`、`kind` 和 `next_actions`。每项操作的 `id` 用于程序分支，`label` 用于展示，`argv` 是固定参数数组；`required_options` 将待填选项映射到输入说明，调用方填写真实值。`requires_confirmation:true` 表示重发未知提交前须明确接受可能重复计费。操作建议来自保存记录，执行时校验文件、凭据和产出；覆盖已有字幕须显式添加 `--overwrite`。
 
 | `counts` 字段 | 含义 |
 | --- | --- |

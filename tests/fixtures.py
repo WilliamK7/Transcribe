@@ -163,6 +163,16 @@ class TemporaryTest(unittest.TestCase):
         self.environment.stop()
 
 
+def seed_job_state(store, job_id, state, manifest=None, *, error='', code=''):
+    """Inject a historical or interrupted checkpoint for recovery tests."""
+    with store.lock, store.db:
+        store.db.execute("UPDATE jobs SET state=?,error=?,error_code=?,request_id='' WHERE id=?",
+                         (state, error, code, job_id))
+        if manifest is not None:
+            store.db.execute('UPDATE jobs SET manifest=? WHERE id=?',
+                             (json.dumps(manifest, ensure_ascii=False), job_id))
+
+
 def point_sentence(at, text="Yes.", language="en"):
     return {"begin_time": at, "end_time": at, "text": text, "language": language,
             "words": [{"begin_time": at, "end_time": at, "text": text[:-1], "punctuation": text[-1]}]}

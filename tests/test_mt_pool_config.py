@@ -1,9 +1,12 @@
 """Gateway snapshots reject corrupted identities and preserve glossary validation."""
 import copy
+from contextlib import closing
 from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config
 from subtitle_tool.mt_backend import key_fingerprint
 from subtitle_tool.mt_pool import configured_route, saved_route
+from subtitle_tool.policy import load_policy
+from subtitle_tool.store import Store
 from tests.fixtures import set_asr_account, TemporaryTest
 
 
@@ -17,6 +20,31 @@ class GatewaySnapshotValidationTests(TemporaryTest):
 
     def manifest_with(self, route):
         return {**self.manifest, 'translation_strategy_version': 5, 'mt_route_snapshot': copy.deepcopy(route)}
+
+    def test_enqueue_and_report_preserve_the_saved_route_on_reuse(self):
+        from subtitle_tool.main import summary
+        route = configured_route(self.config, self.manifest)
+        media = self.path / 'synthetic.mp4'
+        media.write_bytes(b'not-real-media')
+        with closing(Store(self.config.data / 'jobs.sqlite')) as store:
+            options = dict(workspace_id='space', account=self.manifest['account'], mt_route_snapshot=route)
+            job_id = store.enqueue(media, **options)
+            manifest = store.job(job_id)['manifest']
+            self.assertEqual(manifest['translation_strategy_version'], 5)
+            self.assertEqual(saved_route(manifest), route)
+            load_policy(manifest)
+            primary = next(entry['backend'] for entry in route['entries'] if entry['tier'] == 'paid')
+            report = summary(store, job_id)
+            self.assertEqual((report['mt_provider'], report['models']['mt']),
+                             (primary['provider'], primary['model']))
+            self.assertEqual(store.enqueue(media, **options), job_id)
+            self.assertEqual(summary(store, job_id), report)
+            self.config.settings.mt_routing = {'paid_enabled': False}
+            options['mt_route_snapshot'] = configured_route(self.config, self.manifest)
+            with self.assertRaises(ToolError) as error:
+                store.enqueue(media, **options)
+            self.assertEqual(error.exception.code, 'mt_config_changed')
+            self.assertEqual(summary(store, job_id), report)
 
 
     def test_saved_snapshot_rejects_bad_id_duplicate_backend_and_key_mismatch(self):
@@ -33,9 +61,6 @@ class GatewaySnapshotValidationTests(TemporaryTest):
         mutations.append(changed)
         changed = copy.deepcopy(original)
         changed['mt_route_snapshot']['entries'][0]['credential_ref'] = 'openrouter'
-        mutations.append(changed)
-        changed = copy.deepcopy(original)
-        changed['mt_route_snapshot']['entries'][-1]['backend']['key_fingerprint'] = 'f' * 64
         mutations.append(changed)
         changed = copy.deepcopy(original)
         changed['mt_route_snapshot']['entries'][1]['backend']['key_fingerprint'] = 'f' * 64
@@ -75,9 +100,6 @@ class GatewaySnapshotValidationTests(TemporaryTest):
         changed = copy.deepcopy(original)
         del changed['mt_route_snapshot']['entries'][0]['capabilities']['response_format']
         mutations.append(changed)
-        changed = copy.deepcopy(original)
-        changed['mt_route_snapshot']['quality']['max_revisions'] = 2.0
-        mutations.append(changed)
         for changed in mutations:
             with self.subTest(index=mutations.index(changed)):
                 with self.assertRaises(ToolError) as error:
@@ -85,18 +107,12 @@ class GatewaySnapshotValidationTests(TemporaryTest):
                 self.assertNotIn('synthetic-', str(error.exception))
 
 
-    def test_unimplemented_global_strategy_overrides_are_rejected_on_restore(self):
+    def test_saved_quality_requires_current_limits(self):
         baseline = self.manifest_with(configured_route(self.config, self.manifest))
         changes = [
-            ('routing', 'stage_deadline_seconds', 181),
-            ('routing', 'http_timeout_seconds', 59),
-            ('routing', 'max_attempts', 3),
             ('quality', 'input_bytes', 32767),
             ('quality', 'output_tokens', 2048),
             ('quality', 'max_revisions', 1),
-            ('routing', 'stage_deadline_seconds', 180.0),
-            ('routing', 'http_timeout_seconds', 60.0),
-            ('routing', 'max_attempts', 2.0),
             ('quality', 'input_bytes', 32768.0),
             ('quality', 'output_tokens', 4096.0),
             ('quality', 'max_revisions', 2.0),

@@ -12,7 +12,7 @@ from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main
 from subtitle_tool.store import Store
-from tests.fixtures import enqueue_current, FakeService, PipelineFixture, TemporaryTest, result
+from tests.fixtures import enqueue_current, FakeService, PipelineFixture, TemporaryTest, result, seed_job_state
 
 
 class OutputStoreTests(TemporaryTest):
@@ -151,7 +151,7 @@ class OutputStoreTests(TemporaryTest):
         self.store.update(old_id, 'completed')
         job_id = self.enqueue()
         old_manifest = self.store.job(old_id)['manifest'] | {'account': 'other-account'}
-        self.store.update(old_id, 'failed', old_manifest)
+        seed_job_state(self.store, old_id, 'failed', old_manifest)
         before = self.store.job(job_id)
         with self.assertRaises(ToolError) as error:
             self.enqueue(overwrite=True)

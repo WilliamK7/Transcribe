@@ -6,7 +6,7 @@ from unittest import mock
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media
 
-from tests.fixtures import set_asr_account, FakeService, SavedResultFixture, result, timed_raw
+from tests.fixtures import set_asr_account, FakeService, SavedResultFixture, result, timed_raw, seed_job_state
 
 
 class SavedRecoveryTests(SavedResultFixture):
@@ -36,7 +36,7 @@ class SavedRecoveryTests(SavedResultFixture):
                 self.source.write_bytes(b"saved source identity only")
                 self.store.replace_cues(self.job_id, [])
                 self.save_result(result(("本地转写。", "zh")), normalized=False)
-                self.store.update(self.job_id, "queued")
+                seed_job_state(self.store, self.job_id, "queued")
                 if known_id:
                     (self.cache / "raw-0000.json").unlink()
                 else:
@@ -72,7 +72,7 @@ class SavedRecoveryTests(SavedResultFixture):
                 elif kind == "duplicate_source":
                     candidate["segments"].append(copy.deepcopy(candidate["segments"][0]))
                 self.store.initialize_subtitles(self.job_id, records, cues, candidate)
-                self.store.update(self.job_id, "queued")
+                seed_job_state(self.store, self.job_id, "queued")
                 self.assert_mismatch_without_requests()
 
 

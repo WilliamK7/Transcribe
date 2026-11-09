@@ -19,7 +19,8 @@ from .config import Config
 from .media import Media
 from .mt_control import MTControl
 from .mt_quality import GLOSSARY_SCHEDULE
-from .store import TERMINAL, Store
+from .store import Store
+from .lifecycle import INACTIVE, recovery_target, unknown_submission
 from .review import decision_origin
 from .policy import asr_contract, current_execution_snapshot, load_policy
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
@@ -31,12 +32,6 @@ from .subtitles import make_fragment, normalize, plan_display_timing, render_srt
 class LocalStateUnavailable(ToolError):
     def __init__(self):
         super().__init__("无法确认本地事务的已提交状态；已停止处理，请检查数据库后恢复。", "local_persistence")
-
-
-def unknown_submission(manifest, state):
-    return not manifest.get('reflow') and (
-        state == 'submission_unknown' or
-        any(s.get('submitting') and not s.get('task_id') for s in manifest.get('segments', [])))
 
 
 class Engine:
@@ -53,13 +48,12 @@ class Engine:
 
     def recover_jobs(self):
         for job in self.store.jobs():
-            if job["state"] in TERMINAL:
-                continue
-            if unknown_submission(job["manifest"], job["state"]):
+            target = recovery_target(job['state'], job['manifest'])
+            if target == 'submission_unknown':
                 self.store.update(job["id"], "submission_unknown",
-                                  error="提交被中断，结果未知；请确认云端任务。", code="submission_unknown")
-            elif job["state"] not in {"failed", "needs_review", "queued"}:
-                self.store.update(job["id"], "queued")
+                                  error="提交被中断，结果未知；请确认云端任务。", code="submission_unknown", event='recover')
+            elif target is not None:
+                self.store.update(job["id"], target, event='recover')
 
     def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
                task_id=None, allow_resubmit=False, mt_paid=None):
@@ -84,23 +78,24 @@ class Engine:
         if overwrite or output_dir is not None:
             self.store.change_output(job_id, output_dir, overwrite)
         if unknown_submission(job["manifest"], job["state"]):
-            self.store.update(job_id, "submission_unknown")
+            if job['state'] != 'submission_unknown':
+                self.store.update(job_id, "submission_unknown", event='resume')
         elif job["state"] == "cancelled":
-            self.store.update(job_id, "queued")
+            self.store.update(job_id, "queued", event='resume')
         if task_id or allow_resubmit:
             self.resolve_unknown(job_id, task_id, allow_resubmit)
 
 
     def cancel_job(self, job_id, *, interrupted=False):
         job = self.store.job(job_id)
-        if job["state"] in TERMINAL:
+        if job["state"] in INACTIVE:
             return
         manifest = job["manifest"]
         ambiguous = unknown_submission(manifest, job["state"])
         state = "submission_unknown" if interrupted and ambiguous else "cancelled"
         self.store.update(job_id, state, manifest,
                           error="用户停止本地任务；已提交的云端任务仍可能计费。",
-                          code="submission_unknown" if interrupted and ambiguous else "cancelled")
+                          code="submission_unknown" if interrupted and ambiguous else "cancelled", event='cancel')
 
     def review_media(self, job_id):
         job = self.store.job(job_id)
@@ -119,7 +114,7 @@ class Engine:
             raise ToolError("当前任务不是待复核状态。", "review")
         if job["error_code"] == "language_uncertain" and any(c["decision"] == "uncertain" for c in self.store.cues(job_id)):
             raise ToolError("仍有未确认的语种决定。", "review")
-        self.store.update(job_id, "queued")
+        self.store.update(job_id, "queued", event='review')
 
     def commit_local(self, job_id, manifest, candidate, operation, *args, **kwargs):
         """Only local DB boundaries reload state; cloud facts keep their existing handling."""
@@ -438,7 +433,8 @@ class Engine:
         if job["state"] in {"completed", "skipped", "cancelled"}:
             return job["state"]
         if unknown_submission(job["manifest"], job["state"]):
-            self.store.update(job_id, "submission_unknown", code="submission_unknown")
+            if job['state'] != 'submission_unknown':
+                self.store.update(job_id, "submission_unknown", code="submission_unknown", event='recover')
             return "submission_unknown"
         manifest = job["manifest"]
         cache = self.config.data / "cache" / job_id
@@ -819,4 +815,4 @@ class Engine:
             for name in ["oss_url", "upload_expires", "upload_identity"]:
                 segment.pop(name, None)
         segment["submitting"] = False
-        self.store.update(job_id, "submission_unknown" if unknown_submission(manifest, "queued") else "queued", manifest)
+        self.store.update(job_id, "queued", manifest, event='resolve_submission')

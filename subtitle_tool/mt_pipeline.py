@@ -358,9 +358,9 @@ class Pipeline:
                 self.store.count(self.job_id, 'mt_success')
             if status == 429:
                 self.store.count(self.job_id, 'mt_429')
-            failure = service_failure(status, body)
-            if failure is not None:
-                category, scope = failure.category, 'entry'
+            category = service_failure(status, body)
+            if category is not None:
+                scope = 'entry'
                 if status == 401 or category == 'authentication':
                     category, scope = 'authentication', 'credential'
                 elif entry.tier == 'paid' and (status == 402 or category == 'payment_required'):
@@ -408,7 +408,7 @@ class Pipeline:
         for entry in self.router.entries:
             if entry.tier == 'paid' and not self.router.paid_enabled:
                 continue
-            if not self.router._available(entry):
+            if entry != self.router.selected:
                 continue
             try:
                 entry.backend.credential(self.engine.config)

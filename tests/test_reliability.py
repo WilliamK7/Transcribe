@@ -6,7 +6,8 @@ import sqlite3
 from unittest import mock
 
 from subtitle_tool.common import ToolError
-from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, response, result, timed_raw
+from subtitle_tool.engine import Engine
+from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, response, result, timed_raw, seed_job_state
 
 
 class TransactionRecoveryTests(SavedResultFixture):
@@ -74,7 +75,7 @@ class TransactionRecoveryTests(SavedResultFixture):
                             self.assertEqual(actual.get(flag), saved.get(flag), flag)
                         self.assertEqual(self.store.sources(self.job_id), sources)
                         self.assertEqual(self.store.cues(self.job_id), cues)
-                        self.store.update(self.job_id, "queued")
+                        Engine(self.config, self.store).resume(self.job_id)
                         self.assertEqual(self.run_fake(fake), "completed")
                         self.assertFalse(self.store.job(self.job_id)["manifest"].get("no_speech"))
                         self.assertEqual(len(fake.named("/asr/transcription")), 0)
@@ -95,7 +96,7 @@ class TransactionRecoveryTests(SavedResultFixture):
             self.assertEqual(self.run_fake(fake), "cancelled")
         self.assertFalse(self.store.job(self.job_id)["manifest"].get("normalized"))
         self.assertEqual(self.store.cues(self.job_id), [])
-        self.store.update(self.job_id, "queued")
+        Engine(self.config, self.store).resume(self.job_id)
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(len(fake.named("/asr/transcription")), 0)
 
@@ -106,7 +107,7 @@ class TransactionRecoveryTests(SavedResultFixture):
         self.source.with_suffix(".srt").unlink()
         manifest = self.store.job(self.job_id)["manifest"]
         manifest.pop("normalized_count", None)
-        self.store.update(self.job_id, "queued", manifest)
+        seed_job_state(self.store, self.job_id, 'queued', manifest)
         self.store.replace_cues(self.job_id, [])
         self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(self.store.job(self.job_id)["error_code"], "cache_mismatch")

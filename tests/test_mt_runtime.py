@@ -283,28 +283,28 @@ class ServiceFailureTests(TemporaryTest):
             with self.subTest(kind=kind):
                 failure = service_failure(200, {'error': {'metadata': {'error_type': kind},
                                                        'message': 'private response', 'code': 'raw-code'}})
-                self.assertEqual(failure.category, kind)
+                self.assertEqual(failure, kind)
                 self.assertNotIn('private', str(failure))
         for kind in [None, [], {}, 'unknown-value']:
             with self.subTest(kind=kind):
                 failure = service_failure(200, {'error': {'metadata': {'error_type': kind}}})
-                self.assertEqual(failure.category, 'service_unknown')
+                self.assertEqual(failure, 'service_unknown')
 
     def test_refusal_and_content_filter_take_precedence(self):
         for choice in [{'finish_reason': 'content_filter'}, {'message': {'refusal': 'private response'}}]:
             body = {'error': {'metadata': {'error_type': 'timeout'}}, 'choices': [choice]}
-            self.assertEqual(service_failure(200, body).category, 'content_policy_violation')
+            self.assertEqual(service_failure(200, body), 'content_policy_violation')
 
     def test_statuses_and_generation_failures_have_safe_categories(self):
         for status, category in [(401, 'http_permanent'), (404, 'http_permanent'),
                                  (408, 'http_transient'), (429, 'http_transient'), (503, 'http_transient')]:
             with self.subTest(status=status):
-                self.assertEqual(service_failure(status, {}).category, category)
-        self.assertEqual(service_failure(200, {'choices': [{'finish_reason': 'error'}]}).category,
+                self.assertEqual(service_failure(status, {}), category)
+        self.assertEqual(service_failure(200, {'choices': [{'finish_reason': 'error'}]}),
                          'generation_error')
         self.assertIsNone(service_failure(200, {'choices': [{'finish_reason': 'stop'}]}))
 
     def test_malformed_or_mixed_errors_are_not_treated_as_success(self):
         for error in [None, 'private response', {'metadata': {'error_type': []}}]:
             body = {'error': {'metadata': {'error_type': 'timeout'}}, 'choices': [{'error': error}]}
-            self.assertEqual(service_failure(200, body).category, 'service_unknown')
+            self.assertEqual(service_failure(200, body), 'service_unknown')

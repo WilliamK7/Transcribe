@@ -9,7 +9,7 @@ import io
 from subtitle_tool.engine import Engine
 from subtitle_tool.mt_transport import HTTPReply
 from subtitle_tool.common import ToolError
-from tests.fixtures import result, timed_raw
+from tests.fixtures import result, timed_raw, seed_job_state
 from tests.mt_fixtures import PoolPipelineFixture
 
 
@@ -677,7 +677,7 @@ class PoolPipelineTests(PoolPipelineFixture):
     def test_already_published_file_recovers_without_original_mt_key(self):
         self.install()
         self.assertEqual(self.run_pool(), 'completed')
-        self.store.update(self.job_id, 'failed', error='synthetic interruption', code='local_io')
+        seed_job_state(self.store, self.job_id, 'failed', error='synthetic interruption', code='local_io')
         (self.config.data / 'magpie-key.txt').write_text('changed-after-publish', encoding='utf-8')
         Engine(self.config, self.store).resume(self.job_id)
         self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
@@ -687,7 +687,7 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.assertEqual(self.run_pool(), 'completed')
         output = Path(self.store.job(self.job_id)['output'])
         output.unlink()
-        self.store.update(self.job_id, 'failed', error='synthetic interruption', code='local_io')
+        seed_job_state(self.store, self.job_id, 'failed', error='synthetic interruption', code='local_io')
         (self.config.data / 'magpie-key.txt').write_text('changed-before-republish', encoding='utf-8')
         Engine(self.config, self.store).resume(self.job_id)
         self.assertEqual(self.run_pool(), 'failed')
@@ -810,7 +810,7 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.calls.clear()
         manifest = self.store.job(self.job_id)['manifest']
         manifest['overwrite'] = True
-        self.store.update(self.job_id, 'needs_review', manifest, code='language_uncertain')
+        seed_job_state(self.store, self.job_id, 'needs_review', manifest, code='language_uncertain')
         self.store.apply_review(self.job_id, self.store.cues(self.job_id)[0]['cue_id'],
                                 ReviewDecision('translate', 'Japanese'))
         engine.finish_review(self.job_id)

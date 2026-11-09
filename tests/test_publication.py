@@ -8,7 +8,7 @@ import subtitle_tool.engine as engine_module
 from subtitle_tool.engine import Engine
 from subtitle_tool.policy import load_policy
 from subtitle_tool.subtitles import render_srt
-from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, result
+from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, result, seed_job_state
 
 
 class PublicationTests(SavedResultFixture):
@@ -19,7 +19,7 @@ class PublicationTests(SavedResultFixture):
             self.output.write_bytes(b"previous subtitles")
         manifest = self.store.job(self.job_id)["manifest"]
         manifest["overwrite"] = overwrite
-        self.store.update(self.job_id, "queued", manifest)
+        seed_job_state(self.store, self.job_id, "queued", manifest)
         return FakeService(result())
 
     def test_replay_after_write_never_makes_another_backup_even_with_overwrite(self):

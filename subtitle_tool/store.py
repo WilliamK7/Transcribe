@@ -13,17 +13,8 @@ from .review import ReviewDecision, decision_origin
 from .policy import current_execution_snapshot
 from .mt_pool import saved_route
 from .mt_quality import GLOSSARY_SCHEDULE
+from .lifecycle import INACTIVE, validate_transition
 
-TERMINAL = {"completed", "skipped", "cancelled", "archived"}
-STATES = {
-    "archived": "已归档",
-    "queued": "排队", "probing": "检查媒体", "extracting": "提取音频", "uploading": "上传音频",
-    "submitting": "提交识别", "recognizing": "识别中", "downloading_result": "下载结果",
-    "segmenting": "整理字幕", "writing": "写入字幕", "completed": "完成",
-    "skipped": "已跳过", "failed": "失败", "cancelled": "已停止", "submission_unknown": "提交结果未知",
-    "needs_review": "需要确认",
-    "subtitle_translating": "字幕翻译", "layout_adjusting": "排版调整",
-}
 _CUE_COLUMNS = ("cue_id", "begin_ms", "end_ms", "text", "language", "decision", "reason",
                 "translated", "source_lang")
 
@@ -80,9 +71,9 @@ class Store:
             reusable = None
             for row in rows:
                 if (output_key(Path(row["source"])) != output_key(source) and
-                        (row["state"] not in TERMINAL or output.exists())):
+                        (row["state"] not in INACTIVE or output.exists())):
                     raise ToolError("同名不同扩展视频的目标 SRT 冲突，请调整文件名或明确选择输出目录。", "output_conflict")
-                if row["state"] not in TERMINAL:
+                if row["state"] not in INACTIVE:
                     previous = json.loads(row["manifest"])
                     if (previous.get("access_mode"), previous.get("workspace_id"), previous.get("account", "")) != ("workspace", workspace_id, account):
                         raise ToolError("该文件已有其他账号或接入方式的任务，请用 --resume 原任务 ID；不能自动迁移工作空间。", "cache_mismatch")
@@ -162,7 +153,7 @@ class Store:
     def _check_output_conflicts(self, job, output):
         for row in self.db.execute("SELECT state,source FROM jobs WHERE output_key=? AND id<>?",
                                    (output_key(output), job["id"])):
-            if (row["state"] not in TERMINAL or
+            if (row["state"] not in INACTIVE or
                     (output.exists() and output_key(Path(row["source"])) != output_key(Path(job["source"])))):
                 raise ToolError("目标 SRT 与其他任务冲突。", "output_conflict")
 
@@ -183,15 +174,20 @@ class Store:
             return [dict(row, manifest=json.loads(row["manifest"]))
                     for row in self.db.execute("SELECT * FROM jobs ORDER BY created")]
 
-    def update(self, job_id, state=None, manifest=None, error="", code="", request_id=""):
+    def update(self, job_id, state=None, manifest=None, error="", code="", request_id="", *, event="run"):
         with self.lock, self.db:
+            if state is not None:
+                self._transition(job_id, state, event, manifest, error, code, request_id)
             if manifest is not None:
                 self.db.execute("UPDATE jobs SET manifest=? WHERE id=?", (json.dumps(manifest, ensure_ascii=False), job_id))
-            if state is not None:
-                if state not in STATES:
-                    raise ValueError(state)
-                self.db.execute("UPDATE jobs SET state=?, error=?, error_code=?, request_id=?, updated=? WHERE id=?",
-                                (state, error, code, request_id, time.time(), job_id))
+
+    def _transition(self, job_id, state, event, manifest=None, error="", code="", request_id=""):
+        """Caller holds the lock and transaction, including dependent evidence writes."""
+        job = self.job(job_id)
+        validate_transition(job['state'], state, event, job['manifest'],
+                            job['manifest'] if manifest is None else manifest)
+        self.db.execute("UPDATE jobs SET state=?, error=?, error_code=?, request_id=?, updated=? WHERE id=?",
+                        (state, error, code, request_id, time.time(), job_id))
 
     def replace_cues(self, job_id, cues):
         with self.lock, self.db:
@@ -244,18 +240,18 @@ class Store:
         with self.lock, self.db:
             output = Path(output).resolve()
             self.check_republish_output(job_id, output, manifest["overwrite"], operation="重排")
+            self._transition(job_id, 'queued', 'reflow', manifest)
             self.db.execute('DELETE FROM mt_stages WHERE job_id=?', (job_id,))
             self._initialize_subtitles(job_id, sources, cues, manifest)
-            self.db.execute("UPDATE jobs SET output=?,output_key=?,state='queued',error='',error_code='',"
-                            "request_id='',updated=? WHERE id=?", (str(output), output_key(output), time.time(), job_id))
+            self._save_output(job_id, output, manifest)
 
     def commit_retime(self, job_id, manifest, output):
         """Commit display policy, adjustments and publication intent without replacing evidence."""
         with self.lock, self.db:
             output = Path(output).resolve()
             self.check_republish_output(job_id, output, manifest["overwrite"], operation="校时")
+            self._transition(job_id, 'queued', 'retime', manifest)
             self._save_output(job_id, output, manifest)
-            self.db.execute("UPDATE jobs SET state='queued',error='',error_code='',request_id='' WHERE id=?", (job_id,))
 
     def save_layout(self, job_id, cues, manifest):
         """Commit range changes and their resume marker in one SQLite transaction."""

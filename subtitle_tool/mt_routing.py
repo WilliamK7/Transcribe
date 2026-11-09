@@ -84,9 +84,6 @@ class MagpieRoute:
         tier = 'paid' if paid_enabled else 'free'
         self.selected = next(entry for entry in self.entries if entry.tier == tier)
 
-    def _available(self, entry):
-        return entry == self.selected
-
     def cached_result(self, cache, *, prefer_other_than=None, deadline):
         return cached_route_result(self.entries, self.control, self.clock, cache,
                                    prefer_other_than=prefer_other_than, deadline=deadline)

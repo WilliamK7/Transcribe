@@ -14,7 +14,8 @@ from .config import Config
 from .engine import Engine
 from .instance import ProcessLock
 from .reports import ReportWriter
-from .store import STATES, Store
+from .store import Store
+from .lifecycle import STATES, contract as lifecycle_contract, describe as describe_lifecycle
 from .review import MT_LANGUAGES, ReviewDecision
 
 
@@ -27,6 +28,7 @@ def parser():
     actions.add_argument("--retime", metavar="JOB_ID", help="复用最终字幕和译文，仅升级显示时间；覆盖须搭配 --overwrite")
     actions.add_argument("--review", metavar="JOB_ID", help="终端确认音轨、声道或逐条语种后继续")
     actions.add_argument("--jobs", action="store_true", help="列出任务（每行 JSON）")
+    actions.add_argument('--state-machine', action='store_true', help='输出任务状态契约 JSON，无需配置或任务库')
     actions.add_argument("--export-archive", metavar="JOB_ID", help="校验并导出归档字幕，须指定 --output-dir")
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
     actions.add_argument('--check-mt', action='store_true', help='用合成文本在线检查 magpie 字幕组')
@@ -155,6 +157,20 @@ def review(config, store, engine, job_id):
     return True
 
 
+def lifecycle_status(job):
+    """Inspect saved compatibility without keys, filesystem changes or cloud calls."""
+    from .policy import load_policy
+    from .mt_pool import saved_route
+    reflow_required = False
+    try:
+        load_policy(job['manifest'])
+        if 'mt_route_snapshot' in job['manifest']:
+            saved_route(job['manifest'])
+    except ToolError as error:
+        reflow_required = error.code != 'job_archived'
+    return describe_lifecycle(job, reflow_required=reflow_required)
+
+
 def summary(store, job_id):
     job = store.job(job_id)
     manifest = job["manifest"]
@@ -204,6 +220,7 @@ def summary(store, job_id):
         item["audio"] = {k: manifest["media_plan"][k] for k in ["method", "codec", "container", "audio_offset_ms"]}
         item["audio"]["segments"] = len(manifest["segments"])
         item["audio"]["bytes"] = sum(s.get("bytes", 0) for s in manifest["segments"])
+    item['lifecycle'] = lifecycle_status(job)
     return item
 
 
@@ -211,24 +228,17 @@ def hint(store, job_id):
     job = store.job(job_id)
     if job["error"]:
         print(job["error"], file=sys.stderr)
-    command = f".\\scripts\\transcribe.ps1 --resume {job_id}"
-    if job["state"] == "needs_review":
-        print(f"已保存待复核状态：.\\scripts\\transcribe.ps1 --review {job_id}", file=sys.stderr)
-        if job["error_code"] in {"audio_track", "audio_channel"}:
-            print(f"非交互恢复可明确指定：{command} --track 音轨索引 --channel left（按实际选择）", file=sys.stderr)
-        else:
-            print("请在交互终端运行上面的 --review 命令，逐句确认语种及是否翻译。", file=sys.stderr)
-    elif job["state"] == "submission_unknown":
-        print(f"绑定已知 ID：{command} --bind-task-id 云端任务ID\n"
-              f"明确接受可能重复计费后重发：{command} --allow-resubmit", file=sys.stderr)
-    elif job["state"] in {"failed", "cancelled", "queued"}:
-        print("恢复命令：" + command, file=sys.stderr)
+    for action in lifecycle_status(job)['next_actions']:
+        arguments = list(action['argv'])
+        for option, value in action['required_options'].items():
+            arguments.extend([option, value])
+        print(action['label'] + '：.\\scripts\\transcribe.ps1 ' + ' '.join(arguments), file=sys.stderr)
 
 
 def main(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.cancel or
+    action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.state_machine or args.cancel or
               args.check_mt or args.self_test or
               args.export_archive)
     if not args.files and not action:
@@ -244,6 +254,12 @@ def main(argv=None):
         raise ToolError("音轨索引不能为负。", "input")
     if (args.reflow or args.retime) and (args.track is not None or args.channel is not None):
         raise ToolError("重排／校时沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
+    if args.state_machine:
+        if (args.report is not None or args.output_dir is not None or args.workspace_id is not None or
+                args.mt_paid is not None or args.track is not None or args.channel is not None or args.overwrite):
+            raise ToolError('--state-machine 仅输出 stdout JSON，不能搭配任务设置或 --report。', 'input')
+        print(json.dumps(lifecycle_contract(), ensure_ascii=False))
+        return 0
     config = Config()
     if args.mt_paid is not None and not (args.files or args.resume or args.reflow or args.check_mt):
         raise ToolError('--mt-paid 仅用于新任务、--resume、--reflow 或 --check-mt。', 'input')
@@ -284,7 +300,6 @@ def main(argv=None):
         store = Store(config.data / "jobs.sqlite")
         progress = Progress()
         engine = Engine(config, store, cancel, progress)
-        engine.recover_jobs()
         if args.export_archive:
             from .archives import export_archive
             item = export_archive(config, args.export_archive, args.output_dir, overwrite=args.overwrite)
@@ -306,6 +321,8 @@ def main(argv=None):
             if args.report:
                 report_writer.write([item])
             return 0
+
+        engine.recover_jobs()
 
         def interrupt(signum, frame):
             if not processing:

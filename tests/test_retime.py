@@ -11,7 +11,7 @@ import subtitle_tool.engine as engine_module
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.main import main, summary
-from tests.fixtures import set_asr_account, FakeService, SavedResultFixture, overlapping_raw, srt_intervals
+from tests.fixtures import set_asr_account, FakeService, SavedResultFixture, overlapping_raw, srt_intervals, seed_job_state
 
 
 class RetimeTests(SavedResultFixture):
@@ -129,7 +129,7 @@ class RetimeTests(SavedResultFixture):
             for fault in [OSError, KeyboardInterrupt]:
                 with self.subTest(boundary=boundary, fault=fault.__name__):
                     self.output.write_bytes(self.old_content)
-                    self.store.update(self.job_id, "completed", copy.deepcopy(self.before["manifest"]))
+                    seed_job_state(self.store, self.job_id, "completed", copy.deepcopy(self.before["manifest"]))
                     prior_backups = set(self.path.glob("*.bak.*"))
                     engine = Engine(self.config, self.store)
                     commit = self.store.commit_retime

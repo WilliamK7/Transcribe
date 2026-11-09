@@ -6,7 +6,7 @@ from subtitle_tool.archives import export_archive, read_archive
 from subtitle_tool.common import ToolError, atomic_json
 from subtitle_tool.engine import Engine
 from subtitle_tool.policy import load_policy
-from tests.fixtures import FakeService, SavedResultFixture, result
+from tests.fixtures import FakeService, SavedResultFixture, result, seed_job_state
 
 
 class ArchiveTests(SavedResultFixture):
@@ -32,7 +32,7 @@ class ArchiveTests(SavedResultFixture):
                     'files': {name: hashlib.sha256((folder / name).read_bytes()).hexdigest()
                               for name in ['subtitle.srt', 'task.json', 'raw-0000.json']}})
         manifest['archived'] = True
-        self.store.update(self.job_id, 'archived', manifest)
+        seed_job_state(self.store, self.job_id, 'archived', manifest)
         return folder, content
 
     def test_export_is_byte_exact_without_credentials_or_network(self):

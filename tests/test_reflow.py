@@ -122,7 +122,7 @@ class ReflowTests(PipelineFixture):
         with mock.patch('requests.request', side_effect=fake.request), mock.patch('requests.post', side_effect=fake.upload):
             self.assertEqual(Engine(self.config, self.store, progress=interrupt).run(self.job_id), 'cancelled')
         self.assertFalse(self.store.job(self.job_id)['manifest'].get('normalized'))
-        self.store.update(self.job_id, 'queued')
+        Engine(self.config, self.store).resume(self.job_id)
         fake.calls.clear()
         self.assertEqual(self.run_fake(fake), 'completed')
         self.assertEqual(fake.named('/asr/transcription'), [])
@@ -229,7 +229,7 @@ class ReflowTests(PipelineFixture):
         cue = self.store.cues(self.job_id)[0]
         from subtitle_tool.review import ReviewDecision
         self.store.apply_review(self.job_id, cue['cue_id'], ReviewDecision('translate', 'English'))
-        self.store.update(self.job_id, 'queued')
+        Engine(self.config, self.store).finish_review(self.job_id)
         self.assertEqual(self.run_fake(fake), 'completed')
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         source = self.store.sources(self.job_id)[0]

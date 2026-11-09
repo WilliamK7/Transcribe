@@ -30,7 +30,7 @@ class ExecutionPolicyTests(SavedResultFixture):
                 for name in path[:-1]:
                     target = target.setdefault(name, {})
                 target[path[-1]] = value
-                self.store.update(self.job_id, "queued", manifest)
+                self.store.update(self.job_id, manifest=manifest)
                 fake = FakeService(result())
                 with mock.patch.object(self.store, "cache_get", side_effect=AssertionError("no cache")):
                     self.assertEqual(self.run_fake(fake), "failed")

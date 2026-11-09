@@ -5,7 +5,7 @@ from unittest import mock
 
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
-from tests.fixtures import result, timed_raw
+from tests.fixtures import result, timed_raw, seed_job_state
 from tests.mt_fixtures import PoolPipelineFixture
 
 
@@ -173,7 +173,7 @@ class OutputPlanningTests(PoolPipelineFixture):
                 plan['groups'].reverse()
             else:
                 plan['fingerprint'] = '0' * 64
-            self.store.update(self.job_id, 'queued', manifest)
+            seed_job_state(self.store, self.job_id, 'queued', manifest)
             with self.subTest(mutation=mutation):
                 self.assertEqual(self.run_pool(), 'failed')
                 self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
@@ -195,6 +195,7 @@ class OutputPlanningTests(PoolPipelineFixture):
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         before = self.store.job(self.job_id)['manifest']
         self.assertIn('mt_group_plan', before)
+        Engine(self.config, self.store).resume(self.job_id)
         self.store.update(self.job_id, 'needs_review')
         cue = self.store.cues(self.job_id)[0]
         with mock.patch.object(self.store, '_replace_records', side_effect=OSError()), self.assertRaises(OSError):

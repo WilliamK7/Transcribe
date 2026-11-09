@@ -12,7 +12,7 @@ from subtitle_tool.engine import Engine
 from subtitle_tool.main import summary
 from subtitle_tool.subtitles import render_srt, plan_display_timing, validate_display_intervals
 
-from tests.fixtures import FakeService, SavedResultFixture, overlapping_raw, srt_intervals
+from tests.fixtures import FakeService, SavedResultFixture, overlapping_raw, srt_intervals, seed_job_state
 
 
 class DisplayTimingPipelineTests(SavedResultFixture):
@@ -182,7 +182,7 @@ class DisplayTimingV2PipelineTests(SavedResultFixture):
         for field in ['layout_planned', 'layout_complete', 'layout_round',
                       'publication_intent', 'expected_srt_sha256', 'display_timing_adjustments', 'retime']:
             initial.pop(field, None)
-        self.store.update(self.job_id, 'queued', initial)
+        seed_job_state(self.store, self.job_id, 'queued', initial)
         raw = overlapping_raw(overlap=overlap)
         self.save_result(raw)
         manifest = self.store.job(self.job_id)['manifest']
@@ -219,7 +219,7 @@ class DisplayTimingV2PipelineTests(SavedResultFixture):
                                   (self.job_id, self.store.cues(self.job_id)[-1]['cue_id']))
         for field in ['publication_intent', 'expected_srt_sha256']:
             manifest.pop(field, None)
-        self.store.update(self.job_id, 'failed', manifest)
+        seed_job_state(self.store, self.job_id, 'failed', manifest)
         before = self.store.cues(self.job_id)
         self.assertEqual(self.run_fake(self.fake), 'failed')
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'timeline')
