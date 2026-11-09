@@ -66,7 +66,6 @@ class MTBackend:
     request_version: int = 5
     policy_version: int = 1
 
-
     def snapshot(self):
         return {"format_version": 2, **asdict(self)}
 
@@ -74,7 +73,6 @@ class MTBackend:
     def from_snapshot(cls, saved):
         """Construct an identity from an entry validated by saved_route()."""
         return cls(**{key: value for key, value in saved.items() if key != 'format_version'})
-
 
     def credential(self, config):
         key = config.get_magpie_key(self.base_url)

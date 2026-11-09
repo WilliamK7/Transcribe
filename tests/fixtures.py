@@ -39,7 +39,8 @@ def set_asr_account(config, key):
     raw = json.loads(path.read_bytes()) if path.exists() else {
         'providers': [{'id': 'free', 'chat': 'https://openrouter.ai/api/v1'}],
         'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
-                   {'id': 'transcribe', 'members': ['group/transcribe-free']}]}
+                   {'id': 'transcribe', 'members': ['group/transcribe-free']},
+                   {'id': 'transcribe-paid', 'members': ['transcribe-bailian/qwen3.8-flash']}]}
     ids = (config.settings.magpie_asr_provider, config.settings.magpie_upload_provider)
     raw['providers'] = [row for row in raw['providers'] if row['id'] not in ids] + [
         {'id': ids[0], 'chat': f'https://{workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'key': key},
@@ -153,7 +154,7 @@ class TemporaryTest(unittest.TestCase):
         self.addCleanup(transport.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
-        for name in ["MAGPIE_API_KEY", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL"]:
+        for name in ["MAGPIE_API_KEY", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL", "MT_FALLBACK_MODEL"]:
             os.environ.pop(name, None)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP)
         self.path = Path(self.temp.name)

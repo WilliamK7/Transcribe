@@ -35,7 +35,8 @@ class MagpieTests(TemporaryTest):
         route = configured_route(self.config, self.identity, paid_enabled=False)
         self.assertFalse(route['routing']['paid_enabled'])
         self.assertEqual([(e['tier'], e['backend']['model']) for e in route['entries']],
-                         [('free', 'group/transcribe-free'), ('paid', 'group/transcribe')])
+                         [('free', 'group/transcribe-free'), ('paid', 'group/transcribe'),
+                          ('paid', 'group/transcribe-paid')])
 
     def test_remote_gateway_requires_its_own_credential(self):
         self.config.settings.mt_base_url = 'https://gateway.example/v1'

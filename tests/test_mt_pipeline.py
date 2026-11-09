@@ -1,7 +1,6 @@
 """End-to-end v5 orchestration with synthetic source and a fake transport."""
 import json
 import threading
-from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 import io
@@ -27,8 +26,8 @@ class PoolPipelineTests(PoolPipelineFixture):
             self.assertEqual(self.run_pool(), 'completed')
         keys = [call.args[0] for call in lookup.call_args_list]
         self.assertEqual(len(self.calls), 3)
-        self.assertEqual(len(set(keys)), 6)
-        self.assertEqual(len(keys), 6)
+        self.assertEqual(len(set(keys)), 9)
+        self.assertEqual(len(keys), 9)
 
     def test_cli_sigint_saves_inflight_draft_and_starts_no_later_stage(self):
         import _thread
@@ -451,7 +450,7 @@ class PoolPipelineTests(PoolPipelineFixture):
                 return {**data['translations'], '0': '第二轮已纠正了数字。'}
             return {**data['translations'], '1': '只改了另一句。'}
         self.corrected_translations = corrected
-        with mock.patch('subtitle_tool.mt_pipeline.correction_stalled', return_value=False, create=True):
+        with mock.patch('subtitle_tool.mt_pipeline.correction_stalled', return_value=False):
             self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         self.calls.clear()
         self.cancel_after = None
@@ -478,7 +477,7 @@ class PoolPipelineTests(PoolPipelineFixture):
         key = stage_cache_key('correct', data, candidate.backend,
                               capabilities=pipeline.profiles[candidate.id]['capabilities'], scope=scope)
         with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected HTTP')), \
-                mock.patch.object(pipeline, '_prepare_gateway', side_effect=AssertionError('Unexpected gateway validation')):
+                mock.patch.object(pipeline, '_validate_gateway', side_effect=AssertionError('Unexpected gateway validation')):
             self.assertIsNone(pipeline.stage('correct', data, ids=['0'], originals=['Cache.'], saved_only=True))
             cached = {'value': {'translations': {'0': '修正译文'}}, 'actual_model': 'synthetic', 'usage': None}
             with self.store.db:
@@ -581,26 +580,6 @@ class PoolPipelineTests(PoolPipelineFixture):
             self.assertEqual(self.run_pool(), 'failed')
         self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_mismatch')
         self.assertFalse(any(cue['translated'] for cue in self.store.cues(self.job_id)))
-
-    def test_router_propagates_unexpected_local_preparation_error(self):
-        from subtitle_tool.mt_pipeline import Pipeline
-        self.install()
-        manifest = self.store.job(self.job_id)['manifest']
-        engine = Engine(self.config, self.store)
-        _, scope = engine.identity(self.job_id, manifest, persist=False)
-        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': []}
-
-        @contextmanager
-        def invalid_preparation(*args):
-            raise ToolError('Invalid saved data.', 'cache_mismatch')
-            yield
-
-        with mock.patch.object(Pipeline, '_prepare_gateway', invalid_preparation):
-            with self.assertRaises(ToolError) as error:
-                Pipeline(engine, self.job_id, manifest, scope).stage(
-                    'draft', data, ids=['0'], originals=['Cache.'])
-        self.assertEqual(error.exception.code, 'cache_mismatch')
-
 
     def test_oversized_single_sentence_uses_reliable_word_boundaries(self):
         self.config.settings.mt_workers = 1

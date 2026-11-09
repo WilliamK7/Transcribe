@@ -15,6 +15,7 @@ _CAPABILITY_FIELDS = {'response_format', 'input_bytes', 'output_tokens'}
 _ROUTING_FIELDS = {'paid_enabled'}
 _QUALITY_FIELDS = {'input_bytes', 'output_tokens', 'max_revisions', 'manual_glossary'}
 _FORBIDDEN_UNICODE = {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'}
+_ENTRY_TIERS = {'magpie_free': 'free', 'magpie': 'paid', 'magpie_fallback': 'paid'}
 
 
 def _invalid():
@@ -45,10 +46,6 @@ def _fingerprint(key):
         raise _invalid() from None
 
 
-def _identifier(value):
-    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', value) is not None
-
-
 def _manual_glossary(value):
     return (isinstance(value, dict) and len(value) <= 200 and
             all(_text(source, 200) and _text(target, 500) for source, target in value.items()))
@@ -72,7 +69,7 @@ def _quality(value):
 
 
 def configured_route(config, manifest, *, paid_enabled=None):
-    """Freeze the two gateway groups for new work; resume uses saved_route()."""
+    """Freeze primary groups and the paid validation fallback for new work."""
     if not isinstance(manifest, dict):
         raise _invalid()
     settings = config.mt_settings()
@@ -80,8 +77,9 @@ def configured_route(config, manifest, *, paid_enabled=None):
         raise ToolError('mt_policy_version 必须是 1～2147483647 的整数；更换翻译策略时递增。', 'mt_config')
     base = normalize_mt_url(settings.mt_base_url)
     models = [('magpie_free', 'free', settings.mt_free_model),
-              ('magpie', 'paid', settings.mt_model or 'group/transcribe')]
-    if any(not _model(model) for _, _, model in models) or models[0][2] == models[1][2]:
+              ('magpie', 'paid', settings.mt_model or 'group/transcribe'),
+              ('magpie_fallback', 'paid', settings.mt_fallback_model)]
+    if any(not _model(model) for _, _, model in models) or len({model for _, _, model in models}) != 3:
         raise _invalid()
     routing = {'paid_enabled': True}
     if settings.mt_routing is not None:
@@ -107,7 +105,7 @@ def configured_route(config, manifest, *, paid_enabled=None):
                                      policy_version=settings.mt_policy_version).snapshot(),
                 'capabilities': {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}}
                for identity, tier, model in models]
-    return {'format_version': 3, 'entries': entries, 'routing': routing, 'quality': quality}
+    return {'format_version': 4, 'entries': entries, 'routing': routing, 'quality': quality}
 
 
 def saved_route(manifest):
@@ -116,24 +114,22 @@ def saved_route(manifest):
         raise _invalid()
     snapshot = manifest.get('mt_route_snapshot')
     if (not isinstance(snapshot, dict) or set(snapshot) != {'format_version', 'entries', 'routing', 'quality'} or
-            type(snapshot['format_version']) is not int or snapshot['format_version'] != 3 or
+            type(snapshot['format_version']) is not int or snapshot['format_version'] != 4 or
             type(manifest.get('translation_strategy_version')) is not int or
             manifest['translation_strategy_version'] != 5 or not isinstance(snapshot['entries'], list) or
-            len(snapshot['entries']) != 2 or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):
+            len(snapshot['entries']) != 3 or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):
         raise _invalid()
 
     snapshot = copy.deepcopy(snapshot)
-    identities, backends, fingerprints, versions, tiers = set(), set(), {}, set(), set()
+    identities, backends, fingerprints, versions = set(), set(), {}, set()
     for entry in snapshot['entries']:
         if not isinstance(entry, dict) or set(entry) != _ENTRY_FIELDS:
             raise _invalid()
         identity, ref = entry['id'], entry['credential_ref']
-        if (not _identifier(identity) or identity in identities or not isinstance(ref, str) or
-                ref != 'magpie' or not isinstance(entry['tier'], str) or
-                entry['tier'] not in {'free', 'paid'} or entry['tier'] in tiers or not _capabilities(entry['capabilities'])):
+        if (not isinstance(identity, str) or identity not in _ENTRY_TIERS or identity in identities or ref != 'magpie' or
+                entry['tier'] != _ENTRY_TIERS[identity] or not _capabilities(entry['capabilities'])):
             raise _invalid()
         identities.add(identity)
-        tiers.add(entry['tier'])
         saved = entry['backend']
         if (not isinstance(saved, dict) or set(saved) != _BACKEND_FIELDS or
                 type(saved['format_version']) is not int or saved['format_version'] != 2 or

@@ -97,14 +97,15 @@ def _pause_expired_promotion(settings, identity, provider):
         return False
 
 
-def validate_group(settings, model, *, free_only, base_url=None):
+def validate_group(settings, model, *, free_only, base_url=None, paid_only=False):
     """Check the local fee boundary; routing and credentials stay in magpie.
 
     Remote gateways are administered by their owner. A local registry can
     detect accidental paid fallback or an expired promotion.
     """
     from .mt_backend import QINIU_FREE_MODEL, qiniu_free_active
-    error = ToolError('magpie 字幕组不可用或包含未获免费保证的回退；请在 magpie 检查组成员和活动有效期。', 'magpie_group')
+    error = ToolError(('magpie 付费后备组不可用或仍包含免费成员；请检查独立的付费组。' if paid_only else
+                      'magpie 字幕组不可用或包含未获免费保证的回退；请在 magpie 检查组成员和活动有效期。'), 'magpie_group')
     if not bound_gateway(settings, base_url or settings.magpie_base_url):
         if free_only:
             raise error
@@ -120,7 +121,7 @@ def validate_group(settings, model, *, free_only, base_url=None):
             if owner == 'group':
                 group = groups[name]
                 if (group.get('hidden') or not group.get('members') or group.get('match') or
-                        (free_only and (group.get('classifier') or group.get('rules')))):
+                        ((free_only or paid_only) and (group.get('classifier') or group.get('rules')))):
                     raise error
                 for nested in group['members']:
                     if nested not in group.get('off', []):
@@ -131,6 +132,9 @@ def validate_group(settings, model, *, free_only, base_url=None):
                     return
                 plain_model = re.sub(r':(?:none|minimal|low|medium|high|xhigh|max)$', '', name)
                 if free_only and (provider.get('fallback') or not known_free_model(
+                        normalize_mt_url(provider.get('chat')), plain_model)):
+                    raise error
+                if paid_only and (provider.get('fallback') or known_free_model(
                         normalize_mt_url(provider.get('chat')), plain_model)):
                     raise error
                 if plain_model == QINIU_FREE_MODEL and not qiniu_free_active():

@@ -45,6 +45,306 @@ class GatewayContractTests(PoolPipelineFixture):
         data = data or self.data(stage)
         return pipeline.stage(stage, data, ids=['0'], originals=[data['sentences'][0]['text']])
 
+    def test_reasoning_request_applies_to_every_stage_and_repair(self):
+        for paid in (False, True):
+            pipeline = self.pipeline(paid=paid)
+            entry = pipeline.router.request_entries[0]
+            for stage in ('glossary', 'draft', 'align', 'review', 'correct'):
+                for repair in ((False, True) if stage in {'draft', 'align'} else (False,)):
+                    with self.subTest(paid=paid, stage=stage, repair=repair):
+                        payload = pipeline._request_payload(stage, self.data(stage), entry, repair=repair)
+                        self.assertEqual(payload.get('reasoning_effort'), 'none')
+                        self.assertEqual(payload['max_tokens'], 4096)
+                        self.assertEqual(payload['model'], entry.backend.model)
+
+    def test_truncation_retains_cause_request_and_reasoning_usage_without_saving_text(self):
+        pipeline = self.pipeline()
+        response = {'model': 'synthetic/reasoning', 'usage': {'prompt_tokens': 1414,
+                    'completion_tokens': 4096, 'completion_tokens_details': {'reasoning_tokens': 3931}},
+                    'choices': [{'finish_reason': 'length', 'message': {
+                        'content': '{"translations":{"0":"private-incomplete',
+                        'reasoning': 'private reasoning'}}]}
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            return HTTPReply(200, json.dumps(response).encode())
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send) as request:
+            with self.assertRaises(RouteExhausted) as caught:
+                self.stage(pipeline)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(caught.exception.code, 'mt_output_truncated')
+        self.assertIn('截断', str(caught.exception))
+        self.assertEqual(self.store.mt_stages(self.job_id), [])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM mt_cache').fetchone()[0], 0)
+        raw = pipeline.diagnostics.path.read_text(encoding='utf-8')
+        ends = [json.loads(line) for line in raw.splitlines() if json.loads(line)['kind'] == 'request_end']
+        self.assertEqual(caught.exception.request_id, ends[-1]['request_id'])
+        self.assertEqual(ends[-1]['reasoning_tokens'], 3931)
+        self.assertEqual(self.store.counts(self.job_id)['mt_response_reasoning_tokens'], 3931)
+        self.assertNotIn('private', raw)
+
+    def test_truncated_response_automatically_uses_paid_fallback_and_reuses_it(self):
+        pipeline = self.pipeline(paid=True)
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs)
+            return (reply({}, finish='length') if len(calls) == 1 else
+                    reply({'translations': {'0': '完整后备译文。'}}, model='paid/accepted'))
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            value, origin, proof = self.stage(pipeline)
+            self.assertEqual(self.stage(pipeline)[0], value)
+        self.assertEqual([call['json']['model'] for call in calls],
+                         ['group/transcribe', 'group/transcribe-paid'])
+        self.assertEqual(origin, 'magpie_fallback')
+        self.assertEqual(proof['actual_model'], 'paid/accepted')
+        self.assertEqual(calls[0]['json']['messages'], calls[1]['json']['messages'])
+        self.assertEqual(self.store.counts(self.job_id).get('mt_format_repair_request', 0), 0)
+        self.assertEqual(self.store.counts(self.job_id)['mt_paid_fallback_request'], 1)
+        self.assertEqual(self.store.counts(self.job_id)['mt_paid_fallback_success'], 1)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM mt_cache').fetchone()[0], 1)
+
+    def test_exhausted_format_repair_moves_to_paid_fallback_once(self):
+        pipeline = self.pipeline(paid=True)
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs)
+            return reply({'translations': {} if len(calls) < 4 else {'0': '完整后备译文。'}})
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            self.stage(pipeline)
+        self.assertEqual([call['json']['model'] for call in calls],
+                         ['group/transcribe'] * 2 + ['group/transcribe-paid'] * 2)
+        self.assertEqual(calls[0]['json']['messages'], calls[2]['json']['messages'])
+        self.assertEqual(calls[1]['json']['messages'], calls[3]['json']['messages'])
+        events = [json.loads(line) for line in pipeline.diagnostics.path.read_text(encoding='utf-8').splitlines()]
+        completed = [event for event in events if event['kind'] == 'route_complete']
+        self.assertEqual(completed[-1].get('attempt'), 4)
+
+    def test_paid_fallback_exhaustion_is_bounded_and_keeps_last_request_id(self):
+        for truncated, expected in [(True, 2), (False, 4)]:
+            with self.subTest(truncated=truncated):
+                pipeline = self.pipeline(paid=True)
+                def send(*args, **kwargs):
+                    kwargs['on_dispatch']()
+                    return reply({'translations': {}}, finish='length' if truncated else 'stop')
+                with mock.patch.object(pipeline.transport, 'request', side_effect=send) as request:
+                    with self.assertRaises(RouteExhausted) as caught:
+                        self.stage(pipeline)
+                self.assertEqual(request.call_count, expected)
+                events = [json.loads(line) for line in pipeline.diagnostics.path.read_text(encoding='utf-8').splitlines()]
+                ends = [event for event in events if event['kind'] == 'request_end']
+                self.assertEqual(caught.exception.request_id, ends[-1]['request_id'])
+                self.assertEqual(self.store.mt_stages(self.job_id), [])
+
+    def test_paid_fallback_does_not_retry_unknown_transport_or_refusal(self):
+        for answer in (TransportError('network'), reply({}, finish='content_filter'),
+                       HTTPReply(200, b'{"choices":[{"message":{"refusal":"blocked"}}]}'),
+                       HTTPReply(200, b'{}'), reply({}, finish='tool_calls')):
+            pipeline = self.pipeline(paid=True)
+            def send(*args, **kwargs):
+                kwargs['on_dispatch']()
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            with self.subTest(answer=type(answer).__name__), \
+                    mock.patch.object(pipeline.transport, 'request', side_effect=send) as request:
+                with self.assertRaises(RouteExhausted):
+                    self.stage(pipeline)
+            self.assertEqual(request.call_count, 1)
+
+    def test_primary_timeout_reserves_time_for_paid_fallback(self):
+        for paid in (False, True):
+            pipeline = self.pipeline(paid=paid)
+            clock, calls = [100.0], []
+            pipeline.router.clock = lambda: clock[0]
+            def send(*args, **kwargs):
+                kwargs['on_dispatch']()
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    clock[0] += kwargs['timeout']
+                    raise TransportError('deadline')
+                return reply({'translations': {'0': '超时后自动恢复。'}})
+            with self.subTest(paid=paid), mock.patch('time.monotonic', side_effect=lambda: clock[0]), \
+                    mock.patch.object(pipeline.transport, 'request', side_effect=send):
+                if paid:
+                    self.assertEqual(self.stage(pipeline)[1], 'magpie_fallback')
+                    self.assertEqual(len(calls), 2)
+                    self.assertAlmostEqual(calls[0]['timeout'], 120)
+                    self.assertAlmostEqual(calls[1]['timeout'], 60)
+                else:
+                    with self.assertRaises(RouteExhausted):
+                        self.stage(pipeline)
+                    self.assertEqual(len(calls), 1)
+                    self.assertAlmostEqual(calls[0]['timeout'], 180)
+
+    def test_primary_format_repair_cannot_consume_fallback_time(self):
+        pipeline = self.pipeline(paid=True)
+        clock, calls = [100.0], []
+        pipeline.router.clock = lambda: clock[0]
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs)
+            if len(calls) == 1:
+                clock[0] += 115
+                return reply({'translations': {}})
+            if len(calls) == 2:
+                clock[0] += kwargs['timeout']
+                raise TransportError('deadline')
+            return reply({'translations': {'0': '超时后自动恢复。'}})
+        with mock.patch('time.monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            self.assertEqual(self.stage(pipeline)[1], 'magpie_fallback')
+        self.assertEqual([round(call['timeout']) for call in calls], [120, 5, 60])
+        self.assertEqual([call['json']['model'] for call in calls],
+                         ['group/transcribe', 'group/transcribe', 'group/transcribe-paid'])
+
+    def test_job_completes_with_paid_fallback_and_preserves_provenance(self):
+        from subtitle_tool.mt_quality import PROMPTS
+        from subtitle_tool.mt_pipeline import validate_provenance
+        self.config.settings.mt_routing = {'paid_enabled': True}
+        self.install(split=True)
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            payload = kwargs['json']
+            stage = next(name for name, prompt in PROMPTS.items()
+                         if payload['messages'][0]['content'].startswith(prompt))
+            data = json.loads(payload['messages'][1]['content'])
+            calls.append((stage, payload['model']))
+            if stage in {'draft', 'align'} and payload['model'] == 'group/transcribe':
+                return reply({}, finish='length')
+            value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
+                     {'translations': {item['id']: '完整后备译文。' for item in
+                                       (data['sentences'] if stage == 'draft' else data['fragments'])}})
+            return reply(value, model='paid/accepted')
+        with mock.patch('subtitle_tool.mt_transport.ProcessTransport') as transport:
+            transport.return_value.request.side_effect = send
+            engine = Engine(self.config, self.store)
+            self.assertEqual(engine.run(self.job_id), 'completed')
+        validate_provenance(engine, self.job_id, self.store.job(self.job_id)['manifest'])
+        self.assertTrue(all(cue['mt_origin'] == 'magpie_fallback' for cue in self.store.cues(self.job_id)))
+        self.assertIn(('align', 'group/transcribe-paid'), calls)
+        self.assertTrue(self.source.with_suffix('.srt').is_file())
+
+    def test_fallback_group_rejects_free_members_before_dispatch(self):
+        from subtitle_tool.common import atomic_json
+        pipeline = self.pipeline(paid=True)
+        registry = Path(self.config.settings.magpie_data_dir) / 'providers.json'
+        raw = json.loads(registry.read_bytes())
+        next(group for group in raw['groups'] if group['id'] == 'transcribe-paid')['members'] = ['group/transcribe-free']
+        atomic_json(registry, raw)
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            return reply({}, finish='length')
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send) as request:
+            with self.assertRaises(ToolError) as caught:
+                self.stage(pipeline)
+        self.assertEqual(caught.exception.code, 'magpie_group')
+        self.assertEqual(request.call_count, 1)
+
+    def test_fallback_cache_is_reusable_when_paid_network_is_denied(self):
+        pipeline = self.pipeline(paid=True)
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            return (reply({}, finish='length') if kwargs['json']['model'] == 'group/transcribe' else
+                    reply({'translations': {'0': '完整后备译文。'}}))
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            value = self.stage(pipeline)[0]
+        self.config.settings.mt_routing = {'paid_enabled': False}
+        Engine(self.config, self.store).reflow(self.job_id)
+        engine = Engine(self.config, self.store)
+        manifest = self.store.job(self.job_id)['manifest']
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
+        with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('unexpected HTTP')):
+            self.assertEqual(self.stage(pipeline)[0], value)
+
+    def test_truncation_is_reported_by_job_and_resume_reuses_completed_stages(self):
+        from subtitle_tool.main import summary
+        self.install()
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            prompt = kwargs['json']['messages'][0]['content']
+            return (reply({'terms': []}) if prompt.startswith('从课程原文') else
+                    reply({'translations': {}}, finish='length'))
+        with mock.patch('subtitle_tool.mt_transport.ProcessTransport') as transport:
+            transport.return_value.request.side_effect = send
+            self.assertEqual(Engine(self.config, self.store).run(self.job_id), 'failed')
+        report = summary(self.store, self.job_id)
+        self.assertEqual(report['error_code'], 'mt_output_truncated')
+        self.assertRegex(report['request_id'], r'^[0-9a-f]{32}$')
+        Engine(self.config, self.store).resume(self.job_id)
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertNotIn('glossary', [stage for stage, _, _ in self.calls])
+        self.assertTrue(self.source.with_suffix('.srt').is_file())
+
+    def test_truncated_advisory_stages_keep_complete_translation(self):
+        from subtitle_tool.mt_quality import PROMPTS
+        for version, failed in enumerate(('glossary', 'review', 'correct'), 1):
+            with self.subTest(stage=failed):
+                self.config.settings.mt_policy_version = version
+                self.install()
+                def send(*args, **kwargs):
+                    kwargs['on_dispatch']()
+                    payload = kwargs['json']
+                    stage = next(name for name, prompt in PROMPTS.items()
+                                 if payload['messages'][0]['content'].startswith(prompt))
+                    data = json.loads(payload['messages'][1]['content'])
+                    if stage == failed:
+                        return reply({}, finish='length')
+                    if stage == 'glossary':
+                        value = {'terms': []}
+                    elif stage == 'review':
+                        value = {'issues': [{'id': '0', 'category': 'number', 'evidence': '合成疑点'}]}
+                    else:
+                        targets = data['sentences'] if stage == 'draft' else data['fragments']
+                        value = {'translations': {item['id']: '完整译文。' for item in targets}}
+                    return reply(value)
+                with mock.patch('subtitle_tool.mt_transport.ProcessTransport') as transport:
+                    transport.return_value.request.side_effect = send
+                    self.assertEqual(Engine(self.config, self.store).run(self.job_id), 'completed')
+                self.assertGreater(self.store.counts(self.job_id)['mt_output_truncated'], 0)
+                self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
+                # Reflow in the next case needs its own output; retain this result.
+                self.source.with_suffix('.srt').rename(self.path / (failed + '.srt'))
+
+    def test_previous_generation_contract_requires_reflow_and_does_not_reuse_cache(self):
+        from subtitle_tool.main import lifecycle_status, summary
+        from subtitle_tool import mt_quality, mt_pipeline
+        previous = mt_quality.QUALITY_PROMPT_VERSION - 1
+        with mock.patch.object(mt_quality, 'QUALITY_PROMPT_VERSION', previous), \
+                mock.patch.object(mt_pipeline, 'QUALITY_PROMPT_VERSION', previous), \
+                mock.patch('subtitle_tool.policy.QUALITY_PROMPT_VERSION', previous):
+            self.install()
+            self.assertEqual(self.run_pool(), 'completed')
+        before = self.store.job(self.job_id)
+        with self.assertRaises(ToolError) as caught:
+            Engine(self.config, self.store).resume(self.job_id)
+        self.assertEqual(caught.exception.code, 'cache_version')
+        self.assertEqual(self.store.job(self.job_id), before)
+        self.assertIn('reflow', str(lifecycle_status({**before, 'state': 'failed'})))
+        self.assertEqual(summary(self.store, self.job_id)['mt_route_status'], 'reflow_required')
+        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
+        self.calls.clear()
+        self.assertEqual(self.run_pool(), 'completed')
+        self.assertIn('draft', [stage for stage, _, _ in self.calls])
+        self.assertNotIn('asr', [stage for stage, _, _ in self.calls])
+
+    def test_reasoning_usage_rejects_invalid_optional_details(self):
+        pipeline = self.pipeline()
+        for index, reasoning in enumerate((None, True, -1, 5, '3', [], {})):
+            with self.subTest(reasoning=reasoning):
+                response = json.loads(reply({'translations': {'0': '完整译文。'}}).body)
+                response['usage']['completion_tokens_details'] = {'reasoning_tokens': reasoning}
+                def send(*args, **kwargs):
+                    kwargs['on_dispatch']()
+                    return HTTPReply(200, json.dumps(response).encode())
+                with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+                    self.stage(pipeline, data=self.data(text=f'Synthetic usage case {index}.'))
+        self.assertNotIn('mt_response_reasoning_tokens', self.store.counts(self.job_id))
+        events = [json.loads(line) for line in pipeline.diagnostics.path.read_text(encoding='utf-8').splitlines()]
+        self.assertTrue(all('reasoning_tokens' not in event for event in events))
+
     def test_policy_revision_reflow_changes_cache_and_unchanged_revision_reuses_it(self):
         self.install()
         self.assertEqual(self.run_pool(), 'completed')
@@ -87,22 +387,18 @@ class GatewayContractTests(PoolPipelineFixture):
                 saved_route(changed)
         self.assertTrue(pipeline.snapshot)
 
-    def test_old_contract_remains_reportable_and_reflows_explicitly(self):
+    def test_unsupported_route_remains_reportable_and_reflows_explicitly(self):
         from subtitle_tool.main import summary
         self.install()
         self.assertEqual(self.run_pool(), 'completed')
         manifest = self.store.job(self.job_id)['manifest']
-        manifest['execution_snapshot']['recovery_version'] = 4
-        manifest['mt_route_snapshot']['format_version'] = 2
-        for entry in manifest['mt_route_snapshot']['entries']:
-            entry['backend']['format_version'] = 1
-            entry['backend'].pop('policy_version')
+        manifest['mt_route_snapshot']['format_version'] -= 1
         self.store.update(self.job_id, manifest=manifest)
         before = self.store.job(self.job_id)
         output = self.source.with_suffix('.srt').read_bytes()
         with self.assertRaises(ToolError) as caught:
             Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(caught.exception.code, 'cache_version')
+        self.assertEqual(caught.exception.code, 'mt_config')
         self.assertEqual(self.store.job(self.job_id), before)
         report = summary(self.store, self.job_id)
         self.assertEqual(report['mt_route_status'], 'reflow_required')
@@ -155,7 +451,7 @@ class GatewayContractTests(PoolPipelineFixture):
         pipeline = self.pipeline()
         data = self.data()
         data['context'] = [{'position': 'before', 'text': 'Synthetic background. ' * 20}]
-        entry = pipeline.router.selected
+        entry = pipeline.router.request_entries[0]
         capabilities = pipeline.profiles[entry.id]['capabilities']
         initial = make_stage_payload('draft', data, entry.backend, capabilities=capabilities)
         budget = len(json.dumps(initial, ensure_ascii=False).encode('utf-8'))
@@ -216,10 +512,10 @@ class GatewayContractTests(PoolPipelineFixture):
                     self.stage(pipeline, stage)
                 self.assertEqual(request.call_count, 1)
 
-    def test_repair_shares_deadline_and_does_not_start_after_expiry_or_cancel(self):
-        for action in ['consume', 'expire', 'cancel']:
-            pipeline = self.pipeline()
-            data = self.data(text=f'Synthetic deadline case {action}.')
+    def test_repair_and_fallback_share_deadline_and_respect_cancel(self):
+        for paid, action in [(paid, action) for paid in (False, True) for action in ('consume', 'expire', 'cancel')]:
+            pipeline = self.pipeline(paid=paid)
+            data = self.data(text=f'Synthetic deadline case {paid} {action}.')
             clock = [100.0]
             pipeline.router.clock = lambda: clock[0]
             calls = []
@@ -230,14 +526,15 @@ class GatewayContractTests(PoolPipelineFixture):
                     clock[0] += 75 if action == 'consume' else 181 if action == 'expire' else 0
                     if action == 'cancel':
                         pipeline.engine.mt_control.cancel_user()
-                    return reply({'translations': {}})
+                    return reply({'translations': {}}, finish='length' if paid else 'stop')
                 return reply({'translations': {'0': '缓存。'}})
-            with self.subTest(action=action), mock.patch('time.monotonic', side_effect=lambda: clock[0]), \
+            with self.subTest(paid=paid, action=action), mock.patch('time.monotonic', side_effect=lambda: clock[0]), \
                     mock.patch.object(pipeline.transport, 'request', side_effect=send):
                 if action == 'consume':
                     self.stage(pipeline, data=data)
                     self.assertEqual(len(calls), 2)
                     self.assertLessEqual(calls[1]['timeout'], 105)
+                    self.assertEqual(calls[1]['json']['model'], 'group/transcribe-paid' if paid else 'group/transcribe-free')
                 else:
                     with self.assertRaises(Cancelled if action == 'cancel' else RouteExhausted):
                         self.stage(pipeline, data=data)

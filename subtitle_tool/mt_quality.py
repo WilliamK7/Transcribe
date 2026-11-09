@@ -72,7 +72,7 @@ def validate_translations(value, fragments):
     return {str(i): translated[str(i)] for i in range(len(fragments))}
 
 
-QUALITY_PROMPT_VERSION = 3
+QUALITY_PROMPT_VERSION = 4
 GLOSSARY_SCHEDULE = 'prefix-v2'
 INPUT_BUDGET = 32 * 1024
 OUTPUT_TOKENS = 4096
@@ -224,6 +224,7 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
             wire_context.append(item)
         wire_data['context'] = wire_context
     payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
+               'reasoning_effort': 'none',
                'messages': [{'role': 'system', 'content': prompt},
                              {'role': 'user', 'content': json.dumps(wire_data, ensure_ascii=False)}]}
     payload['response_format'] = {'type': 'json_object'}

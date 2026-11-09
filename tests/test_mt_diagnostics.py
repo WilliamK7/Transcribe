@@ -17,7 +17,7 @@ class DiagnosticTests(TemporaryTest):
             'status': 429, 'duration_ms': 1000, 'error': 'private exception'}))
         self.assertTrue(writer.write_route({'kind': 'request_end', 'status': 'private text', 'duration_ms': -1,
             'request_id': 'private', 'gateway_session': 'private', 'actual_model': 'sk-private',
-            'input_tokens': True, 'output_tokens': 2**63, 'policy_version': -1, 'outcome': 'private',
+            'input_tokens': True, 'output_tokens': 2**63, 'reasoning_tokens': -1, 'policy_version': -1, 'outcome': 'private',
             'validation_category': 'private'}))
         self.assertTrue(writer.write_route({'kind': 'route_failure', 'category': 'output_truncated',
                                            'dispatched': False, 'content': 'private response'}))

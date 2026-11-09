@@ -88,12 +88,15 @@ class CliTests(TemporaryTest):
                 self.config.settings.mt_base_url = 'https://gateway.example/v1'
                 self.config.settings.mt_model = 'group/custom'
                 self.config.settings.mt_free_model = 'group/custom-free'
+                self.config.settings.mt_fallback_model = 'group/custom-paid'
                 environment = {'MAGPIE_API_KEY': 'synthetic-gateway'}
                 if source == 'environment':
                     environment.update(MT_BASE_URL='https://gateway.example/v1',
-                                       MT_MODEL='group/custom', MT_FREE_MODEL='group/custom-free')
+                                       MT_MODEL='group/custom', MT_FREE_MODEL='group/custom-free',
+                                       MT_FALLBACK_MODEL='group/custom-paid')
                     self.config.settings.mt_base_url = 'https://openrouter.ai/api/v1'
                     self.config.settings.mt_model = 'openrouter/free'
+                    self.config.settings.mt_fallback_model = 'group/unused-paid'
                 self.config.save()
                 previous = vars(self.config.settings).copy()
                 saved = (self.config.data / 'settings.json').read_bytes()
@@ -106,7 +109,8 @@ class CliTests(TemporaryTest):
                 self.assertEqual([(entry['backend']['provider'], entry['backend']['base_url'],
                                    entry['backend']['model']) for entry in route['entries']],
                                  [('magpie', 'https://gateway.example/v1', 'group/custom-free'),
-                                  ('magpie', 'https://gateway.example/v1', 'group/custom')])
+                                  ('magpie', 'https://gateway.example/v1', 'group/custom'),
+                                  ('magpie', 'https://gateway.example/v1', 'group/custom-paid')])
                 self.assertEqual(vars(self.config.settings), previous)
                 self.assertEqual((self.config.data / 'settings.json').read_bytes(), saved)
 

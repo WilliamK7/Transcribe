@@ -2,7 +2,7 @@
 
 ## magpie 网关契约
 
-翻译使用字幕组，ASR 使用原生代理。接口依据 magpie **0.1.3336** 的 [CLI 参考](https://github.com/yetone/magpie/blob/v0.1.3336/docs/reference.md)、[原生代理实现](https://github.com/yetone/magpie/blob/v0.1.3336/internal/gateway/native.go)及[官方接入说明](https://usemagpie.ai/docs/integrate)。
+翻译使用字幕组，ASR 使用原生代理。接口依据 magpie **0.1.3390** 的 [CLI 参考](https://github.com/yetone/magpie/blob/v0.1.3390/docs/reference.md)、[原生代理实现](https://github.com/yetone/magpie/blob/v0.1.3390/internal/gateway/native.go)及[官方接入说明](https://usemagpie.ai/docs/integrate)。
 
 | 功能 | 网关请求 |
 | --- | --- |
@@ -13,13 +13,26 @@
 
 原生代理按入口主机拼接路径，用上游 Key 签名并保留 `X-DashScope-*`；ASR POST 单次转发。项目读取本机注册表核对工作空间、单一账户凭据及认证头，保留账户指纹。存储上传和签名结果下载直接访问存储。
 
-路线保存免费组 `magpie_free` 与总组 `magpie` 两个完整入口，使用 `json_object`，输入／输出预算为 32768 字节／4096 tokens。请求以 `MAGPIE_API_KEY` 或 `data/magpie-key.txt` 认证，本机缺省为 `magpie-transcribe`，应用标识为 `User-Agent: Transcribe/1`。
+路线保存免费组 `magpie_free`、总组 `magpie` 与独立付费后备 `magpie_fallback` 三个完整入口，后两者费用层级均为 `paid`。请求以 `MAGPIE_API_KEY` 或 `data/magpie-key.txt` 认证，本机缺省为 `magpie-transcribe`，应用标识为 `User-Agent: Transcribe/1`。
 
 `--mt-paid deny` 选择免费组，`allow` 选择总组；恢复时可修改后续请求的费用许可，已完成的匹配结果继续复用。免费证明绑定本机注册表所属监听地址（保存的 `port`，缺省 3425）。请求前递归核验组成员和回退路径，按已核实的地址、模型及活动有效期准入。七牛活动到期时尝试通过 CLI 关闭专用入口；免费标签和估算价格仅供网关调度。配置见 [README](../README.md#配置-magpie)。
 
-每阶段正常发送一次。草稿／对齐收到正常结束的完整字符串响应而本地结构或编号校验失败时，允许一次格式修复：保持组、原文、上下文及术语，追加固定指令，重新核验费用许可；两次请求共用 180 秒时限。网络与服务故障保存进度，草稿／必要对齐通过 `--resume` 继续。术语、复核和纠正的处理见下一节。
-
 `X-Magpie-Response-Model: member` 返回实际 `provider/model`。每次请求以独立 UUID 组成 `X-Magpie-Session: transcribe-<任务ID>-<请求ID>`，对应 `GET /v1/magpie/route?session=<gateway_session>` 的最近一次请求。具体成员尝试、用量及费用在 magpie Routing／Usage 查看；项目记录提交网关的次数与校验结果。
+
+### 阶段恢复
+
+| 主组结果 | 项目处理 |
+| --- | --- |
+| 草稿／对齐正常结束，字符串内容未通过格式或编号校验 | 同组修复一次；再次失败且允许付费时切换后备 |
+| 术语／复核／纠正正常结束，字符串内容未通过校验 | 允许付费时直接切换后备 |
+| 响应截断或达到本地请求时限 | 允许付费时直接切换后备；超时先结束请求子进程 |
+| 连接失败、HTTP 故障、不确定响应、拒绝或内容过滤 | 结束本阶段请求，交由流水线按阶段处理 |
+
+后备是 `mt_fallback_model` 指定的独立付费组，每阶段最多切换一次。草稿／对齐在后备组也可修复一次，因此每阶段最多四次请求。格式修复追加固定指令，修复和切换均沿用冻结的原文、上下文及术语，并在每次发送前核验组配置与费用许可。本地后备组仅允许静态付费成员，递归排除已知免费模型、动态分类规则及服务商级回退；远程网关由其管理员维护成员边界。
+
+缓存查找、准备和全部请求共用一个 180 秒截止时间。允许付费时，主组使用剩余时间的前三分之二，最多预留 60 秒给后备；无准备耗时时分配为 120 秒／60 秒。提前切换时，后备可用全部剩余时间。`--mt-paid deny` 下免费主组使用全部剩余时间，已完成的匹配结果仍可复用。原上游请求是否计费以网关记录为准。
+
+草稿／必要对齐耗尽可用请求后保存进度、停止发布；辅助阶段按[字幕翻译与质量](#字幕翻译与质量)保留完整结果并降级。截断错误码为 `mt_output_truncated`；失败记录保留最后一次本地请求 UUID 和安全原因分类，可据此查询网关。
 
 ## 上游 ASR
 
@@ -33,9 +46,11 @@
 
 ## 字幕翻译与质量
 
-请求使用 `stream:false`、`response_format:{"type":"json_object"}`，提示词提供对应阶段的完整输出 Schema。
+全部阶段及格式修复使用 `stream:false`、`response_format:{"type":"json_object"}`、`reasoning_effort:"none"`，提示词提供对应阶段的完整输出 Schema。magpie 按成员能力和网关规则适配推理级别；支持关闭时为字幕正文保留输出预算，强制推理模型使用其支持的级别。实际 effort 与推理用量见 Routing／Usage。
 
-网络结果、保存阶段及缓存统一校验结构、编号、非空译文和正常结束。术语编号须属于本次请求，词面须出现在对应目标文本中；复核疑点须指向本组片段。`finish_reason:length` 归为 `output_truncated`，可解析的 JSON 同样视为未完成。失败响应不进入阶段结果或缓存；允许的格式修复成功后，按原目标请求和策略版本保存完整结果。修复仍失败则按阶段停止或降级；非法保存结果返回 `cache_mismatch`。
+依据：[magpie 0.1.3390 的能力适配](https://github.com/yetone/magpie/blob/v0.1.3390/internal/gateway/decide.go)、[请求及拒绝处理](https://github.com/yetone/magpie/blob/v0.1.3390/internal/gateway/gateway.go)、[OpenRouter 推理与输出预算](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)。推理 token 会占用输出上限；仅隐藏推理正文并不能节省这部分预算。
+
+网络结果校验正常结束、结构、编号及非空译文；保存阶段及缓存复用同一值校验。术语编号须属于本次请求，词面须出现在对应目标文本中；复核疑点须指向本组片段。`finish_reason:length` 归为 `output_truncated`，可解析的 JSON 同样视为未完成。仅完整通过校验的响应按原目标请求、实际产出入口和策略版本保存，非法保存结果返回 `cache_mismatch`。
 
 本任务阶段记录优先；跨任务缓存按完整目标请求与策略版本匹配，对齐／复核／纠正优先选择另一组的匹配结果，其次免费优先。上下文或术语裁剪后按新输入查缓存。
 
@@ -49,9 +64,9 @@
 
 最多两轮纠正，每轮之后再次复核。译文映射重复时提前结束；若疑点集合（片段编号、类别、证据，忽略顺序及重复项）、输入及所涉完整源句的全部片段译文均未变化，停止新增纠正请求。完整保存阶段和匹配缓存优先复用，停滞时保留最后完整译文并报告警告。
 
-输入按完整请求 JSON 的 UTF-8 字节计量，上限为 32768 与入口 `input_bytes` 的较小值；输出 `max_tokens` 为 4096 与入口 `output_tokens` 的较小值。草稿／对齐在首次发送前预留格式修复指令空间，修复时不再裁剪已经冻结的证据。证据裁剪规则见[上下文与输入预算](#上下文与输入预算)。目标及必需证据超限，或实际译文使后续请求超限时，保存进度并返回 `mt_input_budget`。无法按可靠边界继续拆分时，需要缩短输入后新建任务。
+输入按完整请求 JSON 的 UTF-8 字节计量，上限为 32768 与入口 `input_bytes` 的较小值；输出 `max_tokens` 为 4096 与入口 `output_tokens` 的较小值。草稿／对齐在首次发送前预留格式修复指令空间，同时适配已获许可的主组和后备组；修复及切换时不再裁剪已经冻结的证据。证据裁剪规则见[上下文与输入预算](#上下文与输入预算)。目标及必需证据超限，或实际译文使后续请求超限时，保存进度并返回 `mt_input_budget`。无法按可靠边界继续拆分时，需要缩短输入后新建任务。
 
-新分组估算输出量：目标字符按 1 token、每个编号项加 32、固定结构加 64，术语／复核列表每项另加 64，使用有效输出上限的 75%。规划覆盖术语、草稿、必要对齐、复核及整组纠正，按费用许可所选组的能力同时检查输入与输出预算。
+新分组估算输出量：目标字符按 1 token、每个编号项加 32、固定结构加 64，术语／复核列表每项另加 64，使用有效输出上限的 75%。规划覆盖术语、草稿、必要对齐、复核及整组纠正，按费用许可所选主组及后备组的能力同时检查输入与输出预算。
 
 输出估算用于调整分组，请求仍使用完整 `max_tokens`。优先减少整句数，长句沿可靠字幕片段边界拆组，保留全部原文。无法拆分的目标按输入预算准入，实际截断保存进度。分组方案随任务保存，恢复继续使用。
 
@@ -67,9 +82,9 @@
 
 `--state-machine` 直接输出版本化 JSON：`states` 包含名称、中文 `label`、`kind` 和运行阶段的 `auto_recover` 标记，`events` 包含每个操作的 `from`、`to` 和 `guards`。规则从执行代码生成，无需配置、任务库、凭据或网络。
 
-运行时只接受当前执行契约：媒体处理 2、提取配方 2、字幕格式 2、规范化 4、显示时间 2、翻译策略／请求契约 5、提示词 3、响应恢复标识 5、上下文 2、对齐策略 `execution_snapshot.alignment_version:2`、术语调度 `prefix-v2`。版本字段必须是整数且精确匹配，术语调度字段也必须存在。`--resume` 和 `--retime` 均先核对契约，缺少字段或版本不匹配时返回 `cache_version`，须用 `--reflow` 从完整转写重建。线程数与轮询等待使用当前设置，排版、模型、能力和账户身份沿任务快照。
+当前执行契约：媒体处理 2、提取配方 2、字幕格式 2、规范化 4、显示时间 2、翻译策略／请求契约 5、提示词及生成参数 4、响应恢复标识 5、上下文 2、对齐策略 `execution_snapshot.alignment_version:2`、术语调度 `prefix-v2`。版本字段为整数且精确匹配，术语调度字段也须存在。`--resume` 和 `--retime` 均先核对契约，缺少字段或版本不匹配时返回 `cache_version`，通过 `--reflow` 从完整转写重建。线程数与轮询等待使用当前设置，排版、模型、能力和账户身份沿任务快照。
 
-翻译路线快照为版本 3，身份保存在版本 2 的 `mt_route_snapshot.entries[].backend`，包含独立的 `policy_version`；它是用户管理的策略修订号，不等于固定的运行契约版本。magpie 报告中的模型是费用许可选定的组，并提供 `mt_policy_version`。需要重建的路线在列表中标记 `mt_route_status:reflow_required`，通过 `--reflow` 显式重建。项目记录阶段、校验及提交网关的次数；上游尝试、回退及完整费用统计由 magpie 记录。
+翻译路线快照为版本 4；身份保存在版本 2 的 `mt_route_snapshot.entries[].backend`，包含用户管理的策略修订号 `policy_version`。报告中的模型是费用许可选定的主组，并提供 `mt_policy_version`；每个阶段记录实际使用的入口。需要重建的路线在列表中标记 `mt_route_status:reflow_required`。
 
 `data/archives/{任务ID}` 保存 `task.json`、`subtitle.srt`、原始 `raw-*.json` 和逐文件 SHA-256 索引；目录中的任务库备份与结果均属于用户恢复资料。
 
@@ -132,9 +147,11 @@ stdout 每行 JSON，stderr 显示进度；报告不包含 Key、签名链接、
 | `mt_v5_{阶段}_completed` / `_cache_hit` / `_failure` | 阶段完成、跨任务缓存命中、候选失败数 |
 | `mt_input_tokens` / `mt_output_tokens` / `mt_usage_unknown` | 通过字幕校验的响应：有效用量累计／缺失有效用量的响应数 |
 | `mt_response_input_tokens` / `mt_response_output_tokens` / `mt_response_usage_unknown` | 所有已收到响应（含校验失败）的有效用量累计／缺失有效用量的响应数 |
+| `mt_response_reasoning_tokens` | 已收到响应中有效的推理 token 累计，属于输出 token 的子集；上游未提供时不假设为 0 |
 | `mt_format_repair_request` / `mt_format_repair_success` | 追加格式修复的请求登记数／修复响应通过字幕校验数 |
+| `mt_paid_fallback_request` / `mt_paid_fallback_success` | 独立付费后备的请求登记数（含其格式修复）／响应通过字幕校验数 |
 | `mt_quality_warning` / `mt_glossary_unavailable` | 复核未通过或不可用的组数／术语不可用次数 |
 | `mt_correction_stalled` | 重复疑点及涉及的整句译文均未变化，且无完整保存纠正可复用时停止新增纠正请求的组数 |
 | `stage_*_ms` / `run_ms` | 跨恢复累计阶段与运行耗时 |
 
-诊断位于 `.build/mt-diagnostics/{job_id}.jsonl`。逐请求的 `request_start`／`request_end` 记录 `request_id`、`gateway_session`、`group_key`、`run_id`、阶段、入口、请求模型与实际成员、尝试次数、策略版本、HTTP 状态、耗时、可读取的 token 用量及安全分类。`outcome` 为 `valid`、`invalid`、`service_error`、`transport_error`、`cancelled` 或 `local_error`；格式失败另有 `validation_category`。无效响应的用量也计入全响应统计，缓存命中不虚构新请求。`request_start` 表示登记提交，不能证明上游已收到；进程异常退出可能来不及留下结束事件。正文、凭据和原始异常不进入诊断；本地 token 统计不等同于费用，网关内部尝试及完整费用在 magpie Routing／Usage 查看。
+诊断位于 `.build/mt-diagnostics/{job_id}.jsonl`。逐请求的 `request_start`／`request_end` 记录 `request_id`、`gateway_session`、`group_key`、`run_id`、阶段、入口、请求模型与实际成员、尝试次数、策略版本、HTTP 状态、耗时、可读取的 token 用量及安全分类。请求事件的 `attempt` 是同组内的第 1／2 次；`route_complete.attempt` 是阶段总尝试数 0～4，缓存命中为 0。`outcome` 为 `valid`、`invalid`、`service_error`、`transport_error`、`cancelled` 或 `local_error`；格式失败另有 `validation_category`。无效响应的用量也计入全响应统计，缓存命中不虚构新请求。`request_start` 表示登记提交，不能证明上游已收到；进程异常退出可能来不及留下结束事件。正文、凭据和原始异常不进入诊断；本地 token 统计不等同于费用，网关内部尝试及完整费用在 magpie Routing／Usage 查看。

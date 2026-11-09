@@ -30,8 +30,9 @@ Windows x64 自用字幕 CLI。北京百炼 `qwen3-asr-flash-filetrans` 负责�
 | --- | --- | --- |
 | `group/transcribe-free` | 顺序 `routing=order` | 七牛 `qiniu/conatus-free` → OpenRouter `openrouter/free` |
 | `group/transcribe` | 免费优先 `routing=free` | 免费组 → 七牛 `deepseek/deepseek-v4.1-flash` → 百炼 `qwen3.8-flash` |
+| `group/transcribe-paid` | 顺序 `routing=order` | 百炼 `qwen3.8-flash` → 七牛 `deepseek/deepseek-v4.1-flash` |
 
-两组均设 `stays=off`。免费入口保持服务商级回退为空，OpenRouter 入口使用 20 RPM 或账户要求的更严格值。项目按费用许可选定一个组，由 magpie 完成成员选择。
+三组均设 `stays=off`。免费入口保持服务商级回退为空，OpenRouter 入口使用 20 RPM 或账户要求的更严格值。项目按费用许可选择免费组或总组，由 magpie 完成成员选择。主组超时、响应截断或格式修复失败时，已允许付费的任务自动切换到独立付费组，成功结果随进度保存。时限、重试次数及后备组要求见[阶段恢复](docs/API_CONTRACT.md#阶段恢复)。
 
 七牛活动截至北京时间 **2026 年 11 月 30 日 23:59**，资格见[官方规则](https://www.qiniu.com/ai/free-models/conatus-2026)。活动到期后，项目通过 magpie CLI 停用专用入口 `transcribe-qiniu-free`；自动停用要求该入口仅配置活动模型，且 magpie 为带 `.portable` 标记、同目录 `data` 的 Windows 便携版。停用失败时停止相关请求；自定义活动入口由用户在 magpie 停用或移出组。
 
@@ -52,6 +53,7 @@ Windows x64 自用字幕 CLI。北京百炼 `qwen3-asr-flash-filetrans` 负责�
 | --- | --- |
 | `mt_base_url` / `magpie_base_url` | `http://127.0.0.1:3425/v1`，分别用于翻译和 ASR |
 | `mt_free_model` / `mt_model` | `group/transcribe-free` / `group/transcribe` |
+| `mt_fallback_model` | `group/transcribe-paid`，主组超时或结果校验失败后的付费后备 |
 | `magpie_asr_provider` / `magpie_upload_provider` | `transcribe-bailian` / `transcribe-upload` |
 | `mt_policy_version` | 整数 `1`；更换翻译策略并要求重译时递增 |
 | `mt_routing.paid_enabled` | `true`，可由本次 `--mt-paid allow\|deny` 覆盖 |
@@ -60,7 +62,7 @@ Windows x64 自用字幕 CLI。北京百炼 `qwen3-asr-flash-filetrans` 负责�
 | `zh_line_width` / `other_line_width` | `44` / `84`，范围 12～72 / 24～160 |
 | `chinese_first` | `false`，译文是否位于原文上方 |
 
-翻译地址和组名支持 `MT_BASE_URL`、`MT_MODEL`、`MT_FREE_MODEL` 环境覆盖。网关凭据使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机缺省为 `magpie-transcribe`；远程翻译网关须配置凭据。免费证明及 ASR 身份绑定本机注册表所属监听地址，端口修改需同步 magpie 的保存设置。
+翻译地址和组名支持 `MT_BASE_URL`、`MT_MODEL`、`MT_FREE_MODEL`、`MT_FALLBACK_MODEL` 环境覆盖。网关凭据使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机缺省为 `magpie-transcribe`；远程翻译网关须配置凭据。免费证明及 ASR 身份绑定本机注册表所属监听地址，端口修改需同步 magpie 的保存设置。
 
 新任务与 `--reflow` 使用当前配置；`--resume` 沿用任务保存的翻译身份和排版，线程数与轮询等待使用当前值。需要按新策略重新翻译时，递增 `mt_policy_version` 后执行 `--reflow`；保持版本可复用匹配缓存。
 

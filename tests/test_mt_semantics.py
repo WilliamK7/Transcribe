@@ -263,7 +263,8 @@ class SemanticPipelineTests(PoolPipelineFixture):
         def run():
             pipeline = Pipeline(engine, self.job_id, manifest, scope)
             first = pipeline.stage('glossary', data)
-            pipeline.router.paid_enabled = False
+            manifest['mt_route_snapshot']['routing']['paid_enabled'] = False
+            pipeline = Pipeline(engine, self.job_id, manifest, scope)
             with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected repeated glossary')):
                 second = pipeline.stage('glossary', data)
             self.assertEqual(first[0], second[0])

@@ -138,7 +138,7 @@ class ProcessTransportTests(TemporaryTest):
         if os.name == 'nt':
             self.assertTrue(kwargs['creationflags'] & subprocess.CREATE_NO_WINDOW)
 
-    def test_gateway_queue_can_outlast_the_old_socket_timeout(self):
+    def test_gateway_queue_uses_the_full_request_deadline(self):
         import io
         from types import SimpleNamespace
         from subtitle_tool import _mt_http_worker as worker

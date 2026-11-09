@@ -8,7 +8,6 @@ import re
 import time
 import threading
 import uuid
-from contextlib import nullcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +21,7 @@ from .mt_planning import make_unit, restore_group_plan, save_group_plan
 from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION, correction_stalled, direct_draft_matches,
                          estimate_stage_output, make_stage_payload, manual_terms, parse_stage_response, plan_sentence_groups,
                          stage_cache_key, term_appears, term_evidence, validate_stage_value)
-from .mt_routing import MagpieRoute, RouteEntry, RouteFailure
+from .mt_routing import STAGE_TIMEOUT, MagpieRoute, RouteEntry, RouteExhausted, RouteFailure
 from .mt_runtime import service_failure
 from .mt_transport import TransportError
 from .review import decision_origin
@@ -282,11 +281,11 @@ class Pipeline:
         if event.get('kind') == 'route_failure':
             self.store.count(self.job_id, 'mt_v5_' + getattr(self.context, 'stage', 'unknown') + '_failure')
 
-    def _prepare_gateway(self, entry):
+    def _validate_gateway(self, entry):
         from .magpie import validate_group
         validate_group(self.engine.config.settings, entry.backend.model,
-                       free_only=entry.tier == 'free', base_url=entry.backend.base_url)
-        return nullcontext()
+                       free_only=entry.tier == 'free', base_url=entry.backend.base_url,
+                       paid_only=entry.id == 'magpie_fallback')
 
     def _request_payload(self, stage, data, entry, *, repair=False):
         try:
@@ -318,6 +317,8 @@ class Pipeline:
         def dispatch():
             self.store.count(self.job_id, 'mt')
             self.store.count(self.job_id, 'mt_v5_' + entry.id + '_' + name + '_request')
+            if entry.id == 'magpie_fallback':
+                self.store.count(self.job_id, 'mt_paid_fallback_request')
             if attempt == 2:
                 self.store.count(self.job_id, 'mt_format_repair_request')
             event['dispatched'] = True
@@ -335,7 +336,8 @@ class Pipeline:
                     json=payload, control=self.engine.mt_control, timeout=remaining, on_dispatch=dispatch)
             except TransportError as error:
                 outcome, event['category'] = 'transport_error', error.category
-                raise RouteFailure(error.category, scope='endpoint' if error.category == 'network' else 'entry') from None
+                raise RouteFailure(error.category, scope='endpoint' if error.category == 'network' else 'entry',
+                                   fallback_allowed=error.category == 'deadline') from None
             try:
                 body = json.loads(reply.body)
             except (ValueError, UnicodeError, RecursionError):
@@ -351,6 +353,11 @@ class Pipeline:
                 event.update(usage)
                 for field, amount in usage.items():
                     self.store.count(self.job_id, 'mt_response_' + field, amount)
+                details = raw_usage.get('completion_tokens_details')
+                reasoning = details.get('reasoning_tokens') if isinstance(details, dict) else None
+                if type(reasoning) is int and 0 <= reasoning <= usage['output_tokens']:
+                    event['reasoning_tokens'] = reasoning
+                    self.store.count(self.job_id, 'mt_response_reasoning_tokens', reasoning)
             else:
                 usage = None
                 self.store.count(self.job_id, 'mt_response_usage_unknown')
@@ -381,10 +388,11 @@ class Pipeline:
                     'expected_count': len(ids), 'actual_count': error.actual_count, **metadata})
                 # Regenerate a normally completed response from original
                 # evidence when local format validation fails.
-                repairable = (name in {'draft', 'align'} and metadata['finish_reason'] == 'stop' and
-                              metadata['content_type'] == 'string')
+                completed = metadata['finish_reason'] == 'stop' and metadata['content_type'] == 'string'
+                repairable = name in {'draft', 'align'} and completed
                 raise RouteFailure('output_truncated' if error.category == 'output_truncated' else
-                                   'format_exhausted', repairable=repairable) from None
+                                   'format_exhausted', repairable=repairable,
+                                   fallback_allowed=completed or error.category == 'output_truncated') from None
             if usage is None:
                 self.store.count(self.job_id, 'mt_usage_unknown')
             else:
@@ -392,8 +400,13 @@ class Pipeline:
                     self.store.count(self.job_id, 'mt_' + field, amount)
             if attempt == 2:
                 self.store.count(self.job_id, 'mt_format_repair_success')
+            if entry.id == 'magpie_fallback':
+                self.store.count(self.job_id, 'mt_paid_fallback_success')
             outcome = 'valid'
             return {'value': value, 'actual_model': event['actual_model'], 'usage': usage}
+        except RouteFailure as error:
+            error.request_id = request_id
+            raise
         except Cancelled:
             outcome = 'cancelled'
             raise
@@ -405,11 +418,7 @@ class Pipeline:
         """Fit context and glossary to the budget while preserving targets."""
         data = dict(data)
         candidates = []
-        for entry in self.router.entries:
-            if entry.tier == 'paid' and not self.router.paid_enabled:
-                continue
-            if entry != self.router.selected:
-                continue
+        for entry in self.router.request_entries:
             try:
                 entry.backend.credential(self.engine.config)
             except ToolError:
@@ -425,15 +434,15 @@ class Pipeline:
             make_stage_payload(stage, data, entry.backend, capabilities=capabilities,
                                repair=stage in {'draft', 'align'})
         while True:
-            fits = False
+            fits = bool(candidates)
             for entry in candidates:
                 try:
                     payload_fits(entry)
-                    fits = True
-                    break
                 except ToolError as error:
                     if error.code != 'mt_input_budget':
                         raise
+                    fits = False
+                    break
             if fits:
                 return data
             smaller_context = trim_context(data.get('context', [])) if not fixed_semantics else None
@@ -457,6 +466,7 @@ class Pipeline:
         if self.group_progress is not None and group is not None:
             self.group_progress.set(group, name)
         started = time.monotonic()
+        deadline = started + STAGE_TIMEOUT
         work_key = self._work_key(name, data)
         self.context.stage, self.context.group_key = name, work_key
         self.context.request_id = self.context.gateway_session = None
@@ -535,7 +545,7 @@ class Pipeline:
 
         # Preserve the exact originally requested context and glossary for both
         # free and paid cache lookup before adapting to permitted network models.
-        result = self.router.cached_result(cached, prefer_other_than=prefer, deadline=started + 180.0)
+        result = self.router.cached_result(cached, prefer_other_than=prefer, deadline=deadline)
         if result is None:
             try:
                 data = self._fit(name, data, fixed_semantics=fixed_semantics)
@@ -551,16 +561,12 @@ class Pipeline:
                 saved = saved_stage()
                 if saved is not None:
                     return saved
-            if saved_only:
-                result = (self.router.cached_result(cached, prefer_other_than=prefer, deadline=started + 180.0)
-                          if adapted else None)
-                if result is None:
+            if adapted:
+                result = self.router.cached_result(cached, prefer_other_than=prefer, deadline=deadline)
+            if result is None:
+                if saved_only:
                     return None
-            else:
-                remaining = max(0.0, 180.0 - (time.monotonic() - started))
-                result = self.router.run(invoke, cache=cached if adapted else None, prefer_other_than=prefer,
-                                         prepare=self._prepare_gateway,
-                                         deadline_seconds=remaining)
+                result = self.router.run(invoke, validate=self._validate_gateway, deadline=deadline)
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
             'model': result.entry.backend.model, 'actual_model': result.value['actual_model'],
             'gateway_session': self.context.gateway_session, 'request_id': self.context.request_id,
@@ -675,12 +681,8 @@ class Pipeline:
             targets = {item['id']: item['text'] for item in data['sentences']}
             return [{**term, 'origin': 'model', 'evidence': term_evidence(term['source'], targets[term['sentence']])}
                     for term in result['terms']]
-        except Cancelled:
-            raise
-        except ToolError as error:
+        except RouteExhausted:
             self.engine.mt_control.check_start()
-            if error.code not in {'mt_route_exhausted', 'mt_route_deadline'}:
-                raise
             # Glossary extraction is advisory; translations still use evidenced manual entries.
             with self.engine.mt_control.lock:
                 self.engine.mt_control.check_start()
@@ -759,12 +761,8 @@ class Pipeline:
                                                            fixed_semantics=True)
                 review_keys.append(review_proof['key'])
                 reviewed.append(current)
-            except Cancelled:
-                raise
-            except ToolError as error:
+            except RouteExhausted:
                 self.engine.mt_control.check_start()
-                if error.code not in {'mt_route_exhausted', 'mt_route_deadline'}:
-                    raise
                 warning = True
                 break
             if not review['issues']:
@@ -785,12 +783,8 @@ class Pipeline:
                 correction_keys.append(production['key'])
                 previous_correction = correction_data
                 current = corrected['translations']
-            except Cancelled:
-                raise
-            except ToolError as error:
+            except RouteExhausted:
                 self.engine.mt_control.check_start()
-                if error.code not in {'mt_route_exhausted', 'mt_route_deadline'}:
-                    raise
                 warning = True
                 break
         final_key = _digest({'stage': 'final', 'strategy': 5, 'cues': [c['cue_id'] for c in members],

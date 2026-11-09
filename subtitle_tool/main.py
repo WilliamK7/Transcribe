@@ -187,15 +187,17 @@ def summary(store, job_id):
             "no_speech": manifest.get("no_speech", False), "output_sha256": manifest.get("expected_srt_sha256")}
     if 'mt_route_snapshot' in manifest and not manifest.get('archived'):
         from .mt_pool import saved_route
+        from .policy import load_policy
         try:
+            load_policy(manifest)
             route = saved_route(manifest)
         except ToolError:
             # Historical results remain listable for explicit reflow.
             mt = {'provider': None, 'model': None}
             item['mt_route_status'] = 'reflow_required'
         else:
-            permitted = 'paid' if route['routing']['paid_enabled'] else 'free'
-            mt = next(entry['backend'] for entry in route['entries'] if entry['tier'] == permitted)
+            permitted = 'magpie' if route['routing']['paid_enabled'] else 'magpie_free'
+            mt = next(entry['backend'] for entry in route['entries'] if entry['id'] == permitted)
             item['mt_route_status'] = 'current'
             item['mt_policy_version'] = mt['policy_version']
             item['gateway_session_prefix'] = 'transcribe-' + job_id + '-'

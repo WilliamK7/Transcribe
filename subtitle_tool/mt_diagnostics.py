@@ -128,8 +128,9 @@ class MTDiagnostics:
 
     @staticmethod
     def _routing(record, event):
-        for field, minimum, maximum in [('attempt', 0, 2), ('policy_version', 1, 2**31 - 1),
-                                        ('input_tokens', 0, 2**31 - 1), ('output_tokens', 0, 2**31 - 1)]:
+        for field, minimum, maximum in [('attempt', 0, 4), ('policy_version', 1, 2**31 - 1),
+                                        ('input_tokens', 0, 2**31 - 1), ('output_tokens', 0, 2**31 - 1),
+                                        ('reasoning_tokens', 0, 2**31 - 1)]:
             value = event.get(field)
             if type(value) is int and minimum <= value <= maximum:
                 record[field] = value
