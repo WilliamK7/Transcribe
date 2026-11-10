@@ -58,7 +58,7 @@ class TranslationWorkflowTests(PoolPipelineFixture):
 
     def test_group_alias_is_not_evidence_of_an_independent_reviewer(self):
         self.install()
-        self.actual_model = lambda stage, request: request
+        self.actual_model = lambda stage, request: request if stage == 'review' else 'synthetic/' + stage
         self.assertEqual(self.run_pool(), 'completed')
         self.assertGreater(self.store.counts(self.job_id)['mt_quality_warning'], 0)
 

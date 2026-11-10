@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "enabled": false,
+  "excluded_providers": [],
+  "refresh_seconds": 900,
+  "retry_seconds": 3600,
+  "max_evaluations_per_cycle": 1,
+  "max_evaluations_per_day": 2,
+  "judges": ["transcribe-qiniu-paid/z-ai/glm-5.3-flash", "transcribe-bailian/qwen3.8-flash", "transcribe-bailian/deepseek-v4.1-flash"],
+  "providers": {
+    "github-copilot": {
+      "adapter": "registry",
+      "package": "@magpie-community/opencode-copilot-auth",
+      "preferred": ["gpt-6-luna", "claude-haiku-5.5", "gemini-3.8-flash"],
+      "include": ["*"], "exclude": [], "billing": ["commercial"],
+      "max_candidates": {"free": 0, "commercial": 3}
+    },
+    "cloudflare-workers-ai": {
+      "adapter": "registry",
+      "package": "@magpie-community/opencode-cloudflare-workers-ai-auth",
+      "preferred": ["@cf/qwen/qwen3.8-27b", "@cf/google/gemma-4-26b-a4b-it", "@cf/zai-org/glm-4.7-flash"],
+      "include": ["*"], "exclude": [], "billing": ["commercial"],
+      "max_candidates": {"free": 0, "commercial": 6}
+    },
+    "opencode-zen-free": {
+      "adapter": "registry",
+      "package": "@magpie-community/opencode-zen-free-auth",
+      "preferred": ["deepseek-v4.1-flash-free", "glm-5.3-flash-free", "mimo-v2.6-flash-free"],
+      "include": ["deepseek-*", "glm-*", "mimo-*"], "exclude": [], "billing": ["free"],
+      "max_candidates": {"free": 6, "commercial": 0}
+    },
+    "vllm-sr": {
+      "adapter": "vllm-sr", "package": "opencode-vllm-sr-auth",
+      "preferred": ["vllm-sr/auto"], "include": ["vllm-sr/auto"], "exclude": [], "billing": ["free"],
+      "max_candidates": {"free": 1, "commercial": 0}
+    },
+    "vercel": {
+      "adapter": "vercel",
+      "preferred": ["openai/gpt-6-luna", "anthropic/claude-haiku-5.5", "google/gemini-3.8-flash", "nvidia/nemotron-3.5-lightning-free", "reflection/beam-free", "alibaba/qwen3.8-max", "alibaba/qwen3.8-flash", "alibaba/qwen3.8-27b"],
+      "include": ["*"], "exclude": [], "billing": ["free", "commercial"],
+      "max_candidates": {"free": 2, "commercial": 3}
+    },
+    "transcribe-openrouter-free": {
+      "adapter": "openrouter", "preferred": [], "include": ["*:free"], "exclude": [], "billing": ["free"],
+      "max_candidates": {"free": 5, "commercial": 0}
+    },
+    "transcribe-qiniu-free": {
+      "adapter": "registry", "preferred": ["qiniu/conatus-free"], "include": ["*"], "exclude": [], "billing": ["free"],
+      "max_candidates": {"free": 3, "commercial": 0}
+    },
+    "transcribe-qiniu-paid": {
+      "adapter": "registry", "preferred": ["qwen/qwen3.8-max", "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"],
+      "include": ["*"], "exclude": [], "billing": ["commercial"], "max_candidates": {"free": 0, "commercial": 4}
+    },
+    "transcribe-bailian": {
+      "adapter": "registry", "preferred": ["qwen3.8-max", "deepseek-v4.1-flash", "qwen3.8-flash"],
+      "include": ["*"], "exclude": [], "billing": ["commercial"], "max_candidates": {"free": 0, "commercial": 4}
+    }
+  }
+}

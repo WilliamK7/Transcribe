@@ -83,6 +83,12 @@ class BailianFreeFixture(TemporaryTest):
                     row['members'] += [m for m in value.split(',') if m not in row['members']]
                 elif field == 'models-':
                     row['members'] = [m for m in row['members'] if m not in value.split(',')]
+                elif field == 'routing':
+                    row['routing'] = value
+                elif field == 'stays':
+                    row['affinity'] = value
+                elif field == 'weight':
+                    row['weights'] = {m: float(w) for m, w in (item.rsplit('=', 1) for item in value.split(','))}
         atomic_json(self.registry, raw)
 
     def active(self):

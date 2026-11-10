@@ -2,7 +2,7 @@
 
 ## magpie 网关契约
 
-仅翻译使用 magpie 0.1.3516 的 POST `/v1/chat/completions`。依据 [CLI](https://github.com/yetone/magpie/blob/v0.1.3516/internal/cli/groups_cli.go)、[OpenRouter 型号目录](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)和[百炼额度](https://help.aliyun.com/zh/model-studio/cli/usage-quota)。
+仅翻译使用 magpie 0.1.3565 的 POST `/v1/chat/completions`。依据 [CLI](https://github.com/yetone/magpie/blob/v0.1.3565/internal/cli/groups_cli.go)、[OpenRouter 型号目录](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)和[百炼额度](https://help.aliyun.com/zh/model-studio/cli/usage-quota)。
 
 路线快照保存六个入口：`magpie`、`magpie_fallback`、`magpie_review`、`magpie_review_fallback`、`magpie_judge`、`magpie_judge_fallback`。每个角色主组为 mixed，按免费 → 商业顺序，fallback 为 paid。同档供应商等权，试用子组占一个供应商位置；三个角色按底层型号去重。连接、限流及上游切换由网关负责。
 
@@ -67,7 +67,23 @@
 
 当前执行契约：媒体处理 2、提取配方 2、字幕格式 2、规范化 4、显示时间 2、翻译策略／请求契约 6、提示词及生成参数 5、响应恢复标识 6、上下文 3、对齐策略 `execution_snapshot.alignment_version:3`、术语调度 `window-prefix-v3`。版本字段为整数且精确匹配，术语调度字段也须存在。`--resume` 和 `--retime` 均先核对契约，缺少字段或版本不匹配时返回 `cache_version`，通过 `--reflow` 从完整转写重建。线程数与轮询等待使用当前设置，排版、模型、能力和账户身份沿任务快照。
 
-翻译路线快照为版本 5；身份保存在版本 2 的 `mt_route_snapshot.entries[].backend`，包含用户管理的策略修订号 `policy_version`。报告中的模型是正文主组，并提供 `mt_policy_version`；每个阶段记录实际使用的入口。需要重建的路线在列表中标记 `mt_route_status:reflow_required`。
+新翻译路线快照为版本 6，仍读取版本 5；入口身份保存在版本 2 的 `mt_route_snapshot.entries[].backend`，包含策略修订号 `policy_version`。版本 6 的 `identities` 固定每个网关成员的底层型号集合、动态标记、实际通过验收的 `admitted` 子集及费用档位（free/trial/commercial/unknown），也参与阶段缓存隔离。策略／请求契约仍为 6，接入新渠道不强制所有历史任务重建。报告中的模型是正文主组，并提供 `mt_policy_version`。
+
+阶段记录的 `actual_model` 仍是网关成员，`resolved_model` 表示经校验的底层型号。vLLM-SR `auto` 只允许翻译，必须由白名单响应头 `x-vsr-selected-model` 给出已验收集合内的型号；缺失、越界或跨角色冲突时不采纳响应，按现有有限等待策略进入商业后备。固定型号的旧记录没有 `resolved_model` 时可按已核实别名恢复；旧阶段与恢复后新生成的最终记录按解析后的底层身份比较，不改写旧记录。旧动态记录保留，但不提供新的独立性证据，无法验证时须显式 `--reflow`。需要重建的路线在列表中标记 `mt_route_status:reflow_required`。
+
+型号验收套件为版本 3；缓存键包含接口能力、插件版本、账户指纹、评判者身份及动态后端集合，凭据不写入验收报告。配置发现合并普通提供者、插件注册表、网关有效目录和官方型号能力；`configure-mt.py --list-candidates` 不写入状态、不发送推理请求。System One 独立评测只调用 `/v1/systemone` 与现有复核基线，不修改生产策略。
+
+渠道维护配置 `data/mt-channels.json` 为版本 1，供应商清单是显式授权边界。没有该文件时默认不启动自动维护，`manage-mt.py --enable` 写入模板后启用；新供应商必须显式登记。后台在首次默认本机路线联网请求时启动，与字幕任务一同结束。新任务、恢复任务、独立维护命令共享项目进程锁；后台分组写入与百炼角色分配共用同一个锁，推理不占该锁。远程网关、自定义角色入口和纯缓存恢复不启动自动管理。
+
+可选 `excluded_providers` 是项目级供应商排除列表，缺省为空；它与管理清单、验收评判者冲突时配置无效。自动维护及验收不使用排除项，生产请求在发送前展开本机组检查，不能通过旧验收缓存或嵌套组绕过。独立评测记录排除错误并跳过剩余样本，不发送该入口请求。历史任务与已保存译文不重建，Magpie 全局配置不受此规则影响。
+
+`gateway-maintenance.json` 版本 1 保存型号身份指纹、已通过结果、失败／冷却状态、自动开放入口的归属及 UTC 日验收预算；不保存凭据、字幕或响应正文。默认每轮 1 个、每天 2 个待验收型号，提前预留名额，异常退出不退回。当日达到上限仍可读目录和复用已有资格；临时失败最少按配置冷却 3600 秒。失败缓存绑定原账户及能力；插件指纹按账户和接口能力计算，目录中其他型号的变化不影响已验收资格。
+
+目录来源为插件注册表、网关有效目录、与当前端点绑定的 Magpie 已抓取目录，以及适配器支持的官方目录。后台使用 Magpie `provider refresh` 刷新已登记、未关闭目录请求的渠道；保留 `listOff`。官方目录中的明确候选可按规则增量开放，人工删除自动开放的入口产生持久 `manual_hold`。目录不可读不等于下架；临时故障不取消同身份资格，凭据／接口／动态集合变化不沿用旧资格。新免费入口、商业后备仍由同一角色独立性验证、子组预演、备份和分阶段写入约束；失败更新保留诊断和恢复记录。维护状态不改变路线快照格式或历史执行契约。
+
+`gateway-apply-pending.json` 版本 2 在每次分组命令前记录该组的前后状态，执行核验后记录完成。中断重试先恢复已确认写入的托管归属；回执丢失时用本机状态核对是否生效，再按当前验收结果重新规划，不重放旧的待执行决策。人工删除和停用继续相对已生效的成员表识别。旧版迁移记录可恢复已确认步骤；若未确认步骤的现状与保存证据冲突，返回 `magpie_group` 并保留记录与备份，不猜测归属。下一次更新的备份同时保存上一份迁移记录。
+
+目录接口依据：[Magpie CLI](https://github.com/yetone/magpie/blob/v0.1.3565/internal/cli/providers_cli.go)、[Magpie 已抓取目录](https://github.com/yetone/magpie/blob/v0.1.3565/internal/catalog/live.go)、[Vercel 型号与每 token 价格](https://vercel.com/docs/ai-gateway/models-and-providers)、[OpenRouter 型号目录](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)。
 
 `data/archives/{任务ID}` 保存 `task.json`、`subtitle.srt`、原始 `raw-*.json` 和逐文件 SHA-256 索引；目录中的任务库备份与结果均属于用户恢复资料。
 

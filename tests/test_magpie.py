@@ -132,7 +132,7 @@ class MagpiePipelineTests(PoolPipelineFixture):
         atomic_json(registry / 'providers.json', {'providers': [
             {'id': 'free', 'chat': 'https://openrouter.ai/api/v1', 'countFree': True},
             {'id': 'paid', 'chat': 'https://api.qnaigc.com/v1'}],
-            'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
+            'groups': [{'id': 'transcribe-free', 'members': ['free/provider/draft:free']},
                        {'id': 'transcribe', 'members': ['group/transcribe-free', 'paid/paid-model']},
                        {'id': 'transcribe-paid', 'members': ['paid/paid-model']},
                        {'id': 'transcribe-review', 'members': ['paid/review-model']},
@@ -253,7 +253,7 @@ class MagpiePipelineTests(PoolPipelineFixture):
         def request(method, url, **kwargs):
             calls.append(kwargs['headers'])
             self.assertGreater(kwargs['timeout'], 60)
-            body = {'model': 'free/openrouter/free', 'choices': [{'finish_reason': 'stop',
+            body = {'model': 'free/provider/draft:free', 'choices': [{'finish_reason': 'stop',
                     'message': {'content': '{"translations":{"0":"缓存保存先前计算的结果。"}}'}}]}
             return HTTPReply(200, json.dumps(body).encode())
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport') as transport:
@@ -262,4 +262,4 @@ class MagpiePipelineTests(PoolPipelineFixture):
         self.assertEqual(calls[0].get('X-Magpie-Response-Model'), 'member')
         self.assertRegex(calls[0].get('X-Magpie-Session', ''), r'^transcribe-[0-9a-f]{32}-[0-9a-f]{32}$')
         self.assertEqual(report['gateway_session'], calls[0]['X-Magpie-Session'])
-        self.assertEqual(report['actual_model'], 'free/openrouter/free')
+        self.assertEqual(report['actual_model'], 'free/provider/draft:free')

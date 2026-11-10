@@ -1,19 +1,19 @@
 """Admission gates and measured reasoning with simulated API responses."""
 import json
 import threading
-import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from subtitle_tool.mt_admission import CASES, ModelEvaluator, canonical_model
+from subtitle_tool.mt_admission import CASES, ModelEvaluator
 from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_transport import HTTPReply, TransportError
+from tests.fixtures import TemporaryTest
 
 
-class AdmissionTests(unittest.TestCase):
+class AdmissionTests(TemporaryTest):
     def evaluator(self, *, reasoning=0, semantic=True, actual='candidate', judge='independent'):
         self.calls = []
-        config = SimpleNamespace(settings=SimpleNamespace(mt_base_url='http://offline/v1'),
+        config = SimpleNamespace(data=self.path, settings=SimpleNamespace(mt_base_url='http://offline/v1'),
                                  get_magpie_key=lambda: 'synthetic-key')
         evaluator = ModelEvaluator(config, MTControl(threading.Event()), judge=judge)
         def request(model, stage, data):
@@ -71,6 +71,18 @@ class AdmissionTests(unittest.TestCase):
         self.assertIsNotNone(result['retry_after'])
         evaluator.transport.request.assert_not_called()
 
+    def test_unsupported_model_stops_all_roles_and_records_only_safe_code(self):
+        evaluator = self.evaluator()
+        evaluator.request = lambda *args: ModelEvaluator.request(evaluator, *args)
+        evaluator.transport.request.return_value = HTTPReply(400, json.dumps({'error': {
+            'code': 'model_not_supported', 'message': 'private response text'}}).encode())
+        result = evaluator.evaluate('candidate')
+        self.assertEqual(result['roles'], [])
+        self.assertIsNone(result['retry_after'])
+        self.assertEqual(evaluator.transport.request.call_count, 1)
+        self.assertEqual(result['failures'][0]['service_code'], 'model_not_supported')
+        self.assertNotIn('private', json.dumps(result))
+
     def test_transient_error_after_translation_never_admits_unjudged_output(self):
         evaluator = self.evaluator()
         request = evaluator.request
@@ -103,6 +115,3 @@ class AdmissionTests(unittest.TestCase):
         self.assertGreaterEqual(calls[0].kwargs['timeout'], 120)
         self.assertNotEqual(calls[0].kwargs['headers']['X-Magpie-Session'],
                             calls[1].kwargs['headers']['X-Magpie-Session'])
-
-    def test_model_aliases_are_deduplicated_across_suppliers_and_revisions(self):
-        self.assertEqual(canonical_model('provider/deepseek-v4.1-flash-1017:free'), 'deepseek-v4.1-flash')

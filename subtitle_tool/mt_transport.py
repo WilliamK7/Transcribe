@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .common import ToolError
@@ -20,6 +20,7 @@ MAX_RESPONSE = 4 * 1024 * 1024
 class HTTPReply:
     status: int
     body: bytes
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class TransportError(ToolError):
@@ -82,7 +83,12 @@ class ProcessTransport:
                 status = reply['status']
                 if type(status) is not int or not 100 <= status <= 599:
                     raise ValueError()
-                return HTTPReply(status, body)
+                headers = reply.get('headers', {})
+                if (not isinstance(headers, dict) or set(headers) - {'x-vsr-selected-model'} or
+                        any(not isinstance(v, str) or len(v) > 160 or '\r' in v or '\n' in v
+                            for v in headers.values())):
+                    raise ValueError()
+                return HTTPReply(status, body, headers)
             except (ValueError, KeyError, TypeError, RecursionError):
                 raise TransportError('transport') from None
         except OSError:

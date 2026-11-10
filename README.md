@@ -16,13 +16,19 @@ Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-f
 
 ## 配置 magpie
 
-本机接口依据 magpie 0.1.3516。先在 magpie 配置七牛、OpenRouter 和百炼工作空间凭据，再运行：
+本机适配 magpie 0.1.3565。在 Magpie 中配置渠道，在 `data/settings.json` 中填写 `magpie_data_dir`，再预览和验收候选：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/configure-mt.py --apply --discover-openrouter --refresh-trial
+.\.venv\Scripts\python.exe scripts\configure-mt.py --list-candidates
+.\.venv\Scripts\python.exe scripts\configure-mt.py --apply
+# 筛选本轮发现的渠道；现有字幕池仍参与验收
+.\.venv\Scripts\python.exe scripts\configure-mt.py --providers github-copilot,vercel --apply
+.\.venv\Scripts\python.exe scripts\configure-mt.py --providers transcribe-openrouter-free --apply --refresh-trial
 ```
 
-脚本保存私有配置备份，用固定合成样例验收型号，为合格候选建立三个独立角色。重复执行会更新项目托管成员，保留人工设置。ASR 使用百炼直连接口。
+候选渠道和型号规则保存在 `data/mt-channels.json`，初始内容见[配置模板](subtitle_tool/mt-channels.default.json)。模板包含 GitHub Copilot、Cloudflare Workers AI、OpenCode Zen Free、vLLM-SR、Vercel、OpenRouter、七牛和百炼。新渠道由用户登记，`--list-candidates` 可只读预览。
+
+脚本使用合成文本验收，备份配置后更新托管分组，保留人工成员和开关。角色分配按底层型号隔离，每个角色都有商业后备：
 
 | 角色 | 主组 | 商业后备 |
 | --- | --- | --- |
@@ -30,15 +36,56 @@ Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-f
 | 术语及轻量复核 | `group/transcribe-review` | `group/transcribe-review-paid` |
 | 疑难裁决 | `group/transcribe-judge` | `group/transcribe-judge-paid` |
 
-每个主组按免费组 → 商业组顺序选择。同档供应商子组等权，试用子组作为一个供应商；各组 `stays=off`。正文、复核和裁决按实际底层型号去重。OpenRouter 使用验收通过的明确 `:free` 型号。
+主组按免费组 → 商业组选择。同档供应商等权、供应商内部有序尝试，试用子组占一个供应商位置，各组 `stays=off`。免费组会继续尝试其他候选，冷却、繁忙和阶段总时限可能提前触发商业后备。
 
-百炼试用管理使用 `data/bailian-quota-binding.json` 的账户绑定，自动查询全目录有效额度。每款型号独立入口，最多 12 个合成样例验收并缓存角色资格；后台逐个补充至三个合格候选。首次联网翻译启动后台刷新，默认每 60 秒共享一次查询，失败退避并标记未知。耗尽事件读取 magpie 逐次尝试日志，即使最终 HTTP 200 也会退出对应模型，耗尽状态保持至本任务结束。
+费用按型号识别：Copilot 套餐和 Workers AI 按商业入口处理；Zen 使用明确免费的型号；Vercel 使用官方零价信息，赠送余额单独计量。OpenRouter 只选通过验收的明确 `:free` 型号。商业调用次数与实际现金支出分别记录，资源包和代金券的抵扣以账单为准。
 
-`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停和排除。人工停用入口、关闭或移除组成员会被保留，记录为模型 `manual_hold` 或 `excluded_groups`；恢复时须显式清除对应标记并恢复网关开关。最后一个组成员因 magpie 限制可能保留为停用占位，不再参与选路。管理记录保存在 `.build/mt-diagnostics/trial-management.jsonl`，只含操作者、任务、型号、前后状态及原因。自定义组名及远程网关由管理员维护，自动管理仅作用于上表默认本机角色组。原共用 `transcribe-bailian-trial` 作为绑定模板保留停用，新入口使用该 ID 的哈希后缀。
+vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。需要在 Magpie 提供者设置中添加响应头透传 `X-Vsr-Selected-Model`。项目校验实际型号及验收资格，身份缺失或冲突时使用商业后备。
 
-拆分入口共享原账户 RPM 预算，商业入口也计入；模型及工作空间配额进一步收紧。商业调用次数不等于现金支出，资源包、代金券的实际抵扣需核对账单。七牛活动过期会停用专用入口；其他组可继续翻译。
+### 自动维护
 
-供应商限流、冷却和故障切换由 magpie 管理。候选验收遇到临时失败会暂缓整个型号，至少 300 秒后重试；单请求最多 120 秒，以唯一会话 ID 关联路由。
+```powershell
+.\.venv\Scripts\python.exe scripts\manage-mt.py --enable
+.\.venv\Scripts\python.exe scripts\manage-mt.py --status
+.\.venv\Scripts\python.exe scripts\manage-mt.py --once
+.\.venv\Scripts\python.exe scripts\manage-mt.py --add-provider 供应商ID
+.\.venv\Scripts\python.exe scripts\manage-mt.py --disable
+```
+
+启用后，首次联网字幕请求启动后台，任务退出时停止。默认每 15 分钟刷新已登记渠道的目录，每轮最多验收 1 个型号、每天 UTC 最多 2 个；每型号最多 12 次候选请求和 1 次独立评判。预算在请求前保存，重启继续累计。`--once` 使用相同预算；`configure-mt.py` 用于手动批量验收。`--status` 只读本机状态，登记和启停命令只修改管理配置。
+
+`mt-channels.json` 的主要规则：
+
+| 字段 | 用途 |
+| --- | --- |
+| `providers` | 明确登记的渠道及适配器、候选和费用规则 |
+| `excluded_providers` | 项目级渠道排除，适用于维护、验收、评测和字幕请求 |
+| `include` / `exclude` | 型号名称通配符 |
+| `preferred` | 优先型号及明确允许的商业候选 |
+| `billing` / `max_candidates` | 允许费用档位及每轮目录候选数 |
+| `max_input_usd_per_million` / `max_output_usd_per_million` | 新商业候选单价上限；Vercel 默认输入 2、输出 10 美元 |
+
+新商业型号需要明确候选授权，或有可核实且符合上限的价格。无法确定价格时状态为 `price_unknown`；单价筛选独立于账户总支出。已验收的资格按账户、接口能力和底层型号集合复用。临时故障进入冷却，目录查询失败保留已有池。
+
+维护状态保存在 `data/gateway-maintenance.json`，备份在 `data/gateway-backups/`。人工删除和停用形成持久排除；恢复时需同时恢复 Magpie 开关，并清除相关 `manual_hold` 或 `gateway-managed.json` 排除项。中断更新会先核对已执行变更的归属，再按当前规则规划。成功改变路由时递增策略版本，历史任务继续按原快照恢复。
+
+### 百炼试用
+
+`data/bailian-quota-binding.json` 绑定账户。后台每 60 秒查询有效额度，逐个验收并维持最多三个合格候选，每款型号使用独立入口。额度拒绝会停用对应型号，即使该请求最终通过其他入口成功；耗尽状态保持至本任务结束。共享账户 RPM 预算包含商业入口，模型与工作空间配额可进一步收紧。
+
+`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停与排除。原 `transcribe-bailian-trial` 保存账户模板，实际入口使用带哈希后缀的 ID。百炼额度维护有独立验收预算。七牛限时免费活动到期后，专用免费入口退出选路。
+
+自动管理作用于上表的默认本机角色组。远程网关及自定义角色组由用户维护。运行诊断与恢复细节见[接口契约](docs/API_CONTRACT.md)。
+
+### Decisions / System One 评测
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate-decisions.py
+# 使用指定的 Magpie System One 成员
+.\.venv\Scripts\python.exe scripts\evaluate-decisions.py --models 供应商/型号,供应商/另一型号
+```
+
+独立评测通过 Magpie `/v1/systemone` 比较 D3 Flash、D3 Ultra、OpenRouter Decisions 与当前复核入口。32 个带标签合成样本覆盖八类质量问题、跨句信息和指令干扰。报告位于 `.build/mt-diagnostics/decisions-*.json`，包含漏报、误报、置信度、延迟和接口可取得的用量成本，连接失败单独统计。评测结果供人工比较，生产复核、裁决和阈值继续使用现有配置。
 
 ## 项目配置
 

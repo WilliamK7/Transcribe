@@ -103,7 +103,25 @@ def configured_route(config, manifest):
                                      policy_version=settings.mt_policy_version).snapshot(),
                 'capabilities': {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}}
                for identity, tier, model in models]
-    return {'format_version': 5, 'entries': entries, 'routing': routing, 'quality': quality}
+    from .magpie import bound_gateway
+    from .mt_catalog import saved_catalog
+    identities = saved_catalog(config).get('identities', {}) if bound_gateway(settings, base) else {}
+    if bound_gateway(settings, base):
+        from .magpie import group_models
+        from .mt_catalog import read_registry, offer_billing
+        from .mt_identity import canonical_model, dynamic_model
+        registry = read_registry(settings, saved_catalog(config))
+        for _, _, model in models:
+            for owner, name, provider in group_models(registry, model):
+                member = owner + '/' + name
+                if member not in identities and not dynamic_model(member):
+                    identities[member] = {'models': [canonical_model(member)], 'dynamic': False,
+                                          'billing': offer_billing(provider, name)}
+    from .mt_identity import valid_identity_map
+    if not valid_identity_map(identities):
+        raise _invalid()
+    return {'format_version': 6, 'entries': entries, 'routing': routing, 'quality': quality,
+            'identities': copy.deepcopy(identities)}
 
 
 def saved_route(manifest):
@@ -111,8 +129,14 @@ def saved_route(manifest):
     if not isinstance(manifest, dict):
         raise _invalid()
     snapshot = manifest.get('mt_route_snapshot')
-    if (not isinstance(snapshot, dict) or set(snapshot) != {'format_version', 'entries', 'routing', 'quality'} or
-            type(snapshot['format_version']) is not int or snapshot['format_version'] != 5 or
+    from .mt_identity import valid_identity_map
+    fields = {'format_version', 'entries', 'routing', 'quality'}
+    if isinstance(snapshot, dict) and snapshot.get('format_version') == 6:
+        fields.add('identities')
+        if not valid_identity_map(snapshot.get('identities')):
+            raise _invalid()
+    if (not isinstance(snapshot, dict) or set(snapshot) != fields or
+            type(snapshot['format_version']) is not int or snapshot['format_version'] not in (5, 6) or
             type(manifest.get('translation_strategy_version')) is not int or
             manifest['translation_strategy_version'] != 6 or not isinstance(snapshot['entries'], list) or
             len(snapshot['entries']) != 6 or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):

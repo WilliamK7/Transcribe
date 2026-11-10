@@ -12,7 +12,8 @@ from pathlib import Path
 
 from .bailian_quota import CLIQuotaSource, ModelAccessSource, VerifiedIdentity, beijing_today, parse_observation
 from .common import Cancelled, ToolError, atomic_json
-from .mt_admission import ModelEvaluator, admission_key, canonical_model
+from .mt_admission import ModelEvaluator, admission_key
+from .mt_identity import canonical_model
 from .mt_backend import key_fingerprint, normalize_mt_url
 from .mt_control import MTControl
 
@@ -121,7 +122,7 @@ class BailianFreeGuard:
             raise ToolError('无法管理百炼试用入口；请检查 magpie 便携目录。', 'magpie_group')
         process = None
         try:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + (30 if args[:2] == ('provider', 'refresh') else 5)
             process = subprocess.Popen([str(executable), *args], stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False, close_fds=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
@@ -527,29 +528,32 @@ class BailianFreeGuard:
             if not roles:
                 self.remove(model, 'admission_rejected')
                 continue
-            reserved = self.state.get('reserved_models', {})
-            actual = evaluation.get('actual_models') or [canonical_model(model)]
-            forced = {reserved[m] for m in actual if m in reserved}
-            eligible = [r for r in ROLES if r in roles and (not forced or forced == {r})]
-            if not eligible:
-                self.remove(model, 'role_conflict')
-                continue
-            if (len(active) >= 2 and not any(self.state['models'][m]['role'] == 'translate' for m in active)
-                    and 'translate' not in eligible):
-                self.remove(model, 'standby')
-                continue
-            thinking = evaluation.get('non_thinking', {})
-            role = min(eligible, key=lambda r: (sum(self.state['models'][m]['role'] == r for m in active),
-                r == 'review' and isinstance(thinking, dict) and not thinking.get('review')))
-            identity = self._lane(template, model, evaluation.get('limits', {}))
-            item = self.state['models'].setdefault(model, {'provider': identity, 'role': role, 'status': 'ready'})
-            item['role'] = role
-            for actual_model in actual:
-                reserved[actual_model] = role
-            self.state['reserved_models'] = reserved
-            self._join(model, item)
-            if item.get('status') == 'active':
-                active.append(model)
+            # Gateway maintenance uses this same lock when assigning roles.
+            # Never publish an admission using reservations read before its switch.
+            with self.lock:
+                reserved = self.state.get('reserved_models', {})
+                actual = evaluation.get('actual_models') or [canonical_model(model)]
+                forced = {reserved[m] for m in actual if m in reserved}
+                eligible = [r for r in ROLES if r in roles and (not forced or forced == {r})]
+                if not eligible:
+                    self.remove(model, 'role_conflict')
+                    continue
+                if (len(active) >= 2 and not any(self.state['models'][m]['role'] == 'translate' for m in active)
+                        and 'translate' not in eligible):
+                    self.remove(model, 'standby')
+                    continue
+                thinking = evaluation.get('non_thinking', {})
+                role = min(eligible, key=lambda r: (sum(self.state['models'][m]['role'] == r for m in active),
+                    r == 'review' and isinstance(thinking, dict) and not thinking.get('review')))
+                identity = self._lane(template, model, evaluation.get('limits', {}))
+                item = self.state['models'].setdefault(model, {'provider': identity, 'role': role, 'status': 'ready'})
+                item['role'] = role
+                for actual_model in actual:
+                    reserved[actual_model] = role
+                self.state['reserved_models'] = reserved
+                self._join(model, item)
+                if item.get('status') == 'active':
+                    active.append(model)
         self.state['pool_status'] = 'ready' if active else 'no_candidates'
         self._rank_active(template, active)
         self._save()

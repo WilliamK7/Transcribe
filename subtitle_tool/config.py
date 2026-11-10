@@ -51,14 +51,15 @@ class Settings:
 
 
 class Config:
-    def __init__(self, root: Path | None = None):
+    def __init__(self, root: Path | None = None, *, read_only=False):
         self.root = (root or app_root()).resolve()
         self.data = self.root / "data"
         try:
-            self.data.mkdir(parents=True, exist_ok=True)
-            probe = self.data / (".write-probe-" + str(os.getpid()))
-            probe.write_bytes(b"")
-            probe.unlink()
+            if not read_only:
+                self.data.mkdir(parents=True, exist_ok=True)
+                probe = self.data / (".write-probe-" + str(os.getpid()))
+                probe.write_bytes(b"")
+                probe.unlink()
         except OSError as e:
             raise ToolError("项目 data 目录不可写，请将项目移动到可写目录后运行。", "data_readonly") from e
         self.settings = Settings()

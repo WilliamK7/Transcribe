@@ -42,17 +42,16 @@ def known_free_model(base_url, model):
             (base_url == OPENROUTER_BASE_URL and (model == 'openrouter/free' or model.endswith(':free'))))
 
 
-def billing_route(settings, model):
+def billing_route(settings, model, identities=None):
     """Classify the selected offer; this is not a receipt or cash estimate."""
     try:
         owner, name = model.split('/', 1)
-        raw = json.loads((Path(settings.magpie_data_dir) / 'providers.json').read_bytes())
+        from .mt_catalog import read_registry, offer_billing
+        if model in (identities or {}):
+            return identities[model]['billing']
+        raw = read_registry(settings)
         provider = next(p for p in raw['providers'] if p['id'] == owner)
-        if owner.startswith('transcribe-bailian-trial-'):
-            return 'trial'
-        if provider.get('countFree') or known_free_model(normalize_mt_url(provider.get('chat')), name):
-            return 'free'
-        return 'commercial'
+        return offer_billing(provider, name)
     except (OSError, ValueError, KeyError, TypeError, StopIteration, ToolError):
         return 'unknown'
 
@@ -100,23 +99,26 @@ def group_models(raw, model):
         if provider.get('fallback'):
             raise ValueError()
         plain = re.sub(r':(?:none|minimal|low|medium|high|xhigh|max)$', '', name)
+        if plain in provider.get('modelsOff', []) or provider.get('_models', {}).get(plain, {}).get('decides'):
+            return []
         return [(owner, plain, provider)]
     return visit(model, set())
 
 
-def validate_group(settings, model, *, base_url=None, paid_only=False):
+def validate_group(settings, model, *, base_url=None, paid_only=False, identities=None):
     """Validate enabled local routes, preserving account identity in the gateway."""
     if not bound_gateway(settings, base_url or settings.mt_base_url):
         return
     from .mt_backend import QINIU_FREE_MODEL, qiniu_free_active
     try:
-        raw = json.loads((Path(settings.magpie_data_dir) / 'providers.json').read_bytes())
+        from .mt_catalog import read_registry, offer_billing
+        raw = read_registry(settings)
         leaves = group_models(raw, model)
         if not leaves:
             raise ValueError()
         for owner, name, provider in leaves:
-            trial = owner.startswith('transcribe-bailian-trial')
-            if paid_only and (trial or known_free_model(normalize_mt_url(provider.get('chat')), name)):
+            fee = (identities or {}).get(owner + '/' + name, {}).get('billing') or offer_billing(provider, name)
+            if paid_only and fee != 'commercial':
                 raise ValueError()
             if name == QINIU_FREE_MODEL and not qiniu_free_active():
                 if not _pause_expired_promotion(settings, owner, provider):
@@ -125,19 +127,20 @@ def validate_group(settings, model, *, base_url=None, paid_only=False):
         raise ToolError('magpie 字幕角色组不可用，请检查组成员、账户和商业后备。', 'magpie_group') from None
 
 
-def validate_role_pools(settings, entries, *, base_url=None):
-    from .mt_admission import canonical_model
+def validate_role_pools(settings, entries, *, base_url=None, identities=None, registry=None):
+    from .mt_identity import model_set
+    from .mt_catalog import read_registry
     if not bound_gateway(settings, base_url or settings.mt_base_url):
         return
     try:
-        raw = json.loads((Path(settings.magpie_data_dir) / 'providers.json').read_bytes())
-        identities = {}
+        raw = registry if registry is not None else read_registry(settings)
+        assigned = {}
         for role, models in entries.items():
-            for _, name, _ in [leaf for model in ([models] if isinstance(models, str) else models)
+            for owner, name, _ in [leaf for model in ([models] if isinstance(models, str) else models)
                                for leaf in group_models(raw, model)]:
-                identity = canonical_model(name)
-                if identity in identities and identities[identity] != role:
-                    raise ValueError()
-                identities[identity] = role
+                for identity in model_set(owner + '/' + name, identities):
+                    if identity in assigned and assigned[identity] != role:
+                        raise ValueError()
+                    assigned[identity] = role
     except (OSError, ValueError, KeyError, TypeError):
         raise ToolError('正文、复核和裁决组需要使用互不重叠的底层型号。', 'magpie_group') from None

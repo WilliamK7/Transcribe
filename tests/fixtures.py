@@ -40,7 +40,7 @@ def set_asr_account(config, key):
         atomic_json(path, {
             'providers': [{'id': 'free', 'chat': 'https://openrouter.ai/api/v1'},
                           {'id': 'transcribe-bailian', 'chat': f'https://{workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'key': key}],
-            'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
+            'groups': [{'id': 'transcribe-free', 'members': ['free/provider/draft:free']},
                        {'id': 'transcribe', 'members': ['group/transcribe-free']},
                        {'id': 'transcribe-paid', 'members': ['transcribe-bailian/qwen3.8-flash']},
                        {'id': 'transcribe-review', 'members': ['transcribe-bailian/review-model']},

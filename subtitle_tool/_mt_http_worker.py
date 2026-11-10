@@ -29,7 +29,10 @@ def main():
                 if len(body) + len(chunk) > MAX_RESPONSE:
                     return {'error': 'response_too_large'}
                 body.extend(chunk)
-            return {'status': response.status_code, 'body': base64.b64encode(body).decode('ascii')}
+            identity = response.headers.get('x-vsr-selected-model')
+            headers = ({'x-vsr-selected-model': identity} if isinstance(identity, str) and
+                       len(identity) <= 160 and '\r' not in identity and '\n' not in identity else {})
+            return {'status': response.status_code, 'body': base64.b64encode(body).decode('ascii'), 'headers': headers}
     except requests.RequestException:
         return {'error': 'network'}
     except Exception:

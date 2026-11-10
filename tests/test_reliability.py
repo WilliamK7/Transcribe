@@ -37,7 +37,8 @@ class TransactionRecoveryTests(SavedResultFixture):
                                 value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
                                          {'translations': {item['id']: '中' * 50
                                                            for item in data['fragments']}})
-                                return response({'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(value)}}]})
+                                return response({'model': 'synthetic/' + stage,
+                                    'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(value)}}]})
                             return original_request(method, url, **kwargs)
                         fake.request = request
                         method = "initialize_subtitles" if boundary == "initialize" else "save_layout"

@@ -53,6 +53,7 @@ class LocalServer:
         self.release = threading.Event()
         self.disconnected = threading.Event()
         self.body = b'{"ok":true}'
+        self.headers = {}
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -66,6 +67,8 @@ class LocalServer:
                     owner.release.wait(10)
                 try:
                     self.send_response(200)
+                    for key, value in owner.headers.items():
+                        self.send_header(key, value)
                     self.end_headers()
                     if self.path == '/slow':
                         for _ in range(200):
@@ -125,6 +128,12 @@ class ProcessTransportTests(TemporaryTest):
         self.assertEqual(caught.exception.category, 'response_too_large')
         self.assertEqual(self.children.active_count, 0)
         self.assertNotIn('xxxx', str(caught.exception))
+
+    def test_only_underlying_identity_response_header_crosses_process_boundary(self):
+        self.server.headers = {'X-Vsr-Selected-Model': 'qwen/qwen3.8-27b',
+                               'Set-Cookie': 'private-cookie', 'Authorization': 'private-key'}
+        response = self.send('/ok', timeout=5)
+        self.assertEqual(response.headers, {'x-vsr-selected-model': 'qwen/qwen3.8-27b'})
 
     def test_private_pipes_hidden_process_and_no_key_in_arguments(self):
         with mock.patch('subtitle_tool.mt_transport.subprocess.Popen', wraps=subprocess.Popen) as start:

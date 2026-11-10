@@ -51,7 +51,7 @@ def batch_response_metadata(body):
 
 
 def safe_model_id(value):
-    if (isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}', value)
+    if (isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}', value.replace('/@cf/', '/cf/'))
             and '://' not in value and not value.lower().startswith(('sk-', 'bearer'))):
         return value
     return ''
@@ -135,7 +135,7 @@ class MTDiagnostics:
             value = event.get(field)
             if type(value) is int and minimum <= value <= maximum:
                 record[field] = value
-        for field in ['model', 'actual_model']:
+        for field in ['model', 'actual_model', 'resolved_model']:
             model = safe_model_id(event.get(field))
             if model:
                 record[field] = model

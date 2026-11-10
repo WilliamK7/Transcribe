@@ -24,6 +24,7 @@ from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, QUALITY_PROMPT
 from .mt_routing import STAGE_TIMEOUT, MagpieRoute, RouteEntry, RouteExhausted, RouteFailure
 from .mt_runtime import service_failure
 from .mt_transport import TransportError
+from .mt_identity import canonical_model, resolve_model, dynamic_model
 from .review import decision_origin
 from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, split_mt_units,
                         validate_unit_coverage)
@@ -34,8 +35,16 @@ def _digest(value):
 
 
 def _independent_model(model, forbidden):
-    from .mt_admission import canonical_model
-    return not forbidden or bool(model and not model.startswith('group/') and canonical_model(model) not in forbidden)
+    return bool(model and not model.startswith('group/') and not dynamic_model(model) and
+                canonical_model(model) not in forbidden)
+
+
+def _record_model(record, identities):
+    return resolve_model(record['actual_model'], {}, identities, saved=record.get('resolved_model'), require_admitted=True)
+
+
+def _proof_model(proof):
+    return proof.get('resolved_model') or canonical_model(proof['actual_model'])
 
 
 class GroupProgress:
@@ -202,7 +211,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                 final = saved['record']
                 required = {'backend', 'request_model', 'actual_model', 'production_stage_key', 'translation_stage_key',
                             'review_stage_keys', 'correction_stage_keys', 'cue_ids', 'value', 'warning', 'stage'}
-                if (set(final) != required or final['stage'] != 'final' or type(final['warning']) is not bool or
+                if (set(final) - {'resolved_model'} != required or final['stage'] != 'final' or type(final['warning']) is not bool or
                         not isinstance(final['actual_model'], str) or
                         safe_model_id(final['actual_model']) != final['actual_model'] or
                         not isinstance(final['cue_ids'], list) or not final['cue_ids'] or
@@ -220,6 +229,11 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         proof['record'].get('actual_model') != final['actual_model'] or
                         {'translations': proof['record'].get('value', {}).get('translations')} != final['value']):
                     raise ValueError()
+                identities = route.get('identities', {})
+                # Fixed-model stages saved before resolved_model was introduced
+                # remain unchanged when a resumed run creates its new final.
+                if _record_model(proof['record'], identities) != _record_model(final, identities):
+                    raise ValueError()
                 source_hashes = None
                 if proof['stage'] == 'translate':
                     source_hashes = proof['record'].get('source_text_hashes')
@@ -229,6 +243,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                             any(not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None
                                 for value in source_hashes)):
                         raise ValueError()
+                resolved_roles = {}
                 for stage_name, keys in [('translate', [final['translation_stage_key']]),
                                          ('review', final['review_stage_keys']),
                                          ('judge', final['correction_stage_keys'])]:
@@ -239,6 +254,12 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         if (not isinstance(entry, dict) or entry['stage'] != stage_name or
                                 not isinstance(entry['record'], dict) or entry['record'].get('stage') != stage_name):
                             raise ValueError()
+                        resolved = _record_model(entry['record'], route.get('identities', {}))
+                        if dynamic_model(entry['record']['actual_model']) and stage_name != 'translate':
+                            raise ValueError()
+                        if resolved in resolved_roles and resolved_roles[resolved] != stage_name:
+                            raise ValueError()
+                        resolved_roles[resolved] = stage_name
                 finals[key] = final, source_hashes
             final, source_hashes = finals[key]
             if (final['backend'] != origin or final['request_model'] != profiles[origin]['backend']['model'] or
@@ -249,7 +270,8 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                     source_hashes[final['cue_ids'].index(cue['cue_id'])] != _digest(cue['text'].strip())):
                 raise ValueError()
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        raise ToolError('译文阶段来源与保存的网关组不一致。', 'cache_mismatch') from None
+        raise ToolError('译文阶段来源或底层型号与快照不一致；无法验证的动态旧记录须用 --reflow 从原始转写重建。',
+                        'cache_mismatch') from None
 
 
 class Pipeline:
@@ -265,7 +287,13 @@ class Pipeline:
         self.transport = mt_transport.ProcessTransport()
         from .bailian_free import BailianFreeGuard
         self.bailian_free = BailianFreeGuard(engine.config, engine.mt_control, job_id=job_id)
+        from .mt_maintenance import ChannelMaintenance
+        self.channel_maintenance = ChannelMaintenance(engine.config, engine.mt_control, trial=self.bailian_free)
         self.snapshot = saved_route(manifest)
+        self.identities = self.snapshot.get('identities', {})
+        self.cache_scope = dict(self.scope)
+        if self.snapshot['format_version'] >= 6:
+            self.cache_scope['model_identity'] = _digest(self.identities)
         self.profiles = {profile['id']: profile for profile in self.snapshot['entries']}
         entries = []
         for profile in self.snapshot['entries']:
@@ -282,6 +310,8 @@ class Pipeline:
         return self.routers['review' if stage == 'glossary' else stage]
 
     def close(self):
+        self.bailian_free.stop.set()
+        self.channel_maintenance.close()
         self.bailian_free.close()
 
     def _event(self, event):
@@ -298,7 +328,20 @@ class Pipeline:
 
     def _validate_gateway(self, entry):
         from .magpie import validate_group, validate_role_pools
+        from .mt_catalog import saved_catalog
+        from .mt_channel_policy import check_provider_policy
+        try:
+            check_provider_policy(self.engine.config, entry.backend.model, base_url=entry.backend.base_url)
+        except ToolError as error:
+            if error.code != 'mt_provider_excluded':
+                raise
+            raise RouteFailure('permission_denied', fallback_allowed=True) from None
+        # Old fixed-model tasks can still use their commercial fallback when a
+        # dynamic member was added to the live group later. Only pool validation
+        # sees that new admission; response and saved-stage evidence stay frozen.
+        pool_identities = {**saved_catalog(self.engine.config).get('identities', {}), **self.identities}
         if not entry.id.endswith('_fallback'):
+            self.channel_maintenance.prepare(self.engine.config.settings, entry.backend.base_url)
             try:
                 self.bailian_free.prepare(self.engine.config.settings, entry.backend.base_url)
                 if self.bailian_free.thread is not None:
@@ -310,9 +353,9 @@ class Pipeline:
         validate_role_pools(self.engine.config.settings, {
             role: [candidate.backend.model for candidate in router.entries
                    if candidate.backend.base_url == entry.backend.base_url] for role, router in self.routers.items()},
-            base_url=entry.backend.base_url)
+            base_url=entry.backend.base_url, identities=pool_identities)
         validate_group(self.engine.config.settings, entry.backend.model, base_url=entry.backend.base_url,
-                       paid_only=entry.id.endswith('_fallback'))
+                       paid_only=entry.id.endswith('_fallback'), identities=self.identities)
 
     def _request_payload(self, stage, data, entry, *, repair=False):
         try:
@@ -373,7 +416,7 @@ class Pipeline:
             event['status'] = status
             event['actual_model'] = safe_model_id(body.get('model')) if isinstance(body, dict) else ''
             from .magpie import billing_route
-            event['billing_route'] = billing_route(self.engine.config.settings, event['actual_model'])
+            event['billing_route'] = billing_route(self.engine.config.settings, event['actual_model'], self.identities)
             self.store.count(self.job_id, 'mt_' + event['billing_route'] + '_response')
             event['entitlement_usage'] = event['cash_spend'] = 'unknown'
             raw_usage = body.get('usage') if isinstance(body, dict) else None
@@ -426,7 +469,14 @@ class Pipeline:
                 raise RouteFailure('output_truncated' if error.category == 'output_truncated' else
                                    'format_exhausted', repairable=repairable,
                                    fallback_allowed=completed or error.category == 'output_truncated') from None
-            if not _independent_model(event['actual_model'], forbidden_models):
+            try:
+                event['resolved_model'] = resolve_model(event['actual_model'], reply.headers, self.identities, require_admitted=True)
+                if dynamic_model(event['actual_model']) and name != 'translate':
+                    raise ValueError()
+            except ValueError:
+                outcome = 'invalid'
+                raise RouteFailure('model_not_independent', fallback_allowed=True) from None
+            if not _independent_model(event['resolved_model'], forbidden_models):
                 outcome = 'invalid'
                 raise RouteFailure('model_not_independent', fallback_allowed=True)
             if usage is None:
@@ -439,7 +489,8 @@ class Pipeline:
             if entry.id.endswith('_fallback'):
                 self.store.count(self.job_id, 'mt_paid_fallback_success')
             outcome = 'valid'
-            return {'value': value, 'actual_model': event['actual_model'], 'usage': usage}
+            return {'value': value, 'actual_model': event['actual_model'],
+                    'resolved_model': event['resolved_model'], 'usage': usage}
         except RouteFailure as error:
             error.request_id = request_id
             raise
@@ -491,7 +542,7 @@ class Pipeline:
 
     def _work_key(self, name, data):
         return _digest({'strategy': 6, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
-                        'scope': self.scope, 'profiles': self.snapshot['entries']})
+                        'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
 
     def stage(self, name, data, *, ids=(), originals=(), saved_only=False, fixed_semantics=False,
               forbidden_models=()):
@@ -524,7 +575,7 @@ class Pipeline:
             saved = stored['record']
             usage = saved.get('usage') if isinstance(saved, dict) else None
             if (stored['stage'] != name or not isinstance(saved, dict) or
-                    set(saved) != {'value', 'backend', 'request_model', 'actual_model', 'usage', 'stage'} | set(evidence) | input_fields or
+                    set(saved) - {'resolved_model'} != {'value', 'backend', 'request_model', 'actual_model', 'usage', 'stage'} | set(evidence) | input_fields or
                     any(saved[k] != value for k, value in evidence.items()) or
                     saved.get('stage') != name or not isinstance(saved.get('backend'), str) or
                     saved.get('backend') not in self.profiles or
@@ -548,9 +599,15 @@ class Pipeline:
                             validate_judgment(value, data)
                     except ToolError:
                         raise ToolError('保存的翻译阶段记录无效。', 'cache_mismatch') from None
-                    if not _independent_model(saved['actual_model'], forbidden_models):
+                    try:
+                        resolved = _record_model(saved, self.identities)
+                    except ValueError:
+                        raise ToolError('保存的动态路由缺少可验证身份，请用 --reflow 从原始转写重建。',
+                                        'cache_mismatch') from None
+                    if not _independent_model(resolved, forbidden_models):
                         return None
                     return value, saved['backend'], {'key': work_key, 'actual_model': saved['actual_model'],
+                                                     'resolved_model': resolved,
                                                      'request_model': saved['request_model']}
             return None
 
@@ -562,7 +619,7 @@ class Pipeline:
             try:
                 entry.backend.credential(self.engine.config)
                 key = stage_cache_key(name, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                                      scope=self.scope)
+                    scope=self.cache_scope)
             except ToolError as error:
                 if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
                     return None
@@ -572,7 +629,7 @@ class Pipeline:
                 return None
             try:
                 record = json.loads(raw)
-                if (not isinstance(record, dict) or set(record) != {'value', 'actual_model', 'usage'} or
+                if (not isinstance(record, dict) or set(record) - {'resolved_model'} != {'value', 'actual_model', 'usage'} or
                         not isinstance(record['actual_model'], str) or
                         safe_model_id(record['actual_model']) != record['actual_model'] or
                         not _valid_usage(record['usage'])):
@@ -580,9 +637,10 @@ class Pipeline:
                 value = validate_stage_value(name, record['value'], ids=ids, originals=originals)
                 if name == 'judge':
                     validate_judgment(value, data)
-                if not _independent_model(record['actual_model'], forbidden_models):
+                resolved = _record_model(record, self.identities)
+                if not _independent_model(resolved, forbidden_models):
                     return None
-                return {'value': value, 'actual_model': record['actual_model'], 'usage': None}
+                return {'value': value, 'actual_model': record['actual_model'], 'resolved_model': resolved, 'usage': None}
             except (ValueError, TypeError, KeyError, ToolError):
                 raise ToolError('翻译阶段缓存无效，未复用。', 'cache_mismatch') from None
 
@@ -616,6 +674,7 @@ class Pipeline:
                 result = self.router_for(name).run(invoke, validate=self._validate_gateway, deadline=deadline)
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
             'model': result.entry.backend.model, 'actual_model': result.value['actual_model'],
+            'resolved_model': result.value.get('resolved_model'),
             'gateway_session': self.context.gateway_session, 'request_id': self.context.request_id,
             'duration_ms': round((time.monotonic() - started) * 1000),
             'attempt': result.attempts, 'cached': result.cached,
@@ -628,14 +687,15 @@ class Pipeline:
             # Its cross-task cache still keys the exact fitted wire request.
             record['context'] = data.get('context', [])
         cache_key = stage_cache_key(name, data, result.entry.backend,
-                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.scope)
+                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             self.store.commit_mt_stage(self.job_id, work_key, name, record,
                 cache_key=None if result.cached else cache_key,
                 cache_value=None if result.cached else json.dumps(result.value, ensure_ascii=False),
                 counts={'mt_v6_' + name + ('_cache_hit' if result.cached else '_completed'): 1})
-        proof = {'key': work_key, 'actual_model': record['actual_model'], 'request_model': record['request_model']}
+        proof = {'key': work_key, 'actual_model': record['actual_model'], 'request_model': record['request_model'],
+                 'resolved_model': _record_model(record, self.identities)}
         if not result.cached:
             proof.update(request_id=self.context.request_id, gateway_session=self.context.gateway_session)
         return record['value'], record['backend'], proof
@@ -812,10 +872,9 @@ class Pipeline:
                 warning = True
                 break
             review_data = {**data, 'translations': current}
-            from .mt_admission import canonical_model
-            forbidden_models = {canonical_model(translation_proof['actual_model'])}
+            forbidden_models = {_proof_model(translation_proof)}
             if production is not translation_proof:
-                forbidden_models.add(canonical_model(production['actual_model']))
+                forbidden_models.add(_proof_model(production))
             try:
                 review, _, review_proof = self.stage('review', review_data, ids=ids,
                                                     fixed_semantics=True, forbidden_models=forbidden_models)
@@ -832,8 +891,7 @@ class Pipeline:
                 break
             try:
                 correction_data = {**review_data, 'issues': review['issues']}
-                forbidden_models = {canonical_model(translation_proof['actual_model']),
-                                    canonical_model(review_proof['actual_model'])}
+                forbidden_models = {_proof_model(translation_proof), _proof_model(review_proof)}
                 stalled = correction_stalled(previous_correction, correction_data)
                 correction = self.stage('judge', correction_data, ids=ids, originals=originals,
                                         saved_only=stalled, fixed_semantics=True,
@@ -853,9 +911,10 @@ class Pipeline:
                 warning = True
                 break
         final_key = _digest({'stage': 'final', 'strategy': 6, 'cues': [c['cue_id'] for c in members],
-                             'data': data, 'scope': self.scope, 'profiles': self.snapshot['entries']})
+                             'data': data, 'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
         record = {'backend': origin, 'request_model': production['request_model'],
                   'actual_model': production['actual_model'], 'production_stage_key': production['key'],
+                  'resolved_model': _proof_model(production),
                   'translation_stage_key': translation_proof['key'], 'review_stage_keys': review_keys,
                   'correction_stage_keys': correction_keys, 'cue_ids': [cue['cue_id'] for cue in members],
                   'value': {'translations': current}, 'warning': warning, 'stage': 'final'}

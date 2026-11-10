@@ -25,6 +25,7 @@ class PoolPipelineFixture(SavedResultFixture):
         self.glossary_terms = lambda data: []
         self.corrected_translations = None
         self.actual_model = lambda stage, request: {'glossary': 'review-model'}.get(stage, stage + '-model')
+        self.response_headers = lambda stage, request: {}
 
     def run_pool(self, cancel=None, engine=None, run=None):
         parent = self
@@ -69,7 +70,8 @@ class PoolPipelineFixture(SavedResultFixture):
                             'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}
                 if stage == parent.cancel_after and cancel is not None:
                     cancel.set()
-                return HTTPReply(200, json.dumps(response, ensure_ascii=False).encode('utf-8'))
+                return HTTPReply(200, json.dumps(response, ensure_ascii=False).encode('utf-8'),
+                                 parent.response_headers(stage, payload['model']))
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport', return_value=Transport()):
             return run() if run is not None else (engine or Engine(self.config, self.store, cancel)).run(self.job_id)
 
