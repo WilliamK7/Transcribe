@@ -25,27 +25,24 @@ TEMP = ROOT / ".build" / "test-temp"
 TEMP.mkdir(parents=True, exist_ok=True)
 
 
-GATEWAY = {'base_url': 'http://127.0.0.1:3425/v1', 'asr_provider': 'transcribe-bailian',
-           'upload_provider': 'transcribe-upload', 'key': 'synthetic-gateway-key'}
+ASR_KEY = 'synthetic-asr-key'
 
 
 def set_asr_account(config, key):
-    """Write a synthetic central registry while retaining its current MT groups."""
+    """Keep the ASR credential independent of the synthetic MT registry."""
+    config.set_key(key)
     workspace = config.settings.workspace_id or 'offline-space'
     config.settings.workspace_id = workspace
     registry = Path(config.settings.magpie_data_dir) if config.settings.magpie_data_dir else config.root / 'magpie'
     config.settings.magpie_data_dir = str(registry)
     path = registry / 'providers.json'
-    raw = json.loads(path.read_bytes()) if path.exists() else {
-        'providers': [{'id': 'free', 'chat': 'https://openrouter.ai/api/v1'}],
-        'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
-                   {'id': 'transcribe', 'members': ['group/transcribe-free']},
-                   {'id': 'transcribe-paid', 'members': ['transcribe-bailian/qwen3.8-flash']}]}
-    ids = (config.settings.magpie_asr_provider, config.settings.magpie_upload_provider)
-    raw['providers'] = [row for row in raw['providers'] if row['id'] not in ids] + [
-        {'id': ids[0], 'chat': f'https://{workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'key': key},
-        {'id': ids[1], 'chat': 'https://dashscope.aliyuncs.com/compatible-mode/v1', 'key': key}]
-    atomic_json(path, raw)
+    if not path.exists():
+        atomic_json(path, {
+            'providers': [{'id': 'free', 'chat': 'https://openrouter.ai/api/v1'},
+                          {'id': 'transcribe-bailian', 'chat': f'https://{workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'key': key}],
+            'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
+                       {'id': 'transcribe', 'members': ['group/transcribe-free']},
+                       {'id': 'transcribe-paid', 'members': ['transcribe-bailian/qwen3.8-flash']}]})
 
 
 def result(*sentences):
@@ -154,7 +151,7 @@ class TemporaryTest(unittest.TestCase):
         self.addCleanup(transport.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
-        for name in ["MAGPIE_API_KEY", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL", "MT_FALLBACK_MODEL"]:
+        for name in ["DASHSCOPE_API_KEY", "MAGPIE_API_KEY", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL", "MT_FALLBACK_MODEL"]:
             os.environ.pop(name, None)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP)
         self.path = Path(self.temp.name)
@@ -286,12 +283,3 @@ class FakeTransport:
         control.check_start()
         reply = requests.request(method, url, **kwargs)
         return HTTPReply(reply.status_code, reply.content)
-
-
-def configured_backend(config, identity):
-    from subtitle_tool.mt_pool import configured_route, saved_route
-    from subtitle_tool.mt_backend import key_fingerprint, MTBackend
-    manifest = {**identity, 'account': key_fingerprint(config.get_key()), 'translation_strategy_version': 5}
-    route = configured_route(config, manifest)
-    route = saved_route({**manifest, 'mt_route_snapshot': route})
-    return MTBackend.from_snapshot(next(e['backend'] for e in route['entries'] if e['backend'] is not None))

@@ -13,6 +13,24 @@ from tests.mt_fixtures import PoolPipelineFixture
 
 
 class PoolPipelineTests(PoolPipelineFixture):
+    def test_eight_workers_make_progress_together_and_preserve_all_groups(self):
+        self.config.settings.mt_workers = 8
+        raw = result(*[(f'Technical sentence {i}.', 'en') for i in range(64)])
+        for i, sentence in enumerate(raw['transcripts'][0]['sentences']):
+            sentence['begin_time'], sentence['end_time'] = i * 100, i * 100 + 90
+        self.save_result(raw)
+        Engine(self.config, self.store).reflow(self.job_id)
+        gate = threading.Barrier(8, timeout=10)
+        def hook(stage, data):
+            if stage == 'glossary':
+                gate.wait()
+        self.stage_hook = hook
+        self.assertEqual(self.run_pool(), 'completed')
+        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        self.assertEqual(len(drafts), 8)
+        self.assertEqual({s['text'] for data in drafts for s in data['sentences']},
+                         {f'Technical sentence {i}.' for i in range(64)})
+
     def set_input_budget(self, entry_id, size):
         manifest = self.store.job(self.job_id)['manifest']
         for entry in manifest['mt_route_snapshot']['entries']:

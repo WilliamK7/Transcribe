@@ -34,4 +34,8 @@ uv pip sync requirements.lock --require-hashes --python .venv\Scripts\python.exe
 
 `scripts/transcribe.ps1` 保留调用者当前目录，相对媒体与报告路径按调用位置解释。运行数据及恢复资料见[数据与恢复](API_CONTRACT.md#数据与恢复)。
 
-运行时连接常驻 magpie 网关，配置见 [README](../README.md#配置-magpie)。升级 magpie 后核对原生 POST 单次转发、组费用隔离及会话关联；可用合成短句和只读上传策略请求检查接入。真实长视频识别与人工字幕质量另行验证。
+仅翻译连接常驻 magpie 网关，配置见 [README](../README.md#配置-magpie)。升级 magpie 后核对嵌套组顺序／轮询、组费用隔离及请求会话关联；可用合成短句检查翻译。ASR 单独用只读上传策略请求验证直连接入；真实识别提交与人工字幕质量另行验证。
+
+百炼试用准入依赖官方 `bailian-cli` **2.7.2**（`bl` 在 PATH 中）和 Node.js。适配器校验 CLI 及实际加载的 SDK 版本，查询额度、模型和“用完即停”状态。已确认的 AK/SK 上下文可生成临时查询令牌，凭据与令牌仅在内存及子进程管道中传递。
+
+CLI 缺失、版本或账户不匹配、查询失败、缺少有效 `data/bailian-quota-binding.json` 时，项目自动停用专用试用入口。更换账户后重新确认绑定；升级 CLI 时核对官方额度接口和本地适配器。其他翻译入口与直连 ASR 可独立运行。

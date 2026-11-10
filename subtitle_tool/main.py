@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import signal
@@ -31,6 +32,7 @@ def parser():
     actions.add_argument('--state-machine', action='store_true', help='输出任务状态契约 JSON，无需配置或任务库')
     actions.add_argument("--export-archive", metavar="JOB_ID", help="校验并导出归档字幕，须指定 --output-dir")
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
+    actions.add_argument('--configure-key', action='store_true', help='隐藏输入百炼 Key，保存到 data/key.txt')
     actions.add_argument('--check-mt', action='store_true', help='用合成文本在线检查 magpie 字幕组')
     actions.add_argument("--self-test", action="store_true", help="仅执行本机诊断，不访问云端")
     result.add_argument("--workspace-id", help="本次新任务使用的北京 Workspace ID（域名标签）")
@@ -241,7 +243,7 @@ def main(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
     action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.state_machine or args.cancel or
-              args.check_mt or args.self_test or
+              args.check_mt or args.self_test or args.configure_key or
               args.export_archive)
     if not args.files and not action:
         argument_parser.print_help()
@@ -276,6 +278,12 @@ def main(argv=None):
     previous_signal = None
     processing = False
     try:
+        if args.configure_key:
+            if not interactive:
+                raise ToolError('请在交互终端配置百炼 Key，或设置 DASHSCOPE_API_KEY。', 'credentials')
+            config.set_key(getpass.getpass('北京百炼 API Key（隐藏输入）：', stream=sys.stderr))
+            print('Key 已保存到 data/key.txt；DASHSCOPE_API_KEY 环境变量仍优先。', file=sys.stderr)
+            return 0
         if args.check_mt:
             from .mt_backend import key_fingerprint
             from .mt_pool import configured_route

@@ -54,44 +54,6 @@ class MagpieTests(TemporaryTest):
         self.assertEqual(error.exception.code, 'mt_account_changed')
 
 
-    def test_magpie_is_authoritative_for_asr_account_and_workspace(self):
-        registry = self.path / 'magpie'
-        registry.mkdir(exist_ok=True)
-        rows = [
-            {'id': 'transcribe-bailian', 'chat': 'https://offline-space.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
-             'key': 'central-asr'},
-            {'id': 'transcribe-upload', 'chat': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-             'key': 'central-asr'},
-        ]
-        atomic_json(registry / 'providers.json', {'providers': rows})
-        self.config.settings.magpie_data_dir = str(registry)
-        self.identity['account'] = key_fingerprint('central-asr')
-        self.assertEqual(self.config.get_key(), 'central-asr')
-        gateway = self.config.asr_gateway(self.identity)
-        self.assertEqual(gateway['key'], 'magpie-transcribe')
-        self.assertEqual(gateway['asr_provider'], 'transcribe-bailian')
-        self.config.settings.magpie_base_url = 'https://another.example/v1'
-        with self.assertRaises(ToolError):
-            self.config.asr_gateway(self.identity)
-        self.config.settings.magpie_base_url = 'http://127.0.0.1:3425/v1'
-        rows[0]['chat'] = 'https://another-space.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
-        atomic_json(registry / 'providers.json', {'providers': rows})
-        with self.assertRaises(ToolError):
-            self.config.asr_gateway(self.identity)
-
-        rows[0]['chat'] = 'https://offline-space.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
-        rows[0]['key'] = rows[1]['key'] = 'rotated-account'
-        atomic_json(registry / 'providers.json', {'providers': rows})
-        with self.assertRaises(ToolError) as error:
-            self.config.asr_gateway(self.identity)
-        self.assertEqual(error.exception.code, 'account_changed')
-        rows[0]['chat'] = 'https://offline-space.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
-        rows[1]['key'] = 'other-account'
-        atomic_json(registry / 'providers.json', {'providers': rows})
-        with self.assertRaises(ToolError):
-            self.config.asr_gateway(self.identity)
-
-
     def test_local_free_group_cannot_gain_a_paid_fallback_or_expired_promotion(self):
         from subtitle_tool.magpie import validate_group
         registry = self.path / 'gateway'
@@ -307,15 +269,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
         self.assertEqual(self.run_pool(), 'completed')
         self.assertNotIn('glossary', [stage for stage, _, _ in self.calls])
         self.assertEqual({data['_model'] for _, _, data in self.calls}, {'group/transcribe'})
-
-    def test_gateway_failure_never_falls_back_to_direct_provider(self):
-        self.config.settings.mt_routing = {'paid_enabled': False}
-        self.fail_stage = 'draft'
-        self.install()
-        self.assertEqual(self.run_pool(), 'failed')
-        self.assertTrue(self.calls)
-        self.assertEqual({url for _, url, _ in self.calls}, {'http://127.0.0.1:3425/v1/chat/completions'})
-        self.assertEqual({data['_model'] for _, _, data in self.calls}, {'group/transcribe-free'})
 
     def test_gateway_requests_member_model_for_saved_provenance(self):
         from subtitle_tool.mt_pipeline import check_pool

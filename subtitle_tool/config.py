@@ -5,7 +5,7 @@ import os
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from .common import ToolError, atomic_json, validate_workspace_id
+from .common import ToolError, atomic_bytes, atomic_json, validate_workspace_id
 
 
 def app_root() -> Path:
@@ -16,16 +16,13 @@ def app_root() -> Path:
 class Settings:
     region: str = "beijing"
     workspace_id: str = ""
-    mt_workers: int = 4
+    mt_workers: int = 16
     mt_base_url: str = "http://127.0.0.1:3425/v1"
     mt_model: str = ""
     mt_free_model: str = "group/transcribe-free"
     mt_fallback_model: str = "group/transcribe-paid"
     mt_policy_version: int = 1
     magpie_data_dir: str = ""
-    magpie_asr_provider: str = "transcribe-bailian"
-    magpie_upload_provider: str = "transcribe-upload"
-    magpie_base_url: str = "http://127.0.0.1:3425/v1"
     mt_routing: dict | None = None
     mt_quality: dict | None = None
     channel: str = "ask"
@@ -40,8 +37,8 @@ class Settings:
             raise ToolError("仅支持北京工作空间，请检查 data/settings.json。", "config")
         if self.workspace_id:
             self.workspace_id = validate_workspace_id(self.workspace_id)
-        if not 1 <= self.mt_workers <= 4:
-            raise ToolError("翻译并发数必须为 1～4。", "config")
+        if type(self.mt_workers) is not int or self.mt_workers < 1:
+            raise ToolError("翻译并发数必须为正整数。", "config")
         if self.channel not in {"ask", "mix", "left", "right"}:
             raise ToolError("声道设置无效。", "config")
         if not 1 <= self.poll_seconds <= 60 or self.poll_timeout_seconds <= 0:
@@ -95,25 +92,26 @@ class Config:
             return 'magpie-transcribe'
         raise ToolError('远程 magpie 需要 MAGPIE_API_KEY 或 data/magpie-key.txt。', 'credentials')
 
-    def asr_gateway(self, manifest):
-        from .magpie import asr_providers
-        from .mt_backend import key_fingerprint, normalize_mt_url
-        provider, _ = asr_providers(self.settings, manifest['workspace_id'])
-        if key_fingerprint(self.validate_key(provider['key'])) != manifest.get('account'):
-            raise ToolError('此任务的 magpie 百炼 Key 已变更；不能跨账户复用任务或缓存。', 'account_changed')
-        base = normalize_mt_url(self.settings.magpie_base_url)
-        return {'base_url': base, 'asr_provider': self.settings.magpie_asr_provider,
-                'upload_provider': self.settings.magpie_upload_provider, 'key': self.get_magpie_key(base)}
-
     @staticmethod
     def validate_key(key):
+        if not isinstance(key, str):
+            raise ToolError("API Key 无效。", "credentials")
         key = key.strip()
-        if not key or any(c.isspace() for c in key):
+        if not key or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in key):
             raise ToolError("API Key 为空或包含空白字符。", "credentials")
         return key
 
     def get_key(self) -> str:
-        from .magpie import asr_providers
-        provider, _ = asr_providers(self.settings, self.settings.workspace_id)
-        # Fingerprint the central ASR account; requests use gateway credentials.
-        return self.validate_key(provider['key'])
+        env = os.environ.get('DASHSCOPE_API_KEY', '').strip()
+        if env:
+            return self.validate_key(env)
+        try:
+            return self.validate_key((self.data / 'key.txt').read_text(encoding='utf-8'))
+        except (OSError, UnicodeError):
+            raise ToolError('请用 --configure-key 配置百炼 Key，或设置 DASHSCOPE_API_KEY。', 'credentials') from None
+
+    def set_key(self, key):
+        try:
+            atomic_bytes(self.data / 'key.txt', self.validate_key(key).encode('utf-8'))
+        except OSError:
+            raise ToolError('无法保存百炼 Key，请检查 data 目录权限。', 'credentials') from None

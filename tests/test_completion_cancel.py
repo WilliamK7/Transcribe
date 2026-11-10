@@ -7,7 +7,7 @@ from unittest import mock
 from subtitle_tool.api import Bailian, Http
 from subtitle_tool.common import Cancelled
 from subtitle_tool.engine import Engine
-from tests.fixtures import GATEWAY, enqueue_current, FakeService, PipelineFixture, TemporaryTest, response, result
+from tests.fixtures import ASR_KEY, enqueue_current, FakeService, PipelineFixture, TemporaryTest, response, result
 
 
 class CompletionTests(PipelineFixture):
@@ -142,7 +142,7 @@ class CancelBoundaryTests(TemporaryTest):
                   "x_oss_object_acl": "private", "x_oss_forbid_overwrite": "true", "max_file_size_mb": 1000}
         for boundary in ["progress", "count"]:
             cancel = threading.Event()
-            cloud = Bailian("beijing", cancel, workspace_id="offline-space", gateway=GATEWAY)
+            cloud = Bailian("beijing", cancel, workspace_id="offline-space", key=ASR_KEY)
             if boundary == "progress":
                 cloud.progress = lambda *args: cancel.set()
             else:

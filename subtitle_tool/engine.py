@@ -462,13 +462,13 @@ class Engine:
 
         def client():
             nonlocal api
-            gateway = self.config.asr_gateway(manifest)
+            key, _ = self.identity(job_id, manifest, persist=False)
             if api is None:
                 api = Bailian(manifest["region"], self.cancel,
                     count=lambda name: self.store.count(job_id, name),
                     progress=lambda name, done, total: self.progress(job_id, name, done, total),
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"],
-                    gateway=gateway)
+                    key=key)
             return api
 
         def save_failure(state, error, code, request_id=""):

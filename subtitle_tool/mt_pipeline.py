@@ -259,6 +259,8 @@ class Pipeline:
         self.diagnostics = MTDiagnostics(engine.config.root, job_id)
         from . import mt_transport
         self.transport = mt_transport.ProcessTransport()
+        from .bailian_free import BailianFreeGuard
+        self.bailian_free = BailianFreeGuard(engine.config, engine.mt_control)
         self.snapshot = saved_route(manifest)
         self.profiles = {profile['id']: profile for profile in self.snapshot['entries']}
         entries = []
@@ -283,9 +285,14 @@ class Pipeline:
 
     def _validate_gateway(self, entry):
         from .magpie import validate_group
-        validate_group(self.engine.config.settings, entry.backend.model,
-                       free_only=entry.tier == 'free', base_url=entry.backend.base_url,
-                       paid_only=entry.id == 'magpie_fallback')
+        from dataclasses import replace
+        settings = replace(self.engine.config.settings,
+            mt_free_model=self.profiles['magpie_free']['backend']['model'])
+        with self.bailian_free.synchronized():
+            self.bailian_free.prepare(settings, entry.backend.base_url)
+            validate_group(settings, entry.backend.model,
+                           free_only=entry.tier == 'free', base_url=entry.backend.base_url,
+                           paid_only=entry.id == 'magpie_fallback', verified_free=self.bailian_free.allowed)
 
     def _request_payload(self, stage, data, entry, *, repair=False):
         try:
@@ -879,7 +886,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
     """Schedule ready translations first; prefix waits never occupy a worker."""
     engine, job_id = pipeline.engine, pipeline.job_id
     progress = pipeline.group_progress
-    workers = engine.config.settings.mt_workers
+    workers = min(engine.config.settings.mt_workers, max(1, len(groups)))
     prefix = GlossaryPrefix(pipeline, sources)
     glossaries, errors = {}, []
     next_glossary = next_group = 0

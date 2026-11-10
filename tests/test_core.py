@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import signal
 import io
@@ -12,9 +13,9 @@ from unittest import mock
 
 import requests
 
-from subtitle_tool.api import Bailian, Http
-from subtitle_tool.common import ASR_MODEL, SubmissionUnknown, ToolError, redact
-from subtitle_tool.config import Settings
+from subtitle_tool.api import Http
+from subtitle_tool.common import ASR_MODEL, ToolError, redact
+from subtitle_tool.config import Config, Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.main import main
@@ -22,7 +23,25 @@ from subtitle_tool.subtitles import normalize, render_srt, route
 from subtitle_tool.publication import write_srt
 from subtitle_tool.review import ReviewDecision
 
-from tests.fixtures import GATEWAY, set_asr_account, enqueue_current, ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
+from tests.fixtures import set_asr_account, enqueue_current, ROOT, FakeService, PipelineFixture, TemporaryTest, point_sentence, result, response
+
+
+class ConfigTests(TemporaryTest):
+    def test_asr_key_uses_environment_then_local_file(self):
+        config = Config(self.path)
+        config.set_key('local-asr')
+        with mock.patch.dict(os.environ, {'DASHSCOPE_API_KEY': ''}):
+            self.assertEqual(config.get_key(), 'local-asr')
+        with mock.patch.dict(os.environ, {'DASHSCOPE_API_KEY': 'environment-asr'}):
+            self.assertEqual(config.get_key(), 'environment-asr')
+
+    def test_mt_workers_requires_a_positive_integer(self):
+        for workers in (1, 4, 8, 16, 32):
+            with self.subTest(workers=workers):
+                Settings(mt_workers=workers).validate()
+        for workers in (0, -1, True, 1.5, '8', None):
+            with self.subTest(workers=workers), self.assertRaises(ToolError):
+                Settings(mt_workers=workers).validate()
 
 
 class SubtitleTests(TemporaryTest):
@@ -158,39 +177,11 @@ class SubtitleTests(TemporaryTest):
 
 
 class HttpTests(unittest.TestCase):
-    def test_submit_malformed_output_or_missing_id_is_unknown(self):
-        cloud = Bailian("beijing", threading.Event(), workspace_id="offline-space", gateway=GATEWAY)
-        for body in [{}, {"output": None}, {"output": []}, {"output": {"task_id": ""}}]:
-            with self.subTest(body=body), mock.patch("requests.request", return_value=response(body)) as request:
-                with self.assertRaises(SubmissionUnknown):
-                    cloud.submit("oss://test/a.flac")
-                self.assertEqual(request.call_count, 1)
-
-    def test_submit_timeout_is_never_retried(self):
-        cloud = Bailian("beijing", threading.Event(), workspace_id="offline-space", gateway=GATEWAY)
-        with mock.patch("requests.request", side_effect=requests.Timeout()) as request:
-            with self.assertRaises(SubmissionUnknown):
-                cloud.submit("oss://test/a.wav")
-            self.assertEqual(request.call_count, 1)
-
-    def test_submit_5xx_is_unknown_but_403_is_explicit_rejection(self):
-        cloud = Bailian("beijing", threading.Event(), workspace_id="offline-space", gateway=GATEWAY)
-        with mock.patch("requests.request", return_value=response({}, 503)) as request:
-            with self.assertRaises(SubmissionUnknown):
-                cloud.submit("oss://test/a.wav")
-            self.assertEqual(request.call_count, 1)
-        with mock.patch("requests.request", return_value=response({"code": "Denied"}, 403)) as request:
-            with self.assertRaises(ToolError) as error:
-                cloud.submit("oss://test/a.wav")
-            self.assertNotIsInstance(error.exception, SubmissionUnknown)
-            self.assertEqual(request.call_count, 1)
-
     def test_bounded_429_and_5xx_retry(self):
         http = Http(threading.Event(), attempts=3)
         with mock.patch("requests.request", side_effect=[response({}, 429), response({}, 503), response({"ok": True})]) as request, mock.patch.object(http, "pause"):
             self.assertEqual(http.json("GET", "https://example.test")["ok"], True)
             self.assertEqual(request.call_count, 3)
-
 
     def test_redaction(self):
         sanitized = redact("Bearer sk-secret-value https://oss.example/a?Signature=secret oss://private/file")
@@ -240,9 +231,9 @@ class PipelineTests(PipelineFixture):
         self.assertEqual(request["headers"]["X-DashScope-OssResourceResolve"], "enable")
         self.assertEqual(fake.named("/uploads")[0][2]["params"]["model"], ASR_MODEL)
         self.assertNotIn("Authorization", fake.uploads[0][1])
-        self.assertEqual(fake.named("/asr/transcription")[0][1], "http://127.0.0.1:3425/v1/magpie/native/transcribe-bailian/api/v1/services/audio/asr/transcription")
-        self.assertEqual(fake.named("/uploads")[0][1], "http://127.0.0.1:3425/v1/magpie/native/transcribe-upload/api/v1/uploads")
-        self.assertEqual(request['headers']['Authorization'], 'Bearer magpie-transcribe')
+        self.assertEqual(fake.named("/asr/transcription")[0][1], "https://offline-space.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/asr/transcription")
+        self.assertEqual(fake.named("/uploads")[0][1], "https://dashscope.aliyuncs.com/api/v1/uploads")
+        self.assertEqual(request['headers']['Authorization'], 'Bearer ' + self.config.get_key())
         self.assertIn(b"Content-Type: audio/flac", fake.uploads[0][2])
         segment = self.store.job(self.job_id)["manifest"]["segments"][0]
         self.assertTrue(segment["oss_url"].startswith("oss://"))

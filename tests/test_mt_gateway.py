@@ -604,3 +604,22 @@ class GatewayContractTests(PoolPipelineFixture):
         ends = [event for event in events if event['kind'] == 'request_end']
         self.assertEqual(len({event['gateway_session'] for event in ends}), 2)
         self.assertEqual(len({event['group_key'] for event in ends}), 2)
+
+    def test_cancel_interrupts_gateway_guard_lock_wait_without_reading_or_mutating(self):
+        pipeline = self.pipeline()
+        guard, control = pipeline.bailian_free, pipeline.engine.mt_control
+        entered = threading.Event()
+        def validate():
+            entered.set()
+            pipeline._validate_gateway(pipeline.router.request_entries[0])
+        with mock.patch.object(guard, 'prepare') as prepare, ThreadPoolExecutor(1) as pool:
+            guard.lock.acquire()
+            try:
+                future = pool.submit(validate)
+                self.assertTrue(entered.wait(2))
+                control.cancel_user(force=True)
+                with self.assertRaises(Cancelled):
+                    future.result(1)
+                prepare.assert_not_called()
+            finally:
+                guard.lock.release()

@@ -1,12 +1,13 @@
 # magpie 字幕工具
 
-Windows x64 自用字幕 CLI。北京百炼 `qwen3-asr-flash-filetrans` 负责识别，magpie 字幕组负责翻译。magpie 管理上游凭据、限流与故障切换；项目负责字幕语义、校验、排版与任务恢复。
+Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-filetrans`，管理上传、识别和任务恢复；magpie 只负责翻译上游的凭据、限流与故障切换，项目负责字幕语义、校验与排版。
 
 ## 开始使用
 
 ```powershell
 .\scripts\setup.ps1
 # 完成下方配置并启动 magpie
+.\scripts\transcribe.ps1 --configure-key
 .\scripts\transcribe.ps1 --check-mt --mt-paid deny
 .\scripts\transcribe.ps1 "D:\Videos\课程.mkv"
 ```
@@ -15,28 +16,35 @@ Windows x64 自用字幕 CLI。北京百炼 `qwen3-asr-flash-filetrans` 负责�
 
 ## 配置 magpie
 
-在 magpie 中配置以下入口，并为两者设置同一北京工作空间账户的单一 Key：
+以下为本机翻译入口（magpie 0.1.3423）：
 
-| 入口 ID | `chat` 地址 |
+| 入口 ID | 接入与模型 |
 | --- | --- |
-| `transcribe-bailian` | `https://<workspace_id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` |
-| `transcribe-upload` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `transcribe-qiniu-free` | 七牛兼容接口，固定 `qiniu/conatus-free` |
+| `transcribe-openrouter-free` | 原生 `openrouter` 预设，固定 `openrouter/free` |
+| `transcribe-qiniu-paid` | 七牛兼容接口，商业组选择 `z-ai/glm-5.3-flash` |
+| `transcribe-bailian` | 百炼工作空间兼容接口，商业组选择 `deepseek-v4.1-flash` |
+| `transcribe-bailian-trial` | 同一百炼账户，按已确认额度准入 `qwen3.8-max-0902`、`qwen3.8-27b` |
 
-两个入口保持启用、自定义认证头为空。项目从本机注册表核验账户与工作空间，ASR 提交、查询和上传策略通过网关；OSS 上传与签名结果下载直接访问存储。
+七牛使用 `https://api.qnaigc.com/v1`，百炼使用 `https://<workspace_id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`。地址、模型和凭据统一在 magpie 中维护。
+
+免费／试用入口设 `listOff=true`，使用已核验的模型目录；商业入口允许刷新目录。组成员显式指定，可按需要更换商业模型。`listOff` 控制目录拉取，`off` 控制入口启停。资源包与代金券的抵扣范围以账户账单为准。
 
 本机字幕组配置如下，模型和凭据在 magpie 中维护：
 
-| 组 | 路由 | 成员顺序 |
+| 组 | 路由 | 成员 |
 | --- | --- | --- |
-| `group/transcribe-free` | 顺序 `routing=order` | 七牛 `qiniu/conatus-free` → OpenRouter `openrouter/free` |
-| `group/transcribe` | 免费优先 `routing=free` | 免费组 → 七牛 `deepseek/deepseek-v4.1-flash` → 百炼 `qwen3.8-flash` |
-| `group/transcribe-paid` | 顺序 `routing=order` | 百炼 `qwen3.8-flash` → 七牛 `deepseek/deepseek-v4.1-flash` |
+| `group/transcribe-free` | 轮询 `routing=rotate` | 七牛、OpenRouter、通过额度检查的百炼试用模型 |
+| `group/transcribe` | 顺序 `routing=order` | `group/transcribe-free` → `group/transcribe-paid` |
+| `group/transcribe-paid` | 轮询 `routing=rotate` | 七牛 GLM Flash、百炼 DeepSeek Flash |
 
-三组均设 `stays=off`。免费入口保持服务商级回退为空，OpenRouter 入口使用 20 RPM 或账户要求的更严格值。项目按费用许可选择免费组或总组，由 magpie 完成成员选择。主组超时、响应截断或格式修复失败时，已允许付费的任务自动切换到独立付费组，成功结果随进度保存。时限、重试次数及后备组要求见[阶段恢复](docs/API_CONTRACT.md#阶段恢复)。
+三组均设 `stays=off`（保存字段 `affinity=off`），每个请求重新选路。免费入口的服务商级回退留空，OpenRouter 入口使用 20 RPM 或账户要求的更严格值。项目按费用许可选择免费组或总组。主组超时、响应截断或格式修复失败时，已允许付费的任务切换到商业组；时限及重试规则见[阶段恢复](docs/API_CONTRACT.md#阶段恢复)。
 
 七牛活动截至北京时间 **2026 年 11 月 30 日 23:59**，资格见[官方规则](https://www.qiniu.com/ai/free-models/conatus-2026)。活动到期后，项目通过 magpie CLI 停用专用入口 `transcribe-qiniu-free`；自动停用要求该入口仅配置活动模型，且 magpie 为带 `.portable` 标记、同目录 `data` 的 Windows 便携版。停用失败时停止相关请求；自定义活动入口由用户在 magpie 停用或移出组。
 
-免费组支持上述七牛活动模型和 OpenRouter 的 `openrouter/free`／`:free` 模型，并在请求前核验成员和回退路径。百炼试用额度需另有可验证的网关保护。
+免费组支持上述七牛活动模型、OpenRouter 的 `openrouter/free`／`:free` 模型，以及百炼试用模型。百炼按 `data/bailian-quota-binding.json` 中的用户确认匹配工作空间、Key 与 CLI 账户，并查询每个模型的剩余额度、有效期和“用完即停”。查询结果缓存 20 秒；到期当天、查询失败或绑定不匹配时停用试用入口并移除成员，其他免费入口继续可用。配置更新失败时停止本次请求。
+
+百炼费用边界依赖供应商的“用完即停”，该开关及账户绑定由用户确认。本地查询只用于准入；观察到开关关闭会撤销对应模型的确认，重新开启后须再次确认生效。CLI 环境要求见[环境维护](docs/BUILD.md)。
 
 ## 项目配置
 
@@ -51,18 +59,19 @@ Windows x64 自用字幕 CLI。北京百炼 `qwen3-asr-flash-filetrans` 负责�
 
 | 设置 | 默认值或用途 |
 | --- | --- |
-| `mt_base_url` / `magpie_base_url` | `http://127.0.0.1:3425/v1`，分别用于翻译和 ASR |
+| `mt_base_url` | `http://127.0.0.1:3425/v1`，仅用于翻译 |
 | `mt_free_model` / `mt_model` | `group/transcribe-free` / `group/transcribe` |
 | `mt_fallback_model` | `group/transcribe-paid`，主组超时或结果校验失败后的付费后备 |
-| `magpie_asr_provider` / `magpie_upload_provider` | `transcribe-bailian` / `transcribe-upload` |
 | `mt_policy_version` | 整数 `1`；更换翻译策略并要求重译时递增 |
 | `mt_routing.paid_enabled` | `true`，可由本次 `--mt-paid allow\|deny` 覆盖 |
 | `mt_quality.manual_glossary` | 人工术语映射，最多 200 项 |
-| `mt_workers` | `4`，范围 1～4 |
+| `mt_workers` | 默认 `16`，允许任意正整数；控制同时在途的翻译阶段数 |
 | `zh_line_width` / `other_line_width` | `44` / `84`，范围 12～72 / 24～160 |
 | `chinese_first` | `false`，译文是否位于原文上方 |
 
-翻译地址和组名支持 `MT_BASE_URL`、`MT_MODEL`、`MT_FREE_MODEL`、`MT_FALLBACK_MODEL` 环境覆盖。网关凭据使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机缺省为 `magpie-transcribe`；远程翻译网关须配置凭据。免费证明及 ASR 身份绑定本机注册表所属监听地址，端口修改需同步 magpie 的保存设置。
+ASR Key 使用 `DASHSCOPE_API_KEY`，未设置时读取 `data/key.txt`；`--configure-key` 隐藏输入并保存本地 Key。提交、轮询和上传策略直接使用该 Key，OSS 上传和签名下载不携带它；恢复仍核验原账户指纹。
+
+翻译地址和组名支持 `MT_BASE_URL`、`MT_MODEL`、`MT_FREE_MODEL`、`MT_FALLBACK_MODEL` 环境覆盖。网关凭据使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机缺省为 `magpie-transcribe`；远程翻译网关须配置凭据。免费证明绑定本机注册表所属监听地址，端口修改需同步 magpie 的保存设置。
 
 新任务与 `--reflow` 使用当前配置；`--resume` 沿用任务保存的翻译身份和排版，线程数与轮询等待使用当前值。需要按新策略重新翻译时，递增 `mt_policy_version` 后执行 `--reflow`；保持版本可复用匹配缓存。
 
