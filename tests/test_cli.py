@@ -69,9 +69,9 @@ class CliTests(TemporaryTest):
     def test_pool_progress_describes_active_stages(self):
         progress = Progress()
         with mock.patch('sys.stderr', new_callable=io.StringIO) as output:
-            progress('offline-job', 'mt_v5_progress', {'stages': {'glossary': 1, 'draft': 2}, 'elapsed': 15})
+            progress('offline-job', 'mt_v6_progress', {'stages': {'glossary': 1, 'translate': 2}, 'elapsed': 15})
         self.assertIn('术语分析 1 组', output.getvalue())
-        self.assertIn('整句翻译 2 组', output.getvalue())
+        self.assertIn('字幕翻译 2 组', output.getvalue())
         self.assertIn('15 秒', output.getvalue())
 
 
@@ -81,18 +81,16 @@ class CliTests(TemporaryTest):
         self.assertIn("--check-mt", output.getvalue())
         self.assertFalse((self.config.data / "jobs.sqlite").exists())
 
-
     def test_check_magpie_preserves_effective_gateway_and_groups(self):
         for source in ('settings', 'environment'):
             with self.subTest(source=source):
                 self.config.settings.mt_base_url = 'https://gateway.example/v1'
                 self.config.settings.mt_model = 'group/custom'
-                self.config.settings.mt_free_model = 'group/custom-free'
                 self.config.settings.mt_fallback_model = 'group/custom-paid'
                 environment = {'MAGPIE_API_KEY': 'synthetic-gateway'}
                 if source == 'environment':
                     environment.update(MT_BASE_URL='https://gateway.example/v1',
-                                       MT_MODEL='group/custom', MT_FREE_MODEL='group/custom-free',
+                                       MT_MODEL='group/custom',
                                        MT_FALLBACK_MODEL='group/custom-paid')
                     self.config.settings.mt_base_url = 'https://openrouter.ai/api/v1'
                     self.config.settings.mt_model = 'openrouter/free'
@@ -103,14 +101,14 @@ class CliTests(TemporaryTest):
                 with mock.patch.dict(os.environ, environment), \
                         mock.patch('subtitle_tool.mt_pipeline.check_pool', return_value={}) as check, \
                         mock.patch('sys.stdout', new_callable=io.StringIO):
-                    self.assertEqual(main(['--check-mt', '--mt-paid', 'deny']), 0)
+                    self.assertEqual(main(['--check-mt']), 0)
                 route = check.call_args.args[2]
-                self.assertFalse(route['routing']['paid_enabled'])
+                self.assertEqual(route['routing']['strategy'], 'free_first')
                 self.assertEqual([(entry['backend']['provider'], entry['backend']['base_url'],
                                    entry['backend']['model']) for entry in route['entries']],
-                                 [('magpie', 'https://gateway.example/v1', 'group/custom-free'),
-                                  ('magpie', 'https://gateway.example/v1', 'group/custom'),
-                                  ('magpie', 'https://gateway.example/v1', 'group/custom-paid')])
+                                 [('magpie', 'https://gateway.example/v1', name) for name in
+                                  ['group/custom', 'group/custom-paid', 'group/transcribe-review',
+                                   'group/transcribe-review-paid', 'group/transcribe-judge', 'group/transcribe-judge-paid']])
                 self.assertEqual(vars(self.config.settings), previous)
                 self.assertEqual((self.config.data / 'settings.json').read_bytes(), saved)
 

@@ -43,8 +43,6 @@ def parser():
     result.add_argument("--channel", choices=["mix", "left", "right"], help="明确混音／首声道／第二声道")
     result.add_argument("--output-dir", type=Path, help="显式选择输出目录，默认视频同目录")
     result.add_argument("--non-interactive", action="store_true", help="不询问；遇歧义持久化待复核状态并非零退出")
-    result.add_argument('--mt-paid', choices=['allow', 'deny'],
-                        help='是否允许网关使用付费模型；新任务默认 allow')
     result.add_argument("--report", type=Path, help="保存结构化结果，不包含 Key、上传链接或转写文字")
     return result
 
@@ -81,9 +79,9 @@ class Progress:
                 message = f"音频：{method}，{done['codec']}/{done['container']}，{done['segments']} 段，{done['bytes']:,} 字节；{done['reason']}"
             elif stage == "retry":
                 message = f"网络重试 {done}/{total}，有限退避"
-            elif stage == 'mt_v5_progress':
-                names = {'glossary': '术语分析', 'waiting': '等待前序术语', 'draft': '整句翻译',
-                         'align': '字幕对齐', 'review': '译文复核', 'correct': '译文修正'}
+            elif stage == 'mt_v6_progress':
+                names = {'glossary': '术语分析', 'waiting': '等待前序术语', 'translate': '字幕翻译',
+                         'review': '译文复核', 'judge': '疑点裁决'}
                 parts = [f"{names[name]} {count} 组" for name, count in done['stages'].items() if name in names]
                 message = f"翻译进行中：{'、'.join(parts)}；当前阶段最长 {done['elapsed']} 秒"
             elif stage == "subtitle_translating" and total is not None:
@@ -198,12 +196,12 @@ def summary(store, job_id):
             mt = {'provider': None, 'model': None}
             item['mt_route_status'] = 'reflow_required'
         else:
-            permitted = 'magpie' if route['routing']['paid_enabled'] else 'magpie_free'
+            permitted = 'magpie'
             mt = next(entry['backend'] for entry in route['entries'] if entry['id'] == permitted)
             item['mt_route_status'] = 'current'
             item['mt_policy_version'] = mt['policy_version']
             item['gateway_session_prefix'] = 'transcribe-' + job_id + '-'
-            item['mt_route'] = {'paid_enabled': route['routing']['paid_enabled'],
+            item['mt_route'] = {'strategy': route['routing']['strategy'],
                                 'entries': [{'id': entry['id'], 'tier': entry['tier'],
                                              'model': entry['backend']['model']}
                                             for entry in route['entries']]}
@@ -260,13 +258,11 @@ def main(argv=None):
         raise ToolError("重排／校时沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
     if args.state_machine:
         if (args.report is not None or args.output_dir is not None or args.workspace_id is not None or
-                args.mt_paid is not None or args.track is not None or args.channel is not None or args.overwrite):
+                args.track is not None or args.channel is not None or args.overwrite):
             raise ToolError('--state-machine 仅输出 stdout JSON，不能搭配任务设置或 --report。', 'input')
         print(json.dumps(lifecycle_contract(), ensure_ascii=False))
         return 0
     config = Config()
-    if args.mt_paid is not None and not (args.files or args.resume or args.reflow or args.check_mt):
-        raise ToolError('--mt-paid 仅用于新任务、--resume、--reflow 或 --check-mt。', 'input')
     if args.workspace_id is not None:
         config.settings.workspace_id = validate_workspace_id(args.workspace_id)
     interactive = not args.non_interactive and sys.stdin is not None and sys.stdin.isatty()
@@ -290,9 +286,7 @@ def main(argv=None):
             from .mt_pipeline import check_pool
             identity = {'region': 'beijing', 'workspace_id': validate_workspace_id(config.settings.workspace_id),
                         'access_mode': 'workspace', 'account': key_fingerprint(config.get_key())}
-            route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
-            if route['routing']['paid_enabled']:
-                print('在线检查可能使用网关付费模型；可用 --mt-paid deny 禁止付费请求。', file=sys.stderr)
+            route = configured_route(config, identity)
             print(json.dumps(check_pool(config, identity, route, cancel), ensure_ascii=False))
             return 0
         if args.self_test:
@@ -364,15 +358,13 @@ def main(argv=None):
                     job["manifest"].get("workspace_id") != config.settings.workspace_id):
                 raise ToolError("恢复沿用任务原接入方式和工作空间；--workspace-id 不能迁移旧任务。", "cache_mismatch")
             if args.reflow:
-                current_job = engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir,
-                                            mt_paid=args.mt_paid)
+                current_job = engine.reflow(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
                 ids = [current_job]
             elif args.retime:
                 engine.retime(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
             elif args.resume:
                 engine.resume(current_job, track=args.track, channel=args.channel, output_dir=args.output_dir,
-                              overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit,
-                              mt_paid=args.mt_paid)
+                              overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit)
             else:
                 engine.select_input(current_job, args.track, args.channel)
                 if args.overwrite or args.output_dir:
@@ -383,7 +375,7 @@ def main(argv=None):
             account = hashlib.sha256(key.encode()).hexdigest()
             identity = {'region': 'beijing', 'workspace_id': workspace, 'access_mode': 'workspace', 'account': account}
             from .mt_pool import configured_route
-            route = configured_route(config, identity, paid_enabled=None if args.mt_paid is None else args.mt_paid == 'allow')
+            route = configured_route(config, identity)
             for source in args.files:
                 job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
                                        workspace_id=workspace, account=account, settings=config.settings,
@@ -404,9 +396,6 @@ def main(argv=None):
             else:
                 if manifest.get('retime'):
                     print('仅校时：使用本地已保存的字幕和译文，无需调用云端。',
-                          file=sys.stderr, flush=True)
-                elif manifest.get('mt_route_snapshot', {}).get('routing', {}).get('paid_enabled'):
-                    print('已允许网关使用付费模型，可能产生费用；可用 --mt-paid deny 禁止付费请求。',
                           file=sys.stderr, flush=True)
                 state = run_job(job_id)
             while state == "needs_review" and interactive and not cancel.is_set():

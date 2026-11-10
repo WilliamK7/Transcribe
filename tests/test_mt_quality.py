@@ -30,7 +30,7 @@ class QualityContractTests(unittest.TestCase):
 
     def test_stalled_correction_requires_exact_issues_and_unchanged_affected_sentences(self):
         import copy
-        previous = {'sentences': [], 'draft': {}, 'glossary': [],
+        previous = {'sentences': [], 'translate': {}, 'glossary': [],
                     'fragments': [{'id': '0', 'sentence': '0', 'text': 'First part.'},
                                   {'id': '1', 'sentence': '0', 'text': 'Second part.'},
                                   {'id': '2', 'sentence': '1', 'text': 'Other sentence.'}],
@@ -80,7 +80,7 @@ class QualityContractTests(unittest.TestCase):
 
     def test_length_finish_is_classified_for_every_stage_even_with_complete_json(self):
         for stage, value in [('glossary', {'terms': []}), ('review', {'issues': []}),
-                             *[(name, {'translations': {'0': '完整译文'}}) for name in ('draft', 'align', 'correct')]]:
+                             *[(name, {'translations': {'0': '完整译文'}}) for name in ('translate', 'judge')]]:
             for content in [json.dumps(value), '{"private-incomplete-output":']:
                 response = {'choices': [{'finish_reason': 'length', 'message': {'content': content}}]}
                 with self.subTest(stage=stage, complete=content == json.dumps(value)), self.assertRaises(BatchValidationError) as error:
@@ -89,26 +89,26 @@ class QualityContractTests(unittest.TestCase):
                 self.assertNotIn('private', str(error.exception))
 
     def test_output_workload_tracks_targets_and_translations_without_context_or_glossary(self):
-        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': []}
-        size = stage_output_size('draft', data)
-        self.assertEqual(stage_output_size('draft', {**data, 'context': [{'text': 'Background ' * 1000}],
+        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Cache.'}]]}
+        size = stage_output_size('translate', data)
+        self.assertEqual(stage_output_size('translate', {**data, 'context': [{'text': 'Background ' * 1000}],
                                                     'glossary': [{'source': 'Cache', 'translation': '缓存'}]}), size)
-        self.assertGreater(stage_output_size('draft', {**data, 'sentences': data['sentences'] * 2}), size)
-        review = {**data, 'fragments': data['sentences'], 'draft': {'0': '缓存'}, 'translations': {'0': '缓存'}}
+        self.assertGreater(stage_output_size('translate', {**data, 'fragments': data['fragments'] * 2}), size)
+        review = {**data, 'fragments': data['sentences'], 'translate': {'0': '缓存'}, 'translations': {'0': '缓存'}}
         self.assertEqual(stage_output_size('review', review), size)
         self.assertGreater(stage_output_size('review', {**review, 'translations': {'0': '长译文' * 100}}), size)
 
     def test_output_estimates_allow_for_list_fields_and_full_correction_translation(self):
         target = {'id': '0', 'text': 'A cache.'}
         data = {'sentences': [target], 'fragments': [{**target, 'sentence': '0'}],
-                'draft': {'0': '整句译文'}, 'translations': {'0': '当前译文'}, 'context': [], 'glossary': []}
-        draft = estimate_stage_output('draft', data)
+                'translate': {'0': '整句译文'}, 'translations': {'0': '当前译文'}, 'context': [], 'glossary': []}
+        draft = estimate_stage_output('translate', data)
         self.assertGreater(estimate_stage_output('glossary', data), draft)
         self.assertGreater(estimate_stage_output('review', data), draft)
-        self.assertEqual(estimate_stage_output('correct', data), draft)
+        self.assertGreater(estimate_stage_output('judge', data), draft)
         expanded = {**data, 'translations': {'0': '更长的完整译文' * 100}}
-        self.assertGreater(estimate_stage_output('correct', expanded), draft)
-        self.assertEqual(estimate_stage_output('draft', {**data, 'context': [{'text': 'Other ' * 1000}]}), draft)
+        self.assertGreater(estimate_stage_output('judge', expanded), draft)
+        self.assertEqual(estimate_stage_output('translate', {**data, 'context': [{'text': 'Other ' * 1000}]}), draft)
 
     def test_json_object_review_supplies_the_fields_and_categories_it_validates(self):
         from subtitle_tool.mt_quality import ISSUE_CATEGORIES
@@ -126,13 +126,13 @@ class QualityContractTests(unittest.TestCase):
 
 
     def test_stage_cache_identity_covers_prompt_glossary_context_and_backend(self):
-        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': []}
-        original = stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope=self.scope)
-        self.assertNotEqual(original, stage_cache_key('draft', {**data, 'glossary': [{'source': 'cache'}]},
+        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'A cache.'}]]}
+        original = stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope=self.scope)
+        self.assertNotEqual(original, stage_cache_key('translate', {**data, 'glossary': [{'source': 'cache'}]},
                                                      self.free, capabilities=self.free_caps, scope=self.scope))
-        self.assertNotEqual(original, stage_cache_key('draft', {**data, 'context': ['different']},
+        self.assertNotEqual(original, stage_cache_key('translate', {**data, 'context': ['different']},
                                                      self.free, capabilities=self.free_caps, scope=self.scope))
-        self.assertNotEqual(original, stage_cache_key('draft', data, self.paid,
+        self.assertNotEqual(original, stage_cache_key('translate', data, self.paid,
                                                      capabilities=self.free_caps, scope=self.scope))
 
     def test_review_rejects_choice_error_refusal_and_unicode_surrogates(self):
@@ -150,31 +150,31 @@ class QualityContractTests(unittest.TestCase):
         self.assertEqual(manual_terms(records, {'RAM': '内存'}), [])
 
     def test_complete_payload_budget_includes_context_and_schema(self):
-        data = {'sentences': [{'id': '0', 'text': 'Small.'}], 'context': ['x' * 33000], 'glossary': []}
+        data = {'sentences': [{'id': '0', 'text': 'Small.'}], 'context': ['x' * 33000], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Small.'}]]}
         with self.assertRaises(ToolError) as error:
-            make_stage_payload('draft', data, self.paid, capabilities=self.paid_caps)
+            make_stage_payload('translate', data, self.paid, capabilities=self.paid_caps)
         self.assertEqual(error.exception.code, 'mt_input_budget')
 
     def test_saved_capability_controls_request_size_and_cache_identity(self):
-        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'glossary': []}
+        data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Cache.'}]]}
         caps = {'response_format': 'json_object', 'input_bytes': 2000, 'output_tokens': 512}
-        payload = make_stage_payload('draft', data, self.free, capabilities=caps)
+        payload = make_stage_payload('translate', data, self.free, capabilities=caps)
         self.assertEqual(payload['response_format'], {'type': 'json_object'})
         self.assertEqual(payload['max_tokens'], 512)
-        self.assertNotEqual(stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope=self.scope),
-                            stage_cache_key('draft', data, self.free, capabilities=caps, scope=self.scope))
+        self.assertNotEqual(stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope=self.scope),
+                            stage_cache_key('translate', data, self.free, capabilities=caps, scope=self.scope))
 
     def test_stage_texts_are_simplified_before_use_and_cache_identity_includes_scope(self):
-        translated = parse_stage_response('draft', body({'translations': {'0': '繁體翻譯'}}),
+        translated = parse_stage_response('translate', body({'translations': {'0': '繁體翻譯'}}),
                                           ids=['0'], originals=['Example'])
         self.assertEqual(translated['translations']['0'], '繁体翻译')
         terms = parse_stage_response('glossary', body({'terms': [
             {'source': 'cache', 'translation': '緩存', 'sentence': '0000:00000000'}]}),
             ids=['0000:00000000'], originals=['A cache stores results.'])
         self.assertEqual(terms['terms'][0]['translation'], '缓存')
-        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': []}
-        self.assertNotEqual(stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope={'account': 'a'}),
-                            stage_cache_key('draft', data, self.free, capabilities=self.free_caps, scope={'account': 'b'}))
+        data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'A cache.'}]]}
+        self.assertNotEqual(stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope={'account': 'a'}),
+                            stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope={'account': 'b'}))
 
     def test_translation_mapping_rejects_duplicate_missing_extra_and_empty_results(self):
         invalid = ['{"translations":{"0":"甲","0":"乙","1":"丙"}}',
@@ -185,13 +185,13 @@ class QualityContractTests(unittest.TestCase):
             response = body({})
             response['choices'][0]['message']['content'] = content
             with self.subTest(content=content), self.assertRaises(ToolError):
-                parse_stage_response('align', response, ids=['0', '1'], originals=['First.', 'Second.'])
+                parse_stage_response('translate', response, ids=['0', '1'], originals=['First.', 'Second.'])
         response = body({'translations': {'1': '第二句', '0': '第一句'}})
-        self.assertEqual(parse_stage_response('align', response, ids=['0', '1'], originals=['First.', 'Second.']),
+        self.assertEqual(parse_stage_response('translate', response, ids=['0', '1'], originals=['First.', 'Second.']),
                          {'translations': {'0': '第一句', '1': '第二句'}})
         response['choices'][0]['finish_reason'] = 'length'
         with self.assertRaises(ToolError):
-            parse_stage_response('align', response, ids=['0', '1'], originals=['First.', 'Second.'])
+            parse_stage_response('translate', response, ids=['0', '1'], originals=['First.', 'Second.'])
 
     def test_single_long_sentence_never_creates_a_group_over_sixty_seconds(self):
         from subtitle_tool.config import Settings

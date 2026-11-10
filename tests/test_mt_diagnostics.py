@@ -34,14 +34,14 @@ class DiagnosticTests(TemporaryTest):
         writers = [MTDiagnostics(self.path, job_id), MTDiagnostics(self.path, job_id)]
         event = {'kind': 'invalid_response', 'category': 'id_missing', 'expected_count': 3, 'actual_count': 1,
                  'group_key': 'f' * 64,
-                 'stage': 'align', 'text': 'private transcript', 'error': 'private exception',
+                 'stage': 'translate', 'text': 'private transcript', 'error': 'private exception',
                  'key': 'sk-private', 'url': 'https://private.example/signature'}
         with ThreadPoolExecutor(max_workers=4) as pool:
             self.assertTrue(all(pool.map(lambda i: writers[i % 2].write(event), range(80))))
         raw = writers[0].path.read_text(encoding='utf-8')
         records = [json.loads(line) for line in raw.splitlines()]
         self.assertEqual(len(records), 80)
-        self.assertTrue(all(r['actual_count'] == 1 and r['stage'] == 'align' for r in records))
+        self.assertTrue(all(r['actual_count'] == 1 and r['stage'] == 'translate' for r in records))
         self.assertNotIn('private', raw)
         self.assertNotIn('https:', raw)
 

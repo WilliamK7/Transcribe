@@ -19,6 +19,7 @@ _CATEGORIES = frozenset({
     'unsupported_image_format', 'image_not_found', 'image_download_failed', 'network', 'deadline',
     'transport', 'response_too_large', 'http_transient', 'http_permanent', 'service_unknown',
     'generation_error', 'response_structure', 'format_exhausted', 'output_truncated', 'cancelled', 'local_error',
+    'model_not_independent',
 })
 
 
@@ -60,18 +61,14 @@ class RouteExhausted(ToolError):
 
 
 class MagpieRoute:
-    def __init__(self, entries, *, paid_enabled, control, on_event, clock=time.monotonic):
+    def __init__(self, entries, *, control, on_event, clock=time.monotonic):
         self.entries = tuple(entries)
-        self.paid_enabled, self.control = paid_enabled, control
+        self.control = control
         self.on_event, self.clock = on_event, clock
-        identities = ('magpie', 'magpie_fallback') if paid_enabled else ('magpie_free',)
-        self.request_entries = tuple(next(entry for entry in self.entries if entry.id == identity)
-                                     for identity in identities)
 
-    def cached_result(self, cache, *, prefer_other_than=None, deadline):
-        """Reuse exact completed work regardless of permission for new calls."""
-        ordered = sorted(self.entries, key=lambda entry: (entry.id == prefer_other_than, entry.tier != 'free'))
-        for entry in ordered:
+    def cached_result(self, cache, *, deadline):
+        """Reuse completed work in route order."""
+        for entry in self.entries:
             self.control.check_start()
             if self.clock() >= deadline:
                 raise RouteExhausted(deadline=True)
@@ -85,16 +82,16 @@ class MagpieRoute:
 
     def run(self, invoke, *, validate, deadline):
         remaining = max(0.0, deadline - self.clock())
-        primary_deadline = deadline - min(STAGE_TIMEOUT / 3, remaining / 3) if self.paid_enabled else deadline
+        primary_deadline = deadline - min(STAGE_TIMEOUT / 3, remaining / 3)
         self.control.check_start()
         attempts = 0
-        for index, entry in enumerate(self.request_entries):
+        for index, entry in enumerate(self.entries):
             entry_deadline = primary_deadline if index == 0 else deadline
             for attempt in (1, 2):
                 self.control.check_start()
                 if self.clock() >= deadline:
                     raise RouteExhausted(deadline=True)
-                if index == 0 and self.paid_enabled and self.clock() >= entry_deadline:
+                if index == 0 and self.clock() >= entry_deadline:
                     break
                 try:
                     validate(entry)
@@ -113,7 +110,7 @@ class MagpieRoute:
                     # Network, HTTP, refusal and uncertain response shapes do not.
                     if attempt == 1 and failure.repairable:
                         continue
-                    if index == 0 and self.paid_enabled and failure.fallback_allowed:
+                    if index == 0 and failure.fallback_allowed:
                         break
                     raise RouteExhausted(deadline=failure.category in {'deadline', 'timeout'},
                                          category=failure.category, request_id=failure.request_id) from None

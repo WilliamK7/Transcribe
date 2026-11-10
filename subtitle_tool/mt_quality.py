@@ -1,4 +1,4 @@
-"""Version 5 stage prompts, strict local validation and source-aware grouping.
+"""Stage prompts, response validation and source-aware grouping.
 
 Text and review evidence returned by these helpers belong in private task storage,
 never in diagnostics or ordinary reports.
@@ -21,6 +21,7 @@ VALIDATION_CATEGORIES = {
     'id_out_of_range': '编号越界',
     'glossary_evidence': '术语缺少本次目标原文依据',
     'translation_invalid': '译文无效', 'unfinished': '非正常结束', 'output_truncated': '输出长度耗尽',
+    'judge_evidence': '裁决没有保持已撤销疑点的译文',
 }
 
 
@@ -72,25 +73,28 @@ def validate_translations(value, fragments):
     return {str(i): translated[str(i)] for i in range(len(fragments))}
 
 
-QUALITY_PROMPT_VERSION = 4
-GLOSSARY_SCHEDULE = 'prefix-v2'
+QUALITY_PROMPT_VERSION = 5
+GLOSSARY_SCHEDULE = 'window-prefix-v3'
 INPUT_BUDGET = 32 * 1024
 OUTPUT_TOKENS = 4096
 ISSUE_CATEGORIES = ('omission', 'addition', 'terminology', 'number', 'negation', 'condition', 'repetition', 'meaning')
 PROMPTS = {
     'glossary': ('从课程原文提取有原句依据的技术术语、缩写和定义，给出简体中文译法。'
                  '仅提取输入句中实际出现的术语；sentence 填其原句 id。人工术语优先；不要根据歧义机械统一。'
+                 'glossary 是已确认术语，只补充新术语或有新语境依据的不同含义，不重复已有同义项。'
                  '没有可确定术语时返回空 terms 数组。仅返回 JSON。'),
-    'draft': ('逐个目标译为准确自然的简体中文，以术语表和上下文消歧，忠实保留数字、单位、否定和条件。'
-              '术语有语境歧义时不要机械替换。只翻译 sentences，不翻译上下文。'
-              '返回 translations 对象，键与输入句的 id 一一对应，译文非空。仅返回 JSON。'),
-    'align': ('依据已完成的整句译文，把简体中文译文对齐到各字幕片段；保持完整含义，允许跨片连读，'
-              '不增删或跨片重复内容。返回 translations 对象，键与 fragments 的 id 一一对应，译文非空。仅返回 JSON。'),
+    'translate': ('结合完整 sentences 及分片边界，一次译为准确自然的简体中文字幕。'
+                  '以术语和上下文消歧，忠实保留数字、单位、否定和条件；只翻译目标，不翻译上下文。'
+                  '按 fragments 顺序分配完整含义，允许跨片连读，不增删或重复内容。'
+                  '返回 translations 对象，键与 fragments 的 id 一一对应，译文非空。仅返回 JSON。'),
     'review': ('复核最终 translations 的漏增译、术语、数字单位、否定条件和跨片重复。'
-               '结合原句及上下文；正常分片、同义表达、与 draft 措辞不同不算错误。'
+               '结合原句及上下文；正常分片和同义表达不算错误。'
                '疑点含片段 id、类别及一句具体差异，去重；无疑点返回空 issues 数组。'),
-    'correct': ('根据给出的具体疑点修正整个简体中文字幕组，保持原文的完整含义和片段顺序。'
-                '返回 translations 对象，键与 fragments 的 id 一一对应，译文非空。仅返回 JSON。'),
+    'judge': ('独立核对 issues 中每条疑点是否有原文依据，撤销误报，不为措辞偏好修改译文。'
+              '仅修正确有证据的问题及同句必要片段，其他编号原样保留。'
+              '返回 issues（核实后的问题，误报不保留）和 translations（完整修正结果）。'
+              '若全部为误报，issues 为空，translations 必须原样返回。'
+              'translations 的键与 fragments 的 id 一一对应，译文非空。仅返回 JSON。'),
 }
 
 
@@ -119,34 +123,25 @@ def plan_sentence_groups(sources):
     return groups
 
 
-def direct_draft_matches(sentences, fragments):
-    """A draft needs no redistribution only when every numbered target is identical."""
-    return bool(sentences) and len(sentences) == len(fragments) and all(
-        sentence['id'] == fragment['id'] == fragment['sentence'] == str(index) and
-        sentence['text'].strip() == fragment['text']
-        for index, (sentence, fragment) in enumerate(zip(sentences, fragments)))
-
-
 def stage_output_size(stage, data):
     """Estimate target workload, including translations and JSON field overhead."""
-    targets = data['sentences'] if stage in {'glossary', 'draft'} else data['fragments']
+    targets = data['sentences'] if stage == 'glossary' else data['fragments']
     characters = sum(len(item['text']) for item in targets)
-    for field in ('draft', 'translations'):
-        characters = max(characters, sum(len(text) for text in data.get(field, {}).values()))
+    characters = max(characters, sum(len(text) for text in data.get('translations', {}).values()))
     return characters + 32 * len(targets)
 
 
 def estimate_stage_output(stage, data):
     """Estimate Chinese JSON output, adding room for advisory evidence fields."""
-    targets = data['sentences'] if stage in {'glossary', 'draft'} else data['fragments']
-    return 64 + stage_output_size(stage, data) + (64 * len(targets) if stage in {'glossary', 'review'} else 0)
+    targets = data['sentences'] if stage == 'glossary' else data['fragments']
+    return 64 + stage_output_size(stage, data) + (64 * len(targets) if stage in {'glossary', 'review', 'judge'} else 0)
 
 
 def correction_stalled(previous, current):
     """Detect repeated evidence with unchanged translations across affected sentences."""
     if previous is None or not current['issues']:
         return False
-    for key in ('sentences', 'draft', 'fragments', 'glossary', 'context'):
+    for key in ('sentences', 'fragments', 'glossary', 'context'):
         if previous.get(key) != current.get(key):
             return False
     def issues(data):
@@ -160,6 +155,11 @@ def correction_stalled(previous, current):
 
 
 def _schema(stage, data):
+    if stage == 'judge':
+        schema = _schema('translate', data)
+        schema['properties'].update(_schema('review', data)['properties'])
+        schema['required'].append('issues')
+        return schema
     if stage == 'glossary':
         item = {'type': 'object', 'properties': {'source': {'type': 'string'}, 'translation': {'type': 'string'},
                                                 'sentence': {'type': 'string'}},
@@ -174,7 +174,7 @@ def _schema(stage, data):
         item['properties']['id']['enum'] = [str(f['id']) for f in data['fragments']]
         return {'type': 'object', 'properties': {'issues': {'type': 'array', 'items': item}},
                 'required': ['issues'], 'additionalProperties': False}
-    items = data['sentences'] if stage == 'draft' else data['fragments']
+    items = data['fragments']
     ids = [str(item['id']) for item in items]
     mapping = {'type': 'object', 'properties': {key: {'type': 'string'} for key in ids},
                'required': ids, 'additionalProperties': False}
@@ -199,8 +199,8 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
         prompt += ('术语表中 manual 为人工指定译法；model 条目附原文 evidence，仅供对应语境参考，'
                    '同词可有多个译法，按当前语境选择，不因较早出现而强制统一。')
     if repair:
-        if stage not in {'draft', 'align'}:
-            raise ValueError('Only draft and alignment allow format repair')
+        if stage != 'translate':
+            raise ValueError('Only translation allows format repair')
         prompt += ('上次响应未通过格式或编号校验。请从本次原始任务重新生成完整 JSON：'
                    '每个目标编号恰好一次，译文完整且非空，不添加其他编号或说明。')
     prompt += '输出必须符合此 JSON Schema：' + json.dumps(
@@ -224,7 +224,7 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
             wire_context.append(item)
         wire_data['context'] = wire_context
     payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
-               'reasoning_effort': 'none',
+               'reasoning_effort': 'low' if stage == 'judge' else 'none',
                'messages': [{'role': 'system', 'content': prompt},
                              {'role': 'user', 'content': json.dumps(wire_data, ensure_ascii=False)}]}
     payload['response_format'] = {'type': 'json_object'}
@@ -238,7 +238,7 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
 
 
 def stage_cache_key(stage, data, backend, *, capabilities, scope):
-    value = {'version': QUALITY_PROMPT_VERSION, 'strategy': 5, 'simplification': 'opencc-t2s-0.1.7',
+    value = {'version': QUALITY_PROMPT_VERSION, 'strategy': 6, 'simplification': 'opencc-t2s-0.1.7',
              'backend': backend.snapshot(),
              'capabilities': capabilities, 'scope': scope,
              'request': make_stage_payload(stage, data, backend, capabilities=capabilities)}
@@ -258,7 +258,7 @@ def parse_stage_response(stage, body, *, ids=(), originals=()):
         content = message.get('content') if isinstance(message, dict) else None
         if choice.get('finish_reason') != 'stop':
             truncated = choice.get('finish_reason') == 'length'
-            if stage not in {'draft', 'align', 'correct'}:
+            if stage not in {'translate', 'judge'}:
                 if truncated:
                     raise BatchValidationError('output_truncated')
                 raise ValueError()
@@ -276,7 +276,13 @@ def parse_stage_response(stage, body, *, ids=(), originals=()):
 def validate_stage_value(stage, value, *, ids=(), originals=()):
     """Validate generated fields from either a response or private saved records."""
     try:
-        if stage in {'draft', 'align', 'correct'}:
+        if stage == 'judge':
+            if not isinstance(value, dict) or set(value) != {'issues', 'translations'}:
+                raise ValueError()
+            return {**validate_stage_value('translate', {'translations': value['translations']},
+                                           ids=ids, originals=originals),
+                    **validate_stage_value('review', {'issues': value['issues']}, ids=ids)}
+        if stage == 'translate':
             if list(ids) != [str(i) for i in range(len(ids))] or len(originals) != len(ids):
                 raise ValueError()
             translated = validate_translations(value, originals)
@@ -309,6 +315,12 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
         return value
     except (KeyError, TypeError, ValueError, RecursionError):
         raise BatchValidationError('response_structure') from None
+
+
+def validate_judgment(value, data):
+    if not value['issues'] and value['translations'] != data['translations']:
+        raise BatchValidationError('judge_evidence')
+    return value
 
 
 def _ascii_term_pattern(term):

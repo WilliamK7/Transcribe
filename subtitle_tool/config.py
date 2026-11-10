@@ -19,8 +19,11 @@ class Settings:
     mt_workers: int = 16
     mt_base_url: str = "http://127.0.0.1:3425/v1"
     mt_model: str = ""
-    mt_free_model: str = "group/transcribe-free"
     mt_fallback_model: str = "group/transcribe-paid"
+    mt_review_model: str = "group/transcribe-review"
+    mt_review_fallback_model: str = "group/transcribe-review-paid"
+    mt_judge_model: str = "group/transcribe-judge"
+    mt_judge_fallback_model: str = "group/transcribe-judge-paid"
     mt_policy_version: int = 1
     magpie_data_dir: str = ""
     mt_routing: dict | None = None
@@ -72,7 +75,8 @@ class Config:
     def mt_settings(self):
         # Resolve only for new tasks/reflow: current choices cannot alter a saved resume.
         overrides = {name: os.environ[name.upper()] for name in
-                     ["mt_base_url", "mt_model", "mt_free_model", "mt_fallback_model"] if name.upper() in os.environ}
+                     ["mt_base_url", "mt_model", "mt_fallback_model",
+                      "mt_review_model", "mt_review_fallback_model", "mt_judge_model", "mt_judge_fallback_model"] if name.upper() in os.environ}
         return replace(self.settings, **overrides)
 
     def get_magpie_key(self, base_url=None):

@@ -15,11 +15,11 @@ from tests.fixtures import TemporaryTest
 class QuotaObservationTests(TemporaryTest):
     def row(self, **changes):
         return dict({'model': 'trial-model', 'type': 'Text', 'remaining': 100, 'total': 1000,
-                     'remainingPercent': 10, 'expires': '2099-01-01', 'autoStop': True}, **changes)
+                     'remainingPercent': 10, 'expires': '2099-01-01'}, **changes)
 
     def test_ambiguous_or_malformed_quota_is_never_admitted(self):
         for changes in ({'remaining': True}, {'remaining': 1001}, {'remaining': -1}, {'remaining': 0},
-                        {'total': 0}, {'autoStop': 'true'}, {'type': 'Audio'},
+                        {'total': 0}, {'type': 'Audio'},
                         {'expires': '2099-02-30'}, {'remainingPercent': None}):
             with self.subTest(changes=changes):
                 value = parse_observation(json.dumps([self.row(**changes)]).encode())['trial-model']
@@ -27,7 +27,7 @@ class QuotaObservationTests(TemporaryTest):
         duplicate = json.dumps([self.row(), self.row(remaining=0)]).encode()
         self.assertEqual(parse_observation(duplicate), {})
         with self.assertRaises(ValueError):
-            parse_observation(b'[{"model":"trial-model","autoStop":false,"autoStop":true}]')
+            parse_observation(b'[{"model":"trial-model","remaining":0,"remaining":100}]')
 
     def source(self, version=2):
         self.cli_path = self.path / 'config.json'

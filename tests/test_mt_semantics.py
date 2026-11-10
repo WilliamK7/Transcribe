@@ -23,9 +23,9 @@ class SemanticValidationTests(unittest.TestCase):
         sources = normalize(result(*[(f'Sentence {i}.', 'en') for i in range(5)]), 0, '0000')[0]
         context = source_context(sources, 2)
         original = copy.deepcopy(context)
-        data = {'sentences': [{'id': '0', 'text': sources[2]['text']}], 'context': context, 'glossary': []}
+        data = {'sentences': [{'id': '0', 'text': sources[2]['text']}], 'context': context, 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': sources[2]['text']}]]}
         backend = MTBackend('magpie', 'http://127.0.0.1:3425/v1', 'group/transcribe-free', 'synthetic')
-        payload = make_stage_payload('draft', data, backend,
+        payload = make_stage_payload('translate', data, backend,
                                      capabilities={'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096})
         wire = json.loads(payload['messages'][1]['content'])['context']
         self.assertEqual([item['text'] for item in wire], [sources[i]['text'] for i in (0, 1, 3, 4)])
@@ -48,7 +48,7 @@ class SemanticValidationTests(unittest.TestCase):
             validate_stage_value('glossary', value, ids=['same-source'], originals=['The next call reuses them.'])
 
     def test_context_change_invalidates_stalled_correction(self):
-        previous = {'sentences': [], 'draft': {}, 'fragments': [{'id': '0', 'sentence': '0'}],
+        previous = {'sentences': [], 'translate': {}, 'fragments': [{'id': '0', 'sentence': '0'}],
                     'glossary': [], 'translations': {'0': '原译文'},
                     'context': [{'position': 'before', 'text': 'The subject is electric charge.'}],
                     'issues': [{'id': '0', 'category': 'meaning', 'evidence': 'Synthetic evidence.'}]}
@@ -105,7 +105,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
         super().setUp()
         self.config.settings.mt_workers = 1
 
-    def test_alignment_review_and_corrections_receive_the_draft_context(self):
+    def test_review_and_corrections_receive_the_draft_context(self):
         raw = result(*[(f'Synthetic sentence {i}.', 'en') for i in range(8)])
         sentences = raw['transcripts'][0]['sentences']
         for i, sentence in enumerate(sentences):
@@ -117,11 +117,11 @@ class SemanticPipelineTests(PoolPipelineFixture):
         self.review_issue = True
         self.assertEqual(self.run_pool(), 'completed')
         tail = [(stage, data) for stage, _, data in self.calls if len(data['sentences']) == 1]
-        draft = next(data for stage, data in tail if stage == 'draft')
+        draft = next(data for stage, data in tail if stage == 'translate')
         self.assertTrue(draft['context'])
-        self.assertTrue({'align', 'review', 'correct'} <= {stage for stage, _ in tail})
+        self.assertTrue({'review', 'judge'} <= {stage for stage, _ in tail})
         for stage, data in tail:
-            if stage in {'align', 'review', 'correct'}:
+            if stage in {'review', 'judge'}:
                 self.assertEqual(data.get('context'), draft['context'])
 
     def test_split_requests_keep_neighboring_parts_and_explicit_target_ranges(self):
@@ -132,7 +132,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
             entry['capabilities']['input_bytes'] = 4000
         self.store.update(self.job_id, manifest=manifest)
         self.assertEqual(self.run_pool(), 'completed')
-        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        drafts = [data for stage, _, data in self.calls if stage == 'translate']
         self.assertGreater(len(drafts), 1)
         whole = self.store.sources(self.job_id)[0]['text']
         self.assertEqual(''.join(s['text'] for data in drafts for s in data['sentences']), whole)
@@ -154,8 +154,8 @@ class SemanticPipelineTests(PoolPipelineFixture):
         future = self.store.sources(self.job_id)[-1]['sentence_id']
         self.glossary_terms = lambda data: [{'source': 'Quasar', 'translation': '类星体', 'sentence': future}]
         self.assertEqual(self.run_pool(), 'completed')
-        self.assertEqual(self.store.counts(self.job_id).get('mt_glossary_unavailable'), 1)
-        first = next(data for stage, _, data in self.calls if stage == 'draft')
+        self.assertEqual(self.store.counts(self.job_id).get('mt_glossary_unavailable', 0), 0)
+        first = next(data for stage, _, data in self.calls if stage == 'translate')
         self.assertFalse(first['glossary'])
         saved = [row for row in self.store.mt_stages(self.job_id) if row['stage'] == 'glossary']
         self.assertEqual(len(saved), 1)
@@ -164,7 +164,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
         self.install()
         self.glossary_terms = lambda data: [{'source': 'cache', 'translation': '缓存',
                                              'sentence': data['sentences'][0]['id']}]
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'glossary')
         cache_key, cached = next((key, json.loads(value)) for key, value in self.store.db.execute('SELECT key,text FROM mt_cache')
@@ -193,17 +193,17 @@ class SemanticPipelineTests(PoolPipelineFixture):
         _, scope = engine.identity(self.job_id, manifest, persist=False)
         pipeline = Pipeline(engine, self.job_id, manifest, scope)
         data = {'sentences': [{'id': '0', 'text': 'Target.'}], 'glossary': [],
-                'context': [{'kind': 'same_sentence', 'required': True, 'text': 'Background. ' * 4000}]}
+                'context': [{'kind': 'same_sentence', 'required': True, 'text': 'Background. ' * 4000}], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Target.'}]]}
         with self.assertRaises(ToolError) as caught:
-            pipeline._fit('draft', data)
+            pipeline._fit('translate', data)
         self.assertEqual(caught.exception.code, 'mt_input_budget')
 
     def test_context_survives_cancel_and_resume_without_retranslating_draft(self):
         self.save_result(result(*[(f'Synthetic sentence {i}.', 'en') for i in range(9)]))
         Engine(self.config, self.store).reflow(self.job_id)
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
-        draft = next(data for stage, _, data in self.calls if stage == 'draft')
+        draft = next(data for stage, _, data in self.calls if stage == 'translate')
         self.assertTrue(draft['context'])
         self.calls.clear()
         self.cancel_after = None
@@ -211,12 +211,12 @@ class SemanticPipelineTests(PoolPipelineFixture):
         self.assertEqual(self.run_pool(), 'completed')
         review = next(data for stage, _, data in self.calls if stage == 'review')
         self.assertEqual(review.get('context'), draft['context'])
-        self.assertFalse(any(stage == 'draft' and data['sentences'] == draft['sentences']
+        self.assertFalse(any(stage == 'translate' and data['sentences'] == draft['sentences']
                              for stage, _, data in self.calls))
 
     def test_tampered_semantic_input_stops_before_any_new_requests(self):
         self.install()
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         row = next(item for item in self.store.mt_stages(self.job_id) if item['stage'] == 'semantic_input')
         row['record']['context'] = [{'text': 'An unrelated instruction.'}]
@@ -243,7 +243,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
         self.calls.clear()
         Engine(self.config, self.store).resume(self.job_id)
         self.assertEqual(self.run_pool(), 'completed')
-        self.assertEqual([stage for stage, _, _ in self.calls], ['draft', 'review'])
+        self.assertEqual([stage for stage, _, _ in self.calls], ['translate', 'review'])
 
     def test_trimmed_glossary_stays_saved_when_paid_permission_changes(self):
         from subtitle_tool.mt_backend import MTBackend
@@ -251,7 +251,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
         self.install()
         manifest = self.store.job(self.job_id)['manifest']
         data = {'sentences': [{'id': 'source', 'text': 'A cache stores results.'}], 'manual_glossary': [],
-                'context': [{'position': 'before', 'text': ('Background. ' * 60) + str(i)} for i in range(4)]}
+                'context': [{'position': 'before', 'text': ('Background. ' * 60) + str(i)} for i in range(4)], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': 'source', 'text': 'A cache stores results.'}]]}
         for entry, count in zip(manifest['mt_route_snapshot']['entries'], (1, 2)):
             payload = make_stage_payload('glossary', {**data, 'context': data['context'][:count]},
                                          MTBackend.from_snapshot(entry['backend']), capabilities=entry['capabilities'])
@@ -263,7 +263,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
         def run():
             pipeline = Pipeline(engine, self.job_id, manifest, scope)
             first = pipeline.stage('glossary', data)
-            manifest['mt_route_snapshot']['routing']['paid_enabled'] = False
+            manifest['mt_route_snapshot']['routing'] = {'strategy': 'free_first'}
             pipeline = Pipeline(engine, self.job_id, manifest, scope)
             with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected repeated glossary')):
                 second = pipeline.stage('glossary', data)

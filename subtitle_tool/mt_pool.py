@@ -12,10 +12,11 @@ from .mt_backend import MTBackend, key_fingerprint, normalize_mt_url
 _ENTRY_FIELDS = {'id', 'tier', 'credential_ref', 'backend', 'capabilities'}
 _BACKEND_FIELDS = {'format_version', 'provider', 'base_url', 'model', 'key_fingerprint', 'request_version', 'policy_version'}
 _CAPABILITY_FIELDS = {'response_format', 'input_bytes', 'output_tokens'}
-_ROUTING_FIELDS = {'paid_enabled'}
+_ROUTING_FIELDS = {'strategy'}
 _QUALITY_FIELDS = {'input_bytes', 'output_tokens', 'max_revisions', 'manual_glossary'}
 _FORBIDDEN_UNICODE = {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'}
-_ENTRY_TIERS = {'magpie_free': 'free', 'magpie': 'paid', 'magpie_fallback': 'paid'}
+_ENTRY_TIERS = {name: tier for role in ('', '_review', '_judge') for name, tier in
+                [('magpie' + role, 'mixed'), ('magpie' + role + '_fallback', 'paid')]}
 
 
 def _invalid():
@@ -59,7 +60,7 @@ def _capabilities(value):
 
 def _routing(value):
     return (isinstance(value, dict) and set(value) == _ROUTING_FIELDS and
-            type(value['paid_enabled']) is bool)
+            value['strategy'] == 'free_first')
 
 
 def _quality(value):
@@ -68,7 +69,7 @@ def _quality(value):
             _fixed_integer(value['max_revisions'], 2) and _manual_glossary(value['manual_glossary']))
 
 
-def configured_route(config, manifest, *, paid_enabled=None):
+def configured_route(config, manifest):
     """Freeze primary groups and the paid validation fallback for new work."""
     if not isinstance(manifest, dict):
         raise _invalid()
@@ -76,20 +77,17 @@ def configured_route(config, manifest, *, paid_enabled=None):
     if not _integer(settings.mt_policy_version, 1, 2**31 - 1):
         raise ToolError('mt_policy_version 必须是 1～2147483647 的整数；更换翻译策略时递增。', 'mt_config')
     base = normalize_mt_url(settings.mt_base_url)
-    models = [('magpie_free', 'free', settings.mt_free_model),
-              ('magpie', 'paid', settings.mt_model or 'group/transcribe'),
-              ('magpie_fallback', 'paid', settings.mt_fallback_model)]
-    if any(not _model(model) for _, _, model in models) or len({model for _, _, model in models}) != 3:
+    models = [('magpie', 'mixed', settings.mt_model or 'group/transcribe'),
+              ('magpie_fallback', 'paid', settings.mt_fallback_model),
+              ('magpie_review', 'mixed', settings.mt_review_model),
+              ('magpie_review_fallback', 'paid', settings.mt_review_fallback_model),
+              ('magpie_judge', 'mixed', settings.mt_judge_model),
+              ('magpie_judge_fallback', 'paid', settings.mt_judge_fallback_model)]
+    if any(not _model(model) for _, _, model in models) or len({model for _, _, model in models}) != 6:
         raise _invalid()
-    routing = {'paid_enabled': True}
-    if settings.mt_routing is not None:
-        if not isinstance(settings.mt_routing, dict) or set(settings.mt_routing) - {'paid_enabled'}:
-            raise _invalid()
-        routing.update(settings.mt_routing)
-    if paid_enabled is not None:
-        routing['paid_enabled'] = paid_enabled
-    if not _routing(routing):
-        raise _invalid()
+    routing = {'strategy': 'free_first'}
+    if settings.mt_routing is not None and settings.mt_routing != routing:
+        raise ToolError('mt_routing 必须为 {"strategy":"free_first"}。', 'mt_config')
     quality = {'input_bytes': 32768, 'output_tokens': 4096, 'max_revisions': 2, 'manual_glossary': {}}
     if settings.mt_quality is not None:
         if not isinstance(settings.mt_quality, dict) or set(settings.mt_quality) - {'manual_glossary'}:
@@ -105,7 +103,7 @@ def configured_route(config, manifest, *, paid_enabled=None):
                                      policy_version=settings.mt_policy_version).snapshot(),
                 'capabilities': {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}}
                for identity, tier, model in models]
-    return {'format_version': 4, 'entries': entries, 'routing': routing, 'quality': quality}
+    return {'format_version': 5, 'entries': entries, 'routing': routing, 'quality': quality}
 
 
 def saved_route(manifest):
@@ -114,10 +112,10 @@ def saved_route(manifest):
         raise _invalid()
     snapshot = manifest.get('mt_route_snapshot')
     if (not isinstance(snapshot, dict) or set(snapshot) != {'format_version', 'entries', 'routing', 'quality'} or
-            type(snapshot['format_version']) is not int or snapshot['format_version'] != 4 or
+            type(snapshot['format_version']) is not int or snapshot['format_version'] != 5 or
             type(manifest.get('translation_strategy_version')) is not int or
-            manifest['translation_strategy_version'] != 5 or not isinstance(snapshot['entries'], list) or
-            len(snapshot['entries']) != 3 or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):
+            manifest['translation_strategy_version'] != 6 or not isinstance(snapshot['entries'], list) or
+            len(snapshot['entries']) != 6 or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):
         raise _invalid()
 
     snapshot = copy.deepcopy(snapshot)
@@ -133,7 +131,7 @@ def saved_route(manifest):
         saved = entry['backend']
         if (not isinstance(saved, dict) or set(saved) != _BACKEND_FIELDS or
                 type(saved['format_version']) is not int or saved['format_version'] != 2 or
-                type(saved['request_version']) is not int or saved['request_version'] != 5 or
+                type(saved['request_version']) is not int or saved['request_version'] != 6 or
                 not _integer(saved['policy_version'], 1, 2**31 - 1) or
                 saved['provider'] != 'magpie' or not _model(saved['model']) or
                 not isinstance(saved['base_url'], str) or not isinstance(saved['key_fingerprint'], str) or

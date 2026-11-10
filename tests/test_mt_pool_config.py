@@ -19,7 +19,7 @@ class GatewaySnapshotValidationTests(TemporaryTest):
                          'account': key_fingerprint('synthetic-asr')}
 
     def manifest_with(self, route):
-        return {**self.manifest, 'translation_strategy_version': 5, 'mt_route_snapshot': copy.deepcopy(route)}
+        return {**self.manifest, 'translation_strategy_version': 6, 'mt_route_snapshot': copy.deepcopy(route)}
 
     def test_enqueue_and_report_preserve_the_saved_route_on_reuse(self):
         from subtitle_tool.main import summary
@@ -30,16 +30,16 @@ class GatewaySnapshotValidationTests(TemporaryTest):
             options = dict(workspace_id='space', account=self.manifest['account'], mt_route_snapshot=route)
             job_id = store.enqueue(media, **options)
             manifest = store.job(job_id)['manifest']
-            self.assertEqual(manifest['translation_strategy_version'], 5)
+            self.assertEqual(manifest['translation_strategy_version'], 6)
             self.assertEqual(saved_route(manifest), route)
             load_policy(manifest)
-            primary = next(entry['backend'] for entry in route['entries'] if entry['tier'] == 'paid')
+            primary = next(entry['backend'] for entry in route['entries'] if entry['id'] == 'magpie')
             report = summary(store, job_id)
             self.assertEqual((report['mt_provider'], report['models']['mt']),
                              (primary['provider'], primary['model']))
             self.assertEqual(store.enqueue(media, **options), job_id)
             self.assertEqual(summary(store, job_id), report)
-            self.config.settings.mt_routing = {'paid_enabled': False}
+            self.config.settings.mt_policy_version += 1
             options['mt_route_snapshot'] = configured_route(self.config, self.manifest)
             with self.assertRaises(ToolError) as error:
                 store.enqueue(media, **options)

@@ -79,11 +79,12 @@ class MTDiagnostics:
                 return False
             record = {'time': datetime.now(timezone.utc).isoformat(), 'kind': event['kind']}
             self._routing(record, event)
-            for field in ['entry']:
-                value = safe_model_id(event.get(field))
-                if value:
-                    record[field] = value
-            for field, allowed in [('tier', {'free', 'paid'}), ('scope', _SCOPES),
+            entry = safe_model_id(event.get('entry'))
+            if entry:
+                record['entry'] = entry
+            for field, allowed in [('tier', {'free', 'paid', 'mixed'}), ('scope', _SCOPES),
+                                   ('billing_route', {'trial', 'free', 'commercial', 'unknown'}),
+                                   ('entitlement_usage', {'unknown'}), ('cash_spend', {'unknown'}),
                                    ('category', _CATEGORIES), ('validation_category', VALIDATION_CATEGORIES),
                                    ('outcome', {'valid', 'invalid', 'service_error', 'transport_error',
                                                 'cancelled', 'local_error'})]:
@@ -138,7 +139,7 @@ class MTDiagnostics:
             model = safe_model_id(event.get(field))
             if model:
                 record[field] = model
-        if event.get('stage') in {'glossary', 'draft', 'align', 'review', 'correct'}:
+        if event.get('stage') in {'glossary', 'translate', 'review', 'judge'}:
             record['stage'] = event['stage']
         for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}'),
                                ('request_id', r'[0-9a-f]{32}'),

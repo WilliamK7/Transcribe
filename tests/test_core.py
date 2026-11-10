@@ -251,7 +251,7 @@ class PipelineTests(PipelineFixture):
         self.assertTrue(output.index("First sentence.") < output.index("繁体译文"))
         for call in fake.named("/chat/completions"):
             body = call[2]["json"]
-            self.assertEqual(body["model"], 'group/transcribe')
+            self.assertIn(body["model"], {'group/transcribe', 'group/transcribe-review'})
             self.assertEqual(len(body['messages']), 2)
             self.assertEqual(body['messages'][0]['role'], 'system')
 

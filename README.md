@@ -8,43 +8,37 @@ Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-f
 .\scripts\setup.ps1
 # 完成下方配置并启动 magpie
 .\scripts\transcribe.ps1 --configure-key
-.\scripts\transcribe.ps1 --check-mt --mt-paid deny
+.\scripts\transcribe.ps1 --check-mt
 .\scripts\transcribe.ps1 "D:\Videos\课程.mkv"
 ```
 
-`--check-mt` 用合成短句检查翻译。默认允许付费后备；`--mt-paid deny` 只使用已核验的免费组。多个文件顺序处理，`--help` 显示全部参数。
+`--check-mt` 用合成短句检查翻译。统一免费优先，免费不可用时商业组接替。多个文件顺序处理，`--help` 显示全部参数。
 
 ## 配置 magpie
 
-以下为本机翻译入口（magpie 0.1.3423）：
+本机接口依据 magpie 0.1.3516。先在 magpie 配置七牛、OpenRouter 和百炼工作空间凭据，再运行：
 
-| 入口 ID | 接入与模型 |
-| --- | --- |
-| `transcribe-qiniu-free` | 七牛兼容接口，固定 `qiniu/conatus-free` |
-| `transcribe-openrouter-free` | 原生 `openrouter` 预设，固定 `openrouter/free` |
-| `transcribe-qiniu-paid` | 七牛兼容接口，商业组选择 `z-ai/glm-5.3-flash` |
-| `transcribe-bailian` | 百炼工作空间兼容接口，商业组选择 `deepseek-v4.1-flash` |
-| `transcribe-bailian-trial` | 同一百炼账户，按已确认额度准入 `qwen3.8-max-0902`、`qwen3.8-27b` |
+```powershell
+.\.venv\Scripts\python.exe scripts/configure-mt.py --apply --discover-openrouter --refresh-trial
+```
 
-七牛使用 `https://api.qnaigc.com/v1`，百炼使用 `https://<workspace_id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`。地址、模型和凭据统一在 magpie 中维护。
+脚本保存私有配置备份，用固定合成样例验收型号，为合格候选建立三个独立角色。重复执行会更新项目托管成员，保留人工设置。ASR 使用百炼直连接口。
 
-免费／试用入口设 `listOff=true`，使用已核验的模型目录；商业入口允许刷新目录。组成员显式指定，可按需要更换商业模型。`listOff` 控制目录拉取，`off` 控制入口启停。资源包与代金券的抵扣范围以账户账单为准。
-
-本机字幕组配置如下，模型和凭据在 magpie 中维护：
-
-| 组 | 路由 | 成员 |
+| 角色 | 主组 | 商业后备 |
 | --- | --- | --- |
-| `group/transcribe-free` | 轮询 `routing=rotate` | 七牛、OpenRouter、通过额度检查的百炼试用模型 |
-| `group/transcribe` | 顺序 `routing=order` | `group/transcribe-free` → `group/transcribe-paid` |
-| `group/transcribe-paid` | 轮询 `routing=rotate` | 七牛 GLM Flash、百炼 DeepSeek Flash |
+| 正文 | `group/transcribe` | `group/transcribe-paid` |
+| 术语及轻量复核 | `group/transcribe-review` | `group/transcribe-review-paid` |
+| 疑难裁决 | `group/transcribe-judge` | `group/transcribe-judge-paid` |
 
-三组均设 `stays=off`（保存字段 `affinity=off`），每个请求重新选路。免费入口的服务商级回退留空，OpenRouter 入口使用 20 RPM 或账户要求的更严格值。项目按费用许可选择免费组或总组。主组超时、响应截断或格式修复失败时，已允许付费的任务切换到商业组；时限及重试规则见[阶段恢复](docs/API_CONTRACT.md#阶段恢复)。
+每个主组按免费组 → 商业组顺序选择。同档供应商子组等权，试用子组作为一个供应商；各组 `stays=off`。正文、复核和裁决按实际底层型号去重。OpenRouter 使用验收通过的明确 `:free` 型号。
 
-七牛活动截至北京时间 **2026 年 11 月 30 日 23:59**，资格见[官方规则](https://www.qiniu.com/ai/free-models/conatus-2026)。活动到期后，项目通过 magpie CLI 停用专用入口 `transcribe-qiniu-free`；自动停用要求该入口仅配置活动模型，且 magpie 为带 `.portable` 标记、同目录 `data` 的 Windows 便携版。停用失败时停止相关请求；自定义活动入口由用户在 magpie 停用或移出组。
+百炼试用管理使用 `data/bailian-quota-binding.json` 的账户绑定，自动查询全目录有效额度。每款型号独立入口，最多 12 个合成样例验收并缓存角色资格；后台逐个补充至三个合格候选。首次联网翻译启动后台刷新，默认每 60 秒共享一次查询，失败退避并标记未知。耗尽事件读取 magpie 逐次尝试日志，即使最终 HTTP 200 也会退出对应模型，耗尽状态保持至本任务结束。
 
-免费组支持上述七牛活动模型、OpenRouter 的 `openrouter/free`／`:free` 模型，以及百炼试用模型。百炼按 `data/bailian-quota-binding.json` 中的用户确认匹配工作空间、Key 与 CLI 账户，并查询每个模型的剩余额度、有效期和“用完即停”。查询结果缓存 20 秒；到期当天、查询失败或绑定不匹配时停用试用入口并移除成员，其他免费入口继续可用。配置更新失败时停止本次请求。
+`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停和排除。人工停用入口、关闭或移除组成员会被保留，记录为模型 `manual_hold` 或 `excluded_groups`；恢复时须显式清除对应标记并恢复网关开关。最后一个组成员因 magpie 限制可能保留为停用占位，不再参与选路。管理记录保存在 `.build/mt-diagnostics/trial-management.jsonl`，只含操作者、任务、型号、前后状态及原因。自定义组名及远程网关由管理员维护，自动管理仅作用于上表默认本机角色组。原共用 `transcribe-bailian-trial` 作为绑定模板保留停用，新入口使用该 ID 的哈希后缀。
 
-百炼费用边界依赖供应商的“用完即停”，该开关及账户绑定由用户确认。本地查询只用于准入；观察到开关关闭会撤销对应模型的确认，重新开启后须再次确认生效。CLI 环境要求见[环境维护](docs/BUILD.md)。
+拆分入口共享原账户 RPM 预算，商业入口也计入；模型及工作空间配额进一步收紧。商业调用次数不等于现金支出，资源包、代金券的实际抵扣需核对账单。七牛活动过期会停用专用入口；其他组可继续翻译。
+
+供应商限流、冷却和故障切换由 magpie 管理。候选验收遇到临时失败会暂缓整个型号，至少 300 秒后重试；单请求最多 120 秒，以唯一会话 ID 关联路由。
 
 ## 项目配置
 
@@ -60,10 +54,12 @@ Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-f
 | 设置 | 默认值或用途 |
 | --- | --- |
 | `mt_base_url` | `http://127.0.0.1:3425/v1`，仅用于翻译 |
-| `mt_free_model` / `mt_model` | `group/transcribe-free` / `group/transcribe` |
+| `mt_model` | `group/transcribe`，免费优先的正文主组 |
 | `mt_fallback_model` | `group/transcribe-paid`，主组超时或结果校验失败后的付费后备 |
 | `mt_policy_version` | 整数 `1`；更换翻译策略并要求重译时递增 |
-| `mt_routing.paid_enabled` | `true`，可由本次 `--mt-paid allow\|deny` 覆盖 |
+| `mt_routing.strategy` | `free_first` |
+| `mt_review_model` / `mt_review_fallback_model` | 上表复核主组与商业后备 |
+| `mt_judge_model` / `mt_judge_fallback_model` | 上表裁决主组与商业后备 |
 | `mt_quality.manual_glossary` | 人工术语映射，最多 200 项 |
 | `mt_workers` | 默认 `16`，允许任意正整数；控制同时在途的翻译阶段数 |
 | `zh_line_width` / `other_line_width` | `44` / `84`，范围 12～72 / 24～160 |
@@ -71,7 +67,7 @@ Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-f
 
 ASR Key 使用 `DASHSCOPE_API_KEY`，未设置时读取 `data/key.txt`；`--configure-key` 隐藏输入并保存本地 Key。提交、轮询和上传策略直接使用该 Key，OSS 上传和签名下载不携带它；恢复仍核验原账户指纹。
 
-翻译地址和组名支持 `MT_BASE_URL`、`MT_MODEL`、`MT_FREE_MODEL`、`MT_FALLBACK_MODEL` 环境覆盖。网关凭据使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机缺省为 `magpie-transcribe`；远程翻译网关须配置凭据。免费证明绑定本机注册表所属监听地址，端口修改需同步 magpie 的保存设置。
+翻译地址和组名支持 `MT_BASE_URL`、`MT_MODEL`、`MT_FALLBACK_MODEL`、`MT_REVIEW_MODEL`、`MT_REVIEW_FALLBACK_MODEL`、`MT_JUDGE_MODEL`、`MT_JUDGE_FALLBACK_MODEL` 环境覆盖。网关凭据使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机缺省为 `magpie-transcribe`；远程翻译网关须配置凭据。免费证明绑定本机注册表所属监听地址，端口修改需同步 magpie 的保存设置。
 
 新任务与 `--reflow` 使用当前配置；`--resume` 沿用任务保存的翻译身份和排版，线程数与轮询等待使用当前值。需要按新策略重新翻译时，递增 `mt_policy_version` 后执行 `--reflow`；保持版本可复用匹配缓存。
 
@@ -79,7 +75,7 @@ ASR Key 使用 `DASHSCOPE_API_KEY`，未设置时读取 `data/key.txt`；`--conf
 
 默认生成同目录、同名 UTF-8 SRT，外语原文在上、简体中文译文在下；中文／粤语保留原文，无语音则完成任务。已有 SRT 默认跳过，`--overwrite` 先备份再替换，也可用 `--output-dir` 另存。
 
-每组执行术语提取、整句翻译、必要的片段对齐和自动复核，最多两轮纠正。完整译文逐组保存，仍有疑点时提示人工检查。原文与译文各以两行为目标，按可靠词时间拆分长句；具体规则见[接口与恢复契约](docs/API_CONTRACT.md)。
+默认每 8 组增量提取术语，超预算拆分；一次翻译直接输出全部字幕编号。每组保留独立语义复核，有疑点才裁决并修正，最多两轮。完整译文逐组保存，仍有疑点时提示人工检查。原文与译文各以两行为目标，按可靠词时间拆分长句；具体规则见[接口与恢复契约](docs/API_CONTRACT.md)。
 
 音频优先复制兼容压缩音轨，声道或时间轴需要处理时转为 16kHz 单声道 FLAC，保留偏移、静音及编码延迟。超过 12 小时或上传容量时分段；`media_pcm_limit` 表示需先分割输入。
 
@@ -92,7 +88,7 @@ ASR Key 使用 `DASHSCOPE_API_KEY`，未设置时读取 `data/key.txt`；`--conf
 ```powershell
 .\scripts\transcribe.ps1 --jobs
 .\scripts\transcribe.ps1 --review 本地任务ID
-.\scripts\transcribe.ps1 --resume 本地任务ID --mt-paid deny
+.\scripts\transcribe.ps1 --resume 本地任务ID
 .\scripts\transcribe.ps1 --reflow 本地任务ID --overwrite
 .\scripts\transcribe.ps1 --retime 本地任务ID --overwrite
 .\scripts\transcribe.ps1 --cancel 本地任务ID

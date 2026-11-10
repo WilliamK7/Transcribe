@@ -42,7 +42,11 @@ def set_asr_account(config, key):
                           {'id': 'transcribe-bailian', 'chat': f'https://{workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'key': key}],
             'groups': [{'id': 'transcribe-free', 'members': ['free/openrouter/free']},
                        {'id': 'transcribe', 'members': ['group/transcribe-free']},
-                       {'id': 'transcribe-paid', 'members': ['transcribe-bailian/qwen3.8-flash']}]})
+                       {'id': 'transcribe-paid', 'members': ['transcribe-bailian/qwen3.8-flash']},
+                       {'id': 'transcribe-review', 'members': ['transcribe-bailian/review-model']},
+                       {'id': 'transcribe-review-paid', 'members': ['transcribe-bailian/review-model']},
+                       {'id': 'transcribe-judge', 'members': ['transcribe-bailian/judge-model']},
+                       {'id': 'transcribe-judge-paid', 'members': ['transcribe-bailian/judge-model']}]})
 
 
 def result(*sentences):
@@ -123,12 +127,12 @@ class FakeService:
                           if payload['messages'][0]['content'].startswith(prompt)), None)
             if stage is not None:
                 data = json.loads(payload['messages'][1]['content'])
-                targets = data['sentences'] if stage in {'draft', 'glossary'} else data['fragments']
+                targets = data['sentences'] if stage == 'glossary' else data['fragments']
                 if any(item['text'] in self.mt_failure for item in targets):
                     return response({'error': {'code': 'InvalidApiKey'}}, 401)
                 value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
                          {'translations': {item['id']: '繁體譯文：' + item['text'] for item in targets}})
-                return response({'model': payload['model'], 'choices': [{'finish_reason': 'stop', 'message': {
+                return response({'model': 'synthetic/' + stage, 'choices': [{'finish_reason': 'stop', 'message': {
                     'content': json.dumps(value, ensure_ascii=False)}}]})
         raise AssertionError("Unexpected request " + url)
 

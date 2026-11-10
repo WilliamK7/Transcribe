@@ -11,9 +11,9 @@ from .mt_quality import GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION
 def current_execution_snapshot():
     return dict(format_version=1,
                 prompt_version=QUALITY_PROMPT_VERSION,
-                recovery_version=5,
-                context_version=2,
-                alignment_version=2)
+                recovery_version=6,
+                context_version=3,
+                alignment_version=3)
 
 
 def asr_contract():
@@ -49,7 +49,10 @@ def load_policy(manifest, *, verify_execution=True):
     _version(manifest.get("processing_version"), PROCESSING_VERSION)
     _version(manifest.get("subtitle_version"), SUBTITLE_VERSION)
     display_timing = _version(manifest.get('display_timing_version'), DISPLAY_TIMING_VERSION)
-    _version(manifest.get("translation_strategy_version"), 5)
+    if verify_execution:
+        _version(manifest.get("translation_strategy_version"), 6)
+    elif type(manifest.get('translation_strategy_version')) is not int or manifest['translation_strategy_version'] not in (5, 6):
+        raise ToolError('不支持该历史翻译版本。', 'cache_version')
     saved_layout = manifest.get("subtitle_settings", {})
     if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:
         raise ToolError("任务的排版快照无效，请用 --reflow 重排。", "cache_version")

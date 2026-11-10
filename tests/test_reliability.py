@@ -35,8 +35,8 @@ class TransactionRecoveryTests(SavedResultFixture):
                                 stage = next(name for name, prompt in PROMPTS.items() if body['messages'][0]['content'].startswith(prompt))
                                 data = json.loads(body['messages'][1]['content'])
                                 value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
-                                         {'translations': {item['id']: '中' * (10 if stage == 'draft' else 50)
-                                                           for item in data['sentences' if stage == 'draft' else 'fragments']}})
+                                         {'translations': {item['id']: '中' * 50
+                                                           for item in data['fragments']}})
                                 return response({'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(value)}}]})
                             return original_request(method, url, **kwargs)
                         fake.request = request

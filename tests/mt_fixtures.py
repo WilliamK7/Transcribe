@@ -11,11 +11,12 @@ from tests.fixtures import SavedResultFixture, result, timed_raw
 class PoolPipelineFixture(SavedResultFixture):
     def setUp(self):
         super().setUp()
-        self.config.settings.mt_routing = {'paid_enabled': False}
+        self.config.settings.mt_routing = None
         self.config.settings.mt_workers = 2
         self.calls = []
         self.review_failure = False
         self.review_issue = False
+        self.dismiss_review = False
         self.no_change_correction = False
         self.fail_stage = None
         self.cancel_after = None
@@ -23,6 +24,7 @@ class PoolPipelineFixture(SavedResultFixture):
         self.stage_hook = None
         self.glossary_terms = lambda data: []
         self.corrected_translations = None
+        self.actual_model = lambda stage, request: {'glossary': 'review-model'}.get(stage, stage + '-model')
 
     def run_pool(self, cancel=None, engine=None, run=None):
         parent = self
@@ -41,27 +43,29 @@ class PoolPipelineFixture(SavedResultFixture):
                     parent.stage_hook(stage, data)
                 if stage == parent.fail_stage:
                     return HTTPReply(400, b'{}')
-                if stage == 'draft' and parent.fail_second_group and any(
+                if stage == 'translate' and parent.fail_second_group and any(
                         'sentence 8' in item['text'] for item in data['sentences']):
                     return HTTPReply(400, b'{}')
                 if stage == 'review' and parent.review_failure:
                     return HTTPReply(400, b'{}')
                 if stage == 'glossary':
                     value = {'terms': parent.glossary_terms(data)}
-                elif stage == 'draft':
-                    value = {'translations': {item['id']: '完整句译文。' for item in data['sentences']}}
-                elif stage in {'align', 'correct'}:
-                    suffix = (str(sum(call[0] == 'correct' for call in parent.calls))
-                              if stage == 'correct' and not parent.no_change_correction else '')
-                    value = {'translations': (dict(data['translations']) if stage == 'correct' and parent.no_change_correction
+                elif stage == 'translate':
+                    value = {'translations': {item['id']: '完整句译文。' for item in data['fragments']}}
+                elif stage == 'judge':
+                    suffix = (str(sum(call[0] == 'judge' for call in parent.calls))
+                              if not parent.no_change_correction else '')
+                    value = {'translations': (dict(data['translations']) if parent.no_change_correction
                              else {item['id']: '字幕完整译文。' + suffix for item in data['fragments']})}
-                    if stage == 'correct' and parent.corrected_translations is not None:
+                    if parent.corrected_translations is not None:
                         value = {'translations': parent.corrected_translations(data)}
                 else:
                     value = {'issues': ([{'id': '0', 'category': 'number', 'evidence': '数字有疑点'}]
                                         if parent.review_issue else [])}
+                if stage == 'judge':
+                    value['issues'] = [] if parent.dismiss_review else data['issues']
                 content = json.dumps(value, ensure_ascii=False)
-                response = {'model': payload['model'], 'usage': {'prompt_tokens': 10, 'completion_tokens': 4},
+                response = {'model': parent.actual_model(stage, payload['model']), 'usage': {'prompt_tokens': 10, 'completion_tokens': 4},
                             'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}
                 if stage == parent.cancel_after and cancel is not None:
                     cancel.set()
@@ -78,4 +82,4 @@ class PoolPipelineFixture(SavedResultFixture):
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id)
         manifest = self.store.job(self.job_id)['manifest']
-        self.assertEqual(manifest['translation_strategy_version'], 5)
+        self.assertEqual(manifest['translation_strategy_version'], 6)

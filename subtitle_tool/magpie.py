@@ -42,6 +42,21 @@ def known_free_model(base_url, model):
             (base_url == OPENROUTER_BASE_URL and (model == 'openrouter/free' or model.endswith(':free'))))
 
 
+def billing_route(settings, model):
+    """Classify the selected offer; this is not a receipt or cash estimate."""
+    try:
+        owner, name = model.split('/', 1)
+        raw = json.loads((Path(settings.magpie_data_dir) / 'providers.json').read_bytes())
+        provider = next(p for p in raw['providers'] if p['id'] == owner)
+        if owner.startswith('transcribe-bailian-trial-'):
+            return 'trial'
+        if provider.get('countFree') or known_free_model(normalize_mt_url(provider.get('chat')), name):
+            return 'free'
+        return 'commercial'
+    except (OSError, ValueError, KeyError, TypeError, StopIteration, ToolError):
+        return 'unknown'
+
+
 def _pause_expired_promotion(settings, identity, provider):
     """Disable only the designated promotional endpoint through magpie."""
     from .mt_backend import QINIU_BASE_URL, QINIU_FREE_MODEL
@@ -64,53 +79,65 @@ def _pause_expired_promotion(settings, identity, provider):
         return False
 
 
-def validate_group(settings, model, *, free_only, base_url=None, paid_only=False, verified_free=()):
-    """Check the local fee boundary; routing and credentials stay in magpie.
+def group_models(raw, model):
+    providers = {row['id']: row for row in raw['providers']}
+    groups = {row['id']: row for row in raw.get('groups', [])}
+    def visit(member, seen):
+        if not isinstance(member, str) or member in seen or len(seen) > 8:
+            raise ValueError()
+        owner, name = member.split('/', 1)
+        if owner == 'group':
+            group = groups[name]
+            if group.get('hidden'):
+                return []
+            if group.get('match') or group.get('classifier') or group.get('rules'):
+                raise ValueError()
+            return [leaf for nested in group.get('members', []) if nested not in group.get('off', [])
+                    for leaf in visit(nested, seen | {member})]
+        provider = providers[owner]
+        if provider.get('off'):
+            return []
+        if provider.get('fallback'):
+            raise ValueError()
+        plain = re.sub(r':(?:none|minimal|low|medium|high|xhigh|max)$', '', name)
+        return [(owner, plain, provider)]
+    return visit(model, set())
 
-    Remote gateways are administered by their owner. A local registry can
-    detect accidental paid fallback or an expired promotion.
-    """
-    from .mt_backend import QINIU_FREE_MODEL, qiniu_free_active
-    error = ToolError(('magpie 付费后备组不可用或仍包含免费成员；请检查独立的付费组。' if paid_only else
-                      'magpie 字幕组不可用或包含未获免费保证的回退；请在 magpie 检查组成员和活动有效期。'), 'magpie_group')
+
+def validate_group(settings, model, *, base_url=None, paid_only=False):
+    """Validate enabled local routes, preserving account identity in the gateway."""
     if not bound_gateway(settings, base_url or settings.mt_base_url):
-        if free_only:
-            raise error
+        return
+    from .mt_backend import QINIU_FREE_MODEL, qiniu_free_active
+    try:
+        raw = json.loads((Path(settings.magpie_data_dir) / 'providers.json').read_bytes())
+        leaves = group_models(raw, model)
+        if not leaves:
+            raise ValueError()
+        for owner, name, provider in leaves:
+            trial = owner.startswith('transcribe-bailian-trial')
+            if paid_only and (trial or known_free_model(normalize_mt_url(provider.get('chat')), name)):
+                raise ValueError()
+            if name == QINIU_FREE_MODEL and not qiniu_free_active():
+                if not _pause_expired_promotion(settings, owner, provider):
+                    raise ValueError()
+    except (OSError, ValueError, KeyError, TypeError, ToolError):
+        raise ToolError('magpie 字幕角色组不可用，请检查组成员、账户和商业后备。', 'magpie_group') from None
+
+
+def validate_role_pools(settings, entries, *, base_url=None):
+    from .mt_admission import canonical_model
+    if not bound_gateway(settings, base_url or settings.mt_base_url):
         return
     try:
-        raw = json.loads((Path(settings.magpie_data_dir) / 'providers.json').read_text(encoding='utf-8-sig'))
-        providers = {row['id']: row for row in raw['providers']}
-        groups = {row['id']: row for row in raw.get('groups', [])}
-        def visit(member, seen):
-            if not isinstance(member, str) or member in seen or len(seen) > 8:
-                raise error
-            owner, name = member.split('/', 1)
-            if owner == 'group':
-                group = groups[name]
-                if (group.get('hidden') or not group.get('members') or group.get('match') or
-                        ((free_only or paid_only) and (group.get('classifier') or group.get('rules')))):
-                    raise error
-                for nested in group['members']:
-                    if nested not in group.get('off', []):
-                        visit(nested, seen | {member})
-            else:
-                provider = providers[owner]
-                if provider.get('off'):
-                    return
-                plain_model = re.sub(r':(?:none|minimal|low|medium|high|xhigh|max)$', '', name)
-                trial = owner == 'transcribe-bailian-trial'
-                proven = (owner, plain_model) in verified_free
-                if trial and not proven:
-                    raise error
-                if free_only and (provider.get('fallback') or not known_free_model(
-                        normalize_mt_url(provider.get('chat')), plain_model) and not proven):
-                    raise error
-                if paid_only and (trial or provider.get('fallback') or known_free_model(
-                        normalize_mt_url(provider.get('chat')), plain_model)):
-                    raise error
-                if plain_model == QINIU_FREE_MODEL and not qiniu_free_active():
-                    if not _pause_expired_promotion(settings, owner, provider):
-                        raise error
-        visit(model, set())
-    except (OSError, ValueError, KeyError, TypeError, ToolError):
-        raise error from None
+        raw = json.loads((Path(settings.magpie_data_dir) / 'providers.json').read_bytes())
+        identities = {}
+        for role, models in entries.items():
+            for _, name, _ in [leaf for model in ([models] if isinstance(models, str) else models)
+                               for leaf in group_models(raw, model)]:
+                identity = canonical_model(name)
+                if identity in identities and identities[identity] != role:
+                    raise ValueError()
+                identities[identity] = role
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ToolError('正文、复核和裁决组需要使用互不重叠的底层型号。', 'magpie_group') from None

@@ -47,14 +47,13 @@ class ModelObservation:
     remaining: int | None
     total: int | None
     expires: date | None
-    auto_stop: bool | None
     remaining_percent_known: bool
 
     def usable(self, today):
         # The CLI exposes a local date only. It may expire at any instant on
         # that date, so stop at the *beginning* of the indicated Beijing day.
         # This checks the reported status, not whether a change has taken effect.
-        return (self.kind == 'Text' and self.auto_stop is True and
+        return (self.kind == 'Text' and
                 self.remaining is not None and self.total is not None and
                 0 < self.remaining <= self.total and
                 self.remaining_percent_known and self.expires is not None and self.expires > today)
@@ -104,13 +103,11 @@ def parse_observation(raw):
                 expires = date.fromisoformat(raw_date) if isinstance(raw_date, str) and _DATE.fullmatch(raw_date) else None
             except ValueError:
                 expires = None
-            stop = item.get('autoStop')
-            stop = stop if type(stop) is bool else None
             percent = item.get('remainingPercent')
             percent_known = (not isinstance(percent, bool) and isinstance(percent, (int, float)) and
                              math.isfinite(percent) and 0 <= percent <= 100)
             result[model] = ModelObservation(kind, _integer(item.get('remaining')),
-                _integer(item.get('total')), expires, stop, percent_known)
+                _integer(item.get('total')), expires, percent_known)
         return result
     except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
         raise ValueError('Invalid quota observation') from None
@@ -121,6 +118,44 @@ class QuotaSourceError(Exception):
 
     def __init__(self):
         super().__init__('Quota query failed')
+
+
+class ModelAccessSource:
+    """Official API-key scoped GETs, equivalent to bl permission/quota list."""
+    def inspect(self, config, model, control):
+        from urllib.parse import urlencode
+        from .mt_transport import ProcessTransport
+        base = f'https://{config.settings.workspace_id}.cn-beijing.maas.aliyuncs.com'
+        result = {}
+        for path, field in [('permissions', 'permissions'), ('limits', 'quotas')]:
+            query = urlencode({'model': model, 'page_size': 100,
+                               **({'authorization_scope': 'AUTHORIZABLE'} if path == 'permissions' else {})})
+            reply = ProcessTransport().request('GET', base + '/api/v1/models/' + path + '?' + query,
+                headers={'Authorization': 'Bearer ' + config.get_key()}, control=control, timeout=15, drain=False)
+            if reply.status != 200:
+                raise QuotaSourceError()
+            rows = json.loads(reply.body).get('output', {}).get(field, [])
+            exact = [row for row in rows if row.get('model') == model]
+            result[path] = exact
+        # False/null grant records can still be callable through other grants;
+        # the bounded inference test establishes actual access, never grant it.
+        rates, tokens, shared, shared_tokens = [], [], [], []
+        for row in result['limits']:
+            for scope in ('model_limit', 'workspace_limit'):
+                spec = row.get(scope) or {}
+                for field, period, output in [('request_limit', 'request_limit_period', rates),
+                                               ('usage_limit', 'usage_limit_period', tokens)]:
+                    amount, seconds = spec.get(field), spec.get(period) or 60
+                    if type(amount) is int and amount > 0 and type(seconds) is int and seconds > 0:
+                        output.append(amount * 60 // seconds)
+                        if scope == 'workspace_limit' and field == 'request_limit':
+                            shared.append(amount * 60 // seconds)
+                        if scope == 'workspace_limit' and field == 'usage_limit':
+                            shared_tokens.append(amount * 60 // seconds)
+        return {'rpm': min(rates) if rates else None, 'tpm': min(tokens) if tokens else None,
+                'workspace_rpm': min(shared) if shared else None,
+                'workspace_tpm': min(shared_tokens) if shared_tokens else None,
+                'permission_observed': bool(result['permissions'])}
 
 
 class CLIQuotaSource:

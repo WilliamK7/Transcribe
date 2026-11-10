@@ -96,9 +96,9 @@ class Store:
                         "overwrite": bool(overwrite), "segments": [], "warnings": []}
             if mt_route_snapshot is not None:
                 manifest['mt_route_snapshot'] = mt_route_snapshot
-                saved_route({**manifest, 'translation_strategy_version': 5})
+                saved_route({**manifest, 'translation_strategy_version': 6})
             settings = settings or Settings()
-            manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
+            manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=6,
                             display_timing_version=DISPLAY_TIMING_VERSION,
                             execution_snapshot=current_execution_snapshot(),
                             mt_glossary_schedule=GLOSSARY_SCHEDULE,
@@ -330,7 +330,7 @@ class Store:
                         cache_key=None, cache_value=None):
         """Persist a complete private stage and, when present, all cue updates in one transaction."""
         if (not isinstance(key, str) or len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or
-                stage not in {'glossary', 'glossary_unavailable', 'semantic_input', 'draft', 'align', 'review', 'correct', 'final'} or not isinstance(record, dict) or
+                stage not in {'glossary', 'glossary_unavailable', 'semantic_input', 'translate', 'review', 'judge', 'final'} or not isinstance(record, dict) or
                 (cache_key is None) != (cache_value is None) or
                 translations is not None and (not translations or
                     any(not isinstance(text, str) or not text.strip() for text in translations.values()))):

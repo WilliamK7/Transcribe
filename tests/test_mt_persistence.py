@@ -16,21 +16,21 @@ class StagePersistenceTests(SavedResultFixture):
         self.store.db.execute("CREATE TRIGGER reject_stage BEFORE INSERT ON mt_stages "
                               "BEGIN SELECT RAISE(ABORT,'synthetic rejection'); END")
         with self.assertRaises(sqlite3.IntegrityError):
-            self.store.commit_mt_stage(self.job_id, 'a' * 64, 'align', record,
+            self.store.commit_mt_stage(self.job_id, 'a' * 64, 'translate', record,
                                        translations={cue['cue_id']: '完整译文'}, origin='qiniu_free')
         self.assertFalse(self.store.cues(self.job_id)[0]['translated'])
         self.assertIsNone(self.store.mt_stage_entry(self.job_id, 'a' * 64))
         self.store.db.execute('DROP TRIGGER reject_stage')
-        self.store.commit_mt_stage(self.job_id, 'a' * 64, 'align', record,
+        self.store.commit_mt_stage(self.job_id, 'a' * 64, 'translate', record,
                                    translations={cue['cue_id']: '完整译文'}, origin='qiniu_free')
         self.assertEqual(self.store.cues(self.job_id)[0]['translated'], '完整译文')
         self.assertEqual(self.store.mt_stage_entry(self.job_id, 'a' * 64),
-                         {'stage': 'align', 'record': record})
+                         {'stage': 'translate', 'record': record})
 
     def test_stages_and_cues_survive_reopen(self):
         self.save_result()
         cues = self.store.cues(self.job_id)
-        self.store.commit_mt_stage(self.job_id, 'b' * 64, 'draft', {'text': 'private original'})
+        self.store.commit_mt_stage(self.job_id, 'b' * 64, 'translate', {'text': 'private original'})
         self.store.close()
         from subtitle_tool.store import Store
         self.store = Store(self.config.data / 'jobs.sqlite')
@@ -38,7 +38,7 @@ class StagePersistenceTests(SavedResultFixture):
         self.store.replace_cues(self.job_id, cues)
         self.assertEqual(self.store.cues(self.job_id), cues)
         self.assertEqual(self.store.mt_stage_entry(self.job_id, 'b' * 64),
-                         {'stage': 'draft', 'record': {'text': 'private original'}})
+                         {'stage': 'translate', 'record': {'text': 'private original'}})
 
     def test_group_update_preserves_metadata_and_rolls_back_missing_cue(self):
         self.save_result(result(('First.', 'en'), ('Second.', 'en')))

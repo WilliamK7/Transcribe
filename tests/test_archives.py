@@ -74,7 +74,7 @@ class ArchiveTests(SavedResultFixture):
         new_id = Engine(self.config, self.store).reflow(self.job_id, output_dir=self.path / 'rebuilt')
         self.assertNotEqual(new_id, self.job_id)
         load_policy(self.store.job(new_id)['manifest'])
-        self.assertEqual(self.store.job(new_id)['manifest']['execution_snapshot']['alignment_version'], 2)
+        self.assertEqual(self.store.job(new_id)['manifest']['execution_snapshot']['alignment_version'], 3)
         self.assertEqual(self.store.job(self.job_id), previous)
         self.assertEqual((folder / 'task.json').read_bytes(), frozen)
         self.job_id = new_id

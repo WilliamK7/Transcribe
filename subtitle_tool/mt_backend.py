@@ -63,7 +63,7 @@ class MTBackend:
     base_url: str
     model: str
     key_fingerprint: str
-    request_version: int = 5
+    request_version: int = 6
     policy_version: int = 1
 
     def snapshot(self):

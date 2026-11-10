@@ -56,17 +56,12 @@ class Engine:
                 self.store.update(job["id"], target, event='recover')
 
     def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
-               task_id=None, allow_resubmit=False, mt_paid=None):
+               task_id=None, allow_resubmit=False):
         """Prepare an explicitly requested resume; run() remains the sole executor."""
         manifest = self.store.job(job_id)['manifest']
         load_policy(manifest)
         from .mt_pool import saved_route
         route = saved_route(manifest)
-        if mt_paid is not None:
-            route['routing']['paid_enabled'] = mt_paid == 'allow'
-            manifest['mt_route_snapshot'] = route
-            self.store.update(job_id, manifest=manifest)
-
         self.select_input(job_id, track, channel)
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped"}:
@@ -158,11 +153,11 @@ class Engine:
             self.store.update(job_id, manifest=manifest)
         return key, scope
 
-    def reflow(self, job_id, *, overwrite=False, output_dir=None, mt_paid=None):
+    def reflow(self, job_id, *, overwrite=False, output_dir=None):
         """Prepare a recoverable local reflow; only run() may translate and commit SRT."""
         job = self.store.job(job_id)
         if job['state'] == 'archived':
-            return self.rebuild_archive(job_id, output_dir, overwrite=overwrite, mt_paid=mt_paid)
+            return self.rebuild_archive(job_id, output_dir, overwrite=overwrite)
         manifest = job["manifest"]
         output = self.store.resolve_output(job, output_dir)
         self.store.check_republish_output(job_id, output, overwrite, operation="重排")
@@ -170,7 +165,7 @@ class Engine:
         self.identity(job_id, manifest, persist=False)
         self.config.settings.validate()
         from .mt_pool import configured_route
-        route = configured_route(self.config, manifest, paid_enabled=None if mt_paid is None else mt_paid == 'allow')
+        route = configured_route(self.config, manifest)
         contract = asr_contract()
         cache = self.config.data / "cache" / job_id
         offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
@@ -205,7 +200,7 @@ class Engine:
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                      "backup", "cue_count", "no_speech"]:
             manifest.pop(name, None)
-        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=5,
+        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=6,
                         mt_glossary_schedule=GLOSSARY_SCHEDULE,
                         display_timing_version=DISPLAY_TIMING_VERSION,
                         execution_snapshot=current_execution_snapshot(),
@@ -220,7 +215,7 @@ class Engine:
         self.store.commit_reflow(job_id, sources, [make_fragment(s) for s in sources], manifest, output)
         return job_id
 
-    def rebuild_archive(self, job_id, directory, *, overwrite=False, mt_paid=None):
+    def rebuild_archive(self, job_id, directory, *, overwrite=False):
         from .archives import read_archive
         from .mt_pool import configured_route
         from .reports import ReportWriter
@@ -234,12 +229,12 @@ class Engine:
                     'workspace_id': validate_workspace_id(self.config.settings.workspace_id),
                     'account': hashlib.sha256(key.encode()).hexdigest(), 'processing_version': PROCESSING_VERSION,
                     'subtitle_version': SUBTITLE_VERSION, 'display_timing_version': DISPLAY_TIMING_VERSION,
-                    'translation_strategy_version': 5, 'execution_snapshot': current_execution_snapshot(),
+                    'translation_strategy_version': 6, 'execution_snapshot': current_execution_snapshot(),
                     'mt_glossary_schedule': GLOSSARY_SCHEDULE, 'contract': asr_contract(),
                     'overwrite': bool(overwrite), 'rebuilt_from_archive': job_id,
                     'subtitle_settings': {k: getattr(self.config.settings, k) for k in
                                          ['zh_line_width', 'other_line_width', 'chinese_first']}}
-        route = configured_route(self.config, manifest, paid_enabled=None if mt_paid is None else mt_paid == 'allow')
+        route = configured_route(self.config, manifest)
         manifest['mt_route_snapshot'] = route
         for name in ['fingerprint', 'media', 'track', 'channel']:
             if name in old:

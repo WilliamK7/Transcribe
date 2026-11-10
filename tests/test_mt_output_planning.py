@@ -23,7 +23,7 @@ class OutputPlanningTests(PoolPipelineFixture):
             self.assertGreater(len(saved['groups']), 1)
         self.stage_hook = check_plan
         self.assertEqual(self.run_pool(), 'completed')
-        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        drafts = [data for stage, _, data in self.calls if stage == 'translate']
         self.assertGreater(len(drafts), 1)
         self.assertEqual([sentence['text'] for data in drafts for sentence in data['sentences']],
                          [source['text'] for source in self.store.sources(self.job_id)])
@@ -34,7 +34,7 @@ class OutputPlanningTests(PoolPipelineFixture):
         self.save_result(result((text, 'en')))
         Engine(self.config, self.store).reflow(self.job_id)
         self.assertEqual(self.run_pool(), 'completed')
-        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        drafts = [data for stage, _, data in self.calls if stage == 'translate']
         self.assertEqual(len(drafts), 1)
         self.assertEqual(drafts[0]['sentences'][0]['text'], text.strip())
 
@@ -44,7 +44,7 @@ class OutputPlanningTests(PoolPipelineFixture):
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id)
         self.assertEqual(self.run_pool(), 'completed')
-        drafts = [data for stage, _, data in self.calls if stage == 'draft']
+        drafts = [data for stage, _, data in self.calls if stage == 'translate']
         self.assertGreater(len(drafts), 1)
         self.assertEqual(''.join(sentence['text'] for data in drafts for sentence in data['sentences']),
                          raw['transcripts'][0]['sentences'][0]['text'])
@@ -61,19 +61,19 @@ class OutputPlanningTests(PoolPipelineFixture):
         sources = self.store.sources(self.job_id)
         groups = pipeline.plan_groups(sources, [make_fragment(source) for source in sources])
         self.assertGreater(len(groups), 1)
-        profile = pipeline.profiles['magpie_free']
+        profile = pipeline.profiles['magpie']
         profile['capabilities']['output_tokens'] = 32768
-        data = {'sentences': [{'id': '0', 'text': 'Word ' * 1000}], 'context': [], 'glossary': []}
-        self.assertEqual(pipeline._fit('draft', data), data)
+        data = {'sentences': [{'id': '0', 'text': 'Word ' * 1000}], 'fragments': [{'id': '0', 'sentence': '0', 'text': 'Word ' * 1000}], 'context': [], 'glossary': []}
+        self.assertEqual(pipeline._fit('translate', data), data)
         with self.assertRaises(ToolError) as error:
-            pipeline._fit('draft', data, output_budget=True)
+            pipeline._fit('translate', data, output_budget=True)
         self.assertEqual(error.exception.code, 'mt_input_budget')
 
 
     def test_new_layout_uses_output_budget_with_previous_stage_records(self):
         from subtitle_tool.mt_pipeline import Pipeline
         self.install_many()
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         stages = self.store.mt_stages(self.job_id)
         self.assertTrue(stages)
@@ -109,7 +109,7 @@ class OutputPlanningTests(PoolPipelineFixture):
     def test_plan_structure_is_validated_even_when_its_fingerprint_matches(self):
         from subtitle_tool.mt_planning import _fingerprint, restore_group_plan
         self.install_many()
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         sources, cues = self.store.sources(self.job_id), self.store.cues(self.job_id)
         original = self.store.job(self.job_id)['manifest']['mt_group_plan']
@@ -124,7 +124,7 @@ class OutputPlanningTests(PoolPipelineFixture):
         from subtitle_tool.mt_planning import _fingerprint, restore_group_plan
         self.save_result(result(('First sentence.', 'en'), ('Une autre phrase.', 'fr')))
         Engine(self.config, self.store).reflow(self.job_id)
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.config.settings.mt_workers = 1
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         sources, cues = self.store.sources(self.job_id), self.store.cues(self.job_id)
@@ -138,7 +138,7 @@ class OutputPlanningTests(PoolPipelineFixture):
     def test_resume_uses_frozen_groups_and_saved_draft_without_replanning(self):
         from subtitle_tool.mt_pipeline import Pipeline
         self.install_many()
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         plan = self.store.job(self.job_id)['manifest']['mt_group_plan']
         self.cancel_after = None
@@ -147,11 +147,11 @@ class OutputPlanningTests(PoolPipelineFixture):
         with mock.patch.object(Pipeline, 'plan_groups', side_effect=AssertionError('Unexpected regrouping')):
             self.assertEqual(self.run_pool(), 'completed')
         self.assertEqual(self.store.job(self.job_id)['manifest']['mt_group_plan'], plan)
-        self.assertEqual(sum(stage == 'draft' for stage, _, _ in self.calls), len(plan['groups']) - 1)
+        self.assertEqual(sum(stage == 'translate' for stage, _, _ in self.calls), len(plan['groups']) - 1)
 
     def test_corrupted_saved_plan_stops_before_new_requests_or_changes_to_cues(self):
         self.install_many()
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         original = self.store.job(self.job_id)['manifest']
         self.assertIn('mt_group_plan', original)
@@ -182,7 +182,7 @@ class OutputPlanningTests(PoolPipelineFixture):
 
     def test_reflow_discards_old_group_plan_before_rebuilding(self):
         self.install_many()
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         self.assertIn('mt_group_plan', self.store.job(self.job_id)['manifest'])
         Engine(self.config, self.store).reflow(self.job_id)
@@ -191,7 +191,7 @@ class OutputPlanningTests(PoolPipelineFixture):
     def test_manual_language_review_clears_plan_and_dependent_stages_atomically(self):
         from subtitle_tool.review import ReviewDecision
         self.install_many()
-        self.cancel_after = 'draft'
+        self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
         before = self.store.job(self.job_id)['manifest']
         self.assertIn('mt_group_plan', before)
