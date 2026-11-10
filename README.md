@@ -59,7 +59,7 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 | 字段 | 用途 |
 | --- | --- |
 | `providers` | 明确登记的渠道及适配器、候选和费用规则 |
-| `excluded_providers` | 项目级渠道排除，适用于维护、验收、评测和字幕请求 |
+| `excluded_providers` | 项目级渠道排除，适用于维护、验收和字幕请求 |
 | `include` / `exclude` | 型号名称通配符 |
 | `preferred` | 优先型号及明确允许的商业候选 |
 | `billing` / `max_candidates` | 允许费用档位及每轮目录候选数 |
@@ -76,16 +76,6 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 `data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停与排除。原 `transcribe-bailian-trial` 保存账户模板，实际入口使用带哈希后缀的 ID。百炼额度维护有独立验收预算。七牛限时免费活动到期后，专用免费入口退出选路。
 
 自动管理作用于上表的默认本机角色组。远程网关及自定义角色组由用户维护。运行诊断与恢复细节见[接口契约](docs/API_CONTRACT.md)。
-
-### Decisions / System One 评测
-
-```powershell
-.\.venv\Scripts\python.exe scripts\evaluate-decisions.py
-# 使用指定的 Magpie System One 成员
-.\.venv\Scripts\python.exe scripts\evaluate-decisions.py --models 供应商/型号,供应商/另一型号
-```
-
-独立评测通过 Magpie `/v1/systemone` 比较 D3 Flash、D3 Ultra、OpenRouter Decisions 与当前复核入口。32 个带标签合成样本覆盖八类质量问题、跨句信息和指令干扰。报告位于 `.build/mt-diagnostics/decisions-*.json`，包含漏报、误报、置信度、延迟和接口可取得的用量成本，连接失败单独统计。评测结果供人工比较，生产复核、裁决和阈值继续使用现有配置。
 
 ## 项目配置
 
