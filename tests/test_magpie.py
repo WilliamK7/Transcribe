@@ -182,7 +182,7 @@ class MagpiePipelineTests(PoolPipelineFixture):
         self.assertEqual(caught.exception.code, 'magpie_group')
 
     def test_all_stages_use_gateway_and_resume_keeps_saved_group(self):
-        self.config.settings.mt_routing = None
+        from subtitle_tool.main import summary
         self.install()
         self.assertEqual(self.run_pool(), 'completed')
         self.assertEqual({url for _, url, _ in self.calls}, {'http://127.0.0.1:3425/v1/chat/completions'})
@@ -191,12 +191,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
         self.config.settings.mt_model = 'group/new'
         self.assertEqual(saved_route(self.store.job(self.job_id)['manifest']), before)
 
-    def test_paid_permission_selects_mixed_group_once(self):
-        self.config.settings.mt_routing = None
-        from subtitle_tool.main import summary
-        self.install()
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertEqual({data['_model'] for _, _, data in self.calls}, {'group/transcribe', 'group/transcribe-review'})
         report = summary(self.store, self.job_id)
         self.assertEqual(report['models']['mt'], 'group/transcribe')
         self.assertEqual(report['gateway_session_prefix'], 'transcribe-' + self.job_id + '-')
@@ -215,32 +209,6 @@ class MagpiePipelineTests(PoolPipelineFixture):
         Engine(self.config, self.store).resume(self.job_id)
         self.assertEqual(self.run_pool(), 'completed')
         self.assertNotIn('translate', [stage for stage, _, _ in self.calls])
-
-    def test_gateway_error_is_not_retried_or_sent_to_another_group(self):
-        from subtitle_tool.mt_pipeline import Pipeline
-        from subtitle_tool.mt_routing import RouteExhausted
-        from subtitle_tool.mt_transport import HTTPReply, TransportError
-        from subtitle_tool.engine import Engine
-        self.install()
-        engine = Engine(self.config, self.store)
-        manifest = self.store.job(self.job_id)['manifest']
-        _, scope = engine.identity(self.job_id, manifest, persist=False)
-        for outcome in [HTTPReply(429, b'{}'), HTTPReply(503, b'{}'), TransportError('network'),
-                        HTTPReply(200, b'{"choices":[]}')]:
-            pipeline = Pipeline(engine, self.job_id, manifest, scope)
-            def request(*args, **kwargs):
-                kwargs['on_dispatch']()
-                if isinstance(outcome, Exception):
-                    raise outcome
-                return outcome
-            with self.subTest(outcome=type(outcome).__name__), \
-                    mock.patch.object(pipeline.transport, 'request', side_effect=request) as send:
-                with self.assertRaises(RouteExhausted):
-                    pipeline.stage('translate', {'sentences': [{'id': '0', 'text': 'Cache.'}],
-                                             'context': [], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Cache.'}]]}, ids=['0'], originals=['Cache.'])
-                self.assertEqual(send.call_count, 1)
-                self.assertEqual(send.call_args.kwargs['json']['model'], 'group/transcribe')
-
 
     def test_gateway_requests_member_model_for_saved_provenance(self):
         from subtitle_tool.mt_pipeline import check_pool

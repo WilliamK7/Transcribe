@@ -146,7 +146,7 @@ def _group_samples(sentences, fragments, context, glossary):
 
 
 
-def check_pool(config, identity, route, cancel):
+def check_pool(config, identity, route, cancel, *, magpie=None):
     """Online smoke test using an in-memory task and one synthetic sentence."""
     from .mt_control import MTControl
     from .store import Store
@@ -167,7 +167,7 @@ def check_pool(config, identity, route, cancel):
             store.db.execute('INSERT INTO jobs(id,source,output,output_key,state,manifest,created,updated) '
                              'VALUES(?,?,?,?,?,?,?,?)',
                              (job_id, '', '', '', 'queued', json.dumps(manifest), now, now))
-        engine = SimpleNamespace(config=config, store=store, mt_control=MTControl(cancel))
+        engine = SimpleNamespace(config=config, store=store, mt_control=MTControl(cancel), magpie=magpie)
         pipeline = Pipeline(engine, job_id, manifest, scope)
         sentence = 'A cache stores a previously computed result.'
         data = {'sentences': [{'id': '0', 'text': sentence, 'asr_language': 'en',
@@ -336,6 +336,9 @@ class Pipeline:
             if error.code != 'mt_provider_excluded':
                 raise
             raise RouteFailure('permission_denied', fallback_allowed=True) from None
+        magpie = getattr(self.engine, 'magpie', None)
+        if magpie is not None:
+            magpie.ensure_ready(entry.backend.base_url, self.engine.mt_control)
         # Old fixed-model tasks can still use their commercial fallback when a
         # dynamic member was added to the live group later. Only pool validation
         # sees that new admission; response and saved-stage evidence stay frozen.

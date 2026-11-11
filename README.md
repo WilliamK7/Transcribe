@@ -1,32 +1,31 @@
 # magpie 字幕工具
 
-Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-filetrans`，管理上传、识别和任务恢复；magpie 只负责翻译上游的凭据、限流与故障切换，项目负责字幕语义、校验与排版。
+Windows x64 字幕 CLI。项目直连北京百炼 `qwen3-asr-flash-filetrans` 识别音频，经 Magpie 翻译，再校验和排版为 SRT。
 
 ## 开始使用
 
 ```powershell
 .\scripts\setup.ps1
-# 完成下方配置并启动 magpie
+# 完成下方配置
 .\scripts\transcribe.ps1 --configure-key
 .\scripts\transcribe.ps1 --check-mt
 .\scripts\transcribe.ps1 "D:\Videos\课程.mkv"
 ```
 
-`--check-mt` 用合成短句检查翻译。统一免费优先，免费不可用时商业组接替。多个文件顺序处理，`--help` 显示全部参数。
+`--check-mt` 用合成短句在线检查翻译。多个文件顺序处理，`--help` 显示全部参数。
 
 ## 配置 magpie
 
-本机适配 magpie 0.1.3565。在 Magpie 中配置渠道，在 `data/settings.json` 中填写 `magpie_data_dir`，再预览和验收候选：
+在 Magpie 中配置渠道并启动网关，在 `data/settings.json` 中填写 `magpie_data_dir`，然后预览候选并应用分组。
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\configure-mt.py --list-candidates
 .\.venv\Scripts\python.exe scripts\configure-mt.py --apply
-# 筛选本轮发现的渠道；现有字幕池仍参与验收
-.\.venv\Scripts\python.exe scripts\configure-mt.py --providers github-copilot,vercel --apply
-.\.venv\Scripts\python.exe scripts\configure-mt.py --providers transcribe-openrouter-free --apply --refresh-trial
 ```
 
-候选渠道和型号规则保存在 `data/mt-channels.json`，初始内容见[配置模板](subtitle_tool/mt-channels.default.json)。模板包含 GitHub Copilot、Cloudflare Workers AI、OpenCode Zen Free、vLLM-SR、Vercel、OpenRouter、七牛和百炼。新渠道由用户登记，`--list-candidates` 可只读预览。
+`--providers` 可筛选本轮发现的渠道，现有字幕池仍参与验收。`--refresh-trial` 同时刷新百炼试用库存。渠道清单和型号规则见[配置模板](subtitle_tool/mt-channels.default.json)。
+
+字幕 CLI 首次需要翻译网关时会复用正在运行的本机 Magpie。若配置指向带 `.portable` 标记的 Windows 便携安装且对应端口空闲，CLI 会在后台运行 `magpie serve`，等网关就绪后继续。一次调用中的多个文件共用网关，CLI 在完成、失败或 Ctrl+C 退出时关闭自己启动的进程。
 
 脚本使用合成文本验收，备份配置后更新托管分组，保留人工成员和开关。角色分配按底层型号隔离，每个角色都有商业后备：
 
@@ -36,9 +35,9 @@ Windows x64 自用字幕 CLI。项目直接调用北京百炼 `qwen3-asr-flash-f
 | 术语及轻量复核 | `group/transcribe-review` | `group/transcribe-review-paid` |
 | 疑难裁决 | `group/transcribe-judge` | `group/transcribe-judge-paid` |
 
-主组按免费组 → 商业组选择。同档供应商等权、供应商内部有序尝试，试用子组占一个供应商位置，各组 `stays=off`。免费组会继续尝试其他候选，冷却、繁忙和阶段总时限可能提前触发商业后备。
+主组按免费组 → 商业组选择，冷却、繁忙和阶段超时可触发商业后备。
 
-费用按型号识别：Copilot 套餐和 Workers AI 按商业入口处理；Zen 使用明确免费的型号；Vercel 使用官方零价信息，赠送余额单独计量。OpenRouter 只选通过验收的明确 `:free` 型号。商业调用次数与实际现金支出分别记录，资源包和代金券的抵扣以账单为准。
+免费型号按渠道目录和验收结果识别。Copilot 和 Workers AI 归入商业组。Vercel 按公开零价标记区分免费型号，实际抵扣和费用以账单为准。
 
 vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。需要在 Magpie 提供者设置中添加响应头透传 `X-Vsr-Selected-Model`。项目校验实际型号及验收资格，身份缺失或冲突时使用商业后备。
 
@@ -52,7 +51,7 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 .\.venv\Scripts\python.exe scripts\manage-mt.py --disable
 ```
 
-启用后，首次联网字幕请求启动后台，任务退出时停止。默认每 15 分钟刷新已登记渠道的目录，每轮最多验收 1 个型号、每天 UTC 最多 2 个；每型号最多 12 次候选请求和 1 次独立评判。预算在请求前保存，重启继续累计。`--once` 使用相同预算；`configure-mt.py` 用于手动批量验收。`--status` 只读本机状态，登记和启停命令只修改管理配置。
+启用后，后台随本机默认组的首次联网请求启动，随任务退出停止。默认每 15 分钟刷新目录，每轮最多验收 1 个型号，每天 UTC 最多 2 个。`--once` 共用预算，`--status` 查看本机记录。
 
 `mt-channels.json` 的主要规则：
 
@@ -65,15 +64,13 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 | `billing` / `max_candidates` | 允许费用档位及每轮目录候选数 |
 | `max_input_usd_per_million` / `max_output_usd_per_million` | 新商业候选单价上限；Vercel 默认输入 2、输出 10 美元 |
 
-新商业型号需要明确候选授权，或有可核实且符合上限的价格。无法确定价格时状态为 `price_unknown`；单价筛选独立于账户总支出。已验收的资格按账户、接口能力和底层型号集合复用。临时故障进入冷却，目录查询失败保留已有池。
+新商业型号可通过 `preferred` 明确授权，或按可核实的单价上限选入。目录查询失败时继续使用现有分组。
 
-维护状态保存在 `data/gateway-maintenance.json`，备份在 `data/gateway-backups/`。人工删除和停用形成持久排除；恢复时需同时恢复 Magpie 开关，并清除相关 `manual_hold` 或 `gateway-managed.json` 排除项。中断更新会先核对已执行变更的归属，再按当前规则规划。成功改变路由时递增策略版本，历史任务继续按原快照恢复。
+维护状态保存在 `data/gateway-maintenance.json`，备份在 `data/gateway-backups/`。恢复人工删除或停用的成员时，同时恢复 Magpie 开关，并清除相应 `manual_hold` 或 `gateway-managed.json` 排除项。
 
 ### 百炼试用
 
-`data/bailian-quota-binding.json` 绑定账户。后台每 60 秒查询有效额度，逐个验收并维持最多三个合格候选，每款型号使用独立入口。额度拒绝会停用对应型号，即使该请求最终通过其他入口成功；耗尽状态保持至本任务结束。共享账户 RPM 预算包含商业入口，模型与工作空间配额可进一步收紧。
-
-`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停与排除。原 `transcribe-bailian-trial` 保存账户模板，实际入口使用带哈希后缀的 ID。百炼额度维护有独立验收预算。七牛限时免费活动到期后，专用免费入口退出选路。
+`data/bailian-quota-binding.json` 绑定账户。后台查询有效额度，为最多三个通过验收的型号建立独立入口。`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停与排除。七牛限时免费活动到期后，专用免费入口退出选路。
 
 自动管理作用于上表的默认本机角色组。远程网关及自定义角色组由用户维护。运行诊断与恢复细节见[接口契约](docs/API_CONTRACT.md)。
 
@@ -94,7 +91,6 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 | `mt_model` | `group/transcribe`，免费优先的正文主组 |
 | `mt_fallback_model` | `group/transcribe-paid`，主组超时或结果校验失败后的付费后备 |
 | `mt_policy_version` | 整数 `1`；更换翻译策略并要求重译时递增 |
-| `mt_routing.strategy` | `free_first` |
 | `mt_review_model` / `mt_review_fallback_model` | 上表复核主组与商业后备 |
 | `mt_judge_model` / `mt_judge_fallback_model` | 上表裁决主组与商业后备 |
 | `mt_quality.manual_glossary` | 人工术语映射，最多 200 项 |
@@ -112,7 +108,7 @@ ASR Key 使用 `DASHSCOPE_API_KEY`，未设置时读取 `data/key.txt`；`--conf
 
 默认生成同目录、同名 UTF-8 SRT，外语原文在上、简体中文译文在下；中文／粤语保留原文，无语音则完成任务。已有 SRT 默认跳过，`--overwrite` 先备份再替换，也可用 `--output-dir` 另存。
 
-默认每 8 组增量提取术语，超预算拆分；一次翻译直接输出全部字幕编号。每组保留独立语义复核，有疑点才裁决并修正，最多两轮。完整译文逐组保存，仍有疑点时提示人工检查。原文与译文各以两行为目标，按可靠词时间拆分长句；具体规则见[接口与恢复契约](docs/API_CONTRACT.md)。
+译文逐组保存，由独立型号复核和裁决。仍有疑点时提示人工检查。原文与译文各以两行为目标，按可靠词时间拆分长句。具体规则见[接口与恢复契约](docs/API_CONTRACT.md)。
 
 音频优先复制兼容压缩音轨，声道或时间轴需要处理时转为 16kHz 单声道 FLAC，保留偏移、静音及编码延迟。超过 12 小时或上传容量时分段；`media_pcm_limit` 表示需先分割输入。
 

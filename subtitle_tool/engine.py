@@ -35,11 +35,12 @@ class LocalStateUnavailable(ToolError):
 
 
 class Engine:
-    def __init__(self, config: Config, store: Store, cancel=None, progress=lambda *args: None):
+    def __init__(self, config: Config, store: Store, cancel=None, progress=lambda *args: None, *, magpie=None):
         self.config, self.store = config, store
         self.cancel = cancel or threading.Event()
         self.progress = progress
         self.mt_control = MTControl(self.cancel)
+        self.magpie = magpie
         self.mt_runtime_active = False
         self.run_id = uuid.uuid4().hex
 
@@ -61,7 +62,7 @@ class Engine:
         manifest = self.store.job(job_id)['manifest']
         load_policy(manifest)
         from .mt_pool import saved_route
-        route = saved_route(manifest)
+        saved_route(manifest)
         self.select_input(job_id, track, channel)
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped"}:

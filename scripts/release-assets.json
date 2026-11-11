@@ -1,5 +1,4 @@
 {
-  "python_version": "3.12.10",
   "ffmpeg": {
     "version": "8.1.2-essentials_build",
     "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip",

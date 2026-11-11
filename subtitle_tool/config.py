@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from .common import ToolError, atomic_bytes, atomic_json, validate_workspace_id
+
+
+MT_ENV_SETTINGS = ("mt_base_url", "mt_model", "mt_fallback_model", "mt_review_model",
+                   "mt_review_fallback_model", "mt_judge_model", "mt_judge_fallback_model")
 
 
 def app_root() -> Path:
@@ -26,7 +30,6 @@ class Settings:
     mt_judge_fallback_model: str = "group/transcribe-judge-paid"
     mt_policy_version: int = 1
     magpie_data_dir: str = ""
-    mt_routing: dict | None = None
     mt_quality: dict | None = None
     channel: str = "ask"
     poll_seconds: float = 4
@@ -62,11 +65,10 @@ class Config:
                 probe.unlink()
         except OSError as e:
             raise ToolError("项目 data 目录不可写，请将项目移动到可写目录后运行。", "data_readonly") from e
-        self.settings = Settings()
         path = self.data / "settings.json"
-        if path.exists():
-            values = json.loads(path.read_text(encoding="utf-8"))
-            self.settings = Settings(**{k: v for k, v in values.items() if k in asdict(self.settings)})
+        values = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        names = {field.name for field in fields(Settings)}
+        self.settings = Settings(**{k: v for k, v in values.items() if k in names})
         self.settings.validate()
 
     def save(self):
@@ -75,9 +77,7 @@ class Config:
 
     def mt_settings(self):
         # Resolve only for new tasks/reflow: current choices cannot alter a saved resume.
-        overrides = {name: os.environ[name.upper()] for name in
-                     ["mt_base_url", "mt_model", "mt_fallback_model",
-                      "mt_review_model", "mt_review_fallback_model", "mt_judge_model", "mt_judge_fallback_model"] if name.upper() in os.environ}
+        overrides = {name: os.environ[name.upper()] for name in MT_ENV_SETTINGS if name.upper() in os.environ}
         return replace(self.settings, **overrides)
 
     def get_magpie_key(self, base_url=None):

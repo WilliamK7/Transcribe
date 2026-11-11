@@ -14,6 +14,7 @@ from .common import ASR_MODEL, ToolError, validate_workspace_id
 from .config import Config
 from .engine import Engine
 from .instance import ProcessLock
+from .magpie_process import MagpieProcess
 from .reports import ReportWriter
 from .store import Store
 from .lifecycle import STATES, contract as lifecycle_contract, describe as describe_lifecycle
@@ -196,8 +197,7 @@ def summary(store, job_id):
             mt = {'provider': None, 'model': None}
             item['mt_route_status'] = 'reflow_required'
         else:
-            permitted = 'magpie'
-            mt = next(entry['backend'] for entry in route['entries'] if entry['id'] == permitted)
+            mt = next(entry['backend'] for entry in route['entries'] if entry['id'] == 'magpie')
             item['mt_route_status'] = 'current'
             item['mt_policy_version'] = mt['policy_version']
             item['gateway_session_prefix'] = 'transcribe-' + job_id + '-'
@@ -271,6 +271,7 @@ def main(argv=None):
         raise ToolError("任务库已被其他 CLI 进程使用；请在该终端 Ctrl+C 停止后重试。", "instance_busy")
     store, current_job, report_writer = None, None, None
     cancel = threading.Event()
+    magpie = MagpieProcess(config.settings)
     previous_signal = None
     processing = False
     try:
@@ -287,7 +288,7 @@ def main(argv=None):
             identity = {'region': 'beijing', 'workspace_id': validate_workspace_id(config.settings.workspace_id),
                         'access_mode': 'workspace', 'account': key_fingerprint(config.get_key())}
             route = configured_route(config, identity)
-            print(json.dumps(check_pool(config, identity, route, cancel), ensure_ascii=False))
+            print(json.dumps(check_pool(config, identity, route, cancel, magpie=magpie), ensure_ascii=False))
             return 0
         if args.self_test:
             from .diagnostics import self_test
@@ -303,7 +304,7 @@ def main(argv=None):
             report_writer.validate()
         store = Store(config.data / "jobs.sqlite")
         progress = Progress()
-        engine = Engine(config, store, cancel, progress)
+        engine = Engine(config, store, cancel, progress, magpie=magpie)
         if args.export_archive:
             from .archives import export_archive
             item = export_archive(config, args.export_archive, args.output_dir, overwrite=args.overwrite)
@@ -421,11 +422,14 @@ def main(argv=None):
                 report_writer.write([item])
         return 130
     finally:
-        if previous_signal is not None:
-            signal.signal(signal.SIGINT, previous_signal)
-        if store:
-            store.close()
-        lock.close()
+        try:
+            magpie.close()
+        finally:
+            if previous_signal is not None:
+                signal.signal(signal.SIGINT, previous_signal)
+            if store:
+                store.close()
+            lock.close()
 
 
 def entry():

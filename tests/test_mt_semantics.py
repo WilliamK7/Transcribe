@@ -263,7 +263,6 @@ class SemanticPipelineTests(PoolPipelineFixture):
         def run():
             pipeline = Pipeline(engine, self.job_id, manifest, scope)
             first = pipeline.stage('glossary', data)
-            manifest['mt_route_snapshot']['routing'] = {'strategy': 'free_first'}
             pipeline = Pipeline(engine, self.job_id, manifest, scope)
             with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected repeated glossary')):
                 second = pipeline.stage('glossary', data)

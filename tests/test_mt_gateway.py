@@ -24,7 +24,6 @@ def reply(value, *, model='synthetic/accepted', finish='stop'):
 
 class GatewayContractTests(PoolPipelineFixture):
     def pipeline(self):
-        self.config.settings.mt_routing = None
         self.install()
         engine = Engine(self.config, self.store)
         manifest = self.store.job(self.job_id)['manifest']
@@ -192,7 +191,6 @@ class GatewayContractTests(PoolPipelineFixture):
     def test_job_completes_with_paid_fallback_and_preserves_provenance(self):
         from subtitle_tool.mt_quality import PROMPTS
         from subtitle_tool.mt_pipeline import validate_provenance
-        self.config.settings.mt_routing = None
         self.install(split=True)
         calls = []
         def send(*args, **kwargs):
@@ -241,7 +239,6 @@ class GatewayContractTests(PoolPipelineFixture):
                     reply({'translations': {'0': '完整后备译文。'}}))
         with mock.patch.object(pipeline.transport, 'request', side_effect=send):
             value = self.stage(pipeline)[0]
-        self.config.settings.mt_routing = None
         Engine(self.config, self.store).reflow(self.job_id)
         engine = Engine(self.config, self.store)
         manifest = self.store.job(self.job_id)['manifest']
@@ -485,6 +482,8 @@ class GatewayContractTests(PoolPipelineFixture):
                     self.stage(pipeline, stage)
                 self.assertEqual(request.call_count, 2 if stage in {'review', 'judge'} or
                     isinstance(answer, HTTPReply) and b'length' in answer.body else 1)
+                if stage == 'translate':
+                    self.assertEqual(request.call_args_list[0].kwargs['json']['model'], 'group/transcribe')
 
     def test_repair_and_fallback_share_deadline_and_respect_cancel(self):
         for finish, action in [(finish, action) for finish in ('stop', 'length') for action in ('consume', 'expire', 'cancel')]:

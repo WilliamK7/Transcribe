@@ -2,9 +2,9 @@
 
 ## magpie 网关契约
 
-仅翻译使用 magpie 0.1.3565 的 POST `/v1/chat/completions`。依据 [CLI](https://github.com/yetone/magpie/blob/v0.1.3565/internal/cli/groups_cli.go)、[OpenRouter 型号目录](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)和[百炼额度](https://help.aliyun.com/zh/model-studio/cli/usage-quota)。
+翻译通过 Magpie 的 POST `/v1/chat/completions` 发出。分组命令和渠道资格参考官方资料。[Magpie CLI](https://github.com/yetone/magpie/blob/v0.1.3565/internal/cli/groups_cli.go) · [OpenRouter 型号目录](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties) · [百炼额度](https://help.aliyun.com/zh/model-studio/cli/usage-quota)
 
-路线快照保存六个入口：`magpie`、`magpie_fallback`、`magpie_review`、`magpie_review_fallback`、`magpie_judge`、`magpie_judge_fallback`。每个角色主组为 mixed，按免费 → 商业顺序，fallback 为 paid。同档供应商等权，试用子组占一个供应商位置；三个角色按底层型号去重。连接、限流及上游切换由网关负责。
+路线快照保存六个入口 `magpie`、`magpie_fallback`、`magpie_review`、`magpie_review_fallback`、`magpie_judge`、`magpie_judge_fallback`。每个角色主组按免费 → 商业顺序，后备组使用商业入口。同档供应商等权，供应商内部有序尝试，试用子组占一个供应商位置。分组使用 `stays=off`。三个角色按底层型号去重。连接、限流和上游切换由网关负责。
 
 本机角色池按当前请求 `backend.base_url` 对应的注册表校验。复核／裁决按单次请求排除正文等已用型号，网络响应、阶段恢复和请求缓存共用独立性校验。
 
@@ -53,11 +53,11 @@
 
 各阶段共同语义输入在正文前冻结为 `semantic_input`。缓存键包含原文、上下文、术语、模型接口与参数、能力、账户及策略版本。保存结果与网络响应使用相同校验。最终记录引用 `translation_stage_key`、复核、裁决及实际产出阶段；译文、缓存和阶段完成计数原子提交。
 
-输入上限 32768 字节、输出上限 4096 token，保持并发 16 和阶段时间预算。分组方案在请求前保存，重分片后重新规划；每 15 秒报告活动阶段。请求量、内部尝试、429、空响应、推理 token 和警告均纳入验收，不能仅比较 HTTP 200。
+输入上限 32768 字节，输出上限 4096 token。`mt_workers` 默认 16。分组方案在请求前保存，重分片后重新规划。每 15 秒报告活动阶段。
 
 ### 翻译设置
 
-`mt_routing` 为 `{"strategy":"free_first"}`。三个角色及商业后备的组名见 [配置](../README.md#项目配置)。`mt_quality.manual_glossary` 最多 200 项。`mt_policy_version` 为用户管理的修订号，新任务或显式 `--reflow` 使用当前值，普通恢复沿用保存值。
+路由快照的 `routing.strategy` 固定为 `free_first`。`mt_quality.manual_glossary` 最多 200 项。新任务和 `--reflow` 使用当前 `mt_policy_version`，普通恢复沿用保存值。[角色组配置](../README.md#项目配置)
 
 ## 数据与恢复
 
@@ -65,7 +65,7 @@
 
 `--state-machine` 直接输出版本化 JSON：`states` 包含名称、中文 `label`、`kind` 和运行阶段的 `auto_recover` 标记，`events` 包含每个操作的 `from`、`to` 和 `guards`。规则从执行代码生成，无需配置、任务库、凭据或网络。
 
-当前执行契约：媒体处理 2、提取配方 2、字幕格式 2、规范化 4、显示时间 2、翻译策略／请求契约 6、提示词及生成参数 5、响应恢复标识 6、上下文 3、对齐策略 `execution_snapshot.alignment_version:3`、术语调度 `window-prefix-v3`。版本字段为整数且精确匹配，术语调度字段也须存在。`--resume` 和 `--retime` 均先核对契约，缺少字段或版本不匹配时返回 `cache_version`，通过 `--reflow` 从完整转写重建。线程数与轮询等待使用当前设置，排版、模型、能力和账户身份沿任务快照。
+`--resume` 和 `--retime` 先核对执行版本、排版和术语调度快照。版本不匹配时返回 `cache_version`，可通过 `--reflow` 从完整转写重建。线程数与轮询等待使用当前设置，排版、模型、能力和账户身份沿任务快照。[执行版本校验](../subtitle_tool/policy.py)
 
 新翻译路线快照为版本 6，仍读取版本 5；入口身份保存在版本 2 的 `mt_route_snapshot.entries[].backend`，包含策略修订号 `policy_version`。版本 6 的 `identities` 固定每个网关成员的底层型号集合、动态标记、实际通过验收的 `admitted` 子集及费用档位（free/trial/commercial/unknown），也参与阶段缓存隔离。策略／请求契约仍为 6，接入新渠道不强制所有历史任务重建。报告中的模型是正文主组，并提供 `mt_policy_version`。
 

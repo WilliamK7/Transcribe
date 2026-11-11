@@ -380,7 +380,7 @@ class BailianFreeGuard:
             self._command('group', 'add', free_group, 'models=' + trial, 'routing=weight', 'stays=off')
         elif trial not in groups[free_group].get('members', []):
             self._command('group', 'set', free_group, 'models+=' + trial)
-        paid = 'group/' + main + '-paid' if suffix else 'group/transcribe-paid'
+        paid = 'group/' + main + '-paid'
         if main in groups and 'group/' + free_group not in groups[main].get('members', []):
             # Incremental mutation in one CLI transaction moves only our
             # commercial fallback behind the newly available free subgroup.

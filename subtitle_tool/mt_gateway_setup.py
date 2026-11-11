@@ -182,8 +182,7 @@ class GatewaySetup:
         disabled = set(current.get('off', [])) if current else set()
         excluded = set(self.managed['excluded']) | {name + ':' + m for m in removed | disabled}
         self.managed['excluded'] = sorted(excluded)
-        members = [m for m in dict.fromkeys(members) if name + ':' + m not in excluded and
-                   (current is None or m not in current.get('off', []))]
+        members = [m for m in dict.fromkeys(members) if name + ':' + m not in excluded]
         if current is None:
             if not members:
                 return False
@@ -392,7 +391,6 @@ class GatewaySetup:
         legacy_active = any(p['id'] == TRIAL_PROVIDER and not p.get('off')
                             for p in self.manager._registry()['providers'])
         if (not recovering and not self._actions and not legacy_active and self.catalog == saved_catalog(self.config) and
-                self.config.settings.mt_routing == {'strategy': 'free_first'} and
                 self.manager.state.get('reserved_models') == assignments):
             if self.managed != previous_managed:
                 atomic_json(self.managed_path, self.managed)
@@ -442,7 +440,6 @@ class GatewaySetup:
         self.manager.state['reserved_models'] = assignments
         self.manager.state['admission_judge'] = pools['judge'][0]
         self.manager._save()
-        self.config.settings.mt_routing = {'strategy': 'free_first'}
         self.config.settings.mt_policy_version += 1
         self.config.save()
         atomic_json(self.config.data / 'gateway-catalog.json', self.catalog)

@@ -11,7 +11,6 @@ from tests.fixtures import SavedResultFixture, result, timed_raw
 class PoolPipelineFixture(SavedResultFixture):
     def setUp(self):
         super().setUp()
-        self.config.settings.mt_routing = None
         self.config.settings.mt_workers = 2
         self.calls = []
         self.review_failure = False

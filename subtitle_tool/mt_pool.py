@@ -12,7 +12,7 @@ from .mt_backend import MTBackend, key_fingerprint, normalize_mt_url
 _ENTRY_FIELDS = {'id', 'tier', 'credential_ref', 'backend', 'capabilities'}
 _BACKEND_FIELDS = {'format_version', 'provider', 'base_url', 'model', 'key_fingerprint', 'request_version', 'policy_version'}
 _CAPABILITY_FIELDS = {'response_format', 'input_bytes', 'output_tokens'}
-_ROUTING_FIELDS = {'strategy'}
+_ROUTING_STRATEGY = 'free_first'
 _QUALITY_FIELDS = {'input_bytes', 'output_tokens', 'max_revisions', 'manual_glossary'}
 _FORBIDDEN_UNICODE = {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'}
 _ENTRY_TIERS = {name: tier for role in ('', '_review', '_judge') for name, tier in
@@ -58,11 +58,6 @@ def _capabilities(value):
             _integer(value['input_bytes'], 1, 1048576) and _integer(value['output_tokens'], 1, 32768))
 
 
-def _routing(value):
-    return (isinstance(value, dict) and set(value) == _ROUTING_FIELDS and
-            value['strategy'] == 'free_first')
-
-
 def _quality(value):
     return (isinstance(value, dict) and set(value) == _QUALITY_FIELDS and
             _fixed_integer(value['input_bytes'], 32768) and _fixed_integer(value['output_tokens'], 4096) and
@@ -85,9 +80,6 @@ def configured_route(config, manifest):
               ('magpie_judge_fallback', 'paid', settings.mt_judge_fallback_model)]
     if any(not _model(model) for _, _, model in models) or len({model for _, _, model in models}) != 6:
         raise _invalid()
-    routing = {'strategy': 'free_first'}
-    if settings.mt_routing is not None and settings.mt_routing != routing:
-        raise ToolError('mt_routing 必须为 {"strategy":"free_first"}。', 'mt_config')
     quality = {'input_bytes': 32768, 'output_tokens': 4096, 'max_revisions': 2, 'manual_glossary': {}}
     if settings.mt_quality is not None:
         if not isinstance(settings.mt_quality, dict) or set(settings.mt_quality) - {'manual_glossary'}:
@@ -105,12 +97,14 @@ def configured_route(config, manifest):
                for identity, tier, model in models]
     from .magpie import bound_gateway
     from .mt_catalog import saved_catalog
-    identities = saved_catalog(config).get('identities', {}) if bound_gateway(settings, base) else {}
+    identities = {}
     if bound_gateway(settings, base):
         from .magpie import group_models
         from .mt_catalog import read_registry, offer_billing
         from .mt_identity import canonical_model, dynamic_model
-        registry = read_registry(settings, saved_catalog(config))
+        catalog = saved_catalog(config)
+        identities = copy.deepcopy(catalog.get('identities', {}))
+        registry = read_registry(settings, catalog)
         for _, _, model in models:
             for owner, name, provider in group_models(registry, model):
                 member = owner + '/' + name
@@ -120,8 +114,8 @@ def configured_route(config, manifest):
     from .mt_identity import valid_identity_map
     if not valid_identity_map(identities):
         raise _invalid()
-    return {'format_version': 6, 'entries': entries, 'routing': routing, 'quality': quality,
-            'identities': copy.deepcopy(identities)}
+    return {'format_version': 6, 'entries': entries, 'routing': {'strategy': _ROUTING_STRATEGY},
+            'quality': quality, 'identities': identities}
 
 
 def saved_route(manifest):
@@ -139,16 +133,18 @@ def saved_route(manifest):
             type(snapshot['format_version']) is not int or snapshot['format_version'] not in (5, 6) or
             type(manifest.get('translation_strategy_version')) is not int or
             manifest['translation_strategy_version'] != 6 or not isinstance(snapshot['entries'], list) or
-            len(snapshot['entries']) != 6 or not _routing(snapshot['routing']) or not _quality(snapshot['quality'])):
+            len(snapshot['entries']) != 6 or snapshot['routing'] != {'strategy': _ROUTING_STRATEGY} or
+            not _quality(snapshot['quality'])):
         raise _invalid()
 
     snapshot = copy.deepcopy(snapshot)
-    identities, backends, fingerprints, versions = set(), set(), {}, set()
+    identities, backends, fingerprints, versions = set(), set(), set(), set()
     for entry in snapshot['entries']:
         if not isinstance(entry, dict) or set(entry) != _ENTRY_FIELDS:
             raise _invalid()
-        identity, ref = entry['id'], entry['credential_ref']
-        if (not isinstance(identity, str) or identity not in _ENTRY_TIERS or identity in identities or ref != 'magpie' or
+        identity = entry['id']
+        if (not isinstance(identity, str) or identity not in _ENTRY_TIERS or identity in identities or
+                entry['credential_ref'] != 'magpie' or
                 entry['tier'] != _ENTRY_TIERS[identity] or not _capabilities(entry['capabilities'])):
             raise _invalid()
         identities.add(identity)
@@ -166,15 +162,13 @@ def saved_route(manifest):
                 raise _invalid()
         except ToolError:
             raise _invalid() from None
-        backend = MTBackend.from_snapshot(saved)
-        backend_identity = (backend.provider, backend.base_url, backend.model, backend.key_fingerprint,
-                            backend.request_version, backend.policy_version)
-        if backend_identity in backends or ref in fingerprints and fingerprints[ref] != backend.key_fingerprint:
+        backend_identity = (saved['base_url'], saved['model'])
+        if backend_identity in backends:
             raise _invalid()
         backends.add(backend_identity)
-        fingerprints[ref] = backend.key_fingerprint
-        versions.add(backend.policy_version)
+        fingerprints.add(saved['key_fingerprint'])
+        versions.add(saved['policy_version'])
 
-    if len(versions) != 1:
+    if len(fingerprints) != 1 or len(versions) != 1:
         raise _invalid()
     return snapshot

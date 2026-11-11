@@ -13,7 +13,7 @@ from unittest import mock
 import requests
 
 from subtitle_tool.api import Http
-from subtitle_tool.config import Config
+from subtitle_tool.config import Config, MT_ENV_SETTINGS
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.store import Store
@@ -155,7 +155,7 @@ class TemporaryTest(unittest.TestCase):
         self.addCleanup(transport.stop)
         self.environment = mock.patch.dict(os.environ)
         self.environment.start()
-        for name in ["DASHSCOPE_API_KEY", "MAGPIE_API_KEY", "MT_BASE_URL", "MT_MODEL", "MT_FREE_MODEL", "MT_FALLBACK_MODEL"]:
+        for name in ("DASHSCOPE_API_KEY", "MAGPIE_API_KEY", *(field.upper() for field in MT_ENV_SETTINGS)):
             os.environ.pop(name, None)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP)
         self.path = Path(self.temp.name)

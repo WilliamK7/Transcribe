@@ -17,10 +17,11 @@ def default_policy():
 def load_policy(config):
     path = config.data / 'mt-channels.json'
     try:
-        value = json.loads(path.read_bytes()) if path.exists() else default_policy()
+        defaults = default_policy()
+        value = json.loads(path.read_bytes()) if path.exists() else defaults
         if isinstance(value, dict):
             value.setdefault('excluded_providers', [])
-        if (not isinstance(value, dict) or set(value) != set(default_policy()) or value['version'] != 1 or
+        if (not isinstance(value, dict) or value.keys() != defaults.keys() or value['version'] != 1 or
                 type(value['enabled']) is not bool or not isinstance(value['providers'], dict) or
                 not isinstance(value['judges'], list) or not all(isinstance(m, str) and '/' in m for m in value['judges'])):
             raise ValueError()
