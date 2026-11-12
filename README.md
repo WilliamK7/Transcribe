@@ -156,9 +156,9 @@ ASR Key 使用 `DASHSCOPE_API_KEY`，未设置时读取 `data/key.txt`；`--conf
 ## 本机检查
 
 ```powershell
-.\scripts\transcribe.ps1 --self-test --report ".build\self-test.json"
+.\scripts\transcribe.ps1 --self-test
 ```
 
-使用隔离目录及合成音频检查配置原子保存、独占锁、FFmpeg 和字幕输出，云端调用数为零。逐请求诊断位于 `.build/mt-diagnostics/{任务ID}.jsonl`，提供请求 ID、模型、用量与校验结果。通过 `gateway_session` 可在 magpie Routing／Usage 查看对应请求，字段见[报告契约](docs/API_CONTRACT.md#报告字段)。
+使用临时目录和合成音频检查配置保存、任务锁、FFmpeg 和字幕输出。默认输出到 stdout，可与字幕任务同时运行。使用 `--report ".build\self-test.json"` 另存时，项目锁协调报告写入和字幕任务。翻译请求诊断可用 `gateway_session` 在 Magpie 的 Routing／Usage 查看对应请求。[报告契约](docs/API_CONTRACT.md#报告字段)
 
 [环境维护](docs/BUILD.md) · [接口与恢复契约](docs/API_CONTRACT.md) · [第三方组件](docs/THIRD_PARTY.txt) · [源码许可](LICENSE)

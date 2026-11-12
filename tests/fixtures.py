@@ -21,8 +21,6 @@ from subtitle_tool.common import ASR_MODEL, NORMALIZER_VERSION, atomic_json, fin
 from subtitle_tool.subtitles import make_fragment, normalize
 
 ROOT = Path(__file__).resolve().parent.parent
-TEMP = ROOT / ".build" / "test-temp"
-TEMP.mkdir(parents=True, exist_ok=True)
 
 
 ASR_KEY = 'synthetic-asr-key'
@@ -157,7 +155,7 @@ class TemporaryTest(unittest.TestCase):
         self.environment.start()
         for name in ("DASHSCOPE_API_KEY", "MAGPIE_API_KEY", *(field.upper() for field in MT_ENV_SETTINGS)):
             os.environ.pop(name, None)
-        self.temp = tempfile.TemporaryDirectory(dir=TEMP)
+        self.temp = tempfile.TemporaryDirectory(prefix="transcribe-test-")
         self.path = Path(self.temp.name)
 
     def tearDown(self):
@@ -232,7 +230,7 @@ class PipelineFixture(TemporaryTest):
 
     @classmethod
     def setUpClass(cls):
-        cls.fixture_dir = tempfile.TemporaryDirectory(dir=TEMP)
+        cls.fixture_dir = tempfile.TemporaryDirectory(prefix="transcribe-media-")
         cls.fixture = Path(cls.fixture_dir.name) / "sample.mkv"
         run_process([ROOT / "tools" / "ffmpeg.exe", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c=black:s=160x90:r=10:d={cls.fixture_seconds}",
                      "-f", "lavfi", "-i", f"sine=frequency=440:duration={cls.fixture_seconds}:sample_rate=16000", "-c:v", "ffv1", "-c:a", "pcm_s16le", cls.fixture], threading.Event())

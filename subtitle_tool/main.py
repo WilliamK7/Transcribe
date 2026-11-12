@@ -262,12 +262,13 @@ def main(argv=None):
             raise ToolError('--state-machine 仅输出 stdout JSON，不能搭配任务设置或 --report。', 'input')
         print(json.dumps(lifecycle_contract(), ensure_ascii=False))
         return 0
-    config = Config()
+    stdout_self_test = args.self_test and args.report is None
+    config = Config(read_only=stdout_self_test)
     if args.workspace_id is not None:
         config.settings.workspace_id = validate_workspace_id(args.workspace_id)
     interactive = not args.non_interactive and sys.stdin is not None and sys.stdin.isatty()
-    lock = ProcessLock(config.data)
-    if not lock.acquire():
+    lock = None if stdout_self_test else ProcessLock(config.data)
+    if lock is not None and not lock.acquire():
         raise ToolError("任务库已被其他 CLI 进程使用；请在该终端 Ctrl+C 停止后重试。", "instance_busy")
     store, current_job, report_writer = None, None, None
     cancel = threading.Event()
@@ -275,6 +276,11 @@ def main(argv=None):
     previous_signal = None
     processing = False
     try:
+        if args.self_test:
+            from .diagnostics import self_test
+            result = self_test(config, args.report)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
         if args.configure_key:
             if not interactive:
                 raise ToolError('请在交互终端配置百炼 Key，或设置 DASHSCOPE_API_KEY。', 'credentials')
@@ -289,11 +295,6 @@ def main(argv=None):
                         'access_mode': 'workspace', 'account': key_fingerprint(config.get_key())}
             route = configured_route(config, identity)
             print(json.dumps(check_pool(config, identity, route, cancel, magpie=magpie), ensure_ascii=False))
-            return 0
-        if args.self_test:
-            from .diagnostics import self_test
-            result = self_test(config, args.report or config.data / "self-test.json")
-            print(json.dumps(result, ensure_ascii=False))
             return 0
         if args.report:
             protected_inputs = list(args.files)
@@ -378,7 +379,7 @@ def main(argv=None):
             from .mt_pool import configured_route
             route = configured_route(config, identity)
             for source in args.files:
-                job_id = store.enqueue(Path(source), "beijing", args.overwrite, args.output_dir,
+                job_id = store.enqueue(Path(source), overwrite=args.overwrite, output_dir=args.output_dir,
                                        workspace_id=workspace, account=account, settings=config.settings,
                                        mt_route_snapshot=route)
                 engine.select_input(job_id, args.track, args.channel)
@@ -429,7 +430,8 @@ def main(argv=None):
                 signal.signal(signal.SIGINT, previous_signal)
             if store:
                 store.close()
-            lock.close()
+            if lock is not None:
+                lock.close()
 
 
 def entry():

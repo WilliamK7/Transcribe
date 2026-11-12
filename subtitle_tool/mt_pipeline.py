@@ -12,7 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 
-from .common import MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
+from .common import DISPLAY_TIMING_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
 from .mt_backend import MTBackend
 from .mt_context import group_context, sentence_context, target_span, trim_context, valid_context_subset
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
@@ -153,7 +153,7 @@ def check_pool(config, identity, route, cancel, *, magpie=None):
     from .policy import current_execution_snapshot
     from dataclasses import asdict
     manifest = {**identity, 'mt_route_snapshot': route,
-                'processing_version': 2, 'subtitle_version': 2, 'display_timing_version': 2,
+                'processing_version': 2, 'subtitle_version': 2, 'display_timing_version': DISPLAY_TIMING_VERSION,
                 'subtitle_settings': {k: asdict(config.settings)[k] for k in
                                       ['zh_line_width', 'other_line_width', 'chinese_first']},
                  'translation_strategy_version': 6, 'execution_snapshot': current_execution_snapshot(),
@@ -941,6 +941,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         return
     source_ids = {source['sentence_id']: source for source in sources}
     positions = {source['sentence_id']: index for index, source in enumerate(sources)}
+    timing_version = manifest['display_timing_version']
     pipeline = Pipeline(engine, job_id, manifest, scope)
     try:
         if not manifest.get('layout_planned'):
@@ -951,7 +952,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                     parts = split_mt_units(source, parts, fits=lambda cue: pipeline._fits_group(
                         [{'source': source, 'text': cue['text'], 'cues': [cue]}]))
                 cues.extend(parts)
-            plan_display_timing(cues)
+            plan_display_timing(cues, version=timing_version)
             candidate = copy.deepcopy(manifest)
             candidate.update(layout_planned=True, layout_round=0)
             engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, cues)
@@ -959,7 +960,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             check_cancel(engine.cancel)
             stage('subtitle_translating')
             cues = engine.store.cues(job_id)
-            plan_display_timing(cues)
+            plan_display_timing(cues, version=timing_version)
             groups = pipeline.groups_for_layout(sources, cues, manifest)
             pending = [index for index, group in enumerate(groups)
                        if any(not cue['translated'] for unit in group for cue in unit['cues'])]
@@ -1000,7 +1001,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                 return
             candidate = copy.deepcopy(manifest)
             candidate['layout_round'] = round_number + 1
-            plan_display_timing(revised)
+            plan_display_timing(revised, version=timing_version)
             engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, revised)
     finally:
         pipeline.close()

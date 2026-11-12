@@ -15,16 +15,17 @@ from .subtitles import make_fragment, normalize, plan_display_timing, render_srt
 from .publication import write_srt
 
 
-def self_test(config: Config, report: Path):
+def self_test(config: Config, report: Path | None):
     """Isolated real local checks, zero cloud calls and no access to the user's Key."""
-    writer = ReportWriter(config, report, self_test=True)
-    writer.validate()
+    writer = ReportWriter(config, report) if report is not None else None
+    if writer is not None:
+        writer.validate()
     versions = {}
     media = Media(config.root, threading.Event())
     for name in ["ffmpeg", "ffprobe"]:
         out, _ = run_process([media.executable(name), "-version"], media.cancel, 15)
         versions[name] = out.decode("utf-8", errors="replace").splitlines()[0]
-    with tempfile.TemporaryDirectory(prefix="selftest-", dir=config.data) as directory:
+    with tempfile.TemporaryDirectory(prefix="transcribe-selftest-") as directory:
         temporary = Path(directory)
         isolated = Config(temporary)
         isolated.settings.workspace_id = "diagnostic-workspace"
@@ -63,5 +64,6 @@ def self_test(config: Config, report: Path):
                          "固定 ffprobe 检查合成媒体", "AAC 音轨复制及时间轴校验", "特殊字符路径",
                          "独立显示区间规划与小重叠收尾",
                          "规范化和同名 UTF-8 CRLF SRT 原子写入"]}
-    writer.write(result)
+    if writer is not None:
+        writer.write(result)
     return result

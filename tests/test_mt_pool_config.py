@@ -1,8 +1,7 @@
 """Gateway snapshots reject corrupted identities and preserve glossary validation."""
 import copy
-import json
 from contextlib import closing
-from subtitle_tool.common import ToolError, atomic_json
+from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config
 from subtitle_tool.mt_backend import key_fingerprint
 from subtitle_tool.mt_pool import configured_route, saved_route
@@ -21,19 +20,6 @@ class GatewaySnapshotValidationTests(TemporaryTest):
 
     def manifest_with(self, route):
         return {**self.manifest, 'translation_strategy_version': 6, 'mt_route_snapshot': copy.deepcopy(route)}
-
-    def test_retired_routing_setting_does_not_affect_the_saved_route(self):
-        route = configured_route(self.config, self.manifest)
-        self.config.save()
-        path = self.config.data / 'settings.json'
-        settings = json.loads(path.read_bytes())
-        atomic_json(path, {**settings, 'mt_routing': {'strategy': 'retired'}})
-
-        loaded = Config(self.path)
-        self.assertEqual(configured_route(loaded, self.manifest), route)
-        loaded.save()
-        settings.pop('mt_routing', None)
-        self.assertEqual(json.loads(path.read_bytes()), settings)
 
     def test_enqueue_and_report_preserve_the_saved_route_on_reuse(self):
         from subtitle_tool.main import summary

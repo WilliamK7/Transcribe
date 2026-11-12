@@ -7,7 +7,6 @@ from unittest import mock
 import subtitle_tool.engine as engine_module
 from subtitle_tool.engine import Engine
 from subtitle_tool.policy import load_policy
-from subtitle_tool.subtitles import render_srt
 from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, result, seed_job_state
 
 
@@ -149,13 +148,14 @@ class PublicationTests(SavedResultFixture):
         with mock.patch.object(engine_module, "write_srt", side_effect=OSError()):
             self.assertEqual(self.run_fake(fake), "failed")
         manifest = self.store.job(self.job_id)["manifest"]
+        settings = load_policy(manifest).settings(self.config.settings)
         manifest["execution_snapshot"]["prompt_version"] = 999
         self.store.update(self.job_id, manifest=manifest)
         with mock.patch.object(engine_module, "write_srt", side_effect=AssertionError("no republish")):
             self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(self.store.job(self.job_id)["error_code"], "cache_version")
-        content = render_srt(self.store.cues(self.job_id),
-                             load_policy(manifest, verify_execution=False).settings(self.config.settings))
+        content, _ = Engine.render_subtitles(self.store.cues(self.job_id), settings,
+                                             version=manifest['display_timing_version'])
         publication.write_srt(self.output, content, intent=manifest["publication_intent"])
         manifest["subtitle_version"] = 999
         self.store.update(self.job_id, manifest=manifest)

@@ -373,7 +373,7 @@ class PipelineTests(PipelineFixture):
         other = self.source.with_suffix(".mp4")
         shutil.copyfile(self.source, other)
         with self.assertRaises(ToolError) as error:
-            self.store.enqueue(other, "beijing", workspace_id="offline-space")
+            self.store.enqueue(other, workspace_id="offline-space")
         self.assertEqual(error.exception.code, "output_conflict")
 
     def test_modified_source_invalidates_cache(self):
@@ -470,7 +470,7 @@ class PipelineTests(PipelineFixture):
         shutil.copyfile(self.source, other)
         original = self.source.with_suffix(".srt").read_bytes()
         with self.assertRaises(ToolError) as error:
-            self.store.enqueue(other, "beijing", overwrite=True, workspace_id="offline-space")
+            self.store.enqueue(other, overwrite=True, workspace_id="offline-space")
         self.assertEqual(error.exception.code, "output_conflict")
         self.assertEqual(self.source.with_suffix(".srt").read_bytes(), original)
 

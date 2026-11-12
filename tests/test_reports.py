@@ -9,6 +9,7 @@ from unittest import mock
 from subtitle_tool.common import ToolError
 from subtitle_tool.config import Config
 from subtitle_tool.engine import Engine
+from subtitle_tool.instance import ProcessLock
 from subtitle_tool.main import main
 from subtitle_tool.store import Store
 from tests.fixtures import set_asr_account, enqueue_current, ROOT, TemporaryTest
@@ -163,20 +164,30 @@ class ReportProtectionTests(TemporaryTest):
         self.assertEqual(caught.exception.code, "report_conflict")
         self.assertEqual(self.source.read_bytes(), b"original media")
 
-    def test_selftest_default_exception_does_not_allow_hardlink_to_credentials(self):
+    def test_selftest_report_cannot_target_private_data(self):
         target = self.config.data / "self-test.json"
-        os.link(self.config.data / "magpie-key.txt", target)
         self.assert_conflict(["--self-test"], target)
 
-    def test_selftest_default_and_external_reports_do_not_recover_or_read_key(self):
+    def test_stdout_selftest_runs_during_an_active_job_and_report_uses_lock(self):
         from subtitle_tool.media import Media
         self.store.update(self.job_id, "recognizing")
-        for target in [self.config.data / "self-test.json", self.path / "diagnostics.json"]:
-            with mock.patch.object(Config, "get_key", side_effect=AssertionError("must not read key")), \
-                    mock.patch.object(Engine, "recover_jobs", side_effect=AssertionError("must not recover")), \
-                    mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe")), \
-                    mock.patch("requests.request") as request:
-                self.assertEqual(self.cli(["--self-test", "--report", target]), 0)
-                request.assert_not_called()
-            self.assertTrue(json.loads(target.read_text(encoding="utf-8"))["passed"])
-            self.assertEqual(self.store.job(self.job_id)["state"], "recognizing")
+        target = self.path / "diagnostics.json"
+        with mock.patch.object(Config, "get_key", side_effect=AssertionError("must not read key")), \
+                mock.patch.object(Engine, "recover_jobs", side_effect=AssertionError("must not recover")), \
+                mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe")), \
+                mock.patch("requests.request") as request:
+            lock = ProcessLock(self.config.data)
+            try:
+                self.assertTrue(lock.acquire())
+                self.assertEqual(self.cli(["--self-test"]), 0)
+                self.assertFalse((self.config.data / "self-test.json").exists())
+                with self.assertRaises(ToolError) as caught:
+                    self.cli(["--self-test", "--report", target])
+                self.assertEqual(caught.exception.code, "instance_busy")
+                self.assertFalse(target.exists())
+            finally:
+                lock.close()
+            self.assertEqual(self.cli(["--self-test", "--report", target]), 0)
+            request.assert_not_called()
+        self.assertTrue(json.loads(target.read_text(encoding="utf-8"))["passed"])
+        self.assertEqual(self.store.job(self.job_id)["state"], "recognizing")

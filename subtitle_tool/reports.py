@@ -12,10 +12,10 @@ from .common import ToolError, atomic_json, output_key
 class ReportWriter:
     """Protect business files at preflight and again immediately before atomic report writes."""
 
-    def __init__(self, config, path, *, inputs=(), output_dir=None, job_id=None, self_test=False):
+    def __init__(self, config, path, *, inputs=(), output_dir=None, job_id=None):
         self.config, self.path = config, Path(path)
         self.inputs = [Path(p) for p in inputs]
-        self.output_dir, self.job_id, self.self_test = output_dir, job_id, self_test
+        self.output_dir, self.job_id = output_dir, job_id
 
     @staticmethod
     def _absolute(path):
@@ -50,10 +50,6 @@ class ReportWriter:
             target_stat = None
         if target_stat and not stat.S_ISREG(target_stat.st_mode):
             raise ValueError()
-        default = self.config.data / "self-test.json"
-        default_allowed = (self.self_test and self._absolute(self.path) == self._absolute(default) and
-                           target_key == self._absolute(self.config.data.resolve() / "self-test.json"))
-
         def protect(path, *, directory=False):
             path = Path(path)
             resolved = path.resolve()
@@ -95,8 +91,7 @@ class ReportWriter:
 
         for root in [self.config.data, self.config.root / ".build" / "reflow", self.config.root / ".build" / "retime",
                      self.config.root / '.build' / 'mt-fallback']:
-            if not (default_allowed and root == self.config.data):
-                protect(root, directory=True)
+            protect(root, directory=True)
             if target_stat is None or not root.exists():
                 continue
             # Metadata only: detect a report outside private roots hard-linked to a private file.
@@ -106,10 +101,7 @@ class ReportWriter:
                 for name in dirs:
                     protect(Path(directory) / name, directory=True)
                 for name in files:
-                    path = Path(directory) / name
-                    if default_allowed and self._absolute(path) == self._absolute(default):
-                        continue
-                    protect(path)
+                    protect(Path(directory) / name)
 
     def write(self, value):
         self.validate()

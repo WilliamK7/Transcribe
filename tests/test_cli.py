@@ -115,7 +115,7 @@ class CliTests(TemporaryTest):
 
     def test_jobs_cancel_and_noninteractive_review(self):
         store = Store(self.config.data / "jobs.sqlite")
-        job_id = store.enqueue(self.source, "beijing", workspace_id="offline-space")
+        job_id = store.enqueue(self.source, workspace_id="offline-space")
         from subtitle_tool.subtitles import normalize, make_fragment
         from tests.fixtures import result
         sources = normalize(result(('OK', '')), 0, '0000')[0]
@@ -147,7 +147,7 @@ class CliTests(TemporaryTest):
 
     def add_review_job(self, code="language_uncertain", *, media=None):
         store = Store(self.config.data / "jobs.sqlite")
-        job_id = store.enqueue(self.source, "beijing", workspace_id="offline-space")
+        job_id = store.enqueue(self.source, workspace_id="offline-space")
         manifest = store.job(job_id)["manifest"]
         if media:
             manifest["media"] = media

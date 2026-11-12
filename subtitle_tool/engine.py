@@ -22,7 +22,7 @@ from .mt_quality import GLOSSARY_SCHEDULE
 from .store import Store
 from .lifecycle import INACTIVE, recovery_target, unknown_submission
 from .review import decision_origin
-from .policy import asr_contract, current_execution_snapshot, load_policy
+from .policy import asr_contract, current_execution_snapshot, load_policy, validate_raw_contract
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
                             validate_normalized, validate_segments)
 from .publication import inspect_intent, prepare_intent, write_srt
@@ -162,33 +162,27 @@ class Engine:
         manifest = job["manifest"]
         output = self.store.resolve_output(job, output_dir)
         self.store.check_republish_output(job_id, output, overwrite, operation="重排")
-        load_policy(manifest, verify_execution=False).settings(self.config.settings)
+        validate_raw_contract(manifest)
+        if not manifest.get("segments"):
+            raise ToolError("重排缺少完整本地转写；不会重新上传或识别。", "reflow_cache_missing")
+        validate_segments(manifest)
         self.identity(job_id, manifest, persist=False)
         self.config.settings.validate()
         from .mt_pool import configured_route
         route = configured_route(self.config, manifest)
         contract = asr_contract()
         cache = self.config.data / "cache" / job_id
-        offset = manifest.get("media_plan", {}).get("audio_offset_ms", manifest.get("audio_offset_ms", 0))
-        if type(offset) is not int:
-            raise ToolError("本地转写缺少有效的时间偏移记录。", "cache_mismatch")
-        if not manifest["segments"]:
-            raise ToolError("重排缺少完整本地转写；不会重新上传或识别。", "reflow_cache_missing")
         sources, warnings = [], []
         for segment in manifest["segments"]:
             check_cancel(self.cancel)
-            segment_id = segment.get("id", "")
-            if not isinstance(segment_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", segment_id):
-                raise ToolError("转写分段标识无效。", "cache_mismatch")
-            path = cache / ("raw-" + segment_id + ".json")
-            if not path.is_file():
+            if not saved_raw_path(cache, segment).is_file():
                 raise ToolError("重排缺少完整本地转写；不会重新上传或识别。", "reflow_cache_missing")
             try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as error:
+                items, notes = normalize_raw(cache, manifest, segment)
+            except ToolError as error:
+                if error.code != 'cache_mismatch':
+                    raise
                 raise ToolError("重排无法读取本地转写，原任务及字幕已保留。", "reflow_cache_invalid") from error
-            items, notes = normalize(raw, offset + segment["offset_ms"], segment_id,
-                                     duration_ms=segment.get("duration_ms"))
             sources.extend(items)
             warnings.extend(notes)
         sources.sort(key=lambda s: (s["begin_ms"], s["end_ms"], s["sentence_id"]))
@@ -303,7 +297,7 @@ class Engine:
         self.verify_source_output(job_id, manifest, output)
         candidate = copy.deepcopy(manifest)
         candidate["display_timing_version"] = DISPLAY_TIMING_VERSION
-        content, adjustments = self.render_subtitles(cues, settings)
+        content, adjustments = self.render_subtitles(cues, settings, version=candidate['display_timing_version'])
         intent = prepare_intent(output, content, overwrite)
         check_cancel(self.cancel)
         snapshot = self.config.root / ".build" / "retime" / job_id / (str(time.time_ns()) + ".json")
@@ -458,7 +452,6 @@ class Engine:
 
         def client():
             nonlocal api
-            key, _ = self.identity(job_id, manifest, persist=False)
             if api is None:
                 api = Bailian(manifest["region"], self.cancel,
                     count=lambda name: self.store.count(job_id, name),
@@ -749,7 +742,7 @@ class Engine:
         cues = self.store.cues(job_id)
         check_cancel(self.cancel)
         stage("writing")
-        content, adjustments = self.render_subtitles(cues, settings)
+        content, adjustments = self.render_subtitles(cues, settings, version=manifest['display_timing_version'])
         if "publication_intent" not in manifest:
             candidate = copy.deepcopy(manifest)
             intent = prepare_intent(output, content, manifest["overwrite"])
@@ -768,8 +761,8 @@ class Engine:
         return "completed"
 
     @staticmethod
-    def render_subtitles(cues, settings):
-        intervals, adjustments = plan_display_timing(cues)
+    def render_subtitles(cues, settings, *, version=DISPLAY_TIMING_VERSION):
+        intervals, adjustments = plan_display_timing(cues, version=version)
         return render_srt(cues, settings, display_intervals=intervals), adjustments
 
     def cleanup_completed_audio(self, job_id, manifest, cache):

@@ -18,7 +18,6 @@ def app_root() -> Path:
 
 @dataclass
 class Settings:
-    region: str = "beijing"
     workspace_id: str = ""
     mt_workers: int = 16
     mt_base_url: str = "http://127.0.0.1:3425/v1"
@@ -39,8 +38,6 @@ class Settings:
     other_line_width: int = 84
 
     def validate(self):
-        if self.region != "beijing":
-            raise ToolError("仅支持北京工作空间，请检查 data/settings.json。", "config")
         if self.workspace_id:
             self.workspace_id = validate_workspace_id(self.workspace_id)
         if type(self.mt_workers) is not int or self.mt_workers < 1:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from .common import ToolError
+from .common import DISPLAY_TIMING_VERSION, SUPPORTED_DISPLAY_TIMING_VERSIONS, ToolError
 from .review import decision_origin
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
@@ -700,8 +700,30 @@ def validate_display_intervals(cues, intervals):
         previous = {**interval, "sentence_id": cue.get("sentence_id", cue["cue_id"])}
 
 
-def plan_display_timing(cues):
+def _display_trim_issue(original, remaining):
+    duration = original['end_ms'] - original['begin_ms']
+    trimmed = duration - remaining
+    if trimmed > 500:
+        return f'累计缩短超限：{trimmed}ms，最多允许 500ms'
+    if trimmed * 10 > duration:
+        return f'缩短比例超限：{trimmed}ms / {duration}ms，最多允许原显示时长的 10%'
+    if remaining < 1000:
+        return f'时长不足：修整后 {remaining}ms，须至少 1000ms'
+    return None
+
+
+def _trim_display_interval(interval, begin, end, reason):
+    old_begin, old_end = interval['begin_ms'], interval['end_ms']
+    interval.update(begin_ms=begin, end_ms=end)
+    return {'cue_id': interval['cue_id'], 'old_begin_ms': old_begin, 'old_end_ms': old_end,
+            'new_begin_ms': begin, 'new_end_ms': end,
+            'adjustment_ms': (begin - old_begin) + (old_end - end), 'reason': reason}
+
+
+def plan_display_timing(cues, *, version=DISPLAY_TIMING_VERSION):
     """Derive bounded display adjustments without altering recognition evidence."""
+    if type(version) is not int or version not in SUPPORTED_DISPLAY_TIMING_VERSIONS:
+        raise ToolError('任务显示时间版本不受支持，请用 --reflow 显式重排。', 'cache_version')
     intervals, adjustments = [], []
     for index, cue in enumerate(cues):
         begin, end = cue["begin_ms"], cue["end_ms"]
@@ -718,24 +740,25 @@ def plan_display_timing(cues):
                 overlap = previous["end_ms"] - begin
                 structure_ok = (all(parts) and parts[0][1] == parts[1][1] and int(parts[0][2]) < int(parts[1][2]) and
                                 previous['begin_ms'] < begin < previous['end_ms'] < end)
-                detail = None
-                duration = prior_cue['end_ms'] - prior_cue['begin_ms']
                 if not structure_ok:
                     detail = '区间结构冲突：须同分段、来源递增且前起点 < 后起点 < 前终点 < 后终点'
-                elif overlap > 500:
-                    detail = f'重叠超限：{overlap}ms，最多允许 500ms'
-                elif overlap * 10 > duration:
-                    detail = f'缩短比例超限：{overlap}ms / {duration}ms，最多允许原显示时长的 10%'
-                elif begin - previous['begin_ms'] < 1000 or end - begin < 1000:
-                    detail = (f"时长不足：前条修整后 {begin - previous['begin_ms']}ms、后条原时长 {end - begin}ms，"
-                              '均须至少 1000ms')
-                if detail:
                     raise _timeline_error(prior_cue, cue, detail=detail)
-                adjustments.append({"cue_id": previous["cue_id"],
-                                    "old_begin_ms": previous["begin_ms"], "old_end_ms": previous["end_ms"],
-                                    "new_begin_ms": previous["begin_ms"], "new_end_ms": begin,
-                                    "adjustment_ms": overlap, "reason": "bounded_sentence_overlap"})
-                previous["end_ms"] = begin
+                if overlap > 500:
+                    raise _timeline_error(prior_cue, cue, detail=f'重叠超限：{overlap}ms，最多允许 500ms')
+                previous_issue = _display_trim_issue(prior_cue, begin - previous['begin_ms'])
+                if version == 2 and previous_issue is None and end - begin < 1000:
+                    previous_issue = f'时长不足：后条原时长 {end - begin}ms，须至少 1000ms'
+                if previous_issue is None:
+                    adjustments.append(_trim_display_interval(previous, previous['begin_ms'], begin,
+                                                              'bounded_sentence_overlap'))
+                elif version == 2:
+                    raise _timeline_error(prior_cue, cue, detail=previous_issue)
+                else:
+                    next_issue = _display_trim_issue(cue, end - previous['end_ms'])
+                    if next_issue:
+                        raise _timeline_error(prior_cue, cue, detail=f'前条{previous_issue}；后条{next_issue}')
+                    adjustments.append(_trim_display_interval(current, previous['end_ms'], end,
+                                                              'bounded_sentence_overlap_start_delay'))
         intervals.append(current)
     validate_display_intervals(cues, intervals)
     return intervals, adjustments

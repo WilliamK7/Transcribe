@@ -70,22 +70,31 @@ class ExecutionPolicyTests(SavedResultFixture):
                 self.assertEqual(output.read_bytes(), content)
         self.assertFalse((self.config.root / '.build' / 'retime').exists())
 
-    def test_reflow_refreshes_snapshot_only_after_successful_preparation(self):
-        from subtitle_tool.policy import current_execution_snapshot
+    def test_reflow_replaces_retired_subtitle_state_only_after_validating_raw(self):
+        from subtitle_tool.policy import current_execution_snapshot, load_policy
         self.save_result()
         manifest = self.store.job(self.job_id)["manifest"]
-        manifest["execution_snapshot"] = {"format_version": 1, "prompt_version": -1, "recovery_version": -1}
+        manifest.update(subtitle_version=1, display_timing_version=1, normalized_version=1,
+                        subtitle_settings={'retired': True}, translation_strategy_version=5,
+                        execution_snapshot={'recovery_version': 5}, mt_glossary_schedule='prefix-v2')
+        manifest['contract']['normalizer'] = 1
         self.store.update(self.job_id, manifest=manifest)
         before = self.store.job(self.job_id)
         raw = self.cache / "raw-0000.json"
         content = raw.read_bytes()
         raw.unlink()
-        with self.assertRaises(ToolError):
-            Engine(self.config, self.store).reflow(self.job_id)
+        engine = Engine(self.config, self.store)
+        with self.assertRaises(ToolError) as caught:
+            engine.reflow(self.job_id)
+        self.assertEqual(caught.exception.code, 'reflow_cache_missing')
         self.assertEqual(self.store.job(self.job_id), before)
         raw.write_bytes(content)
-        Engine(self.config, self.store).reflow(self.job_id)
-        self.assertEqual(self.store.job(self.job_id)["manifest"]["execution_snapshot"], current_execution_snapshot())
+        engine.reflow(self.job_id)
+        rebuilt = self.store.job(self.job_id)['manifest']
+        load_policy(rebuilt)
+        self.assertEqual(rebuilt['execution_snapshot'], current_execution_snapshot())
+        self.assertTrue((self.path / rebuilt['reflow']['snapshot']).is_file())
+        self.assertEqual(raw.read_bytes(), content)
 
     def test_resume_uses_saved_layout_and_current_concurrency(self):
         from subtitle_tool.policy import load_policy

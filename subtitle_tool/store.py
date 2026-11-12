@@ -54,10 +54,8 @@ class Store:
         """)
         self.db.commit()
 
-    def enqueue(self, source: Path, region: str = "beijing", overwrite=False, output_dir: Path | None = None,
-                *, workspace_id="", account="", settings=None, mt_route_snapshot=None):
-        if region != "beijing":
-            raise ToolError("新任务只支持北京工作空间。", "config")
+    def enqueue(self, source: Path, *, overwrite=False, output_dir: Path | None = None,
+                workspace_id="", account="", settings=None, mt_route_snapshot=None):
         workspace_id = validate_workspace_id(workspace_id)
         source = source.resolve()
         if not source.is_file():
@@ -91,7 +89,7 @@ class Store:
                 return reusable["id"]
             job_id = uuid.uuid4().hex
             now = time.time()
-            manifest = {"region": region, "workspace_id": workspace_id, "access_mode": "workspace",
+            manifest = {"region": "beijing", "workspace_id": workspace_id, "access_mode": "workspace",
                         "processing_version": PROCESSING_VERSION, "account": account,
                         "overwrite": bool(overwrite), "segments": [], "warnings": []}
             if mt_route_snapshot is not None:

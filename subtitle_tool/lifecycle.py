@@ -134,6 +134,8 @@ def contract():
 def describe(job, *, reflow_required=False):
     """Command arguments and inputs derived from saved metadata."""
     state, manifest, job_id = job['state'], job['manifest'], job['id']
+    legacy_display_conflict = (job.get('error_code') == 'timeline' and manifest.get('normalized') and
+                               manifest.get('display_timing_version') == 2)
     actions = []
 
     def action(name, label, argv, *, required=None, confirmation=False):
@@ -152,7 +154,9 @@ def describe(job, *, reflow_required=False):
                required={'--bind-task-id': '云端任务ID'})
         action('allow_resubmit', '明确接受可能重复计费后重发', ['--resume', job_id, '--allow-resubmit'],
                confirmation=True)
-    elif reflow_required or job.get('error_code') in {'cache_version', 'reflow_required'}:
+    elif legacy_display_conflict and manifest.get('layout_complete') and not reflow_required:
+        action('retime', '复用完整译文并升级显示时间，覆盖已有字幕须明确添加 --overwrite', ['--retime', job_id])
+    elif reflow_required or legacy_display_conflict or job.get('error_code') in {'cache_version', 'reflow_required'}:
         action('reflow', '从完整本地转写重建；可能重新翻译，覆盖已有字幕须明确添加 --overwrite', ['--reflow', job_id])
     elif state == 'needs_review':
         action('review', '在交互终端确认音轨、声道或语种后继续', ['--review', job_id])

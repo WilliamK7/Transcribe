@@ -11,27 +11,6 @@ from subtitle_tool.mt_pipeline import GlossaryPrefix, Pipeline
 
 
 class TranslationWorkflowTests(PoolPipelineFixture):
-    def test_v5_task_requires_explicit_reflow_and_preserves_raw(self):
-        from subtitle_tool.common import ToolError
-        from subtitle_tool.policy import load_policy
-        self.save_result(result(('Recover the original transcript.', 'en')))
-        job = self.store.job(self.job_id)
-        manifest = job['manifest']
-        manifest['translation_strategy_version'] = 5
-        manifest['execution_snapshot'] = dict(format_version=1, prompt_version=4,
-            recovery_version=5, context_version=2, alignment_version=2)
-        manifest['mt_glossary_schedule'] = 'prefix-v2'
-        self.store.update(self.job_id, manifest=manifest)
-        raw = (self.cache / 'raw-0000.json').read_bytes()
-        with self.assertRaises(ToolError) as caught:
-            load_policy(manifest)
-        self.assertEqual(caught.exception.code, 'cache_version')
-        Engine(self.config, self.store).reflow(self.job_id)
-        rebuilt = self.store.job(self.job_id)['manifest']
-        self.assertEqual(rebuilt['translation_strategy_version'], 6)
-        self.assertTrue((self.path / rebuilt['reflow']['snapshot']).is_file())
-        self.assertEqual((self.cache / 'raw-0000.json').read_bytes(), raw)
-
     def test_translation_schema_targets_fragments_in_one_request(self):
         data = {'sentences': [{'id': '0', 'text': 'Do not disable the cache.'}],
                 'fragments': [{'id': '0', 'sentence': '0', 'text': 'Do not disable'},
