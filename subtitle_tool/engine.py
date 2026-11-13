@@ -361,11 +361,20 @@ class Engine:
 
     @staticmethod
     def prepare_output(output):
-        output.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd, test_name = tempfile.mkstemp(prefix=".subtitle-write-test-", dir=output.parent)
-            os.close(fd)
-            Path(test_name).unlink()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            for _ in range(5):
+                probe = output.parent / (".subtitle-write-test-" + uuid.uuid4().hex)
+                try:
+                    fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
+                except FileExistsError:
+                    continue
+                try:
+                    os.close(fd)
+                finally:
+                    probe.unlink()
+                return
+            raise FileExistsError("无法创建唯一的输出目录检查文件")
         except OSError as error:
             raise ToolError("视频输出目录不可写；请用 --output-dir 明确选择可写位置。", "output_readonly") from error
 

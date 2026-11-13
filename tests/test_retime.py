@@ -18,8 +18,6 @@ class RetimeTests(SavedResultFixture):
     def prepare_completed(self, *, overlap=40):
         self.save_result(overlapping_raw(overlap=overlap))
         manifest = self.store.job(self.job_id)["manifest"]
-        manifest["display_timing_version"] = 2
-        self.store.update(self.job_id, manifest=manifest)
         self.fake = FakeService(overlapping_raw(overlap=overlap))
         self.assertEqual(self.run_fake(self.fake), "completed")
         self.output = self.source.with_suffix(".srt")
@@ -189,7 +187,7 @@ class RetimeTests(SavedResultFixture):
                 mock.patch("requests.post", side_effect=self.fake.upload):
             self.assertEqual(main(["--retime", self.job_id, "--output-dir", str(directory), "--non-interactive"]), 0)
             report = json.loads(stdout.getvalue())
-            self.assertEqual(report["retime"]["from_display_timing_version"], 2)
+            self.assertEqual(report["retime"]["from_display_timing_version"], 3)
             self.assertEqual(report["display_timing_version"], 3)
         self.assertEqual(self.output.read_bytes(), self.old_content)
         self.assertTrue((directory / self.output.name).is_file())

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from .common import DISPLAY_TIMING_VERSION, SUPPORTED_DISPLAY_TIMING_VERSIONS, ToolError
+from .common import DISPLAY_TIMING_VERSION, ToolError
 from .review import decision_origin
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
@@ -18,6 +18,7 @@ BRANDS = {"windows", "python", "ffmpeg", "ffprobe", "qwen", "chatgpt", "openai",
 CHINESE_MARKERS = re.compile(r"的|了|我们|你们|这个|欢迎|今天|你好|一个|可以|需要|使用|然后|请|谢谢|中文")
 FOREIGN_FUNCTIONS = {"the", "and", "is", "are", "was", "you", "your", "please", "turn", "on", "off",
                      "with", "have", "this", "that", "what", "where", "why", "when", "how", "from", "to", "for"}
+MAX_SEGMENT_END_OVERRUN_MS = 200
 
 
 def route(text: str, language: str, neighbors=()) -> tuple[str, str]:
@@ -157,7 +158,7 @@ def _merge_boundary_point_groups(records, segment_id):
     return records, warnings
 
 
-def prepare_sentence_timings(sentences, duration_ms, segment_id):
+def prepare_sentence_timings(sentences, duration_ms, segment_id, *, end_clips=None):
     """Zero-length ASR points get display timing, never invented word alignment."""
     records, warnings = [], []
     for index, sentence in enumerate(sentences):
@@ -166,7 +167,9 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
         b, e = sentence.get("begin_time"), sentence.get("end_time")
         if type(b) is not int or type(e) is not int or b < 0 or e < b:
             raise ToolError(f"第 {index + 1} 句时间戳异常；原始结果已保留，需修复后恢复。", "timeline")
-        records.append({**sentence, "_indices": [index], "_adjustments": []})
+        clip = (end_clips or {}).get(index)
+        records.append({**sentence, "end_time": clip["new_end_ms"] if clip else e,
+                        "_indices": [index], "_adjustments": [clip] if clip else []})
     records, warnings = _merge_boundary_point_groups(records, segment_id)
     at = 0
     while at < len(records):
@@ -228,6 +231,22 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id):
     return records, warnings
 
 
+def _segment_end_clip(sentence, index, duration_ms):
+    """Require complete word evidence before bounding a short final overrun."""
+    b, e = sentence.get("begin_time"), sentence.get("end_time")
+    if (type(b) is not int or type(e) is not int or not isinstance(sentence.get("language"), str) or
+            not 0 <= b < duration_ms < e or
+            e > duration_ms + MAX_SEGMENT_END_OVERRUN_MS):
+        return None
+    words, status = aligned_words(sentence, 0)
+    raw_words = sentence.get("words")
+    if (not words or status not in {"reliable", "reliable_grouped_points"} or
+            raw_words[-1]["begin_time"] >= duration_ms or raw_words[-1]["end_time"] != e):
+        return None
+    return {"asr_sentence_index": index, "original_begin_ms": b, "original_end_ms": e,
+            "new_end_ms": duration_ms, "kind": "clipped_segment_end"}
+
+
 def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -> tuple[list[dict], list[str]]:
     if not isinstance(raw, dict) or not isinstance(raw.get("transcripts"), list):
         raise ToolError("Qwen3 结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
@@ -246,6 +265,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
             if not any(clean_text(s.get("text")) for s in transcript["sentences"]):
                 raise ToolError("识别汇总含文字但没有有效句子；原始结果已保留。", "response_schema")
         sentences.extend(transcript["sentences"])
+    end_clips = {}
     if duration_ms is not None:
         if type(duration_ms) is not int or duration_ms <= 0:
             raise ToolError("分段时长无效，不能验证识别时间范围。", "timeline")
@@ -255,8 +275,13 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
             b, e = sentence.get("begin_time"), sentence.get("end_time")
             if clean_text(sentence.get("text")) and (type(b) is not int or type(e) is not int or
                                                       b >= duration_ms or e > duration_ms + 1):
-                raise ToolError(f"第 {index + 1} 句超出本段时间范围；原始结果已保留。", "timeline")
-    records, timing_warnings = prepare_sentence_timings(sentences, duration_ms, segment_id)
+                clip = _segment_end_clip(sentence, index, duration_ms) if index == len(sentences) - 1 else None
+                if not clip:
+                    raise ToolError(f"第 {index + 1} 句超出本段时间范围；原始结果已保留。", "timeline")
+                end_clips[index] = clip
+                warnings.append(f"分段 {segment_id} 第 {index + 1} 句结束时间超出音频 {e - duration_ms}ms，"
+                                "已裁到音频末尾并保留原始文字和时间，不使用该句词级时间拆分；请人工核对结尾。")
+    records, timing_warnings = prepare_sentence_timings(sentences, duration_ms, segment_id, end_clips=end_clips)
     warnings.extend(timing_warnings)
     languages = [s.get("language", "") for s in sentences]
     for sentence in records:
@@ -722,7 +747,7 @@ def _trim_display_interval(interval, begin, end, reason):
 
 def plan_display_timing(cues, *, version=DISPLAY_TIMING_VERSION):
     """Derive bounded display adjustments without altering recognition evidence."""
-    if type(version) is not int or version not in SUPPORTED_DISPLAY_TIMING_VERSIONS:
+    if type(version) is not int or version != DISPLAY_TIMING_VERSION:
         raise ToolError('任务显示时间版本不受支持，请用 --reflow 显式重排。', 'cache_version')
     intervals, adjustments = [], []
     for index, cue in enumerate(cues):
@@ -746,13 +771,9 @@ def plan_display_timing(cues, *, version=DISPLAY_TIMING_VERSION):
                 if overlap > 500:
                     raise _timeline_error(prior_cue, cue, detail=f'重叠超限：{overlap}ms，最多允许 500ms')
                 previous_issue = _display_trim_issue(prior_cue, begin - previous['begin_ms'])
-                if version == 2 and previous_issue is None and end - begin < 1000:
-                    previous_issue = f'时长不足：后条原时长 {end - begin}ms，须至少 1000ms'
                 if previous_issue is None:
                     adjustments.append(_trim_display_interval(previous, previous['begin_ms'], begin,
                                                               'bounded_sentence_overlap'))
-                elif version == 2:
-                    raise _timeline_error(prior_cue, cue, detail=previous_issue)
                 else:
                     next_issue = _display_trim_issue(cue, end - previous['end_ms'])
                     if next_issue:

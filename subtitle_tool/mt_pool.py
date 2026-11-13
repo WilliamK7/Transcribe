@@ -124,13 +124,10 @@ def saved_route(manifest):
         raise _invalid()
     snapshot = manifest.get('mt_route_snapshot')
     from .mt_identity import valid_identity_map
-    fields = {'format_version', 'entries', 'routing', 'quality'}
-    if isinstance(snapshot, dict) and snapshot.get('format_version') == 6:
-        fields.add('identities')
-        if not valid_identity_map(snapshot.get('identities')):
-            raise _invalid()
+    fields = {'format_version', 'entries', 'routing', 'quality', 'identities'}
     if (not isinstance(snapshot, dict) or set(snapshot) != fields or
-            type(snapshot['format_version']) is not int or snapshot['format_version'] not in (5, 6) or
+            type(snapshot['format_version']) is not int or snapshot['format_version'] != 6 or
+            not valid_identity_map(snapshot['identities']) or
             type(manifest.get('translation_strategy_version')) is not int or
             manifest['translation_strategy_version'] != 6 or not isinstance(snapshot['entries'], list) or
             len(snapshot['entries']) != 6 or snapshot['routing'] != {'strategy': _ROUTING_STRATEGY} or

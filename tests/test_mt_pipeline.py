@@ -85,7 +85,8 @@ class PoolPipelineTests(PoolPipelineFixture):
         entry = pipeline.router.entries[0]
         key = stage_cache_key('translate', data, entry.backend,
                               capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.cache_scope)
-        record = {'value': {'translations': {'0': '缓存。'}}, 'actual_model': 'synthetic', 'usage': None}
+        record = {'value': {'translations': {'0': '缓存。'}}, 'actual_model': 'synthetic',
+                  'resolved_model': 'synthetic', 'usage': None}
         with self.store.db:
             self.store.db.execute('INSERT INTO mt_cache VALUES(?,?)', (key, json.dumps(record)))
         data['context'] = [{'position': 'before', 'text': 'synthetic background ' * 200}]
@@ -334,7 +335,8 @@ class PoolPipelineTests(PoolPipelineFixture):
         with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected HTTP')), \
                 mock.patch.object(pipeline, '_validate_gateway', side_effect=AssertionError('Unexpected gateway validation')):
             self.assertIsNone(pipeline.stage('judge', data, ids=['0'], originals=['Cache.'], saved_only=True))
-            cached = {'value': {'translations': {'0': '修正译文'}, 'issues': data['issues']}, 'actual_model': 'synthetic', 'usage': None}
+            cached = {'value': {'translations': {'0': '修正译文'}, 'issues': data['issues']},
+                      'actual_model': 'synthetic', 'resolved_model': 'synthetic', 'usage': None}
             with self.store.db:
                 self.store.db.execute('INSERT INTO mt_cache VALUES(?,?)', (key, json.dumps(cached)))
             value, _, _ = pipeline.stage('judge', data, ids=['0'], originals=['Cache.'], saved_only=True)

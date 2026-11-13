@@ -253,29 +253,18 @@ class GatewaySetup:
                 raise ValueError()
             applied = set(completed)
             live = {g['id']: g for g in self.manager._registry().get('groups', [])}
-            if plan.get('version', 1) == 1:
-                # Older journals only confirm completed steps. An unrecorded
-                # change cannot safely be attributed to either us or the user.
-                backup = Path(plan['backup']).resolve()
-                if not backup.is_relative_to((self.config.data / 'gateway-backups').resolve()):
-                    raise ValueError()
-                before = {g['id']: g for g in json.loads((backup / 'providers.json').read_bytes()).get('groups', [])}
-                if any(self._group_state(live.get(name)) != self._group_state(before.get(name))
-                       for name in groups.keys() - applied):
-                    raise ValueError()
-            elif plan['version'] == 2:
-                active = plan.get('active')
-                if active is not None:
-                    name = active['group']
-                    if name not in groups or not isinstance(active['after'], dict):
-                        raise ValueError()
-                    actual = self._group_state(live.get(name))
-                    if actual == active['after']:
-                        applied.add(name)  # The CLI committed before its reply/checkpoint was lost.
-                    elif actual != active['before']:
-                        raise ValueError()  # Preserve ambiguous concurrent edits for inspection.
-            else:
+            if plan.get('version') != 2:
                 raise ValueError()
+            active = plan.get('active')
+            if active is not None:
+                name = active['group']
+                if name not in groups or not isinstance(active['after'], dict):
+                    raise ValueError()
+                actual = self._group_state(live.get(name))
+                if actual == active['after']:
+                    applied.add(name)  # The CLI committed before its reply/checkpoint was lost.
+                elif actual != active['before']:
+                    raise ValueError()  # Preserve ambiguous concurrent edits for inspection.
             recovered = copy.deepcopy(self.managed)
             for name in applied:
                 recovered['groups'][name] = groups[name]

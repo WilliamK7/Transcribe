@@ -40,11 +40,17 @@ def _independent_model(model, forbidden):
 
 
 def _record_model(record, identities):
-    return resolve_model(record['actual_model'], {}, identities, saved=record.get('resolved_model'), require_admitted=True)
+    resolved = record['resolved_model']
+    if not isinstance(resolved, str):
+        raise ValueError('Missing saved model identity')
+    return resolve_model(record['actual_model'], {}, identities, saved=resolved, require_admitted=True)
 
 
 def _proof_model(proof):
-    return proof.get('resolved_model') or canonical_model(proof['actual_model'])
+    resolved = proof['resolved_model']
+    if not isinstance(resolved, str):
+        raise ValueError('Missing production model identity')
+    return resolved
 
 
 class GroupProgress:
@@ -211,7 +217,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                 final = saved['record']
                 required = {'backend', 'request_model', 'actual_model', 'production_stage_key', 'translation_stage_key',
                             'review_stage_keys', 'correction_stage_keys', 'cue_ids', 'value', 'warning', 'stage'}
-                if (set(final) - {'resolved_model'} != required or final['stage'] != 'final' or type(final['warning']) is not bool or
+                if (set(final) != required | {'resolved_model'} or final['stage'] != 'final' or type(final['warning']) is not bool or
                         not isinstance(final['actual_model'], str) or
                         safe_model_id(final['actual_model']) != final['actual_model'] or
                         not isinstance(final['cue_ids'], list) or not final['cue_ids'] or
@@ -230,8 +236,6 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         {'translations': proof['record'].get('value', {}).get('translations')} != final['value']):
                     raise ValueError()
                 identities = route.get('identities', {})
-                # Fixed-model stages saved before resolved_model was introduced
-                # remain unchanged when a resumed run creates its new final.
                 if _record_model(proof['record'], identities) != _record_model(final, identities):
                     raise ValueError()
                 source_hashes = None
@@ -270,7 +274,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                     source_hashes[final['cue_ids'].index(cue['cue_id'])] != _digest(cue['text'].strip())):
                 raise ValueError()
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        raise ToolError('译文阶段来源或底层型号与快照不一致；无法验证的动态旧记录须用 --reflow 从原始转写重建。',
+        raise ToolError('译文阶段来源或底层型号与快照不一致；请用 --reflow 从原始转写重建。',
                         'cache_mismatch') from None
 
 
@@ -339,9 +343,8 @@ class Pipeline:
         magpie = getattr(self.engine, 'magpie', None)
         if magpie is not None:
             magpie.ensure_ready(entry.backend.base_url, self.engine.mt_control)
-        # Old fixed-model tasks can still use their commercial fallback when a
-        # dynamic member was added to the live group later. Only pool validation
-        # sees that new admission; response and saved-stage evidence stay frozen.
+        # Live pool validation sees newly admitted members while saved-stage
+        # evidence remains tied to the route snapshot.
         pool_identities = {**saved_catalog(self.engine.config).get('identities', {}), **self.identities}
         if not entry.id.endswith('_fallback'):
             self.channel_maintenance.prepare(self.engine.config.settings, entry.backend.base_url)
@@ -578,7 +581,7 @@ class Pipeline:
             saved = stored['record']
             usage = saved.get('usage') if isinstance(saved, dict) else None
             if (stored['stage'] != name or not isinstance(saved, dict) or
-                    set(saved) - {'resolved_model'} != {'value', 'backend', 'request_model', 'actual_model', 'usage', 'stage'} | set(evidence) | input_fields or
+                    set(saved) != {'value', 'backend', 'request_model', 'actual_model', 'resolved_model', 'usage', 'stage'} | set(evidence) | input_fields or
                     any(saved[k] != value for k, value in evidence.items()) or
                     saved.get('stage') != name or not isinstance(saved.get('backend'), str) or
                     saved.get('backend') not in self.profiles or
@@ -605,7 +608,7 @@ class Pipeline:
                     try:
                         resolved = _record_model(saved, self.identities)
                     except ValueError:
-                        raise ToolError('保存的动态路由缺少可验证身份，请用 --reflow 从原始转写重建。',
+                        raise ToolError('保存的路由缺少可验证身份，请用 --reflow 从原始转写重建。',
                                         'cache_mismatch') from None
                     if not _independent_model(resolved, forbidden_models):
                         return None
@@ -632,7 +635,7 @@ class Pipeline:
                 return None
             try:
                 record = json.loads(raw)
-                if (not isinstance(record, dict) or set(record) - {'resolved_model'} != {'value', 'actual_model', 'usage'} or
+                if (not isinstance(record, dict) or set(record) != {'value', 'actual_model', 'resolved_model', 'usage'} or
                         not isinstance(record['actual_model'], str) or
                         safe_model_id(record['actual_model']) != record['actual_model'] or
                         not _valid_usage(record['usage'])):

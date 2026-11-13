@@ -234,10 +234,3 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertEqual(self.guard._registry(), before)
         self.assertEqual((self.config.data / 'gateway-apply-pending.json').read_bytes(), pending)
         self.assertEqual(len(self.commands), count)
-
-    def test_legacy_pending_record_recovers_confirmed_child_ownership(self):
-        _, original, _, free = self.interrupted_existing_groups()
-        path = self.config.data / 'gateway-apply-pending.json'
-        pending = json.loads(path.read_bytes())
-        atomic_json(path, {k: pending[k] for k in ('backup', 'groups', 'completed')})
-        self.assert_original_group_restored(GatewaySetup(self.config, self.parent, manager=self.guard), original, free)

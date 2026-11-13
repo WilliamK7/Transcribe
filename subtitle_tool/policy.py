@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from .common import (ASR_MODEL, NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION,
-                     SUPPORTED_DISPLAY_TIMING_VERSIONS, ToolError)
+from .common import (ASR_MODEL, DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, PROCESSING_VERSION,
+                     SUBTITLE_VERSION, ToolError)
 from .media import EXTRACT_RECIPE_VERSION
 from .mt_quality import GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION
 
@@ -59,7 +59,7 @@ def load_policy(manifest):
     """Validate the saved execution contract before reusing derived results."""
     validate_raw_contract(manifest)
     _version(manifest.get("subtitle_version"), SUBTITLE_VERSION)
-    display_timing = _version(manifest.get('display_timing_version'), *SUPPORTED_DISPLAY_TIMING_VERSIONS)
+    display_timing = _version(manifest.get('display_timing_version'), DISPLAY_TIMING_VERSION)
     _version(manifest.get("translation_strategy_version"), 6)
     saved_layout = manifest.get("subtitle_settings", {})
     if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:

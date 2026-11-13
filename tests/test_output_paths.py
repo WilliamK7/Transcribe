@@ -166,6 +166,26 @@ class OutputStoreTests(TemporaryTest):
 
 
 class OutputPipelineTests(PipelineFixture):
+    def test_output_probe_stops_promptly_on_windows_permission_error(self):
+        output = self.path / 'saved.srt'
+        with mock.patch('tempfile.TMP_MAX', 3), \
+                mock.patch('tempfile._os.open', side_effect=PermissionError('denied')) as open_file:
+            with self.assertRaises(ToolError) as caught:
+                Engine.prepare_output(output)
+        self.assertEqual(caught.exception.code, 'output_readonly')
+        self.assertEqual(open_file.call_count, 1)
+
+    def test_output_probe_keeps_existing_collision_and_cleans_its_own_file(self):
+        output = self.path / 'saved.srt'
+        existing = self.path / '.subtitle-write-test-existing'
+        existing.write_bytes(b'keep')
+        with mock.patch('subtitle_tool.engine.uuid.uuid4', side_effect=[
+                mock.Mock(hex='existing'), mock.Mock(hex='new')]) as random_id:
+            Engine.prepare_output(output)
+        self.assertEqual(random_id.call_count, 2)
+        self.assertEqual(existing.read_bytes(), b'keep')
+        self.assertFalse((self.path / '.subtitle-write-test-new').exists())
+
     def test_relative_enqueue_in_a_resumes_in_b_and_writes_only_to_a(self):
         a, b = self.path / 'A', self.path / 'B'
         a.mkdir()
