@@ -23,7 +23,7 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertEqual(pools['review'], ['quiet'])
         self.assertEqual(len(set(assignments.values())), 3)
 
-    def test_incremental_migration_preserves_manual_member_and_exclusion(self):
+    def test_incremental_update_preserves_manual_member_and_exclusion(self):
         setup = GatewaySetup(self.config, self.parent, manager=self.guard)
         self.assertTrue(setup._group('transcribe-free', ['manual/keep', 'project/a'], 'weight'))
         self.command('group', 'set', 'transcribe-free', 'models-=project/a', 'models+=manual/new')
@@ -32,8 +32,7 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertIn('manual/new', members)
         self.assertNotIn('project/a', members)
 
-    def test_repeated_migration_preserves_disabled_managed_member(self):
-        from subtitle_tool.common import atomic_json
+    def test_repeated_update_preserves_disabled_managed_member(self):
         setup = GatewaySetup(self.config, self.parent, manager=self.guard)
         setup._group('transcribe-free', ['project/a', 'project/b'], 'weight')
         raw = self.guard._registry()
@@ -52,28 +51,25 @@ class RoleChoiceTests(BailianFreeFixture):
         group = next(g for g in self.guard._registry()['groups'] if g['id'] == 'transcribe')
         self.assertEqual(group['members'], ['group/free', 'group/paid'])
 
-    def legacy_setup(self, *, managed=False, only_trial=False):
+    def gateway_setup(self, *, paid_only=False):
         raw = self.guard._registry()
-        raw['providers'][0]['off'] = False
         raw['providers'] += [{'id': 'manual'}, {'id': 'transcribe-bailian'}, {'id': 'transcribe-qiniu-free'}]
-        raw['groups'][0]['members'] = [TRIAL_PROVIDER + '/trial-a', TRIAL_PROVIDER + '/trial-b']
-        if not only_trial:
-            raw['groups'][0]['members'].append('manual/keep')
-            raw['groups'][0]['off'] = [TRIAL_PROVIDER + '/trial-b']
+        if paid_only:
+            raw['groups'] = []
         atomic_json(self.registry, raw)
         setup = GatewaySetup(self.config, self.parent, manager=self.guard)
-        if managed:
-            setup.managed['groups']['transcribe-free'] = []  # A previous incomplete v6 migration.
         evaluations = {'transcribe-bailian/' + name: {'roles': [role], 'actual_models': [name]}
                        for name, role in [('draft', 'translate'), ('reviewer', 'review'), ('arbiter', 'judge')]}
         free = []
-        if not only_trial:
+        if not paid_only:
             evaluations['transcribe-qiniu-free/qualified'] = {'roles': ['translate'], 'actual_models': ['qualified']}
             free.append('transcribe-qiniu-free/qualified')
         return setup, evaluations, free, raw
 
-    def assert_legacy_retired(self, *, managed=False):
-        setup, evaluations, free, before = self.legacy_setup(managed=managed)
+    def test_apply_preserves_manual_members_and_disables_account_template(self):
+        setup, evaluations, free, before = self.gateway_setup()
+        before['providers'][0]['off'] = False
+        atomic_json(self.registry, before)
         first = setup.apply(evaluations, free)
         setup.apply(evaluations, free)
         raw = self.guard._registry()
@@ -82,34 +78,27 @@ class RoleChoiceTests(BailianFreeFixture):
         enabled = group_models(raw, 'group/transcribe')
         self.assertNotIn(TRIAL_PROVIDER, {owner for owner, _, _ in enabled})
         self.assertIn(('manual', 'keep'), {(owner, model) for owner, model, _ in enabled})
-        group = next(g for g in raw['groups'] if g['id'] == 'transcribe-free')
-        self.assertNotIn(TRIAL_PROVIDER + '/trial-a', group['members'])
-        self.assertIn(TRIAL_PROVIDER + '/trial-b', group['off'])
         self.assertEqual(self.commands.count(('provider', 'off', TRIAL_PROVIDER)), 1)
         backup = json.loads((Path(first['backup']) / 'providers.json').read_bytes())
         self.assertFalse(backup['providers'][0]['off'])
 
-    def test_v5_migration_retires_shared_trial_and_preserves_manual_members(self):
-        self.assert_legacy_retired()
-
-    def test_repeated_migration_repairs_already_managed_legacy_members(self):
-        self.assert_legacy_retired(managed=True)
-
-    def test_migration_without_free_replacement_keeps_commercial_route_usable(self):
-        setup, evaluations, free, _ = self.legacy_setup(only_trial=True)
+    def test_apply_without_free_candidates_keeps_commercial_route_usable(self):
+        setup, evaluations, free, _ = self.gateway_setup(paid_only=True)
         setup.apply(evaluations, free)
         raw = self.guard._registry()
         self.assertTrue(next(p for p in raw['providers'] if p['id'] == TRIAL_PROVIDER)['off'])
         self.assertEqual({owner for owner, _, _ in group_models(raw, 'group/transcribe')}, {'transcribe-bailian'})
 
-    def test_migration_stops_before_group_changes_if_shared_trial_stays_enabled(self):
-        setup, evaluations, free, before = self.legacy_setup()
+    def test_apply_stops_before_group_changes_if_account_template_stays_enabled(self):
+        setup, evaluations, free, before = self.gateway_setup()
+        before['providers'][0]['off'] = False
+        atomic_json(self.registry, before)
         command = self.guard._command
-        def ignore_retirement(*args):
+        def ignore_disable(*args):
             if args == ('provider', 'off', TRIAL_PROVIDER):
                 return
             command(*args)
-        self.guard._command = ignore_retirement
+        self.guard._command = ignore_disable
         with self.assertRaises(ToolError) as caught:
             setup.apply(evaluations, free)
         self.assertEqual(caught.exception.code, 'magpie_group')
@@ -117,7 +106,7 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertFalse(setup.managed_path.exists())
 
     def test_repeat_apply_keeps_policy_version_and_issues_no_commands(self):
-        setup, evaluations, free, _ = self.legacy_setup()
+        setup, evaluations, free, _ = self.gateway_setup()
         setup.apply(evaluations, free)
         version, count = self.config.settings.mt_policy_version, len(self.commands)
         result = setup.apply(evaluations, free)
@@ -126,7 +115,7 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertEqual(len(self.commands), count)
 
     def test_rejected_old_role_is_not_reassigned_on_identical_repeat(self):
-        setup, evaluations, free, _ = self.legacy_setup()
+        setup, evaluations, free, _ = self.gateway_setup()
         setup.apply(evaluations, free)
         evaluations['transcribe-qiniu-free/qualified']['roles'] = ['review', 'judge']
         setup.apply(evaluations, free)
@@ -136,7 +125,7 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertEqual(self.config.settings.mt_policy_version, version)
 
     def test_failed_projection_does_not_touch_live_groups(self):
-        setup, evaluations, free, before = self.legacy_setup()
+        setup, evaluations, free, before = self.gateway_setup()
         with mock.patch('subtitle_tool.mt_gateway_setup.validate_role_pools', side_effect=ToolError('blocked', 'mt_admission')):
             with self.assertRaises(ToolError):
                 setup.apply(evaluations, free)
@@ -145,7 +134,7 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertIsNone(setup._staged)
 
     def test_child_write_failure_keeps_parent_and_can_resume(self):
-        setup, evaluations, free, _ = self.legacy_setup()
+        setup, evaluations, free, _ = self.gateway_setup()
         original_command = self.guard._command
         def fail_second_child(*args):
             if args[:3] == ('group', 'add', 'transcribe-qiniu-free'):
@@ -163,7 +152,7 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertEqual(json.loads((self.config.data / 'gateway-apply-pending.json').read_bytes())['status'], 'complete')
 
     def interrupted_existing_groups(self, *, after_write=False):
-        setup, original, free, _ = self.legacy_setup()
+        setup, original, free, _ = self.gateway_setup()
         setup.apply(original, free)
         desired = copy.deepcopy(original)
         for old, new in [('draft', 'replacement'), ('reviewer', 'new-reviewer')]:

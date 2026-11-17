@@ -98,7 +98,7 @@ class BailianFreeGuard:
     def _identity(self, provider):
         record = json.loads((self.config.data / 'bailian-quota-binding.json').read_bytes())
         if (record.get('invalidated') is not False or record.get('source') != 'user_confirmed' or
-                type(record.get('version')) is not int or record['version'] not in (1, 2) or
+                type(record.get('version')) is not int or record['version'] != 2 or
                 record.get('region') != 'cn-beijing' or record.get('workspace') != self.config.settings.workspace_id or
                 provider.get('keys') or provider.get('headers') or provider.get('fallback') or
                 normalize_mt_url(provider.get('chat')) !=
@@ -109,7 +109,7 @@ class BailianFreeGuard:
                 re.fullmatch(r'[0-9a-f]{64}', record['cli_fingerprint']) is None):
             raise ValueError('identity')
         proof = VerifiedIdentity(record['workspace'], record['key_fingerprint'], record['region'],
-                                 record['cli_fingerprint'], record['version'])
+                                 record['cli_fingerprint'])
         if not self.source.bound_to(proof):
             raise ValueError('identity')
         return proof
@@ -370,6 +370,24 @@ class BailianFreeGuard:
                 exclusions.add(parent + ':' + child)
                 self.state['excluded_groups'] = sorted(exclusions)
                 self.remove(model, 'user_paused')
+                return
+        # A group that cannot be emptied may remain disconnected after
+        # retirement. Do not reconnect it while adding a new trial lane.
+        from .mt_catalog import read_registry, saved_catalog
+        from .magpie import group_models
+        catalog = saved_catalog(self.config)
+        reserved = self.state.get('reserved_models', {})
+        conflicts = {member for member, row in catalog.get('identities', {}).items()
+                     if row.get('dynamic') and any(reserved.get(m, role) != role for m in row['models'])}
+        if conflicts and free_group in groups:
+            leaves = group_models(read_registry(self.config.settings, catalog), 'group/' + free_group)
+            if any(owner + '/' + name in conflicts for owner, name, _ in leaves):
+                before = item.get('status')
+                item['status'] = 'role_conflict'
+                self.allowed.discard((item['provider'], model))
+                self._save()
+                if before != 'role_conflict':
+                    self._audit('role_conflict', model, before, 'role_conflict')
                 return
         if trial_group not in groups:
             self._command('group', 'add', trial_group, 'models=' + member, 'routing=order', 'stays=off')

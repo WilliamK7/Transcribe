@@ -29,7 +29,7 @@ class QuotaObservationTests(TemporaryTest):
         with self.assertRaises(ValueError):
             parse_observation(b'[{"model":"trial-model","remaining":0,"remaining":100}]')
 
-    def source(self, version=2):
+    def source(self):
         self.cli_path = self.path / 'config.json'
         self.context = {'access_key_id': 'synthetic-id', 'access_key_secret': 'synthetic-secret',
                         'console_region': 'cn-beijing', 'console_site': 'domestic',
@@ -37,7 +37,7 @@ class QuotaObservationTests(TemporaryTest):
         atomic_json(self.cli_path, self.context)
         source = CLIQuotaSource(config_dir=self.path)
         proof = VerifiedIdentity('offline-space', 'a' * 64, 'cn-beijing',
-                                 source._context(version=version)[2], version)
+                                 source._context()[2])
         return source, proof
 
     def run_query(self, source, proof, script, *, timeout=3):
@@ -49,9 +49,8 @@ class QuotaObservationTests(TemporaryTest):
             children.append(child)
             return child
 
-        command = '_renewal_command' if proof.context_version == 2 else '_command'
         try:
-            with mock.patch.object(source, command, return_value=[sys.executable, '-I', '-c', script]), \
+            with mock.patch.object(source, '_command', return_value=[sys.executable, '-I', '-c', script]), \
                     mock.patch('subtitle_tool.bailian_quota.subprocess.Popen', side_effect=start):
                 return source.query(control=MTControl(threading.Event()), timeout=timeout, proof=proof)
         finally:
@@ -62,24 +61,18 @@ class QuotaObservationTests(TemporaryTest):
                     child.wait()
                 self.assertFalse(running, 'Quota query returned before reaping its subprocess')
 
-    def test_query_reads_both_confirmed_contexts_and_reuses_renewed_token(self):
+    def test_query_uses_confirmed_credentials_and_reuses_renewed_token(self):
         row = self.row()
-        for version in (1, 2):
-            with self.subTest(version=version):
-                source, proof = self.source(version)
-                if version == 1:
-                    script = 'print(' + repr(json.dumps([row])) + ')'
-                else:
-                    script = ('import json, sys\nrequest = json.load(sys.stdin)\n'
-                              'assert request["credentials"]["accessKeyId"] == "synthetic-id"\n'
-                              'print(' + repr(json.dumps({'token': 'renewed-token', 'observation': [row]})) + ')')
-                result = self.run_query(source, proof, script)
-                self.assertEqual(json.loads(result), [row])
-                if version == 2:
-                    self.assertEqual(json.loads(source._renewal_input(proof))['token'], 'renewed-token')
+        source, proof = self.source()
+        script = ('import json, sys\nrequest = json.load(sys.stdin)\n'
+                  'assert request["credentials"]["accessKeyId"] == "synthetic-id"\n'
+                  'print(' + repr(json.dumps({'token': 'renewed-token', 'observation': [row]})) + ')')
+        result = self.run_query(source, proof, script)
+        self.assertEqual(json.loads(result), [row])
+        self.assertEqual(json.loads(source._query_input(proof))['token'], 'renewed-token')
 
     def test_query_sanitizes_cli_failure_and_reaps_timed_out_process(self):
-        source, proof = self.source(1)
+        source, proof = self.source()
         for script, timeout in (
                 ('import sys; sys.stderr.write("private" * 65536); sys.exit(3)', 3),
                 ('import time; time.sleep(30)', .3)):
@@ -100,12 +93,12 @@ class QuotaObservationTests(TemporaryTest):
         source, proof = self.source()
         atomic_json(self.cli_path, dict(self.context, access_token='renewed-unrelated-token'))
         self.assertTrue(source.bound_to(proof))
-        self.assertNotIn(b'renewed-unrelated-token', source._renewal_input(proof))
+        self.assertNotIn(b'renewed-unrelated-token', source._query_input(proof))
 
     def test_invalid_selected_profile_is_sanitized_and_unbound(self):
         source, proof = self.source()
         atomic_json(self.cli_path, dict(self.context, active_config='missing-private-profile'))
         self.assertFalse(source.bound_to(proof))
         with self.assertRaises(QuotaSourceError) as raised:
-            source._renewal_input(proof)
+            source._query_input(proof)
         self.assertNotIn('private', str(raised.exception))

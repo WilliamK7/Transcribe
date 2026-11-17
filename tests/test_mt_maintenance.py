@@ -4,8 +4,10 @@ import json
 from unittest import mock
 
 from subtitle_tool.common import ToolError, atomic_json
+from subtitle_tool.magpie import group_models
 from subtitle_tool.mt_catalog import Catalog
 from subtitle_tool.mt_gateway_setup import GatewaySetup
+from subtitle_tool.mt_identity import VSR_MEMBER
 from subtitle_tool.mt_transport import HTTPReply
 from tests.test_bailian_free import BailianFreeFixture
 
@@ -150,6 +152,167 @@ class MaintenanceTests(BailianFreeFixture):
         manager.refresh(policy=policy, discover=catalog)
         self.assertEqual(self.config.settings.mt_policy_version, version)
         self.assertEqual(manager.state['budget']['evaluations'], 1)
+
+    def prepared_dynamic_route(self):
+        from subtitle_tool.mt_catalog import read_registry
+        from subtitle_tool.mt_maintenance import identity_key
+        policy, manager, setup, catalog = self.prepared()
+        policy['providers']['vllm-sr'] = {**policy['providers']['existing'], 'adapter': 'vllm-sr'}
+        policy['max_evaluations_per_cycle'] = 2
+        policy['max_evaluations_per_day'] = 3
+        atomic_json(self.config.data / 'mt-channels.json', policy)
+        setup.policy = policy
+        name = VSR_MEMBER.split('/', 1)[1]
+        raw = self.guard._registry()
+        raw['providers'].append({'id': 'vllm-sr', 'models': [name]})
+        atomic_json(self.registry, raw)
+        setup.catalog['models']['vllm-sr'] = {name: {'free': True}}
+        setup.catalog['identities'][VSR_MEMBER] = {'models': ['fast', 'other'], 'dynamic': True, 'billing': 'free'}
+        old = {'roles': ['translate'], 'actual_models': ['fast', 'other'], 'observed_models': ['fast']}
+        rows = {member: record['accepted'] for member, record in manager.state['members'].items()}
+        setup.apply({**rows, VSR_MEMBER: old}, [VSR_MEMBER])
+        self.assertIn(VSR_MEMBER, setup.current_members())
+        registry = read_registry(self.config.settings, setup.catalog)
+        manager.state['members'][VSR_MEMBER] = {
+            'accepted': old, 'proof': identity_key(VSR_MEMBER, registry, setup.catalog)}
+        self.guard.state['models']['reviewer-1017'] = {'status': 'active', 'role': 'review'}
+        catalog.complete.add('vllm-sr')
+        catalog.available.add(VSR_MEMBER)
+        catalog.discover.return_value['identities'][VSR_MEMBER] = {
+            'models': ['fast', 'reviewer'], 'dynamic': True, 'billing': 'free'}
+        return policy, manager, setup, catalog
+
+    def test_dynamic_role_conflict_retires_route_and_applies_other_qualification(self):
+        policy, manager, setup, catalog = self.prepared_dynamic_route()
+        conflict = {'roles': ['translate'], 'actual_models': ['fast', 'reviewer'], 'observed_models': ['fast']}
+        setup.evaluate = mock.Mock(side_effect=lambda member, _: conflict if member == VSR_MEMBER else {
+            'roles': ['translate'], 'actual_models': ['new']})
+        result = manager.refresh(policy=policy, discover=catalog, setup=setup)
+        self.assertEqual(result['last_status'], 'updated')
+        self.assertEqual(result['members'][VSR_MEMBER]['status'], 'role_conflict')
+        self.assertEqual(manager.state['members'][VSR_MEMBER]['accepted'], conflict)
+        self.assertEqual(self.guard.state['reserved_models']['reviewer'], 'review')
+        self.assertEqual(self.guard.state['models']['reviewer-1017']['role'], 'review')
+        leaves = {(owner + '/' + name) for owner, name, _ in group_models(self.guard._registry(), 'group/transcribe')}
+        self.assertIn('existing/new', leaves)
+        self.assertNotIn(VSR_MEMBER, leaves)
+
+        version, command_count = self.config.settings.mt_policy_version, len(self.commands)
+        result = manager.refresh(policy=policy, discover=catalog)
+        self.assertEqual(result['last_status'], 'unchanged')
+        self.assertEqual(result['members'][VSR_MEMBER]['status'], 'role_conflict')
+        self.assertEqual(self.config.settings.mt_policy_version, version)
+        self.assertEqual(len(self.commands), command_count)
+
+    def test_dynamic_route_retirement_preserves_manual_sibling_and_can_be_reversed(self):
+        policy, manager, setup, catalog = self.prepared_dynamic_route()
+        raw = self.guard._registry()
+        raw['providers'].append({'id': 'manual'})
+        group = next(g for g in raw['groups'] if VSR_MEMBER in g['members'])
+        group['members'].append('manual/keep')
+        atomic_json(self.registry, raw)
+        setup.evaluate = mock.Mock(side_effect=lambda member, _: {
+            'roles': ['translate'], 'actual_models': ['fast', 'reviewer'], 'observed_models': ['fast']}
+            if member == VSR_MEMBER else {'roles': ['translate'], 'actual_models': ['new']})
+        result = manager.refresh(policy=policy, discover=catalog, setup=setup)
+        self.assertEqual(result['last_status'], 'updated')
+        self.assertIn('manual/keep', setup.current_members())
+        self.assertNotIn(VSR_MEMBER, setup.current_members())
+        self.assertEqual(manager.refresh(policy=policy, discover=catalog)['last_status'], 'unchanged')
+        self.assertIn('manual/keep', setup.current_members())
+
+        catalog.discover.return_value['identities'][VSR_MEMBER]['models'] = ['fast', 'other']
+        fresh = GatewaySetup(self.config, self.parent, manager=self.guard)
+        fresh.evaluate = mock.Mock(return_value={'roles': ['translate'], 'actual_models': ['fast', 'other'],
+                                                 'observed_models': ['fast']})
+        result = manager.refresh(policy=policy, discover=catalog, setup=fresh)
+        self.assertEqual(result['last_status'], 'updated')
+        self.assertEqual(result['members'][VSR_MEMBER]['status'], 'qualified')
+        self.assertIn(VSR_MEMBER, fresh.current_members())
+        self.assertIn('manual/keep', fresh.current_members())
+
+    def test_manually_linked_conflicting_route_in_standalone_fallback_blocks_group_writes(self):
+        policy, manager, setup, catalog = self.prepared_dynamic_route()
+        raw = self.guard._registry()
+        groups = {g['id']: g for g in raw['groups']}
+        groups['transcribe']['off'] = ['group/transcribe-paid']
+        groups['transcribe-paid']['members'].append(VSR_MEMBER)
+        atomic_json(self.registry, raw)
+        setup.evaluate = mock.Mock(side_effect=lambda member, _: {
+            'roles': ['translate'], 'actual_models': ['fast', 'reviewer'], 'observed_models': ['fast']}
+            if member == VSR_MEMBER else {'roles': ['translate'], 'actual_models': ['new']})
+        version, command_count = self.config.settings.mt_policy_version, len(self.commands)
+        result = manager.refresh(policy=policy, discover=catalog, setup=setup)
+        self.assertEqual(result['last_status'], 'application_blocked')
+        self.assertEqual(result['application_error'], 'mt_dynamic_role_conflict')
+        self.assertEqual(self.guard._registry(), raw)
+        self.assertEqual(self.config.settings.mt_policy_version, version)
+        self.assertEqual(len(self.commands), command_count)
+
+    def test_catalog_conflict_isolated_before_admission_and_stays_out_during_catalog_failure(self):
+        policy, manager, setup, catalog = self.prepared_dynamic_route()
+        setup.evaluate = mock.Mock(side_effect=lambda member, _: {'roles': [], 'retry_after': None}
+            if member == VSR_MEMBER else {'roles': ['translate'], 'actual_models': ['new']})
+        result = manager.refresh(policy=policy, discover=catalog, setup=setup)
+        self.assertEqual(result['last_status'], 'updated')
+        self.assertEqual(result['members'][VSR_MEMBER]['status'], 'role_conflict')
+        self.assertNotIn(VSR_MEMBER, setup.current_members())
+        self.assertNotIn('admitted', setup.catalog['identities'][VSR_MEMBER])
+        self.assertEqual(manager.state['members'][VSR_MEMBER]['accepted']['actual_models'], ['fast', 'other'])
+        catalog.complete.remove('vllm-sr')
+        del catalog.discover.return_value['identities'][VSR_MEMBER]
+        result = manager.refresh(policy=policy, discover=catalog)
+        self.assertEqual(result['last_status'], 'unchanged')
+        self.assertNotIn(VSR_MEMBER, setup.current_members())
+
+    def test_trial_join_does_not_reconnect_an_isolated_conflicting_free_chain(self):
+        policy, manager, setup, catalog = self.prepared_dynamic_route()
+        setup.evaluate = mock.Mock(side_effect=lambda member, _: {
+            'roles': ['translate'], 'actual_models': ['fast', 'reviewer'], 'observed_models': ['fast']}
+            if member == VSR_MEMBER else {'roles': ['translate'], 'actual_models': ['new']})
+        self.assertEqual(manager.refresh(policy=policy, discover=catalog, setup=setup)['last_status'], 'updated')
+        self.assertNotIn(VSR_MEMBER, setup.current_members())
+        from subtitle_tool.bailian_free import provider_id
+        model = 'synthetic-trial'
+        provider = provider_id(model)
+        raw = self.guard._registry()
+        raw['providers'].append({'id': provider, 'models': [model]})
+        atomic_json(self.registry, raw)
+        item = {'provider': provider, 'role': 'translate', 'status': 'qualified'}
+        self.guard.state['models'][model] = item
+        self.guard._save()
+        command_count = len(self.commands)
+        self.guard._join(model, item)
+        self.assertEqual(item['status'], 'role_conflict')
+        self.assertEqual(len(self.commands), command_count)
+        self.assertNotIn(VSR_MEMBER, setup.current_members())
+        self.assertNotIn((provider, model), self.guard.allowed)
+
+    def test_retirement_recovers_lost_child_receipt_without_losing_manual_sibling(self):
+        policy, manager, setup, catalog = self.prepared_dynamic_route()
+        raw = self.guard._registry()
+        raw['providers'].append({'id': 'manual'})
+        child = next(g for g in raw['groups'] if VSR_MEMBER in g['members'])
+        child['members'].append('manual/keep')
+        atomic_json(self.registry, raw)
+        setup.evaluate = mock.Mock(side_effect=lambda member, _: {
+            'roles': ['translate'], 'actual_models': ['fast', 'reviewer'], 'observed_models': ['fast']}
+            if member == VSR_MEMBER else {'roles': ['translate'], 'actual_models': ['new']})
+        command = self.guard._command
+        def lose_receipt(*args):
+            command(*args)
+            if args[:3] == ('group', 'set', child['id']):
+                raise ToolError('synthetic lost receipt', 'magpie_group')
+        with mock.patch.object(self.guard, '_command', side_effect=lose_receipt):
+            self.assertEqual(manager.refresh(policy=policy, discover=catalog, setup=setup)['last_status'],
+                             'application_blocked')
+        fresh = GatewaySetup(self.config, self.parent, manager=self.guard)
+        result = manager.refresh(policy=policy, discover=catalog, setup=fresh)
+        self.assertEqual(result['last_status'], 'updated')
+        self.assertIn('manual/keep', fresh.current_members())
+        self.assertNotIn(VSR_MEMBER, fresh.current_members())
+        self.assertNotIn(child['id'] + ':' + VSR_MEMBER, fresh.managed['excluded'])
+        self.assertEqual(json.loads(fresh.plan_path.read_bytes())['status'], 'complete')
 
     def test_transient_candidate_cools_down_across_restart_without_retiring_pool(self):
         from subtitle_tool.mt_maintenance import ChannelMaintenance

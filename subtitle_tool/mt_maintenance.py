@@ -355,7 +355,6 @@ class ChannelMaintenance:
             metadata = setup.catalog['models'].get(owner, {})
             if name in metadata:
                 routing_catalog['models'].setdefault(owner, {})[name] = metadata[name]
-        setup.catalog = routing_catalog
         # Trial discoveries may finish while cloud admission runs. Re-read their
         # reservations under the same lock that protects trial group mutations.
         with self.trial.lock:
@@ -364,10 +363,20 @@ class ChannelMaintenance:
                 self.state['last_status'] = 'policy_changed'
             else:
                 try:
+                    # A confirmed conflict must survive a later catalog outage,
+                    # even when the changed router has not passed admission.
+                    # This records identity only; old acceptance remains private.
+                    _, conflicts = setup._role_constraints(desired)
+                    for member in conflicts:
+                        routing_catalog['identities'][member] = {
+                            k: v for k, v in setup.catalog['identities'][member].items() if k != 'admitted'}
+                    setup.catalog = routing_catalog
                     applied = setup.apply(desired, free)
                     self.state['last_status'] = 'updated' if applied['changed'] else 'unchanged'
                     self.state.pop('application_error', None)
                     self.state['last_application'] = applied
+                    for member in applied['role_conflicts']:
+                        records.setdefault(member, {})['status'] = 'role_conflict'
                 except Cancelled:
                     raise
                 except ToolError as error:

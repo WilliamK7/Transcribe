@@ -21,8 +21,8 @@ def asr_contract():
             "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}}
 
 
-def _version(value, *supported):
-    if type(value) is not int or value not in supported:
+def _version(value, expected):
+    if type(value) is not int or value != expected:
         raise ToolError("任务执行版本不受支持，请用 --reflow 显式重排。", "cache_version")
     return value
 

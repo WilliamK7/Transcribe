@@ -38,7 +38,6 @@ class VerifiedIdentity:
     key_fingerprint: str = field(repr=False)
     region: str
     context_fingerprint: str = field(repr=False)
-    context_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -159,7 +158,7 @@ class ModelAccessSource:
 
 
 class CLIQuotaSource:
-    """Launch the verified npm CLI directly, without a shell or API Key.
+    """Query the verified npm SDK through the private Node bridge.
 
     The current JSON schema is pinned to the inspected version. The npm layout
     is deliberately required on Windows so that terminating the Node process
@@ -222,22 +221,14 @@ class CLIQuotaSource:
             raise QuotaSourceError()
         return result
 
-    def _fingerprint_context(self, snapshot, *, version=1):
+    def _fingerprint_context(self, snapshot):
         try:
-            if type(version) is not int or version not in (1, 2):
-                raise ValueError()
             folder, profile, selected = snapshot
-            token = selected.get('access_token') or selected.get('accessToken')
             if selected.get('console_site', 'domestic') != 'domestic':
                 raise ValueError()
-            if version == 2:
-                self._openapi_credentials(selected)
-                # v2 queries obtain their own token from the confirmed AK/SK;
-                # they never use this independent browser/CLI session token.
-                selected = {k: v for k, v in selected.items() if k in _OPENAPI_CONTEXT_FIELDS}
-            elif not isinstance(token, str) or not token.strip():
-                raise ValueError()
-            context = {'schema': version, 'cli_version': _CLI_VERSION, 'config_dir': str(folder),
+            self._openapi_credentials(selected)
+            selected = {k: v for k, v in selected.items() if k in _OPENAPI_CONTEXT_FIELDS}
+            context = {'schema': 2, 'cli_version': _CLI_VERSION, 'config_dir': str(folder),
                        'profile': profile, 'selected': selected, 'query_region': 'cn-beijing',
                        'query_site': 'domestic'}
             raw = json.dumps(context, sort_keys=True, ensure_ascii=True, allow_nan=False,
@@ -246,14 +237,14 @@ class CLIQuotaSource:
         except (OSError, ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
             raise QuotaSourceError() from None
 
-    def _context(self, *, version=1):
-        return self._fingerprint_context(self._read_context(), version=version)
+    def _context(self):
+        return self._fingerprint_context(self._read_context())
 
     def bound_to(self, proof):
         try:
             return (isinstance(proof, VerifiedIdentity) and
                     bool(_FINGERPRINT.fullmatch(proof.context_fingerprint)) and
-                    self._context(version=proof.context_version)[2] == proof.context_fingerprint)
+                    self._context()[2] == proof.context_fingerprint)
         except (QuotaSourceError, TypeError):
             return False
 
@@ -274,20 +265,14 @@ class CLIQuotaSource:
             if (not isinstance(info, dict) or info.get('name') != 'bailian-cli' or
                     info.get('version') != _CLI_VERSION or not script.is_file() or not node):
                 raise ValueError()
-            return [node, str(script), 'usage', 'free', '--all', '--sort', 'expires',
-                    '--console-region', 'cn-beijing', '--console-site', 'domestic', '--output', 'json']
+            # The bridge verifies the dependency versions Node actually resolves.
+            return [node, str(Path(__file__).with_name('mt_bailian_bridge.mjs')), str(package)]
         except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
             raise QuotaSourceError() from None
 
-    def _renewal_command(self):
-        command = self._command()
-        package = Path(command[1]).parent.parent
-        # The bridge verifies the dependency versions Node actually resolves.
-        return [command[0], str(Path(__file__).with_name('mt_bailian_bridge.mjs')), str(package)]
-
-    def _renewal_input(self, proof):
+    def _query_input(self, proof):
         snapshot = self._read_context()
-        if self._fingerprint_context(snapshot, version=2)[2] != proof.context_fingerprint:
+        if self._fingerprint_context(snapshot)[2] != proof.context_fingerprint:
             raise QuotaSourceError()
         with self._token_lock:
             token = self._token if self._token_context == proof else None
@@ -313,8 +298,7 @@ class CLIQuotaSource:
         process, readers = None, []
         output = bytearray()
         too_large, read_failed = threading.Event(), threading.Event()
-        # The CLI owns its console login. Do not read or pass unrelated API
-        # keys, access tokens, or credentials from the parent environment.
+        # Credentials travel through stdin; keep the child environment minimal.
         allowed = ('SYSTEMROOT', 'WINDIR', 'PATH', 'PATHEXT', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
                    'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP')
         environment = {key: value for key in allowed if (value := os.environ.get(key)) is not None}
@@ -337,31 +321,23 @@ class CLIQuotaSource:
                 read_failed.set()
 
         try:
-            renewing = proof.context_version == 2
-            command = self._renewal_command() if renewing else self._command()
-            request = self._renewal_input(proof) if renewing else None
+            command = self._command()
+            request = self._query_input(proof)
             environment['BAILIAN_CONFIG_DIR'] = str(self._folder())
-            if not renewing:
-                folder, profile, fingerprint = self._context()
-                if fingerprint != proof.context_fingerprint:
-                    raise QuotaSourceError()
-                environment['BAILIAN_CONFIG_DIR'] = str(folder)
-                command = [*command, '--config', profile]
             control.check_start()
             if time.monotonic() >= query_deadline:
                 raise QuotaSourceError()
-            process = subprocess.Popen(command, stdin=subprocess.PIPE if renewing else subprocess.DEVNULL, stdout=subprocess.PIPE,
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, shell=False, close_fds=True, env=environment,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             readers = [threading.Thread(target=read_stream, args=(process.stdout, output, MAX_CLI_RESPONSE), daemon=True)]
-            if renewing:
-                def write_input():
-                    try:
-                        with process.stdin:
-                            process.stdin.write(request)
-                    except (OSError, ValueError):
-                        read_failed.set()
-                readers.append(threading.Thread(target=write_input, daemon=True))
+            def write_input():
+                try:
+                    with process.stdin:
+                        process.stdin.write(request)
+                except (OSError, ValueError):
+                    read_failed.set()
+            readers.append(threading.Thread(target=write_input, daemon=True))
             for reader in readers:
                 reader.start()
             while True:
@@ -375,23 +351,21 @@ class CLIQuotaSource:
                 raise QuotaSourceError()
             if not self.bound_to(proof):
                 raise QuotaSourceError()
-            if renewing:
-                try:
-                    envelope = json.loads(output, object_pairs_hook=_unique)
-                    if not isinstance(envelope, dict) or set(envelope) != {'token', 'observation'}:
-                        raise ValueError()
-                    token = envelope['token']
-                    if (not isinstance(token, str) or not 1 <= len(token) <= 16384 or
-                            any(c.isspace() or ord(c) < 32 for c in token)):
-                        raise ValueError()
-                    observation = json.dumps(envelope['observation'], ensure_ascii=True).encode('utf-8')
-                    parse_observation(observation)
-                except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
-                    raise QuotaSourceError() from None
-                with self._token_lock:
-                    self._token_context, self._token = proof, token
-                return observation
-            return bytes(output)
+            try:
+                envelope = json.loads(output, object_pairs_hook=_unique)
+                if not isinstance(envelope, dict) or set(envelope) != {'token', 'observation'}:
+                    raise ValueError()
+                token = envelope['token']
+                if (not isinstance(token, str) or not 1 <= len(token) <= 16384 or
+                        any(c.isspace() or ord(c) < 32 for c in token)):
+                    raise ValueError()
+                observation = json.dumps(envelope['observation'], ensure_ascii=True).encode('utf-8')
+                parse_observation(observation)
+            except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+                raise QuotaSourceError() from None
+            with self._token_lock:
+                self._token_context, self._token = proof, token
+            return observation
         except (OSError, ValueError, TypeError):
             raise QuotaSourceError() from None
         finally:

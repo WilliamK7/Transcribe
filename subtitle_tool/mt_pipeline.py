@@ -296,8 +296,7 @@ class Pipeline:
         self.snapshot = saved_route(manifest)
         self.identities = self.snapshot.get('identities', {})
         self.cache_scope = dict(self.scope)
-        if self.snapshot['format_version'] >= 6:
-            self.cache_scope['model_identity'] = _digest(self.identities)
+        self.cache_scope['model_identity'] = _digest(self.identities)
         self.profiles = {profile['id']: profile for profile in self.snapshot['entries']}
         entries = []
         for profile in self.snapshot['entries']:

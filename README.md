@@ -70,7 +70,7 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 
 ### 百炼试用
 
-`data/bailian-quota-binding.json` 绑定账户。后台查询有效额度，为最多三个通过验收的型号建立独立入口。`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停与排除。七牛限时免费活动到期后，专用免费入口退出选路。
+`data/bailian-quota-binding.json` 版本 2 将账户绑定到已确认的 AK/SK 查询上下文。后台查询有效额度，为最多三个通过验收的型号建立独立入口。`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停与排除。
 
 自动管理作用于上表的默认本机角色组。远程网关及自定义角色组由用户维护。运行诊断与恢复细节见[接口契约](docs/API_CONTRACT.md)。
 
