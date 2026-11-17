@@ -12,7 +12,7 @@ from .common import Cancelled, ToolError
 from .mt_quality import make_stage_payload, parse_stage_response, parse_content, validate_judgment
 from .mt_transport import ProcessTransport, TransportError
 from .mt_identity import resolve_model, model_set
-from .mt_channel_policy import check_provider_policy
+from .mt_channel_policy import ROLES, check_provider_policy, load_policy
 
 SUITE_VERSION = 3
 CAPABILITIES = {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}
@@ -38,6 +38,47 @@ class AdmissionHTTPError(ToolError):
     def __init__(self, status):
         super().__init__('候选接口拒绝了验收请求。', 'mt_admission_http')
         self.retryable = status in {408, 429} or status >= 500
+
+
+def current_role_members(registry):
+    from .magpie import group_models
+    groups = {g['id'] for g in registry.get('groups', [])}
+    members = {}
+    for role in ROLES:
+        main = 'transcribe' + ('' if role == 'translate' else '-' + role)
+        for group in (main, main + '-paid'):
+            if group not in groups:
+                continue
+            for owner, name, provider in group_models(registry, 'group/' + group):
+                member = owner + '/' + name
+                if member in members and members[member][0] != role:
+                    raise ToolError('同一网关成员已跨角色使用，未修改分组。', 'mt_admission')
+                members[member] = (role, provider)
+    return members
+
+
+def select_admission_judge(config, member, catalog, *, policy=None, preferred=None):
+    """Select an enabled, independent configured or established judge."""
+    from .mt_catalog import read_registry
+    policy = policy or load_policy(config)
+    identities = catalog.get('identities', {})
+    raw = read_registry(config.settings, catalog, policy=policy)
+    candidates = list(policy['judges'])
+    candidates.extend(m for m, (role, _) in current_role_members(raw).items() if role in {'review', 'judge'})
+    if preferred in candidates:
+        candidates.insert(0, preferred)
+    enabled = {p['id']: p for p in raw['providers'] if not p.get('off') and p['id'] not in policy['excluded_providers']}
+    possible = model_set(member, identities)
+    for candidate in dict.fromkeys(candidates):
+        owner, name = candidate.split('/', 1)
+        if owner not in enabled or enabled[owner].get('noModels') or name in enabled[owner].get('modelsOff', []):
+            continue
+        try:
+            if not possible & model_set(candidate, identities):
+                return candidate
+        except ValueError:
+            continue  # An unverified dynamic judge cannot prove independence.
+    raise ToolError('找不到与候选底层型号独立的验收评判者。', 'mt_admission')
 
 
 def case_data(index):

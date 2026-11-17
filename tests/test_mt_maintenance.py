@@ -17,7 +17,7 @@ class MaintenanceTests(BailianFreeFixture):
         policy = self.policy()
         policy['excluded_providers'] = ['blocked-first', 'blocked-second']
         atomic_json(self.config.data / 'mt-channels.json', policy)
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'] += [{'id': 'blocked-first', 'models': ['model-a']},
                              {'id': 'blocked-second', 'models': ['model-b']}]
         raw['groups'].append({'id': 'forbidden', 'members': ['blocked-first/model-a']})
@@ -47,7 +47,7 @@ class MaintenanceTests(BailianFreeFixture):
     def test_excluded_supplier_inside_nested_live_group_blocks_request(self):
         from subtitle_tool.mt_channel_policy import check_provider_policy
         self.exclude_providers()
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['groups'].append({'id': 'nested', 'members': ['group/forbidden']})
         atomic_json(self.registry, raw)
         with self.assertRaises(ToolError) as caught:
@@ -101,7 +101,7 @@ class MaintenanceTests(BailianFreeFixture):
 
     def test_custom_explicit_provider_discovers_without_source_code_changes(self):
         policy = self.policy()
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'] += [{'id': 'existing', 'models': ['new', 'auto', 'embedding'], 'modelsOff': ['paused']}]
         atomic_json(self.registry, raw)
         transport = mock.Mock()
@@ -119,15 +119,15 @@ class MaintenanceTests(BailianFreeFixture):
         policy = self.policy()
         policy['providers']['existing']['preferred'] = ['new']
         atomic_json(self.config.data / 'mt-channels.json', policy)
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'] += [{'id': 'existing', 'models': ['draft', 'reviewer', 'arbiter', 'new'], 'key': 'private'}]
         raw['groups'] = []
         atomic_json(self.registry, raw)
         rows = {'existing/' + name: {'roles': [role], 'actual_models': [name], 'suite': 3}
                 for name, role in [('draft', 'translate'), ('reviewer', 'review'), ('arbiter', 'judge')]}
-        setup = GatewaySetup(self.config, self.parent, manager=self.guard)
+        setup = GatewaySetup(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         setup.apply(rows)
-        manager = ChannelMaintenance(self.config, self.parent, trial=self.guard)
+        manager = ChannelMaintenance(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         registry = read_registry(self.config.settings, setup.catalog)
         for member, result in rows.items():
             manager.state['members'][member] = {'accepted': copy.deepcopy(result),
@@ -163,7 +163,7 @@ class MaintenanceTests(BailianFreeFixture):
         atomic_json(self.config.data / 'mt-channels.json', policy)
         setup.policy = policy
         name = VSR_MEMBER.split('/', 1)[1]
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'].append({'id': 'vllm-sr', 'models': [name]})
         atomic_json(self.registry, raw)
         setup.catalog['models']['vllm-sr'] = {name: {'free': True}}
@@ -193,7 +193,7 @@ class MaintenanceTests(BailianFreeFixture):
         self.assertEqual(manager.state['members'][VSR_MEMBER]['accepted'], conflict)
         self.assertEqual(self.guard.state['reserved_models']['reviewer'], 'review')
         self.assertEqual(self.guard.state['models']['reviewer-1017']['role'], 'review')
-        leaves = {(owner + '/' + name) for owner, name, _ in group_models(self.guard._registry(), 'group/transcribe')}
+        leaves = {(owner + '/' + name) for owner, name, _ in group_models(self.guard.admin.registry(), 'group/transcribe')}
         self.assertIn('existing/new', leaves)
         self.assertNotIn(VSR_MEMBER, leaves)
 
@@ -206,7 +206,7 @@ class MaintenanceTests(BailianFreeFixture):
 
     def test_dynamic_route_retirement_preserves_manual_sibling_and_can_be_reversed(self):
         policy, manager, setup, catalog = self.prepared_dynamic_route()
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'].append({'id': 'manual'})
         group = next(g for g in raw['groups'] if VSR_MEMBER in g['members'])
         group['members'].append('manual/keep')
@@ -222,7 +222,7 @@ class MaintenanceTests(BailianFreeFixture):
         self.assertIn('manual/keep', setup.current_members())
 
         catalog.discover.return_value['identities'][VSR_MEMBER]['models'] = ['fast', 'other']
-        fresh = GatewaySetup(self.config, self.parent, manager=self.guard)
+        fresh = GatewaySetup(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         fresh.evaluate = mock.Mock(return_value={'roles': ['translate'], 'actual_models': ['fast', 'other'],
                                                  'observed_models': ['fast']})
         result = manager.refresh(policy=policy, discover=catalog, setup=fresh)
@@ -233,7 +233,7 @@ class MaintenanceTests(BailianFreeFixture):
 
     def test_manually_linked_conflicting_route_in_standalone_fallback_blocks_group_writes(self):
         policy, manager, setup, catalog = self.prepared_dynamic_route()
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         groups = {g['id']: g for g in raw['groups']}
         groups['transcribe']['off'] = ['group/transcribe-paid']
         groups['transcribe-paid']['members'].append(VSR_MEMBER)
@@ -245,7 +245,7 @@ class MaintenanceTests(BailianFreeFixture):
         result = manager.refresh(policy=policy, discover=catalog, setup=setup)
         self.assertEqual(result['last_status'], 'application_blocked')
         self.assertEqual(result['application_error'], 'mt_dynamic_role_conflict')
-        self.assertEqual(self.guard._registry(), raw)
+        self.assertEqual(self.guard.admin.registry(), raw)
         self.assertEqual(self.config.settings.mt_policy_version, version)
         self.assertEqual(len(self.commands), command_count)
 
@@ -275,22 +275,21 @@ class MaintenanceTests(BailianFreeFixture):
         from subtitle_tool.bailian_free import provider_id
         model = 'synthetic-trial'
         provider = provider_id(model)
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'].append({'id': provider, 'models': [model]})
         atomic_json(self.registry, raw)
         item = {'provider': provider, 'role': 'translate', 'status': 'qualified'}
         self.guard.state['models'][model] = item
-        self.guard._save()
+        self.guard.trial_state.save(self.guard.control)
         command_count = len(self.commands)
         self.guard._join(model, item)
         self.assertEqual(item['status'], 'role_conflict')
         self.assertEqual(len(self.commands), command_count)
         self.assertNotIn(VSR_MEMBER, setup.current_members())
-        self.assertNotIn((provider, model), self.guard.allowed)
 
     def test_retirement_recovers_lost_child_receipt_without_losing_manual_sibling(self):
         policy, manager, setup, catalog = self.prepared_dynamic_route()
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'].append({'id': 'manual'})
         child = next(g for g in raw['groups'] if VSR_MEMBER in g['members'])
         child['members'].append('manual/keep')
@@ -298,15 +297,15 @@ class MaintenanceTests(BailianFreeFixture):
         setup.evaluate = mock.Mock(side_effect=lambda member, _: {
             'roles': ['translate'], 'actual_models': ['fast', 'reviewer'], 'observed_models': ['fast']}
             if member == VSR_MEMBER else {'roles': ['translate'], 'actual_models': ['new']})
-        command = self.guard._command
-        def lose_receipt(*args):
-            command(*args)
+        command = self.guard.admin.command
+        def lose_receipt(*args, **kwargs):
+            command(*args, **kwargs)
             if args[:3] == ('group', 'set', child['id']):
                 raise ToolError('synthetic lost receipt', 'magpie_group')
-        with mock.patch.object(self.guard, '_command', side_effect=lose_receipt):
+        with mock.patch.object(self.guard.admin, 'command', side_effect=lose_receipt):
             self.assertEqual(manager.refresh(policy=policy, discover=catalog, setup=setup)['last_status'],
                              'application_blocked')
-        fresh = GatewaySetup(self.config, self.parent, manager=self.guard)
+        fresh = GatewaySetup(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         result = manager.refresh(policy=policy, discover=catalog, setup=fresh)
         self.assertEqual(result['last_status'], 'updated')
         self.assertIn('manual/keep', fresh.current_members())
@@ -320,7 +319,7 @@ class MaintenanceTests(BailianFreeFixture):
         setup.evaluate = mock.Mock(return_value={'roles': [], 'retry_after': 1})
         result = manager.refresh(policy=policy, discover=catalog, setup=setup)
         self.assertEqual(result['members']['existing/new']['status'], 'cooldown')
-        fresh = ChannelMaintenance(self.config, self.parent, trial=self.guard)
+        fresh = ChannelMaintenance(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         with mock.patch.object(GatewaySetup, 'evaluate') as evaluate:
             fresh.refresh(policy=policy, discover=catalog)
         evaluate.assert_not_called()
@@ -331,10 +330,10 @@ class MaintenanceTests(BailianFreeFixture):
         catalog.complete = set()
         catalog.discover.return_value = {'version': 1, 'models': {}, 'identities': {}}
         setup.evaluate = mock.Mock()
-        before = self.guard._registry()
+        before = self.guard.admin.registry()
         result = manager.refresh(policy=policy, discover=catalog, setup=setup)
         self.assertEqual(result['last_status'], 'unchanged')
-        self.assertEqual(before, self.guard._registry())
+        self.assertEqual(before, self.guard.admin.registry())
         setup.evaluate.assert_not_called()
 
     def test_unqualified_discovery_does_not_bump_production_policy(self):
@@ -348,7 +347,7 @@ class MaintenanceTests(BailianFreeFixture):
 
     def test_manual_model_switch_prevents_background_inference(self):
         policy, manager, setup, catalog = self.prepared()
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         next(p for p in raw['providers'] if p['id'] == 'existing')['modelsOff'] = ['new']
         atomic_json(self.registry, raw)
         setup.evaluate = mock.Mock()
@@ -385,7 +384,7 @@ class MaintenanceTests(BailianFreeFixture):
         policy, manager, setup, catalog = self.prepared()
         policy['max_evaluations_per_cycle'] = 0
         atomic_json(self.config.data / 'mt-channels.json', policy)
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         next(p for p in raw['providers'] if p['id'] == 'existing')['key'] = 'changed'
         atomic_json(self.registry, raw)
         result = manager.refresh(policy=policy, discover=catalog, setup=setup)
@@ -402,17 +401,17 @@ class MaintenanceTests(BailianFreeFixture):
 
     def test_provider_refresh_only_touches_enrolled_enabled_list_sources(self):
         policy, manager, setup, catalog = self.prepared()
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'].append({'id': 'unrelated', 'models': ['secret']})
         atomic_json(self.registry, raw)
-        with mock.patch.object(self.guard, '_command') as command:
+        with mock.patch.object(self.guard.admin, 'command') as command:
             manager.refresh_provider_lists(policy)
-        command.assert_called_once_with('provider', 'refresh', 'existing')
+        command.assert_called_once_with('provider', 'refresh', 'existing', control=manager.control)
 
     def test_removed_auto_exposure_is_never_added_back(self):
         policy, manager, setup, catalog = self.prepared()
         manager.state['exposed'] = {'existing/new': 'managed'}
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         next(p for p in raw['providers'] if p['id'] == 'existing')['models'].remove('new')
         atomic_json(self.registry, raw)
         catalog.pending = {'existing/new'}
@@ -424,7 +423,7 @@ class MaintenanceTests(BailianFreeFixture):
     def test_upstream_new_free_model_is_previewed_without_exposure(self):
         policy = self.policy()
         policy['providers']['existing']['adapter'] = 'openrouter'
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'].append({'id': 'existing', 'listOff': True, 'models': ['old']})
         atomic_json(self.registry, raw)
         transport = mock.Mock()
@@ -436,7 +435,7 @@ class MaintenanceTests(BailianFreeFixture):
             data = catalog.discover(policy=policy)
         self.assertEqual(catalog.pending, {'existing/vendor/new:free'})
         self.assertEqual(data['identities']['existing/vendor/new:free']['billing'], 'free')
-        self.assertEqual(raw, self.guard._registry())
+        self.assertEqual(raw, self.guard.admin.registry())
 
     def test_unrelated_plugin_model_does_not_expire_existing_qualification(self):
         from subtitle_tool.mt_catalog import read_registry
@@ -486,10 +485,10 @@ class MaintenanceTests(BailianFreeFixture):
     def test_daily_admission_budget_survives_restart_and_reserves_before_call(self):
         from subtitle_tool.mt_maintenance import ChannelMaintenance
         policy = self.policy()
-        manager = ChannelMaintenance(self.config, self.parent, trial=self.guard)
+        manager = ChannelMaintenance(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         self.assertTrue(manager.reserve_evaluation(policy))
         self.assertTrue(manager.reserve_evaluation(policy))
-        fresh = ChannelMaintenance(self.config, self.parent, trial=self.guard)
+        fresh = ChannelMaintenance(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         self.assertFalse(fresh.reserve_evaluation(policy))
         self.assertEqual(fresh.state['budget']['evaluations'], 2)
 
@@ -513,5 +512,48 @@ class MaintenanceTests(BailianFreeFixture):
     def test_status_never_contains_credentials(self):
         from subtitle_tool.mt_maintenance import ChannelMaintenance
         self.policy()
-        manager = ChannelMaintenance(self.config, self.parent, trial=self.guard)
+        manager = ChannelMaintenance(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         self.assertNotIn('trial-key', json.dumps(manager.status()))
+
+    def test_status_does_not_load_unrelated_corrupt_trial_state(self):
+        from subtitle_tool.mt_maintenance import ChannelMaintenance
+        self.policy()
+        path = self.config.data / 'bailian-trial-state.json'
+        path.write_bytes(b'invalid trial state')
+        manager = ChannelMaintenance(self.config, self.parent)
+        self.addCleanup(manager.close)
+        self.assertEqual(manager.status()['last_status'], 'not_run')
+        self.assertEqual(path.read_bytes(), b'invalid trial state')
+        self.assertEqual(self.commands, [])
+
+    def test_closing_worker_cancels_shared_admin_command_and_reaps_child(self):
+        import subprocess
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from subtitle_tool.common import Cancelled
+        from subtitle_tool.magpie_admin import MagpieAdmin
+        from subtitle_tool.mt_maintenance import ChannelMaintenance
+        self.policy()
+        manager = ChannelMaintenance(self.config, self.parent, admin=self.guard.admin,
+                                     trial_state=self.guard.trial_state)
+        self.addCleanup(manager.close)
+        real_start = subprocess.Popen
+        started, children = threading.Event(), []
+        def start(args, **kwargs):
+            child = real_start([sys.executable, '-I', '-c', 'import time; time.sleep(30)'], **kwargs)
+            children.append(child)
+            started.set()
+            return child
+        self.guard.admin.command = MagpieAdmin.command.__get__(self.guard.admin)
+        with mock.patch('subtitle_tool.magpie_admin.subprocess.Popen', side_effect=start), ThreadPoolExecutor(1) as pool:
+            future = pool.submit(manager.expose, 'existing/new')
+            try:
+                self.assertTrue(started.wait(3))
+                manager.close()
+                with self.assertRaises(Cancelled):
+                    future.result(2)
+                self.assertIsNotNone(children[0].returncode)
+                self.assertFalse(self.guard.control.stopping)
+            finally:
+                self.parent.cancel_user()

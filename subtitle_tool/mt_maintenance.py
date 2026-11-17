@@ -7,12 +7,13 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from .bailian_free import BailianFreeGuard, _BackgroundCancel
+from .bailian_state import TrialState
+from .magpie_admin import MagpieAdmin
 from .common import Cancelled, ToolError, atomic_json
 from .mt_admission import admission_key
 from .mt_catalog import Catalog, offer_billing, read_registry
 from .mt_channel_policy import candidate_allowed, load_policy, check_provider_policy
-from .mt_control import MTControl
+from .mt_control import BackgroundCancel, MTControl
 from .mt_gateway_setup import GatewaySetup
 from .mt_identity import canonical_model, model_set
 
@@ -33,7 +34,7 @@ def group_role(name):
 def manually_held(member, current, setup, registry):
     """A deletion in a former role does not ban the same model's assigned role."""
     roles = {current[member][0]} if member in current else {
-        setup.manager.state.get('reserved_models', {}).get(m) for m in model_set(member, setup.catalog['identities'])}
+        setup.trial_state.data.get('reserved_models', {}).get(m) for m in model_set(member, setup.catalog['identities'])}
     roles.discard(None)
     if not roles:
         roles = {'translate', 'review', 'judge'}
@@ -62,13 +63,15 @@ def identity_key(member, registry, catalog):
 
 
 class ChannelMaintenance:
-    """One worker inside the process lock; share trial's lock only during writes."""
-    def __init__(self, config, control, *, trial=None):
+    """One worker inside the process lock; share role reservations and their lock during writes."""
+    def __init__(self, config, control, *, admin=None, trial_state=None):
         self.config = config
         self.stop = threading.Event()
-        self.control = MTControl(_BackgroundCancel(control, self.stop), drain_seconds=0)
-        self.trial = trial or BailianFreeGuard(config, self.control, job_id='channel-maintenance')
-        self.owns_trial = trial is None
+        self.control = MTControl(BackgroundCancel(control, self.stop), drain_seconds=0)
+        self.trial_state = trial_state if trial_state is not None else TrialState(config, lock=admin.lock if admin else None)
+        self.admin = admin or MagpieAdmin(config, self.control, job_id='channel-maintenance', lock=self.trial_state.lock)
+        if self.admin.lock is not self.trial_state.lock:
+            raise ValueError('Channel administration and role reservations must share a lock')
         self.lock = threading.Lock()
         self.thread = None
         self.path = config.data / 'gateway-maintenance.json'
@@ -87,7 +90,7 @@ class ChannelMaintenance:
     def _backup(self):
         folder = self.config.data / 'gateway-backups' / ('maintenance-' + str(time.time_ns()))
         folder.mkdir(parents=True)
-        atomic_json(folder / 'providers.json', self.trial._registry())
+        atomic_json(folder / 'providers.json', self.admin.registry())
         for path in (self.path, self.config.data / 'mt-channels.json'):
             if path.exists():
                 (folder / path.name).write_bytes(path.read_bytes())
@@ -103,7 +106,7 @@ class ChannelMaintenance:
         for provider in eligible:
             self.control.check_start()
             try:
-                self.trial._command('provider', 'refresh', provider['id'])
+                self.admin.command('provider', 'refresh', provider['id'], control=self.control)
             except Cancelled:
                 raise
             except ToolError:
@@ -120,11 +123,11 @@ class ChannelMaintenance:
         """Incrementally expose one catalog-backed candidate before its admission."""
         check_provider_policy(self.config, member)
         owner, name = member.split('/', 1)
-        with self.trial.lock:
+        with self.admin.lock:
             self.control.check_start()
             self._backup()
-            self.trial._command('provider', 'models', owner, '+' + name)
-            provider = next(p for p in self.trial._registry()['providers'] if p['id'] == owner)
+            self.admin.command('provider', 'models', owner, '+' + name, control=self.control)
+            provider = next(p for p in self.admin.registry()['providers'] if p['id'] == owner)
             if name not in provider.get('models', []):
                 raise ToolError('候选未能加入 Magpie 型号列表。', 'magpie_group')
             self.state.setdefault('exposed', {})[member] = 'managed'
@@ -158,12 +161,8 @@ class ChannelMaintenance:
 
     def close(self):
         self.stop.set()
-        if self.owns_trial:
-            self.trial.stop.set()
         if self.thread:
             self.thread.join()
-        if self.owns_trial:
-            self.trial.close()
 
     def _run(self):
         while not self.control.stopping:
@@ -218,7 +217,7 @@ class ChannelMaintenance:
         policy = policy or load_policy(self.config)
         if not policy['enabled']:
             return self.status()
-        setup = setup or GatewaySetup(self.config, self.control, manager=self.trial)
+        setup = setup or GatewaySetup(self.config, self.control, admin=self.admin, trial_state=self.trial_state)
         before_catalog = copy.deepcopy(setup.catalog)
         before_registry = read_registry(self.config.settings, before_catalog, policy=policy)
         current = {m: r for m, r in setup.current_members().items()
@@ -357,7 +356,7 @@ class ChannelMaintenance:
                 routing_catalog['models'].setdefault(owner, {})[name] = metadata[name]
         # Trial discoveries may finish while cloud admission runs. Re-read their
         # reservations under the same lock that protects trial group mutations.
-        with self.trial.lock:
+        with self.admin.lock:
             self.control.check_start()
             if load_policy(self.config) != policy:
                 self.state['last_status'] = 'policy_changed'

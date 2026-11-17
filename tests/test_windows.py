@@ -44,7 +44,7 @@ class WindowsTests(TemporaryTest):
         track, offset = media.select(info)
         self.assertEqual(offset, 1250)
         audio = self.path / "audio.wav"
-        media.extract(sample, audio, track, "mix")
+        media.extract(sample, audio, track, "mix", info=info)
         import wave
         with wave.open(str(audio), "rb") as reader:
             self.assertAlmostEqual(reader.getnframes() / reader.getframerate(), 3, delta=0.02)

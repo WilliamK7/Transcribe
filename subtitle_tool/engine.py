@@ -297,7 +297,7 @@ class Engine:
         self.verify_source_output(job_id, manifest, output)
         candidate = copy.deepcopy(manifest)
         candidate["display_timing_version"] = DISPLAY_TIMING_VERSION
-        content, adjustments = self.render_subtitles(cues, settings, version=candidate['display_timing_version'])
+        content, adjustments = self.render_subtitles(cues, settings)
         intent = prepare_intent(output, content, overwrite)
         check_cancel(self.cancel)
         snapshot = self.config.root / ".build" / "retime" / job_id / (str(time.time_ns()) + ".json")
@@ -309,7 +309,7 @@ class Engine:
                          cue_count=len(cues),
                          retime={"snapshot": str(snapshot.relative_to(self.config.root)),
                                  "prepared_at": time.time(),
-                                 "from_display_timing_version": policy.display_timing_version})
+                                 "from_display_timing_version": manifest['display_timing_version']})
         check_cancel(self.cancel)
         inspect_intent(output, intent)
         self.store.commit_retime(job_id, candidate, output)
@@ -751,7 +751,7 @@ class Engine:
         cues = self.store.cues(job_id)
         check_cancel(self.cancel)
         stage("writing")
-        content, adjustments = self.render_subtitles(cues, settings, version=manifest['display_timing_version'])
+        content, adjustments = self.render_subtitles(cues, settings)
         if "publication_intent" not in manifest:
             candidate = copy.deepcopy(manifest)
             intent = prepare_intent(output, content, manifest["overwrite"])
@@ -770,8 +770,8 @@ class Engine:
         return "completed"
 
     @staticmethod
-    def render_subtitles(cues, settings, *, version=DISPLAY_TIMING_VERSION):
-        intervals, adjustments = plan_display_timing(cues, version=version)
+    def render_subtitles(cues, settings):
+        intervals, adjustments = plan_display_timing(cues)
         return render_srt(cues, settings, display_intervals=intervals), adjustments
 
     def cleanup_completed_audio(self, job_id, manifest, cache):

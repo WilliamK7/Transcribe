@@ -13,7 +13,7 @@ class ChannelTests(BailianFreeFixture):
     def test_plugin_provider_is_a_valid_group_member_and_free_offer(self):
         atomic_json(self.folder / 'plugin-providers.json', [{'id': 'opencode-zen-free', 'signedIn': True,
             'api': 'https://opencode.ai/zen/v1', 'models': [{'id': 'deepseek-v4.1-flash-free', 'free': True}]}])
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['groups'] = [{'id': 'plugin', 'members': ['opencode-zen-free/deepseek-v4.1-flash-free']}]
         atomic_json(self.registry, raw)
         validate_group(self.config.settings, 'group/plugin')
@@ -38,16 +38,16 @@ class ChannelTests(BailianFreeFixture):
         self.assertEqual(assignments['a'], assignments['b'])
 
     def test_one_provider_can_have_both_free_and_paid_translation_members(self):
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'] += [{'id': 'vercel', 'chat': 'https://ai-gateway.vercel.sh/v1'}]
         raw['groups'] = []
         atomic_json(self.registry, raw)
         rows = {'vercel/' + model: {'actual_models': [model], 'roles': [role]}
                 for model, role in [('paid', 'translate'), ('gift', 'translate'),
                                     ('reviewer', 'review'), ('arbiter', 'judge')]}
-        setup = GatewaySetup(self.config, self.parent, manager=self.guard)
+        setup = GatewaySetup(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
         setup.apply(rows, ['vercel/gift'])
-        groups = {g['id']: g for g in self.guard._registry()['groups']}
+        groups = {g['id']: g for g in self.guard.admin.registry()['groups']}
         free = groups['transcribe-free']['members']
         paid = groups['transcribe-paid']['members']
         self.assertFalse(set(free) & set(paid))
@@ -96,7 +96,7 @@ class ChannelTests(BailianFreeFixture):
         from subtitle_tool.mt_catalog import Catalog
         from subtitle_tool.mt_channel_policy import default_policy
         from subtitle_tool.mt_transport import HTTPReply
-        raw = self.guard._registry()
+        raw = self.guard.admin.registry()
         raw['providers'].append({'id': 'vercel', 'modelsOff': ['openai/gpt-6-luna']})
         atomic_json(self.registry, raw)
         before = {p: p.read_bytes() for p in self.path.rglob('*') if p.is_file()}

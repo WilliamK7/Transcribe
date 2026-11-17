@@ -178,7 +178,7 @@ class MagpiePipelineTests(PoolPipelineFixture):
         pipeline = Pipeline(engine, self.job_id, manifest, scope)
         self.addCleanup(pipeline.close)
         with self.assertRaises(ToolError) as caught:
-            pipeline._validate_gateway(pipeline.router.entries[0])
+            pipeline._validate_gateway(pipeline.router_for('translate').entries[0])
         self.assertEqual(caught.exception.code, 'magpie_group')
 
     def test_all_stages_use_gateway_and_resume_keeps_saved_group(self):

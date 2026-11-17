@@ -82,7 +82,7 @@ class PoolPipelineTests(PoolPipelineFixture):
         _, scope = engine.identity(self.job_id, manifest, persist=False)
         pipeline = Pipeline(engine, self.job_id, manifest, scope)
         data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Cache.'}]]}
-        entry = pipeline.router.entries[0]
+        entry = pipeline.router_for('translate').entries[0]
         key = stage_cache_key('translate', data, entry.backend,
                               capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.cache_scope)
         record = {'value': {'translations': {'0': '缓存。'}}, 'actual_model': 'synthetic',

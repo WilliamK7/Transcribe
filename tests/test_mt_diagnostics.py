@@ -18,14 +18,15 @@ class DiagnosticTests(TemporaryTest):
         self.assertTrue(writer.write_route({'kind': 'request_end', 'status': 'private text', 'duration_ms': -1,
             'request_id': 'private', 'gateway_session': 'private', 'actual_model': 'sk-private',
             'input_tokens': True, 'output_tokens': 2**63, 'reasoning_tokens': -1, 'policy_version': -1, 'outcome': 'private',
-            'validation_category': 'private'}))
+            'validation_category': 'private', 'scope': 'private'}))
         self.assertTrue(writer.write_route({'kind': 'route_failure', 'category': 'output_truncated',
-                                           'dispatched': False, 'content': 'private response'}))
+                                           'scope': 'entry', 'dispatched': False, 'content': 'private response'}))
         raw = writer.path.read_text(encoding='utf-8')
         first, second, failure = [json.loads(line) for line in raw.splitlines()]
         self.assertEqual((first['status'], first['duration_ms']), (429, 1000))
         self.assertEqual(set(second), {'time', 'kind'})
         self.assertEqual(failure['category'], 'output_truncated')
+        self.assertEqual(failure['scope'], 'entry')
         self.assertIs(failure['dispatched'], False)
         self.assertNotIn('private', raw)
 

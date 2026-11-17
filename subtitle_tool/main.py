@@ -27,7 +27,7 @@ def parser():
     actions = result.add_mutually_exclusive_group()
     actions.add_argument("--resume", metavar="JOB_ID", help="恢复本地任务")
     actions.add_argument("--reflow", metavar="JOB_ID", help="仅从完整本地转写重排字幕，覆盖须搭配 --overwrite")
-    actions.add_argument("--retime", metavar="JOB_ID", help="复用最终字幕和译文，仅升级显示时间；覆盖须搭配 --overwrite")
+    actions.add_argument("--retime", metavar="JOB_ID", help="复用最终字幕和译文重新规划显示时间；覆盖须搭配 --overwrite")
     actions.add_argument("--review", metavar="JOB_ID", help="终端确认音轨、声道或逐条语种后继续")
     actions.add_argument("--jobs", action="store_true", help="列出任务（每行 JSON）")
     actions.add_argument('--state-machine', action='store_true', help='输出任务状态契约 JSON，无需配置或任务库')

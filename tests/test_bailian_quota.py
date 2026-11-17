@@ -4,12 +4,90 @@ import subprocess
 import sys
 import threading
 from datetime import date
+from types import SimpleNamespace
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
-from subtitle_tool.bailian_quota import CLIQuotaSource, QuotaSourceError, VerifiedIdentity, parse_observation
+from subtitle_tool.bailian_quota import CLIQuotaSource, ModelAccessSource, QuotaSourceError, VerifiedIdentity, parse_observation
 from subtitle_tool.common import atomic_json
+from subtitle_tool.mt_admission import ModelEvaluator
 from subtitle_tool.mt_control import MTControl
+from subtitle_tool.mt_transport import HTTPReply
 from tests.fixtures import TemporaryTest
+from tests.test_bailian_free import BailianFreeFixture
+
+
+class ModelAccessTests(TemporaryTest):
+    def setUp(self):
+        super().setUp()
+        self.config = SimpleNamespace(settings=SimpleNamespace(workspace_id='offline-space'),
+                                      get_key=lambda: 'synthetic-key')
+        self.control = MTControl(threading.Event())
+
+    def limits_reply(self, rows):
+        return HTTPReply(200, json.dumps({'output': {'quotas': rows}}).encode())
+
+    def test_unreadable_permission_catalog_does_not_block_model_limits(self):
+        calls = []
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if urlsplit(url).path == '/api/v1/models/permissions':
+                return HTTPReply(403, b'{"message":"private catalog error"}')
+            return self.limits_reply([{'model': 'trial-model', 'model_limit': {'request_limit': 60}}])
+        with mock.patch('subtitle_tool.mt_transport.ProcessTransport.request', side_effect=request):
+            limits = ModelAccessSource().inspect(self.config, 'trial-model', self.control)
+        self.assertEqual(limits, {'rpm': 60, 'tpm': None, 'workspace_rpm': None, 'workspace_tpm': None})
+        self.assertEqual(len(calls), 1)
+        method, url, kwargs = calls[0]
+        self.assertEqual(method, 'GET')
+        self.assertEqual(urlsplit(url).netloc, 'offline-space.cn-beijing.maas.aliyuncs.com')
+        self.assertEqual(urlsplit(url).path, '/api/v1/models/limits')
+        self.assertEqual(parse_qs(urlsplit(url).query), {'model': ['trial-model'], 'page_size': ['100']})
+        self.assertEqual(kwargs, {'headers': {'Authorization': 'Bearer synthetic-key'},
+                                  'control': self.control, 'timeout': 15, 'drain': False})
+
+    def test_limits_preserve_model_and_shared_ceiling_in_requests_per_minute(self):
+        rows = [{'model': 'trial-model',
+                 'model_limit': {'request_limit': 2, 'request_limit_period': 1,
+                                 'usage_limit': 20000, 'usage_limit_period': 30},
+                 'workspace_limit': {'request_limit': 40, 'request_limit_period': 60,
+                                     'usage_limit': 150000, 'usage_limit_period': 300}},
+                {'model': 'different-model', 'model_limit': {'request_limit': 1, 'usage_limit': 1}}]
+        with mock.patch('subtitle_tool.mt_transport.ProcessTransport.request', return_value=self.limits_reply(rows)):
+            limits = ModelAccessSource().inspect(self.config, 'trial-model', self.control)
+        self.assertEqual(limits, {'rpm': 40, 'tpm': 30000, 'workspace_rpm': 40, 'workspace_tpm': 30000})
+
+    def test_limits_failure_still_blocks_admission_without_leaking_response(self):
+        for status in (401, 403, 429, 500):
+            with self.subTest(status=status), mock.patch('subtitle_tool.mt_transport.ProcessTransport.request',
+                    return_value=HTTPReply(status, b'private-key-or-service-message')) as request:
+                with self.assertRaises(QuotaSourceError) as raised:
+                    ModelAccessSource().inspect(self.config, 'trial-model', self.control)
+                self.assertEqual(str(raised.exception), 'Quota query failed')
+                self.assertEqual(urlsplit(request.call_args.args[1]).path, '/api/v1/models/limits')
+
+
+class ModelAccessAdmissionTests(BailianFreeFixture):
+    def test_readable_limits_do_not_admit_model_when_inference_is_forbidden(self):
+        self.rows = self.rows[:1]
+        self.guard.access = ModelAccessSource()
+        calls = []
+        def request(method, url, **kwargs):
+            calls.append((method, url))
+            if method == 'GET' and urlsplit(url).path == '/api/v1/models/limits':
+                return HTTPReply(200, json.dumps({'output': {'quotas': [
+                    {'model': 'trial-a', 'model_limit': {'request_limit': 60, 'usage_limit': 1000000}}
+                ]}}).encode())
+            return HTTPReply(403, b'{"error":{"code":"permission_denied","message":"private error"}}')
+        self.guard.evaluator = ModelEvaluator(self.config, self.guard.control, judge='independent/judge',
+                                             transport=SimpleNamespace(request=request))
+        with mock.patch('subtitle_tool.mt_transport.ProcessTransport.request', side_effect=request):
+            self.guard.refresh()
+        self.assertEqual([method for method, _ in calls], ['GET', 'POST'])
+        self.assertFalse(self.active())
+        self.assertEqual(self.guard.state['models']['trial-a']['status'], 'admission_rejected')
+        self.assertTrue(all(p.get('off') for p in self.guard.admin.registry()['providers']))
+        self.assertNotIn('private error', self.guard.trial_state.path.read_text(encoding='utf-8'))
 
 
 class QuotaObservationTests(TemporaryTest):

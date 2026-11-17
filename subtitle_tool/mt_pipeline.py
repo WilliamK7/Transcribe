@@ -283,7 +283,6 @@ class Pipeline:
         from .policy import load_policy
         self.engine, self.store, self.job_id = engine, engine.store, job_id
         load_policy(manifest)
-        self.scope = dict(scope)
         self.context = threading.local()
         self.group_progress = None
         self.diagnostics = MTDiagnostics(engine.config.root, job_id)
@@ -292,10 +291,10 @@ class Pipeline:
         from .bailian_free import BailianFreeGuard
         self.bailian_free = BailianFreeGuard(engine.config, engine.mt_control, job_id=job_id)
         from .mt_maintenance import ChannelMaintenance
-        self.channel_maintenance = ChannelMaintenance(engine.config, engine.mt_control, trial=self.bailian_free)
+        self.channel_maintenance = ChannelMaintenance(engine.config, engine.mt_control, trial_state=self.bailian_free.trial_state)
         self.snapshot = saved_route(manifest)
         self.identities = self.snapshot.get('identities', {})
-        self.cache_scope = dict(self.scope)
+        self.cache_scope = dict(scope)
         self.cache_scope['model_identity'] = _digest(self.identities)
         self.profiles = {profile['id']: profile for profile in self.snapshot['entries']}
         entries = []
@@ -307,7 +306,6 @@ class Pipeline:
             selected = [entry for name in ('magpie' + suffix, 'magpie' + suffix + '_fallback')
                         for entry in entries if entry.id == name]
             self.routers[role] = MagpieRoute(selected, control=engine.mt_control, on_event=self._event)
-        self.router = self.routers['translate']
 
     def router_for(self, stage):
         return self.routers['review' if stage == 'glossary' else stage]
@@ -378,7 +376,7 @@ class Pipeline:
         try:
             key = entry.backend.credential(self.engine.config)
         except ToolError:
-            raise RouteFailure('authentication', scope='credential') from None
+            raise RouteFailure('authentication', diagnostic_scope='credential') from None
         payload = self._request_payload(name, data, entry, repair=attempt == 2)
         request_id = uuid.uuid4().hex
         session = 'transcribe-' + self.job_id + '-' + request_id
@@ -411,7 +409,7 @@ class Pipeline:
                     json=payload, control=self.engine.mt_control, timeout=remaining, on_dispatch=dispatch)
             except TransportError as error:
                 outcome, event['category'] = 'transport_error', error.category
-                raise RouteFailure(error.category, scope='endpoint' if error.category == 'network' else 'entry',
+                raise RouteFailure(error.category, diagnostic_scope='endpoint' if error.category == 'network' else 'entry',
                                    fallback_allowed=error.category == 'deadline') from None
             try:
                 body = json.loads(reply.body)
@@ -454,7 +452,7 @@ class Pipeline:
                 elif status == 404:
                     scope = 'model'
                 outcome, event['category'] = 'service_error', category
-                raise RouteFailure(category, scope=scope) from None
+                raise RouteFailure(category, diagnostic_scope=scope) from None
             try:
                 value = parse_stage_response(name, body, ids=ids, originals=originals)
                 if name == 'judge':
@@ -943,7 +941,6 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         return
     source_ids = {source['sentence_id']: source for source in sources}
     positions = {source['sentence_id']: index for index, source in enumerate(sources)}
-    timing_version = manifest['display_timing_version']
     pipeline = Pipeline(engine, job_id, manifest, scope)
     try:
         if not manifest.get('layout_planned'):
@@ -954,7 +951,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                     parts = split_mt_units(source, parts, fits=lambda cue: pipeline._fits_group(
                         [{'source': source, 'text': cue['text'], 'cues': [cue]}]))
                 cues.extend(parts)
-            plan_display_timing(cues, version=timing_version)
+            plan_display_timing(cues)
             candidate = copy.deepcopy(manifest)
             candidate.update(layout_planned=True, layout_round=0)
             engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, cues)
@@ -962,7 +959,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             check_cancel(engine.cancel)
             stage('subtitle_translating')
             cues = engine.store.cues(job_id)
-            plan_display_timing(cues, version=timing_version)
+            plan_display_timing(cues)
             groups = pipeline.groups_for_layout(sources, cues, manifest)
             pending = [index for index, group in enumerate(groups)
                        if any(not cue['translated'] for unit in group for cue in unit['cues'])]
@@ -1003,7 +1000,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                 return
             candidate = copy.deepcopy(manifest)
             candidate['layout_round'] = round_number + 1
-            plan_display_timing(revised, version=timing_version)
+            plan_display_timing(revised)
             engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, revised)
     finally:
         pipeline.close()

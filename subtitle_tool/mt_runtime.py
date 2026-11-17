@@ -1,6 +1,7 @@
 """Provider error classification for translation replies."""
 from __future__ import annotations
 
+# These sets classify response envelopes; they do not authorize retries.
 TRANSIENT_TYPES = {'timeout', 'provider_unavailable', 'provider_overloaded', 'server', 'rate_limit_exceeded'}
 PERMANENT_TYPES = {
     'context_length_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded', 'string_too_long',
@@ -9,6 +10,15 @@ PERMANENT_TYPES = {
     'content_policy_violation', 'refusal', 'invalid_image', 'image_too_large', 'image_too_small',
     'unsupported_image_format', 'image_not_found', 'image_download_failed',
 }
+
+
+# Diagnostic labels; routing uses explicit repairable/fallback_allowed flags.
+FAILURE_SCOPES = frozenset({'entry', 'model', 'credential', 'endpoint', 'paid_account'})
+FAILURE_CATEGORIES = frozenset(TRANSIENT_TYPES | PERMANENT_TYPES | {
+    'network', 'deadline', 'transport', 'response_too_large', 'http_transient', 'http_permanent', 'service_unknown',
+    'generation_error', 'response_structure', 'format_exhausted', 'output_truncated', 'cancelled', 'local_error',
+    'model_not_independent',
+})
 
 
 def service_failure(status, body) -> str | None:

@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .common import ToolError
 
+ROLES = ('translate', 'review', 'judge')
+
 
 def default_policy():
     return json.loads(Path(__file__).with_name('mt-channels.default.json').read_bytes())

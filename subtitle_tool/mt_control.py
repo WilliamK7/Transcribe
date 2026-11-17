@@ -7,6 +7,15 @@ import time
 from .common import Cancelled
 
 
+class BackgroundCancel:
+    """Stop a background worker locally or with its parent, without a drain."""
+    def __init__(self, parent, stop):
+        self.parent, self.stop = parent, stop
+
+    def is_set(self):
+        return self.stop.is_set() or self.parent.stopping
+
+
 class MTControl:
     def __init__(self, cancel, *, clock=time.monotonic, drain_seconds=5.0):
         self.cancel = cancel

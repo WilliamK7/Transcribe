@@ -119,10 +119,10 @@ class SubtitleTests(TemporaryTest):
     def test_offset_sentence_only_and_unicode_srt(self):
         cues, _ = normalize(result(("مرحبا بالعالم", "ar")), 1511, "01")
         cues[0]["translated"] = "你好，世界"
-        content = render_srt(cues, Settings())
+        content = render_srt(cues, Settings(), display_intervals=cues)
         self.assertIn(b"00:00:01,511 --> 00:00:02,411", content)
         self.assertTrue(content.decode().index("مرحبا") < content.decode().index("你好"))
-        chinese_first = render_srt(cues, Settings(chinese_first=True))
+        chinese_first = render_srt(cues, Settings(chinese_first=True), display_intervals=cues)
         self.assertTrue(chinese_first.decode().index("你好") < chinese_first.decode().index("مرحبا"))
         self.assertFalse(content.startswith(b"\xef\xbb\xbf"))
         self.assertNotIn(b"\n", content.replace(b"\r\n", b""))
@@ -173,7 +173,7 @@ class SubtitleTests(TemporaryTest):
     def test_incomplete_translation_never_writes(self):
         cues, _ = normalize(result(("Hello world", "en")), 0, "0")
         with self.assertRaises(ToolError):
-            render_srt(cues, Settings())
+            render_srt(cues, Settings(), display_intervals=cues)
 
 
 class HttpTests(unittest.TestCase):

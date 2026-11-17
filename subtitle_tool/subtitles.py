@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from .common import DISPLAY_TIMING_VERSION, ToolError
+from .common import ToolError
 from .review import decision_origin
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
@@ -745,10 +745,8 @@ def _trim_display_interval(interval, begin, end, reason):
             'adjustment_ms': (begin - old_begin) + (old_end - end), 'reason': reason}
 
 
-def plan_display_timing(cues, *, version=DISPLAY_TIMING_VERSION):
+def plan_display_timing(cues):
     """Derive bounded display adjustments without altering recognition evidence."""
-    if type(version) is not int or version != DISPLAY_TIMING_VERSION:
-        raise ToolError('任务显示时间版本不受支持，请用 --reflow 显式重排。', 'cache_version')
     intervals, adjustments = [], []
     for index, cue in enumerate(cues):
         begin, end = cue["begin_ms"], cue["end_ms"]
@@ -785,9 +783,8 @@ def plan_display_timing(cues, *, version=DISPLAY_TIMING_VERSION):
     return intervals, adjustments
 
 
-def render_srt(cues, settings, *, display_intervals=None) -> bytes:
-    if display_intervals is not None:
-        validate_display_intervals(cues, display_intervals)
+def render_srt(cues, settings, *, display_intervals) -> bytes:
+    validate_display_intervals(cues, display_intervals)
     rows, last = [], -1
     for number, cue in enumerate(cues, 1):
         if cue["begin_ms"] < last or cue["end_ms"] <= cue["begin_ms"]:
@@ -804,6 +801,6 @@ def render_srt(cues, settings, *, display_intervals=None) -> bytes:
             raise ToolError("仍有语种不确定项，需确认后生成字幕。", "language_uncertain")
         if not source or any("-->" in s for s in source):
             raise ToolError("字幕文本含异常时间箭头或为空。", "srt_invalid")
-        timing = cue if display_intervals is None else display_intervals[number - 1]
+        timing = display_intervals[number - 1]
         rows.append(str(number) + "\r\n" + timestamp(timing["begin_ms"]) + " --> " + timestamp(timing["end_ms"]) + "\r\n" + "\r\n".join(source))
     return ("\r\n\r\n".join(rows) + ("\r\n\r\n" if rows else "")).encode("utf-8")

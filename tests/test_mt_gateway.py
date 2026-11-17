@@ -45,7 +45,7 @@ class GatewayContractTests(PoolPipelineFixture):
 
     def test_reasoning_request_applies_to_every_stage_and_repair(self):
         pipeline = self.pipeline()
-        entry = pipeline.router.entries[0]
+        entry = pipeline.router_for('translate').entries[0]
         for stage in ('glossary', 'translate', 'review', 'judge'):
             for repair in ((False, True) if stage == 'translate' else (False,)):
                 with self.subTest(stage=stage, repair=repair):
@@ -152,7 +152,7 @@ class GatewayContractTests(PoolPipelineFixture):
     def test_primary_timeout_reserves_time_for_paid_fallback(self):
         pipeline = self.pipeline()
         clock, calls = [100.0], []
-        pipeline.router.clock = lambda: clock[0]
+        pipeline.router_for('translate').clock = lambda: clock[0]
         def send(*args, **kwargs):
             kwargs['on_dispatch']()
             calls.append(kwargs)
@@ -170,7 +170,7 @@ class GatewayContractTests(PoolPipelineFixture):
     def test_primary_format_repair_cannot_consume_fallback_time(self):
         pipeline = self.pipeline()
         clock, calls = [100.0], []
-        pipeline.router.clock = lambda: clock[0]
+        pipeline.router_for('translate').clock = lambda: clock[0]
         def send(*args, **kwargs):
             kwargs['on_dispatch']()
             calls.append(kwargs)
@@ -436,7 +436,7 @@ class GatewayContractTests(PoolPipelineFixture):
         pipeline = self.pipeline()
         data = self.data()
         data['context'] = [{'position': 'before', 'text': 'Synthetic background. ' * 20}]
-        entry = pipeline.router.entries[0]
+        entry = pipeline.router_for('translate').entries[0]
         capabilities = pipeline.profiles[entry.id]['capabilities']
         initial = make_stage_payload('translate', data, entry.backend, capabilities=capabilities)
         budget = len(json.dumps(initial, ensure_ascii=False).encode('utf-8'))
@@ -490,7 +490,7 @@ class GatewayContractTests(PoolPipelineFixture):
             pipeline = self.pipeline()
             data = self.data(text=f'Synthetic deadline case {finish} {action}.')
             clock = [100.0]
-            pipeline.router.clock = lambda: clock[0]
+            pipeline.router_for('translate').clock = lambda: clock[0]
             calls = []
             def send(*args, **kwargs):
                 kwargs['on_dispatch']()

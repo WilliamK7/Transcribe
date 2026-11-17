@@ -120,26 +120,21 @@ class QuotaSourceError(Exception):
 
 
 class ModelAccessSource:
-    """Official API-key scoped GETs, equivalent to bl permission/quota list."""
+    """Read API-key scoped limits; bounded inference establishes actual access."""
     def inspect(self, config, model, control):
         from urllib.parse import urlencode
         from .mt_transport import ProcessTransport
         base = f'https://{config.settings.workspace_id}.cn-beijing.maas.aliyuncs.com'
-        result = {}
-        for path, field in [('permissions', 'permissions'), ('limits', 'quotas')]:
-            query = urlencode({'model': model, 'page_size': 100,
-                               **({'authorization_scope': 'AUTHORIZABLE'} if path == 'permissions' else {})})
-            reply = ProcessTransport().request('GET', base + '/api/v1/models/' + path + '?' + query,
-                headers={'Authorization': 'Bearer ' + config.get_key()}, control=control, timeout=15, drain=False)
-            if reply.status != 200:
-                raise QuotaSourceError()
-            rows = json.loads(reply.body).get('output', {}).get(field, [])
-            exact = [row for row in rows if row.get('model') == model]
-            result[path] = exact
-        # False/null grant records can still be callable through other grants;
-        # the bounded inference test establishes actual access, never grant it.
+        query = urlencode({'model': model, 'page_size': 100})
+        reply = ProcessTransport().request('GET', base + '/api/v1/models/limits?' + query,
+            headers={'Authorization': 'Bearer ' + config.get_key()}, control=control, timeout=15, drain=False)
+        if reply.status != 200:
+            raise QuotaSourceError()
+        rows = json.loads(reply.body).get('output', {}).get('quotas', [])
         rates, tokens, shared, shared_tokens = [], [], [], []
-        for row in result['limits']:
+        for row in rows:
+            if row.get('model') != model:
+                continue
             for scope in ('model_limit', 'workspace_limit'):
                 spec = row.get(scope) or {}
                 for field, period, output in [('request_limit', 'request_limit_period', rates),
@@ -153,8 +148,7 @@ class ModelAccessSource:
                             shared_tokens.append(amount * 60 // seconds)
         return {'rpm': min(rates) if rates else None, 'tpm': min(tokens) if tokens else None,
                 'workspace_rpm': min(shared) if shared else None,
-                'workspace_tpm': min(shared_tokens) if shared_tokens else None,
-                'permission_observed': bool(result['permissions'])}
+                'workspace_tpm': min(shared_tokens) if shared_tokens else None}
 
 
 class CLIQuotaSource:

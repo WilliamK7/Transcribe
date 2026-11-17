@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 
 from .mt_quality import VALIDATION_CATEGORIES
+from .mt_runtime import FAILURE_CATEGORIES, FAILURE_SCOPES
 
 
 _WRITE_LOCK = threading.Lock()
@@ -72,7 +73,6 @@ class MTDiagnostics:
 
     def write_route(self, event):
         """Write only fixed route classifications and bounded, non-content metadata."""
-        from .mt_routing import _CATEGORIES, _SCOPES
         try:
             if event.get('kind') not in {'route_attempt', 'route_failure', 'route_complete',
                                        'request_start', 'request_end'}:
@@ -82,10 +82,10 @@ class MTDiagnostics:
             entry = safe_model_id(event.get('entry'))
             if entry:
                 record['entry'] = entry
-            for field, allowed in [('tier', {'free', 'paid', 'mixed'}), ('scope', _SCOPES),
+            for field, allowed in [('tier', {'free', 'paid', 'mixed'}), ('scope', FAILURE_SCOPES),
                                    ('billing_route', {'trial', 'free', 'commercial', 'unknown'}),
                                    ('entitlement_usage', {'unknown'}), ('cash_spend', {'unknown'}),
-                                   ('category', _CATEGORIES), ('validation_category', VALIDATION_CATEGORIES),
+                                   ('category', FAILURE_CATEGORIES), ('validation_category', VALIDATION_CATEGORIES),
                                    ('outcome', {'valid', 'invalid', 'service_error', 'transport_error',
                                                 'cancelled', 'local_error'})]:
                 if event.get(field) in allowed:

@@ -32,7 +32,6 @@ class ExecutionPolicy:
     zh_line_width: int
     other_line_width: int
     chinese_first: bool
-    display_timing_version: int
 
     def settings(self, runtime):
         """Saved result settings plus current concurrency and polling parameters."""
@@ -59,7 +58,7 @@ def load_policy(manifest):
     """Validate the saved execution contract before reusing derived results."""
     validate_raw_contract(manifest)
     _version(manifest.get("subtitle_version"), SUBTITLE_VERSION)
-    display_timing = _version(manifest.get('display_timing_version'), DISPLAY_TIMING_VERSION)
+    _version(manifest.get('display_timing_version'), DISPLAY_TIMING_VERSION)
     _version(manifest.get("translation_strategy_version"), 6)
     saved_layout = manifest.get("subtitle_settings", {})
     if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:
@@ -76,4 +75,4 @@ def load_policy(manifest):
         raise ToolError('任务执行版本已退役；请用 --reflow 从原始转写重建当前版本任务。', 'cache_version')
     if manifest.get('mt_glossary_schedule') != GLOSSARY_SCHEDULE:
         raise ToolError('任务术语调度版本不受支持，请用 --reflow 从原始转写重建。', 'cache_version')
-    return ExecutionPolicy(**saved_layout, display_timing_version=display_timing)
+    return ExecutionPolicy(**saved_layout)

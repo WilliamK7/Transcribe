@@ -42,9 +42,9 @@ class PcmLimitTests(TemporaryTest):
 
     def test_missing_track_range_uses_container_and_rejects_before_ffmpeg(self):
         info = {"duration_ms": 200_000_000, "tracks": [{"index": 7}]}
-        with mock.patch.object(self.media, "probe", return_value=info), mock.patch("subtitle_tool.media.run_process") as process:
+        with mock.patch("subtitle_tool.media.run_process") as process:
             with self.assertRaises(ToolError) as caught:
-                self.media.extract(self.path / "input.mkv", self.path / "audio.wav", 7, "mix")
+                self.media.extract(self.path / "input.mkv", self.path / "audio.wav", 7, "mix", info=info)
             self.assertEqual(caught.exception.code, "media_pcm_limit")
             process.assert_not_called()
 
@@ -68,11 +68,10 @@ class PcmLimitTests(TemporaryTest):
             return original_stat(path, *args, **kwargs)
         def extract(args, *unused, **kwargs):
             Path(args[-1]).write_bytes(before)
-        with mock.patch.object(self.media, "probe", return_value=info), \
-                mock.patch("subtitle_tool.media.run_process", side_effect=extract), \
+        with mock.patch("subtitle_tool.media.run_process", side_effect=extract), \
                 mock.patch.object(Path, "stat", new=size):
             with self.assertRaises(ToolError) as caught:
-                self.media.extract(self.path / "input.mkv", target, 7, "mix")
+                self.media.extract(self.path / "input.mkv", target, 7, "mix", info=info)
         self.assertEqual(caught.exception.code, "media_pcm_limit")
         self.assertEqual(target.read_bytes(), before)
         self.assertFalse(target.with_suffix(".partial.wav").exists())

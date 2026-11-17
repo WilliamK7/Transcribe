@@ -368,8 +368,8 @@ class Media:
         finally:
             pcm.unlink(missing_ok=True)
 
-    def extract(self, source: Path, path: Path, track, channel, *, info=None, timeline=None):
-        self.check_pcm_capacity(info if info is not None else self.probe(source), track, timeline)
+    def extract(self, source: Path, path: Path, track, channel, *, info, timeline=None):
+        self.check_pcm_capacity(info, track, timeline)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(".partial.wav")
         filters = []

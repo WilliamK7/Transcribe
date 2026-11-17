@@ -35,7 +35,7 @@ Windows x64 字幕 CLI。项目直连北京百炼 `qwen3-asr-flash-filetrans` �
 | 术语及轻量复核 | `group/transcribe-review` | `group/transcribe-review-paid` |
 | 疑难裁决 | `group/transcribe-judge` | `group/transcribe-judge-paid` |
 
-主组按免费组 → 商业组选择，冷却、繁忙和阶段超时可触发商业后备。
+主组内按免费组 → 商业组选择，由 Magpie 处理上游切换。阶段超时或结果校验失败时，字幕工具在剩余时限内调用该角色的商业后备。
 
 免费型号按渠道目录和验收结果识别。Copilot 和 Workers AI 归入商业组。Vercel 按公开零价标记区分免费型号，实际抵扣和费用以账单为准。
 
@@ -71,6 +71,8 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 ### 百炼试用
 
 `data/bailian-quota-binding.json` 版本 2 将账户绑定到已确认的 AK/SK 查询上下文。后台查询有效额度，为最多三个通过验收的型号建立独立入口。`data/bailian-trial-state.json` 的 `paused` 和 `excluded` 控制人工暂停与排除。
+
+试用验收读取模型与工作空间限额，通过实际推理确认调用资格。评判者从渠道策略 `judges` 或当前复核／裁决成员中选择；缺少独立且启用的评判者时暂缓候选。
 
 自动管理作用于上表的默认本机角色组。远程网关及自定义角色组由用户维护。运行诊断与恢复细节见[接口契约](docs/API_CONTRACT.md)。
 

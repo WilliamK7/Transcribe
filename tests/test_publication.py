@@ -154,8 +154,7 @@ class PublicationTests(SavedResultFixture):
         with mock.patch.object(engine_module, "write_srt", side_effect=AssertionError("no republish")):
             self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(self.store.job(self.job_id)["error_code"], "cache_version")
-        content, _ = Engine.render_subtitles(self.store.cues(self.job_id), settings,
-                                             version=manifest['display_timing_version'])
+        content, _ = Engine.render_subtitles(self.store.cues(self.job_id), settings)
         publication.write_srt(self.output, content, intent=manifest["publication_intent"])
         manifest["subtitle_version"] = 999
         self.store.update(self.job_id, manifest=manifest)

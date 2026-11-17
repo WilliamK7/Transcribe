@@ -7,13 +7,14 @@ import json
 import time
 from collections import defaultdict
 
-from .bailian_free import BailianFreeGuard, ROLES, TRIAL_PROVIDER
+from .bailian_state import TrialState, TRIAL_PROVIDER
+from .magpie_admin import MagpieAdmin
 from .common import ToolError, atomic_json
 from .magpie import bound_gateway, validate_role_pools
-from .mt_admission import ModelEvaluator, admission_key
+from .mt_admission import ModelEvaluator, admission_key, current_role_members, select_admission_judge
 from .mt_catalog import read_registry, saved_catalog
 from .mt_identity import VSR_MEMBER, canonical_model, model_set
-from .mt_channel_policy import load_policy, check_provider_policy
+from .mt_channel_policy import ROLES, load_policy, check_provider_policy
 
 
 def _supplier_group(main, supplier, free):
@@ -71,10 +72,13 @@ def choose_roles(evaluations, reserved=None):
 
 
 class GatewaySetup:
-    def __init__(self, config, control, *, manager=None):
+    def __init__(self, config, control, *, admin=None, trial_state=None):
         self.config, self.control = config, control
         self.policy = load_policy(config)
-        self.manager = manager or BailianFreeGuard(config, control, job_id='gateway-setup')
+        self.trial_state = trial_state if trial_state is not None else TrialState(config, lock=admin.lock if admin else None)
+        self.admin = admin or MagpieAdmin(config, control, job_id='gateway-setup', lock=self.trial_state.lock)
+        if self.admin.lock is not self.trial_state.lock:
+            raise ValueError('Gateway administration and role reservations must share a lock')
         self.path = config.data / 'gateway-admission.json'
         self.state = json.loads(self.path.read_bytes()) if self.path.exists() else {'version': 1, 'evaluations': {}}
         self.managed_path = config.data / 'gateway-managed.json'
@@ -85,12 +89,16 @@ class GatewaySetup:
         self._staged = None
         self._actions = []
 
+    def _audit(self, reason, model='', before=None, after=None):
+        if not self.admin.audit(reason, model, before, after):
+            self.state['audit_status'] = 'write_failed'
+
     def _registry(self):
-        return self._staged if self._staged is not None else self.manager._registry()
+        return self._staged if self._staged is not None else self.admin.registry()
 
     def _command(self, *args):
         if self._staged is None:
-            return self.manager._command(*args)
+            return self.admin.command(*args, control=self.control)
         self._actions.append(args)
         group = next((g for g in self._staged['groups'] if g['id'] == args[2]), None)
         if group is None:
@@ -121,7 +129,7 @@ class GatewaySetup:
             result.update(model=member, evaluated_at=time.time())
             self.state['evaluations'][key] = result
             atomic_json(self.path, self.state)
-            self.manager._audit('evaluation_finished', member, None, result['roles'])
+            self._audit('evaluation_finished', member, None, result['roles'])
         return result
 
     def cached_evaluation(self, member, judge):
@@ -152,33 +160,10 @@ class GatewaySetup:
                 raise ToolError('商业后备为空或包含免费／试用型号，未更新分组。', 'mt_admission')
 
     def independent_judge(self, member):
-        identities = self.catalog.get('identities', {})
-        candidates = list(self.policy['judges'])
-        candidates.extend(m for m, (role, _) in self.current_members().items() if role in {'review', 'judge'})
-        raw = read_registry(self.config.settings, self.catalog, policy=self.policy)
-        enabled = {p['id']: p for p in raw['providers'] if not p.get('off') and p['id'] not in self.policy['excluded_providers']}
-        for candidate in candidates:
-            owner, name = candidate.split('/', 1)
-            if (owner in enabled and name not in enabled[owner].get('modelsOff', []) and
-                    not model_set(member, identities) & model_set(candidate, identities)):
-                return candidate
-        raise ToolError('找不到与候选底层型号独立的验收评判者。', 'mt_admission')
+        return select_admission_judge(self.config, member, self.catalog, policy=self.policy)
 
     def current_members(self):
-        from .magpie import group_models
-        raw = read_registry(self.config.settings, self.catalog, policy=self.policy)
-        groups = {g['id'] for g in raw.get('groups', [])}
-        members = {}
-        for role in ROLES:
-            main = 'transcribe' + ('' if role == 'translate' else '-' + role)
-            for group in (main, main + '-paid'):
-                if group not in groups:
-                    continue
-                for owner, name, provider in group_models(raw, 'group/' + group):
-                    if owner + '/' + name in members and members[owner + '/' + name][0] != role:
-                        raise ToolError('同一网关成员已跨角色使用，未修改分组。', 'mt_admission')
-                    members[owner + '/' + name] = (role, provider)
-        return members
+        return current_role_members(read_registry(self.config.settings, self.catalog, policy=self.policy))
 
     def _group(self, name, members, routing):
         """Incremental CLI transaction; preserve external members and switches."""
@@ -221,19 +206,19 @@ class GatewaySetup:
         self.managed['groups'][name] = members
         if self._staged is None:
             atomic_json(self.managed_path, self.managed)
-            self.manager._audit('role_group_updated', name, current.get('members', []) if current else [], members)
+            self._audit('role_group_updated', name, current.get('members', []) if current else [], members)
         return True
 
     def _disable_trial_template(self):
         """Keep the account template disabled; trials use model-specific providers."""
-        current = next((p for p in self.manager._registry()['providers'] if p['id'] == TRIAL_PROVIDER), None)
+        current = next((p for p in self.admin.registry()['providers'] if p['id'] == TRIAL_PROVIDER), None)
         if current is None or current.get('off'):
             return
-        self.manager._command('provider', 'off', TRIAL_PROVIDER)
-        after = next((p for p in self.manager._registry()['providers'] if p['id'] == TRIAL_PROVIDER), None)
+        self.admin.command('provider', 'off', TRIAL_PROVIDER, control=self.control)
+        after = next((p for p in self.admin.registry()['providers'] if p['id'] == TRIAL_PROVIDER), None)
         if after is None or after.get('off') is not True:
             raise ToolError('试用账户模板未停用，分组更新已停止。', 'magpie_group')
-        self.manager._audit('trial_template_disabled', TRIAL_PROVIDER,
+        self._audit('trial_template_disabled', TRIAL_PROVIDER,
                            {'off': bool(current.get('off'))}, {'off': True})
 
     @staticmethod
@@ -258,7 +243,7 @@ class GatewaySetup:
                     any(not isinstance(name, str) or name not in groups for name in completed)):
                 raise ValueError()
             applied = set(completed)
-            live = {g['id']: g for g in self.manager._registry().get('groups', [])}
+            live = {g['id']: g for g in self.admin.registry().get('groups', [])}
             if plan.get('version') != 2:
                 raise ValueError()
             active = plan.get('active')
@@ -291,8 +276,8 @@ class GatewaySetup:
 
     def _role_constraints(self, evaluations):
         """Inspect current reservations without moving roles or granting admission."""
-        pinned = dict(self.manager.state.get('reserved_models', {}))
-        for model, row in self.manager.state['models'].items():
+        pinned = dict(self.trial_state.data.get('reserved_models', {}))
+        for model, row in self.trial_state.data['models'].items():
             if row.get('status') == 'active':
                 identity = canonical_model(model)
                 if identity in pinned and pinned[identity] != row['role']:
@@ -324,8 +309,13 @@ class GatewaySetup:
         return pinned, retired
 
     def apply(self, evaluations, free=()):
+        with self.admin.lock:
+            return self._apply(evaluations, free)
+
+    def _apply(self, evaluations, free):
         if not bound_gateway(self.config.settings, self.config.settings.mt_base_url):
             raise ToolError('角色分组更新需要已绑定的本机 magpie。', 'mt_config')
+        self.trial_state.read()  # A cached snapshot cannot excuse corrupt on-disk reservations.
         recovering = self._recover_pending()
         pinned, retired = self._role_constraints(evaluations)
         free = set(free) - set(retired)
@@ -352,7 +342,7 @@ class GatewaySetup:
         if any(not set(members) - free for members in pools.values()):
             raise ToolError('每个角色必须有已验收的商业后备。', 'mt_admission')
         previous_managed = copy.deepcopy(self.managed)
-        self._staged = copy.deepcopy(self.manager._registry())
+        self._staged = copy.deepcopy(self.admin.registry())
         self._staged.setdefault('groups', [])
         self._actions = []
         try:
@@ -405,9 +395,9 @@ class GatewaySetup:
         finally:
             self._staged = None
         template_active = any(p['id'] == TRIAL_PROVIDER and not p.get('off')
-                              for p in self.manager._registry()['providers'])
+                              for p in self.admin.registry()['providers'])
         if (not recovering and not self._actions and not template_active and self.catalog == saved_catalog(self.config) and
-                self.manager.state.get('reserved_models') == assignments):
+                self.trial_state.data.get('reserved_models') == assignments):
             if self.managed != previous_managed:
                 atomic_json(self.managed_path, self.managed)
             return {'roles': pools, 'backup': None, 'changed': False, 'role_conflicts': retired}
@@ -415,7 +405,7 @@ class GatewaySetup:
         self.managed = previous_managed  # A failed attempt must not expose uncommitted ownership in memory.
         backup = self.config.data / 'gateway-backups' / str(time.time_ns())
         backup.mkdir(parents=True)
-        atomic_json(backup / 'providers.json', self.manager._registry())
+        atomic_json(backup / 'providers.json', self.admin.registry())
         for filename in ('settings.json', 'gateway-managed.json', 'gateway-catalog.json', 'bailian-trial-state.json',
                          'gateway-apply-pending.json'):
             path = self.config.data / filename
@@ -438,24 +428,24 @@ class GatewaySetup:
                     g for g in projected['groups'] if g['id'] in roots]
                 self._validated_groups(live, entries)
                 children_checked = True
-            before = next((g for g in self.manager._registry()['groups'] if g['id'] == command[2]), None)
+            before = next((g for g in self.admin.registry()['groups'] if g['id'] == command[2]), None)
             expected = next(g for g in projected['groups'] if g['id'] == command[2])
             plan['active'] = {'group': command[2], 'before': self._group_state(before), 'after': self._group_state(expected)}
             atomic_json(self.plan_path, plan)  # Intent must survive a committed command with no reply.
-            self.manager._command(*command)
-            actual = next((g for g in self.manager._registry()['groups'] if g['id'] == command[2]), None)
+            self.admin.command(*command, control=self.control)
+            actual = next((g for g in self.admin.registry()['groups'] if g['id'] == command[2]), None)
             if self._group_state(actual) != self._group_state(expected):
                 raise ToolError('子组写入后与预演不一致；已保留备份和更新记录。', 'magpie_group')
             plan['completed'].append(command[2])
             plan['active'] = None
             atomic_json(self.plan_path, plan)
-            self.manager._audit('role_group_updated', command[2], None, target_managed['groups'].get(command[2], []))
+            self._audit('role_group_updated', command[2], None, target_managed['groups'].get(command[2], []))
         self._validated_groups(read_registry(self.config.settings, self.catalog), entries)
         atomic_json(self.managed_path, target_managed)
         self.managed = target_managed
-        self.manager.state['reserved_models'] = assignments
-        self.manager.state['admission_judge'] = pools['judge'][0]
-        self.manager._save()
+        self.trial_state.data['reserved_models'] = assignments
+        self.trial_state.data['admission_judge'] = pools['judge'][0]
+        self.trial_state.save(self.control)
         self.config.settings.mt_policy_version += 1
         self.config.save()
         atomic_json(self.config.data / 'gateway-catalog.json', self.catalog)

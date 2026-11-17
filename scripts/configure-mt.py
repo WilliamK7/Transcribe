@@ -44,7 +44,6 @@ def main():
     manager = None
     try:
         setup = GatewaySetup(config, control)
-        manager = setup.manager
         setup.catalog['models'].update(discovered['models'])
         setup.catalog['identities'].update(discovered['identities'])
         raw = read_registry(config.settings, setup.catalog, policy=policy)
@@ -68,7 +67,7 @@ def main():
             print(json.dumps({'evaluating': member}), flush=True)
             if member in catalog.pending:
                 from subtitle_tool.mt_maintenance import ChannelMaintenance
-                exposure = ChannelMaintenance(config, control, trial=manager)
+                exposure = ChannelMaintenance(config, control, admin=setup.admin, trial_state=setup.trial_state)
                 try:
                     exposure.expose(member)
                 finally:
@@ -100,6 +99,8 @@ def main():
             atomic_json(report_path, report)
             print(json.dumps(applied, ensure_ascii=False), flush=True)
         if args.refresh_trial:
+            from subtitle_tool.bailian_free import BailianFreeGuard
+            manager = BailianFreeGuard(config, control, job_id='gateway-setup', trial_state=setup.trial_state)
             manager.refresh()
             print(json.dumps({'trial': manager.state.get('pool_status'),
                 'models': {m: r['status'] for m, r in manager.state['models'].items()}}, ensure_ascii=False))

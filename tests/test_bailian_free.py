@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from unittest import mock
 
+from subtitle_tool.magpie_admin import MagpieAdmin
 from subtitle_tool.bailian_free import BailianFreeGuard, TRIAL_PROVIDER, provider_id
 from subtitle_tool.bailian_quota import beijing_today
 from subtitle_tool.common import Cancelled, atomic_json
@@ -44,7 +45,7 @@ class BailianFreeFixture(TemporaryTest):
         self.source.bound_to.return_value = True
         self.source.query.side_effect = lambda **kw: json.dumps(self.rows).encode()
         self.access = mock.Mock()
-        self.access.inspect.return_value = {'rpm': 60, 'tpm': 1000000, 'permission_observed': True}
+        self.access.inspect.return_value = {'rpm': 60, 'tpm': 1000000}
         self.evaluator = mock.Mock()
         self.evaluator.evaluate.side_effect = lambda model: {'roles': ['translate', 'review', 'judge'],
             'actual_models': [model.rsplit('/', 1)[-1]], 'non_thinking': True, 'duration_ms': 10, 'suite': 1}
@@ -53,10 +54,10 @@ class BailianFreeFixture(TemporaryTest):
                                      access=self.access, evaluator=self.evaluator)
         self.addCleanup(self.guard.close)
         self.commands = []
-        self.guard._command = self.command
+        self.guard.admin.command = self.command
 
-    def command(self, *args):
-        self.guard.control.check_start()
+    def command(self, *args, control=None):
+        (control or self.guard.control).check_start()
         self.commands.append(args)
         raw = json.loads(self.registry.read_bytes())
         if args[0] == 'provider':
@@ -96,6 +97,39 @@ class BailianFreeFixture(TemporaryTest):
 
 
 class BailianFreeTests(BailianFreeFixture):
+    def test_first_admission_uses_policy_judge_and_skips_same_underlying_model(self):
+        from subtitle_tool.mt_channel_policy import default_policy
+        self.rows = self.rows[:1]
+        policy = default_policy()
+        policy['judges'] = ['configured/trial-a', 'configured/independent']
+        atomic_json(self.config.data / 'mt-channels.json', policy)
+        raw = self.guard.admin.registry()
+        raw['providers'].append({'id': 'configured', 'models': ['trial-a', 'independent']})
+        atomic_json(self.registry, raw)
+        self.guard.state['admission_judge'] = 'retired/old-judge'
+        self.guard.evaluator = None
+        with mock.patch('subtitle_tool.bailian_free.ModelEvaluator', return_value=self.evaluator) as create:
+            self.guard.refresh()
+        self.assertEqual(create.call_args.kwargs['judge'], 'configured/independent')
+        self.assertEqual(self.active(), {'trial-a'})
+
+    def test_missing_independent_judge_defers_before_creating_or_querying_lane(self):
+        from subtitle_tool.mt_channel_policy import default_policy
+        self.rows = self.rows[:1]
+        policy = default_policy()
+        policy['judges'] = ['configured/trial-a', 'disabled/independent']
+        atomic_json(self.config.data / 'mt-channels.json', policy)
+        raw = self.guard.admin.registry()
+        raw['providers'] += [{'id': 'configured'}, {'id': 'disabled', 'off': True}]
+        atomic_json(self.registry, raw)
+        self.guard.evaluator = None
+        with mock.patch('subtitle_tool.bailian_free.ModelEvaluator', return_value=self.evaluator) as create:
+            self.guard.refresh()
+        create.assert_not_called()
+        self.access.inspect.assert_not_called()
+        self.assertEqual(self.commands, [])
+        self.assertFalse(self.active())
+
     def test_third_unlisted_model_replaces_exhausted_candidates(self):
         self.rows[0]['remaining'] = self.rows[1]['remaining'] = 0
         self.guard.refresh()
@@ -150,10 +184,10 @@ class BailianFreeTests(BailianFreeFixture):
         self.guard.refresh()
         self.guard.observe_route({'tries': [{'id': provider_id('trial-a'), 'model': 'trial-a',
                                             'status': 403, 'error': 'Free quota exhausted'}]})
-        template = next(p for p in self.guard._registry()['providers'] if p['id'] == TRIAL_PROVIDER)
+        template = next(p for p in self.guard.admin.registry()['providers'] if p['id'] == TRIAL_PROVIDER)
         with self.assertRaises(ToolError):
             self.guard._lane(template, 'trial-a', {})
-        lane = next(p for p in self.guard._registry()['providers'] if p['id'] == provider_id('trial-a'))
+        lane = next(p for p in self.guard.admin.registry()['providers'] if p['id'] == provider_id('trial-a'))
         self.assertTrue(lane['off'])
 
     def test_query_failure_preserves_known_candidates_and_does_not_raise(self):
@@ -189,9 +223,9 @@ class BailianFreeTests(BailianFreeFixture):
 
     def test_pause_disables_last_model_even_when_group_cannot_be_emptied(self):
         self.guard.refresh()
-        state = json.loads(self.guard.state_path.read_bytes())
+        state = json.loads(self.guard.trial_state.path.read_bytes())
         state['paused'] = True
-        atomic_json(self.guard.state_path, state)
+        atomic_json(self.guard.trial_state.path, state)
         self.guard.refresh()
         from subtitle_tool.magpie import group_models
         raw = json.loads(self.registry.read_bytes())
@@ -216,7 +250,7 @@ class BailianFreeTests(BailianFreeFixture):
         self.command('group', 'set', 'transcribe-free', 'models-=group/transcribe-trial')
         self.rows[0]['remaining'] = 0
         self.guard.refresh()
-        parent = next(g for g in self.guard._registry()['groups'] if g['id'] == 'transcribe-free')
+        parent = next(g for g in self.guard.admin.registry()['groups'] if g['id'] == 'transcribe-free')
         self.assertNotIn('group/transcribe-trial', parent['members'])
 
     def test_manual_member_removal_is_preserved_in_a_new_task(self):
@@ -228,7 +262,7 @@ class BailianFreeTests(BailianFreeFixture):
             row['remaining'] = 0
         next_task = BailianFreeGuard(self.config, self.parent, source=self.source,
                                     access=self.access, evaluator=self.evaluator, job_id='new-task')
-        next_task._command = self.command
+        next_task.admin.command = self.command
         next_task.refresh()
         self.assertNotEqual(next_task.state['models']['trial-a']['status'], 'active')
 
@@ -236,7 +270,7 @@ class BailianFreeTests(BailianFreeFixture):
         self.evaluator.evaluate.side_effect = Cancelled()
         with self.assertRaises(Cancelled):
             self.guard.refresh()
-        state = json.loads(self.guard.state_path.read_bytes())
+        state = json.loads(self.guard.trial_state.path.read_bytes())
         self.assertEqual(state['models']['trial-a']['status'], 'evaluating')
 
     def test_exhaustion_is_processed_while_new_candidate_is_being_evaluated(self):
@@ -342,8 +376,8 @@ class BailianFreeTests(BailianFreeFixture):
             children.append(child)
             started.set()
             return child
-        with mock.patch('subtitle_tool.bailian_free.subprocess.Popen', side_effect=start), ThreadPoolExecutor(1) as pool:
-            future = pool.submit(BailianFreeGuard._command, self.guard, 'provider', 'on', TRIAL_PROVIDER)
+        with mock.patch('subtitle_tool.magpie_admin.subprocess.Popen', side_effect=start), ThreadPoolExecutor(1) as pool:
+            future = pool.submit(MagpieAdmin.command, self.guard.admin, 'provider', 'on', TRIAL_PROVIDER)
             self.assertTrue(started.wait(3))
             self.parent.cancel_user()
             with self.assertRaises(Cancelled):
@@ -352,7 +386,7 @@ class BailianFreeTests(BailianFreeFixture):
 
     def test_stopped_run_never_starts_cli(self):
         self.parent.cancel_user()
-        with mock.patch('subtitle_tool.bailian_free.subprocess.Popen') as launch:
+        with mock.patch('subtitle_tool.magpie_admin.subprocess.Popen') as launch:
             with self.assertRaises(Cancelled):
-                BailianFreeGuard._command(self.guard, 'provider', 'on', TRIAL_PROVIDER)
+                MagpieAdmin.command(self.guard.admin, 'provider', 'on', TRIAL_PROVIDER)
         launch.assert_not_called()

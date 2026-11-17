@@ -30,8 +30,8 @@ class WrappingRegressionTests(unittest.TestCase):
         for language, text in cases:
             with self.subTest(language=language, text=text):
                 cue = self.cue(text, language)
-                wide = render_srt([cue], Settings()).decode('utf-8').splitlines()
-                narrow_rows = render_srt([cue], narrow).decode('utf-8').splitlines()
+                wide = render_srt([cue], Settings(), display_intervals=[cue]).decode('utf-8').splitlines()
+                narrow_rows = render_srt([cue], narrow, display_intervals=[cue]).decode('utf-8').splitlines()
                 self.assertEqual(wide[2:-1], [text])
                 self.assertGreater(len(narrow_rows), len(wide))
                 self.assertEqual(wide[1], '00:00:01,234 --> 00:00:06,234')
@@ -42,7 +42,7 @@ class WrappingRegressionTests(unittest.TestCase):
         source = wrap(cue['text'], settings.other_line_width)
         target = wrap(cue['translated'], settings.zh_line_width * 2)
         self.assertEqual((len(source), len(target)), (2, 2))
-        rows = render_srt([cue], settings).decode('utf-8').splitlines()
+        rows = render_srt([cue], settings, display_intervals=[cue]).decode('utf-8').splitlines()
         self.assertEqual(rows[2:-1], source + target)
         self.assertEqual(' '.join(source), cue['text'])
         self.assertEqual(''.join(target), cue['translated'])
@@ -70,9 +70,9 @@ class WrappingRegressionTests(unittest.TestCase):
         text = "字" * 22 + "。"
         lines = wrap(text, 44)
         self.assertEqual(lines, [text])
-        cue = {"begin_ms": 0, "end_ms": 1000, "text": text, "language": "zh", "decision": "original"}
+        cue = self.cue(text, 'zh')
         settings = Settings(zh_line_width=22, other_line_width=42)
-        self.assertIn((text + "\r\n").encode(), render_srt([cue], settings))
+        self.assertIn((text + "\r\n").encode(), render_srt([cue], settings, display_intervals=[cue]))
 
     def test_english_two_word_tail_is_balanced_without_breaking_words(self):
         text = "One two three four five six seven eight nine ten"

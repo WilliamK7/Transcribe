@@ -3,97 +3,55 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import subprocess
 import threading
 import time
 from pathlib import Path
 
 from .bailian_quota import CLIQuotaSource, ModelAccessSource, VerifiedIdentity, beijing_today, parse_observation
-from .common import Cancelled, ToolError, atomic_json
-from .mt_admission import ModelEvaluator, admission_key
+from .common import Cancelled, ToolError
+from .bailian_state import TrialState, TRIAL_PROVIDER
+from .magpie_admin import MagpieAdmin
+from .mt_admission import ModelEvaluator, admission_key, select_admission_judge
+from .mt_catalog import saved_catalog
 from .mt_identity import canonical_model
 from .mt_backend import key_fingerprint, normalize_mt_url
-from .mt_control import MTControl
+from .mt_control import BackgroundCancel, MTControl
+from .mt_channel_policy import ROLES
 
-TRIAL_PROVIDER = 'transcribe-bailian-trial'
 MANAGED_PREFIX = TRIAL_PROVIDER + '-'
-ROLES = ('translate', 'review', 'judge')
 
 
 def provider_id(model):
     return MANAGED_PREFIX + hashlib.sha256(model.encode()).hexdigest()[:12]
 
 
-class _BackgroundCancel:
-    def __init__(self, parent, stop):
-        self.parent, self.stop = parent, stop
-
-    def is_set(self):
-        return self.stop.is_set() or self.parent.stopping
-
-
 class BailianFreeGuard:
     """One worker per pipeline; never wait for cloud discovery on a stage thread."""
     def __init__(self, config, control, *, source=None, access=None, evaluator=None,
-                 job_id='', clock=time.monotonic):
+                 job_id='', clock=time.monotonic, trial_state=None):
         self.config, self.parent, self.clock, self.job_id = config, control, clock, job_id
         self.stop = threading.Event()
-        self.control = MTControl(_BackgroundCancel(control, self.stop), drain_seconds=0)
+        self.control = MTControl(BackgroundCancel(control, self.stop), drain_seconds=0)
         self.source, self.access = source or CLIQuotaSource(), access or ModelAccessSource()
         self.evaluator = evaluator
-        self.lock = threading.RLock()
+        self.trial_state = trial_state if trial_state is not None else TrialState(config)
+        self.admin = MagpieAdmin(config, self.control, job_id=job_id, lock=self.trial_state.lock)
         self.route_lock = threading.Lock()
         self.thread = None
         self.discovery = None
-        self.rows, self.allowed, self.exhausted = {}, set(), set()
+        self.rows, self.exhausted = {}, set()
         self.offsets = {}
-        self.state_path = config.data / 'bailian-trial-state.json'
-        self.state = self._load_state()
+        self.state = self.trial_state.data
         self.exhausted.update(m for m, row in self.state['models'].items()
                               if row.get('stopped_job') == job_id and row.get('status') in
                               {'quota_exhausted', 'account_credit', 'permission_denied', 'user_paused'})
         self.next_refresh = 0
         self.failures = 0
 
-    def _load_state(self):
-        if self.state_path.exists():
-            try:
-                value = json.loads(self.state_path.read_bytes())
-            except (OSError, ValueError):
-                raise ToolError('百炼试用状态无效，请检查保存记录。', 'mt_config') from None
-            if (not isinstance(value, dict) or value.get('version') != 1 or
-                    not isinstance(value.get('models'), dict) or not isinstance(value.get('evaluations'), dict) or
-                    type(value.get('paused')) is not bool or not isinstance(value.get('excluded'), list) or
-                    any(not isinstance(m, str) for m in value['excluded']) or
-                    any(not isinstance(r, dict) or not isinstance(m, str) for m, r in value['models'].items())):
-                raise ToolError('百炼试用状态无效，请检查保存记录。', 'mt_config')
-            return value
-        return {'version': 1, 'paused': False, 'excluded': [], 'models': {}, 'evaluations': {}}
-
-    def _save(self):
-        with self.lock:
-            self.control.check_start()
-            if self.state_path.exists():
-                latest = self._load_state()
-                self.state['paused'] = latest.get('paused', False)
-                self.state['excluded'] = latest.get('excluded', [])
-            atomic_json(self.state_path, self.state)
-
-    def _audit(self, reason, model='', before=None, after=None, *, actor='transcribe.trial-manager'):
-        path = self.config.root / '.build' / 'mt-diagnostics' / 'trial-management.jsonl'
-        record = {'time': time.time(), 'actor': actor, 'job_id': self.job_id,
-                  'reason': reason, 'model': model, 'before': before, 'after': after}
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open('a', encoding='utf-8') as stream:
-                stream.write(json.dumps(record, ensure_ascii=False) + '\n')
-        except OSError:
+    def _audit(self, reason, model='', before=None, after=None):
+        if not self.admin.audit(reason, model, before, after):
             self.state['audit_status'] = 'write_failed'
-
-    def _registry(self):
-        return json.loads((Path(self.config.settings.magpie_data_dir) / 'providers.json').read_bytes())
 
     def _identity(self, provider):
         record = json.loads((self.config.data / 'bailian-quota-binding.json').read_bytes())
@@ -114,34 +72,6 @@ class BailianFreeGuard:
             raise ValueError('identity')
         return proof
 
-    def _command(self, *args):
-        self.control.check_start()
-        folder = Path(self.config.settings.magpie_data_dir)
-        executable = folder.parent / 'magpie.com'
-        if folder.name != 'data' or not (folder.parent / '.portable').is_file() or not executable.is_file():
-            raise ToolError('无法管理百炼试用入口；请检查 magpie 便携目录。', 'magpie_group')
-        process = None
-        try:
-            deadline = time.monotonic() + (30 if args[:2] == ('provider', 'refresh') else 5)
-            process = subprocess.Popen([str(executable), *args], stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False, close_fds=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            while process.poll() is None:
-                self.control.check_inflight(drain=False)
-                if time.monotonic() >= deadline:
-                    raise ValueError()
-                self.stop.wait(.05)
-            if process.returncode:
-                raise ValueError()
-            self.control.check_start()
-        except (OSError, ValueError, subprocess.SubprocessError):
-            raise ToolError('无法更新百炼试用入口；商业后备仍可用。', 'magpie_group') from None
-        finally:
-            if process is not None:
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-
     def prepare(self, settings, base_url):
         from .magpie import bound_gateway
         self.parent.check_start()
@@ -153,8 +83,8 @@ class BailianFreeGuard:
                     'mt_judge_model': 'group/transcribe-judge', 'mt_judge_fallback_model': 'group/transcribe-judge-paid'}
         if any((getattr(effective, field) or expected[field]) != value for field, value in expected.items()):
             return  # Custom/remote role groups remain administrator-managed.
-        with self.lock:
-            raw = self._registry()
+        with self.admin.lock:
+            raw = self.admin.registry()
             template = next((p for p in raw['providers'] if p['id'] == TRIAL_PROVIDER), None)
             if template is None:
                 self.exhausted.update(self.state['models'])
@@ -236,7 +166,7 @@ class BailianFreeGuard:
                         continue
 
     def observe_route(self, route):
-        with self.lock:
+        with self.admin.lock:
             self._observe_route(route)
 
     def _observe_route(self, route):
@@ -258,7 +188,7 @@ class BailianFreeGuard:
                 self.remove(model, 'permission_denied')
 
     def remove(self, model, reason):
-        with self.lock:
+        with self.admin.lock:
             self._remove(model, reason)
 
     def _remove(self, model, reason):
@@ -266,34 +196,33 @@ class BailianFreeGuard:
         if not item:
             return
         member = item['provider'] + '/' + model
-        groups = self._registry().get('groups', [])
+        groups = self.admin.registry().get('groups', [])
         for group in groups:
             if group['id'].startswith('transcribe') and member in group.get('members', []):
                 if len(group['members']) > 1:
-                    self._command('group', 'set', group['id'], 'models-=' + member)
+                    self.admin.command('group', 'set', group['id'], 'models-=' + member)
         # magpie requires at least one stored member. The last disabled lane
         # may remain as a placeholder; it is never an eligible route.
-        provider = next((p for p in self._registry()['providers'] if p['id'] == item['provider']), None)
+        provider = next((p for p in self.admin.registry()['providers'] if p['id'] == item['provider']), None)
         if provider is not None and not provider.get('off'):
-            self._command('provider', 'off', item['provider'])
+            self.admin.command('provider', 'off', item['provider'])
             item['disabled_by_manager'] = True
         before = item.get('status')
         item['status'] = reason
         item['stopped_job'] = self.job_id
-        self.allowed.discard((item['provider'], model))
-        self._save()
+        self.trial_state.save(self.control)
         if before != reason:
             self._audit(reason, model, before, reason)
 
     def _lane(self, template, model, limits):
-        with self.lock:
+        with self.admin.lock:
             return self._lane_locked(template, model, limits)
 
     def _lane_locked(self, template, model, limits):
         if model in self.exhausted:
             raise ToolError('本任务已退出该试用模型。', 'mt_config')
         identity = provider_id(model)
-        providers = {p['id']: p for p in self._registry()['providers']}
+        providers = {p['id']: p for p in self.admin.registry()['providers']}
         ceiling = self.state.setdefault('aggregate_rpm', template.get('maxRPM') or 60)
         known_limits = [limits] + [item.get('limits', {}) for item in self.state['evaluations'].values()]
         for known in known_limits:
@@ -307,7 +236,7 @@ class BailianFreeGuard:
         if identity not in providers:
             # magpie deduplicates identical endpoint/key/header providers.
             # This non-secret model tag gives each lane its own cooldown key.
-            self._command('provider', 'add', identity, 'id=' + identity, 'chat=' + template['chat'],
+            self.admin.command('provider', 'add', identity, 'id=' + identity, 'chat=' + template['chat'],
                           'key=' + template['key'], 'models=' + model, 'free=yes', 'list=off',
                           'header.X-Transcribe-Trial-Model=' + model)
             self._audit('provider_created', model, None, identity)
@@ -317,7 +246,7 @@ class BailianFreeGuard:
             if lane.get('off') and not owned_off or lane.get('key') != template['key'] or lane.get('chat') != template['chat']:
                 raise ToolError('试用模型入口已被人工修改。', 'mt_config')
             if lane.get('off') and owned_off:
-                self._command('provider', 'on', identity)
+                self.admin.command('provider', 'on', identity)
                 self.state['models'][model]['disabled_by_manager'] = False
         # Four shares: the existing commercial lane plus at most three trial
         # lanes (including the one under evaluation). Never clone the budget.
@@ -330,25 +259,25 @@ class BailianFreeGuard:
             rpm = min(rpm, providers[identity]['maxRPM'])
         for lane in providers.values():
             if lane['id'].startswith(MANAGED_PREFIX) and lane.get('maxRPM', 0) > ceiling // 4:
-                self._command('provider', 'rpm', lane['id'], str(ceiling // 4))
+                self.admin.command('provider', 'rpm', lane['id'], str(ceiling // 4))
         commercial = providers.get('transcribe-bailian')
         if commercial and commercial.get('chat') == template['chat'] and commercial.get('key') == template['key']:
             previous = commercial.get('maxRPM') or ceiling
             share = min(previous, max(1, ceiling // 4))
             if previous != share:
-                self._command('provider', 'rpm', commercial['id'], str(share))
+                self.admin.command('provider', 'rpm', commercial['id'], str(share))
                 self._audit('shared_budget', '', previous, share)
-        self._command('provider', 'rpm', identity, str(rpm))
+        self.admin.command('provider', 'rpm', identity, str(rpm))
         return identity
 
     def _join(self, model, item):
-        with self.lock:
+        with self.admin.lock:
             if model in self.exhausted:
                 return
             self._join_locked(model, item)
 
     def _join_locked(self, model, item):
-        latest = self._load_state()
+        latest = self.trial_state.read()
         if latest['paused'] or model in latest['excluded']:
             self.remove(model, 'user_paused')
             return
@@ -362,7 +291,7 @@ class BailianFreeGuard:
             self.remove(model, 'user_paused')
             return
         member = item['provider'] + '/' + model
-        groups = {g['id']: g for g in self._registry().get('groups', [])}
+        groups = {g['id']: g for g in self.admin.registry().get('groups', [])}
         for parent, child in edges:
             group = groups.get(parent, {})
             if group.get('hidden') or child in group.get('off', []):
@@ -384,26 +313,25 @@ class BailianFreeGuard:
             if any(owner + '/' + name in conflicts for owner, name, _ in leaves):
                 before = item.get('status')
                 item['status'] = 'role_conflict'
-                self.allowed.discard((item['provider'], model))
-                self._save()
+                self.trial_state.save(self.control)
                 if before != 'role_conflict':
                     self._audit('role_conflict', model, before, 'role_conflict')
                 return
         if trial_group not in groups:
-            self._command('group', 'add', trial_group, 'models=' + member, 'routing=order', 'stays=off')
+            self.admin.command('group', 'add', trial_group, 'models=' + member, 'routing=order', 'stays=off')
         elif member not in groups[trial_group].get('members', []):
-            self._command('group', 'set', trial_group, 'models+=' + member)
+            self.admin.command('group', 'set', trial_group, 'models+=' + member)
         trial = 'group/' + trial_group
         if free_group not in groups:
-            self._command('group', 'add', free_group, 'models=' + trial, 'routing=weight', 'stays=off')
+            self.admin.command('group', 'add', free_group, 'models=' + trial, 'routing=weight', 'stays=off')
         elif trial not in groups[free_group].get('members', []):
-            self._command('group', 'set', free_group, 'models+=' + trial)
+            self.admin.command('group', 'set', free_group, 'models+=' + trial)
         paid = 'group/' + main + '-paid'
         if main in groups and 'group/' + free_group not in groups[main].get('members', []):
             # Incremental mutation in one CLI transaction moves only our
             # commercial fallback behind the newly available free subgroup.
             changes = (['models-=' + paid] if paid in groups[main].get('members', []) else [])
-            self._command('group', 'set', main, *changes, 'models+=group/' + free_group + ',' + paid)
+            self.admin.command('group', 'set', main, *changes, 'models+=group/' + free_group + ',' + paid)
         before = item.get('status')
         item['status'] = 'active'
         item['joined'] = True
@@ -413,23 +341,22 @@ class BailianFreeGuard:
                 edge = parent + ':' + child
                 if edge not in owned_edges:
                     owned_edges.append(edge)
-        self.allowed.add((item['provider'], model))
-        self._save()
+        self.trial_state.save(self.control)
         if before != 'active':
             self._audit('model_admitted', model, before, 'active')
 
     def refresh(self):
         self.control.check_start()
         self.next_refresh = self.clock() + 60
-        fresh = self._load_state()
+        fresh = self.trial_state.read()
         self.state['paused'], self.state['excluded'] = fresh.get('paused', False), fresh.get('excluded', [])
         if self.state['paused']:
             for model in list(self.state['models']):
                 self.remove(model, 'user_paused')
             self.state['pool_status'] = 'user_paused'
-            self._save()
+            self.trial_state.save(self.control)
             return
-        raw = self._registry()
+        raw = self.admin.registry()
         groups = {g['id']: g for g in raw.get('groups', [])}
         exclusions = set(self.state.get('excluded_groups', []))
         owned_edges = self.state.setdefault('owned_edges', [])
@@ -474,7 +401,7 @@ class BailianFreeGuard:
             raise
         except Exception:
             self.state['quota_status'] = 'unknown'
-            self._save()
+            self.trial_state.save(self.control)
             self.failures += 1
             self.next_refresh = self.clock() + min(300, 60 * 2 ** min(self.failures, 3))
             self._audit('quota_unknown')
@@ -521,24 +448,33 @@ class BailianFreeGuard:
                 evaluation = None
             if evaluation is None:
                 self.state['pool_status'] = 'replenishing'
-                self._save()
+                self.trial_state.save(self.control)
+                evaluator = self.evaluator
+                if evaluator is None:
+                    catalog = saved_catalog(self.config) or {}
+                    try:
+                        judge = select_admission_judge(self.config, provider_id(model) + '/' + model,
+                            catalog, preferred=self.state.get('admission_judge'))
+                    except (ToolError, ValueError):
+                        self._audit('no_independent_judge', model)
+                        continue
+                    evaluator = ModelEvaluator(self.config, self.control, judge=judge,
+                                               identities=catalog.get('identities', {}))
                 try:
                     limits = self.access.inspect(self.config, model, self.control)
                     identity = self._lane(template, model, limits)
                 except Cancelled:
                     raise
                 except Exception:
-                    self._audit('permission_or_limits_unknown', model)
+                    self._audit('limits_unknown', model)
                     continue
                 item = self.state['models'].setdefault(model, {'provider': identity, 'role': 'translate'})
                 item['status'] = 'evaluating'
-                self._save()
-                evaluator = self.evaluator or ModelEvaluator(self.config, self.control,
-                    judge=self.state.get('admission_judge', 'transcribe-qiniu-paid/z-ai/glm-5.3-flash'))
+                self.trial_state.save(self.control)
                 evaluation = evaluator.evaluate(identity + '/' + model)
                 evaluation['limits'] = limits
                 self.state['evaluations'][key] = evaluation
-                self._save()
+                self.trial_state.save(self.control)
                 self._audit('evaluation_finished', model, None, evaluation['roles'])
             if model in self.exhausted or self.state.get('paused') or model in self.state['excluded']:
                 continue
@@ -548,7 +484,7 @@ class BailianFreeGuard:
                 continue
             # Gateway maintenance uses this same lock when assigning roles.
             # Never publish an admission using reservations read before its switch.
-            with self.lock:
+            with self.admin.lock:
                 reserved = self.state.get('reserved_models', {})
                 actual = evaluation.get('actual_models') or [canonical_model(model)]
                 forced = {reserved[m] for m in actual if m in reserved}
@@ -574,11 +510,11 @@ class BailianFreeGuard:
                     active.append(model)
         self.state['pool_status'] = 'ready' if active else 'no_candidates'
         self._rank_active(template, active)
-        self._save()
+        self.trial_state.save(self.control)
 
     def _rank_active(self, template, active):
         """Order qualified lanes within each supplier without touching manual members."""
-        with self.lock:
+        with self.admin.lock:
             for role in ROLES:
                 names = [m for m in active if self.state['models'][m]['role'] == role and m not in self.exhausted]
                 def rank(model):
@@ -591,8 +527,8 @@ class BailianFreeGuard:
                 if len(desired) < 2:
                     continue
                 name = 'transcribe-trial' + ('' if role == 'translate' else '-' + role)
-                group = next((g for g in self._registry().get('groups', []) if g['id'] == name), {})
+                group = next((g for g in self.admin.registry().get('groups', []) if g['id'] == name), {})
                 current = [m for m in group.get('members', []) if m in desired and m not in group.get('off', [])]
                 if set(current) == set(desired) and current != desired and not group.get('hidden'):
-                    self._command('group', 'set', name, 'models-=' + ','.join(current), 'models+=' + ','.join(desired))
+                    self.admin.command('group', 'set', name, 'models-=' + ','.join(current), 'models+=' + ','.join(desired))
                     self._audit('candidate_order', name, current, desired)
