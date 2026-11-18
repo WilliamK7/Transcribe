@@ -23,7 +23,7 @@ from .lifecycle import INACTIVE, recovery_target, unknown_submission
 from .review import decision_origin
 from .policy import asr_contract, load_policy, subtitle_contract, validate_raw_contract
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
-                            validate_normalized, validate_segments)
+                            segment_recovery_action, validate_normalized, validate_segments)
 from .publication import inspect_intent, prepare_intent, write_srt
 from .subtitles import make_fragment, normalize, plan_display_timing, render_srt
 
@@ -413,6 +413,184 @@ class Engine:
         if len(rebuilt) != len(segments) or not matches or not plan_matches:
             raise ToolError("恢复提取的编码、分段或时间轴与原记录不同，不能改变已有识别输入。", "cache_mismatch")
 
+    def _prepare_recognition(self, job_id, manifest, cache, source, output, settings, stage, client):
+        segments = manifest['segments']
+        needs_media = not segments
+        if self.store.sources(job_id) or self.store.cues(job_id):
+            raise mismatch()
+        if segments:
+            validate_segments(manifest)
+        for segment in segments:
+            action = segment_recovery_action(segment, raw_available=saved_raw_path(cache, segment).is_file())
+            if action == 'read_raw':
+                normalize_raw(cache, manifest, segment)
+            elif action == 'confirm_submission':
+                raise SubmissionUnknown()
+            elif action == 'submit_audio':
+                needs_media = True
+        self.prepare_output(output)
+        media = Media(self.config.root, self.cancel)
+        if not needs_media:
+            self.verify_source_output(job_id, manifest, output)
+        else:
+            stage("probing")
+            if not source.is_file():
+                raise ToolError("源文件已移动或删除；仍需提交识别，必须恢复原媒体。", "input")
+            current = fingerprint(source, self.cancel)
+            if manifest.get("fingerprint") and manifest["fingerprint"] != current:
+                raise ToolError("源文件内容或时间发生变化；仍需识别的任务不能改变原输入。", "source_changed")
+            manifest["fingerprint"] = current
+            if not manifest.get("media"):
+                manifest["media"] = media.probe(source)
+            track, audio_offset = media.select(manifest["media"], manifest.get("track"),
+                                               manifest.get("channel", settings.channel))
+            manifest["track"], manifest["audio_offset_ms"] = track, audio_offset
+            if manifest.get("media_plan"):
+                manifest["audio_offset_ms"] = manifest["media_plan"]["audio_offset_ms"]
+            manifest.setdefault("channel", settings.channel)
+        self.store.update(job_id, manifest=manifest)
+        if not manifest["segments"]:
+            stage("uploading")
+            policy = client().policy()
+            limit = upload_limit(policy)
+            manifest["upload_limit_bytes"] = limit
+            stage("extracting")
+            plan, manifest["segments"] = self.prepare_audio(media, source, cache, manifest, limit)
+            if plan:
+                manifest["media_plan"] = plan
+                manifest["audio_offset_ms"] = plan["audio_offset_ms"]
+            self.store.update(job_id, manifest=manifest)
+        validate_segments(manifest)
+        if manifest.get("media_plan"):
+            self.progress(job_id, "audio_ready", {**manifest["media_plan"],
+                          "segments": len(manifest["segments"]),
+                          "bytes": sum(s.get("bytes", 0) for s in manifest["segments"])}, None)
+        return media
+
+    def _submit_segment(self, job_id, manifest, segment, oss_url, cloud, stage):
+        # Construct/check client BEFORE the durable marker; only POST uncertainty should mark it.
+        segment["submitting"] = True
+        stage("submitting")
+        try:
+            task_id, request_id = cloud.submit(oss_url)
+        except (SubmissionUnknown, Cancelled):
+            raise
+        except ToolError:
+            # An explicit 4xx rejection is known not to have created the task.
+            segment["submitting"] = False
+            self.store.update(job_id, manifest=manifest)
+            raise
+        segment["task_id"] = task_id
+        segment["submitted_at"] = time.time()
+        segment["submitting"] = False
+        self.store.update(job_id, "recognizing", manifest, request_id=request_id)
+
+    def _poll_segment(self, job_id, manifest, segment, raw_path, client, settings, stage):
+        stage("recognizing")
+        deadline = time.monotonic() + settings.poll_timeout_seconds
+        while True:
+            check_cancel(self.cancel)
+            result = client().query(segment["task_id"])
+            cloud_output = result.get("output")
+            if not isinstance(cloud_output, dict):
+                raise ToolError("查询缺少合法的 output 对象；已保存 task_id。", "response_schema")
+            status = cloud_output.get("task_status")
+            segment["cloud_status"] = status
+            self.store.update(job_id, manifest=manifest)
+            self.progress(job_id, "recognizing", status, None)
+            if status == "SUCCEEDED":
+                cloud_result = cloud_output.get("result")
+                url = cloud_result.get("transcription_url") if isinstance(cloud_result, dict) else None
+                if not isinstance(url, str) or not url:
+                    raise ToolError("任务成功但缺少 output.result.transcription_url。", "response_schema", result.get("request_id", ""))
+                stage("downloading_result")
+                raw = client().download(url)
+                # The exact response is preserved; signed result URLs are never persisted.
+                atomic_json(raw_path, raw)
+                segment["raw"] = raw_path.name
+                self.store.update(job_id, manifest=manifest)
+                break
+            if status in {"FAILED", "CANCELED", "CANCELLED", "UNKNOWN"}:
+                code = result.get("output", {}).get("code", "asr_" + status.lower())
+                raise ToolError(f"云端识别 {status}（{code}）。如结果已过期，请新建任务；不会自动重新计费。",
+                                code, result.get("request_id", ""))
+            if status not in {"PENDING", "RUNNING"}:
+                raise ToolError("查询返回未知状态；已保存 task_id，可重试查询。", "response_schema")
+            if time.monotonic() >= deadline:
+                raise ToolError("本地轮询超时；已保存 task_id，重试时只查询原任务。", "poll_timeout")
+            if self.cancel.wait(settings.poll_seconds):
+                check_cancel(self.cancel)
+
+    def _recognize_segments(self, job_id, manifest, cache, source, media, settings, scope, stage, client):
+        position, replans = 0, 0
+        while position < len(manifest["segments"]):
+            segment = manifest["segments"][position]
+            check_cancel(self.cancel)
+            if segment.get("upload_identity") and segment["upload_identity"] != scope:
+                raise ToolError("分段的上传／识别身份与任务记录不一致。", "cache_mismatch")
+            raw_path = saved_raw_path(cache, segment)
+            action = segment_recovery_action(segment, raw_available=raw_path.is_file())
+            if action == 'read_raw':
+                position += 1
+                continue
+            if action == 'confirm_submission':
+                raise SubmissionUnknown()
+            if action == 'submit_audio':
+                audio = cache / segment["audio"]
+                oss_url = None
+                if segment.get("upload_expires", 0) > time.time() + 60:
+                    oss_url = segment.get("oss_url")
+                if oss_url and (not isinstance(oss_url, str) or not oss_url.startswith("oss://") or any(c.isspace() for c in oss_url)):
+                    raise ToolError("缓存上传引用格式无效。", "cache_mismatch")
+                if not oss_url:
+                    if (not audio.exists() or (segment.get("sha256") and
+                            media.audio_identity(audio) != {"bytes": segment["bytes"], "sha256": segment["sha256"]})):
+                        stage("extracting")
+                        self.rebuild_audio(media, source, cache, manifest)
+                    stage("uploading")
+                    try:
+                        oss_url = client().upload(audio)
+                    except ToolError as error:
+                        committed = (any(s.get("task_id") or s.get("submitting") or s.get("raw") for s in manifest["segments"])
+                                     or any(cache.glob("raw-*.json")))
+                        if error.code != "upload_size" or committed or replans >= 2:
+                            raise
+                        replans += 1
+                        manifest["upload_limit_bytes"] = error.limit
+                        stage("extracting")
+                        self.cleanup_audio(cache)
+                        plan, manifest["segments"] = self.prepare_audio(media, source, cache, manifest, error.limit, "flac")
+                        if plan:
+                            manifest["media_plan"] = plan
+                            manifest["audio_offset_ms"] = plan["audio_offset_ms"]
+                        self.store.update(job_id, manifest=manifest)
+                        position = 0
+                        continue
+                    segment["oss_url"] = oss_url
+                    segment["upload_identity"] = scope
+                    segment["upload_expires"] = time.time() + 48 * 3600
+                    self.store.update(job_id, manifest=manifest)
+                self._submit_segment(job_id, manifest, segment, oss_url, client(), stage)
+            self._poll_segment(job_id, manifest, segment, raw_path, client, settings, stage)
+            position += 1
+
+    def _save_source_sentences(self, job_id, manifest, cache, stage):
+        stage("segmenting")
+        candidate = copy.deepcopy(manifest)
+        source_sentences = []
+        audio_offset = segment_offset(manifest)
+        for segment in manifest["segments"]:
+            raw = json.loads(saved_raw_path(cache, segment).read_text(encoding="utf-8"))
+            items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
+                                        duration_ms=segment.get("duration_ms"))
+            source_sentences.extend(items)
+            candidate["warnings"].extend(warnings)
+        source_sentences.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
+        candidate.update(normalized=True, normalized_count=len(source_sentences),
+                         normalized_version=NORMALIZER_VERSION)
+        cues = [make_fragment(sentence) for sentence in source_sentences]
+        self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, source_sentences, cues)
+
     def run(self, job_id):
         self.mt_control.begin()
         self.run_id = uuid.uuid4().hex
@@ -506,170 +684,9 @@ class Engine:
                 self.verify_source_output(job_id, manifest, output)
                 self.prepare_output(output)
                 return self.finish_subtitles(job_id, manifest, settings, scope, stage, output, cache)
-            saved_asr = False
-            if self.store.sources(job_id) or self.store.cues(job_id):
-                raise mismatch()
-            if manifest["segments"]:
-                validate_segments(manifest)
-                saved_asr = all(saved_raw_path(cache, s).is_file() or s.get("task_id") for s in manifest["segments"])
-                # Validate already saved raw before any missing known task is queried.
-                for segment in manifest["segments"]:
-                    if saved_raw_path(cache, segment).is_file():
-                        normalize_raw(cache, manifest, segment)
-                    elif segment.get("raw") and not segment.get("task_id"):
-                        raise mismatch()
-            self.prepare_output(output)
-            media = Media(self.config.root, self.cancel)
-            if saved_asr:
-                audio_offset = segment_offset(manifest)
-                self.verify_source_output(job_id, manifest, output)
-            else:
-                stage("probing")
-                if not source.is_file():
-                    raise ToolError("源文件已移动或删除；仍需提交识别，必须恢复原媒体。", "input")
-                current = fingerprint(source, self.cancel)
-                if manifest.get("fingerprint") and manifest["fingerprint"] != current:
-                    raise ToolError("源文件内容或时间发生变化；仍需识别的任务不能改变原输入。", "source_changed")
-                manifest["fingerprint"] = current
-                if not manifest.get("media"):
-                    manifest["media"] = media.probe(source)
-                track, audio_offset = media.select(manifest["media"], manifest.get("track"),
-                                                   manifest.get("channel", settings.channel))
-                manifest["track"], manifest["audio_offset_ms"] = track, audio_offset
-                if manifest.get("media_plan"):
-                    manifest["audio_offset_ms"] = manifest["media_plan"]["audio_offset_ms"]
-                manifest.setdefault("channel", settings.channel)
-            self.store.update(job_id, manifest=manifest)
-            if not manifest["segments"]:
-                stage("uploading")
-                policy = client().policy()
-                limit = upload_limit(policy)
-                manifest["upload_limit_bytes"] = limit
-                stage("extracting")
-                plan, manifest["segments"] = self.prepare_audio(media, source, cache, manifest, limit)
-                if plan:
-                    manifest["media_plan"] = plan
-                    manifest["audio_offset_ms"] = audio_offset = plan["audio_offset_ms"]
-                self.store.update(job_id, manifest=manifest)
-            validate_segments(manifest)
-            if manifest.get("media_plan"):
-                audio_offset = manifest["media_plan"]["audio_offset_ms"]
-                self.progress(job_id, "audio_ready", {**manifest["media_plan"],
-                              "segments": len(manifest["segments"]),
-                              "bytes": sum(s.get("bytes", 0) for s in manifest["segments"])}, None)
-            position, replans = 0, 0
-            while position < len(manifest["segments"]):
-                segment = manifest["segments"][position]
-                check_cancel(self.cancel)
-                if segment.get("upload_identity") and segment["upload_identity"] != scope:
-                    raise ToolError("分段的上传／识别身份与任务记录不一致。", "cache_mismatch")
-                raw_path = cache / ("raw-" + segment["id"] + ".json")
-                if raw_path.exists():
-                    position += 1
-                    continue
-                if segment.get("submitting") and not segment.get("task_id"):
-                    raise SubmissionUnknown()
-                if not segment.get("task_id"):
-                    audio = cache / segment["audio"]
-                    oss_url = None
-                    if segment.get("upload_expires", 0) > time.time() + 60:
-                        oss_url = segment.get("oss_url")
-                    if oss_url and (not isinstance(oss_url, str) or not oss_url.startswith("oss://") or any(c.isspace() for c in oss_url)):
-                        raise ToolError("缓存上传引用格式无效。", "cache_mismatch")
-                    if not oss_url:
-                        if (not audio.exists() or (segment.get("sha256") and
-                                media.audio_identity(audio) != {"bytes": segment["bytes"], "sha256": segment["sha256"]})):
-                            stage("extracting")
-                            self.rebuild_audio(media, source, cache, manifest)
-                        stage("uploading")
-                        try:
-                            oss_url = client().upload(audio)
-                        except ToolError as error:
-                            committed = (any(s.get("task_id") or s.get("submitting") or s.get("raw") for s in manifest["segments"])
-                                         or any(cache.glob("raw-*.json")))
-                            if error.code != "upload_size" or committed or replans >= 2:
-                                raise
-                            replans += 1
-                            manifest["upload_limit_bytes"] = error.limit
-                            stage("extracting")
-                            self.cleanup_audio(cache)
-                            plan, manifest["segments"] = self.prepare_audio(media, source, cache, manifest, error.limit, "flac")
-                            if plan:
-                                manifest["media_plan"] = plan
-                                manifest["audio_offset_ms"] = audio_offset = plan["audio_offset_ms"]
-                            self.store.update(job_id, manifest=manifest)
-                            position = 0
-                            continue
-                        segment["oss_url"] = oss_url
-                        segment["upload_identity"] = scope
-                        segment["upload_expires"] = time.time() + 48 * 3600
-                        self.store.update(job_id, manifest=manifest)
-                    # Construct/check client BEFORE the durable marker; only POST uncertainty should mark it.
-                    cloud = client()
-                    segment["submitting"] = True
-                    stage("submitting")
-                    try:
-                        task_id, request_id = cloud.submit(oss_url)
-                    except (SubmissionUnknown, Cancelled):
-                        raise
-                    except ToolError:
-                        # An explicit 4xx rejection is known not to have created the task.
-                        segment["submitting"] = False
-                        self.store.update(job_id, manifest=manifest)
-                        raise
-                    segment["task_id"] = task_id
-                    segment["submitted_at"] = time.time()
-                    segment["submitting"] = False
-                    self.store.update(job_id, "recognizing", manifest, request_id=request_id)
-                stage("recognizing")
-                deadline = time.monotonic() + settings.poll_timeout_seconds
-                while True:
-                    check_cancel(self.cancel)
-                    result = client().query(segment["task_id"])
-                    cloud_output = result.get("output")
-                    if not isinstance(cloud_output, dict):
-                        raise ToolError("查询缺少合法的 output 对象；已保存 task_id。", "response_schema")
-                    status = cloud_output.get("task_status")
-                    segment["cloud_status"] = status
-                    self.store.update(job_id, manifest=manifest)
-                    self.progress(job_id, "recognizing", status, None)
-                    if status == "SUCCEEDED":
-                        cloud_result = cloud_output.get("result")
-                        url = cloud_result.get("transcription_url") if isinstance(cloud_result, dict) else None
-                        if not isinstance(url, str) or not url:
-                            raise ToolError("任务成功但缺少 output.result.transcription_url。", "response_schema", result.get("request_id", ""))
-                        stage("downloading_result")
-                        raw = client().download(url)
-                        # The exact response is preserved; signed result URLs are never persisted.
-                        atomic_json(raw_path, raw)
-                        segment["raw"] = raw_path.name
-                        self.store.update(job_id, manifest=manifest)
-                        break
-                    if status in {"FAILED", "CANCELED", "CANCELLED", "UNKNOWN"}:
-                        code = result.get("output", {}).get("code", "asr_" + status.lower())
-                        raise ToolError(f"云端识别 {status}（{code}）。如结果已过期，请新建任务；不会自动重新计费。",
-                                        code, result.get("request_id", ""))
-                    if status not in {"PENDING", "RUNNING"}:
-                        raise ToolError("查询返回未知状态；已保存 task_id，可重试查询。", "response_schema")
-                    if time.monotonic() >= deadline:
-                        raise ToolError("本地轮询超时；已保存 task_id，重试时只查询原任务。", "poll_timeout")
-                    if self.cancel.wait(settings.poll_seconds):
-                        check_cancel(self.cancel)
-                position += 1
-            stage("segmenting")
-            candidate = copy.deepcopy(manifest)
-            cues = []
-            for segment in manifest["segments"]:
-                raw = json.loads((cache / ("raw-" + segment["id"] + ".json")).read_text(encoding="utf-8"))
-                items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
-                                            duration_ms=segment.get("duration_ms"))
-                cues.extend(items)
-                candidate["warnings"].extend(warnings)
-            cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
-            candidate.update(normalized=True, normalized_count=len(cues),
-                             normalized_version=NORMALIZER_VERSION)
-            sources, fragments = cues, [make_fragment(s) for s in cues]
-            self.commit_local(job_id, manifest, candidate, self.store.initialize_subtitles, sources, fragments)
+            media = self._prepare_recognition(job_id, manifest, cache, source, output, settings, stage, client)
+            self._recognize_segments(job_id, manifest, cache, source, media, settings, scope, stage, client)
+            self._save_source_sentences(job_id, manifest, cache, stage)
             return self.finish_subtitles(job_id, manifest, settings, scope, stage, output, cache)
         except LocalStateUnavailable:
             # Never let a generic handler persist an unconfirmed in-memory state.

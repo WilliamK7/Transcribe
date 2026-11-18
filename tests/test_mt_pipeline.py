@@ -38,15 +38,6 @@ class PoolPipelineTests(PoolPipelineFixture):
                 entry['capabilities']['input_bytes'] = size
         self.store.update(self.job_id, manifest=manifest)
 
-    def test_unchanged_stage_reads_each_cache_miss_once(self):
-        self.install()
-        with mock.patch.object(self.store, 'cache_get', wraps=self.store.cache_get) as lookup:
-            self.assertEqual(self.run_pool(), 'completed')
-        keys = [call.args[0] for call in lookup.call_args_list]
-        self.assertEqual(len(self.calls), 3)
-        self.assertEqual(len(set(keys)), 6)
-        self.assertEqual(len(keys), 6)
-
     def test_cli_sigint_saves_inflight_draft_and_starts_no_later_stage(self):
         import _thread
         from subtitle_tool.main import main
@@ -74,7 +65,7 @@ class PoolPipelineTests(PoolPipelineFixture):
 
     def test_trimmed_input_can_still_reuse_its_exact_persistent_cache(self):
         from subtitle_tool.mt_pipeline import Pipeline
-        from subtitle_tool.mt_quality import stage_cache_key
+        from subtitle_tool.mt_quality import request_cache_key
         self.install()
         self.set_input_budget('magpie', 3000)
         manifest = self.store.job(self.job_id)['manifest']
@@ -83,7 +74,7 @@ class PoolPipelineTests(PoolPipelineFixture):
         pipeline = Pipeline(engine, self.job_id, manifest, scope)
         data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Cache.'}]]}
         entry = pipeline.router_for('translate').entries[0]
-        key = stage_cache_key('translate', data, entry.backend,
+        key = request_cache_key('translate', data, entry.backend,
                               capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.cache_scope)
         record = {'value': {'translations': {'0': '缓存。'}}, 'actual_model': 'synthetic',
                   'resolved_model': 'synthetic', 'usage': None}
@@ -326,7 +317,7 @@ class PoolPipelineTests(PoolPipelineFixture):
 
     def test_saved_only_stage_reuses_exact_cache_without_validation_or_network(self):
         from subtitle_tool.mt_pipeline import Pipeline
-        from subtitle_tool.mt_quality import stage_cache_key
+        from subtitle_tool.mt_quality import request_cache_key
         self.install()
         engine = Engine(self.config, self.store)
         manifest = self.store.job(self.job_id)['manifest']
@@ -336,7 +327,7 @@ class PoolPipelineTests(PoolPipelineFixture):
                 'fragments': [{'id': '0', 'sentence': '0', 'text': 'Cache.'}], 'glossary': [],
                 'translations': {'0': '缓存'}, 'issues': [{'id': '0', 'category': 'meaning', 'evidence': '待复核'}]}
         candidate = pipeline.router_for('judge').entries[0]
-        key = stage_cache_key('judge', data, candidate.backend,
+        key = request_cache_key('judge', data, candidate.backend,
                               capabilities=pipeline.profiles[candidate.id]['capabilities'], scope=pipeline.cache_scope)
         with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected HTTP')), \
                 mock.patch.object(pipeline, '_validate_gateway', side_effect=AssertionError('Unexpected gateway validation')):

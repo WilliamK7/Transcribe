@@ -23,7 +23,7 @@ ALIGNMENT_VERSION = 5
 _EN_BOUND_PREFIXES = frozenset('a an the my your its our their of to with from for by into on at and or'.split())
 
 
-def route(text: str, language: str, neighbors=()) -> tuple[str, str]:
+def decide_translation(text: str, language: str, neighbors=()) -> tuple[str, str]:
     """Conservative local rules. No Latin=>English default; uncertainty requires explicit review."""
     language = (language or "").lower().strip()
     chinese = len(ZH.findall(text))
@@ -252,7 +252,7 @@ def _segment_end_clip(sentence, index, duration_ms):
 def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -> tuple[list[dict], list[str]]:
     if not isinstance(raw, dict) or not isinstance(raw.get("transcripts"), list):
         raise ToolError("Qwen3 结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
-    cues, warnings = [], []
+    source_sentences, warnings = [], []
     sentences = []
     for transcript in raw["transcripts"]:
         if not isinstance(transcript, dict):
@@ -293,7 +293,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
         if not text:
             warnings.append(f"分段 {segment_id} 第 {index + 1} 句为空，未生成字幕")
             continue
-        decision, reason = route(text, sentence.get("language", ""), languages[max(0, index - 2):index] + languages[last_index + 1:last_index + 3])
+        decision, reason = decide_translation(text, sentence.get("language", ""), languages[max(0, index - 2):index] + languages[last_index + 1:last_index + 3])
         start, stop = sentence["begin_time"] + offset_ms, sentence["end_time"] + offset_ms
         if stop <= 0:
             warnings.append(f"第 {index + 1} 句在播放器时间零点之前，保留原始结果并跳过负时间字幕")
@@ -304,7 +304,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
         if start < 0:
             words, status = [], "clipped_timeline"
         sentence_id = f"{segment_id}:{index:08}"
-        cue = {"cue_id": fragment_id(sentence_id, 0, len(words), 0, len(text)),
+        source_sentence = {"cue_id": fragment_id(sentence_id, 0, len(words), 0, len(text)),
                "sentence_id": sentence_id, "begin_ms": max(0, start), "end_ms": stop,
                "text": text, "language": sentence.get("language", ""), "decision": decision, "reason": reason,
                "decision_origin": "automatic", "asr_sentence_indices": sentence["_indices"],
@@ -315,15 +315,15 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
                                      "end_ms": sentences[i]["end_time"] + offset_ms}
                                     for i in sentence["_indices"]]}
         if sentence["_adjustments"]:
-            cue["timing_adjustments"] = sentence["_adjustments"]
-        cues.append(cue)
-    cues.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
-    for previous, current in zip(cues, cues[1:]):
+            source_sentence["timing_adjustments"] = sentence["_adjustments"]
+        source_sentences.append(source_sentence)
+    source_sentences.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
+    for previous, current in zip(source_sentences, source_sentences[1:]):
         if current["begin_ms"] < previous["end_ms"]:
             warnings.append("识别时间存在重叠；保留原始时间依据，最终显示区间按任务策略处理")
         if current["text"] == previous["text"]:
             warnings.append("相邻句文本相同；保留并提示复核，避免误删重复讲话")
-    return cues, warnings
+    return source_sentences, warnings
 
 
 def timestamp(ms):
@@ -486,24 +486,24 @@ def fragment_id(sentence_id, word_start, word_end, char_start, char_end):
     return sentence_id + ":" + suffix
 
 
-def make_fragment(source, lo=0, hi=None, *, layout_round=0):
-    words = source.get("words", [])
+def make_fragment(source_sentence, lo=0, hi=None, *, layout_round=0):
+    words = source_sentence.get("words", [])
     hi = len(words) if hi is None else hi
     full = lo == 0 and hi == len(words)
     char_start = 0 if full else words[lo]["char_start"]
-    char_end = len(source["text"]) if full else words[hi - 1]["char_end"]
+    char_end = len(source_sentence["text"]) if full else words[hi - 1]["char_end"]
     # Whole sentences retain sentence timing. New pieces use only actual word endpoints.
-    begin = source["begin_ms"] if full else words[lo]["begin_ms"]
-    end = source["end_ms"] if full else words[hi - 1]["end_ms"]
-    cue = {k: source[k] for k in ("sentence_id", "language", "decision", "reason")}
-    cue["decision_origin"] = decision_origin(source)
-    cue.update(cue_id=fragment_id(source["sentence_id"], lo, hi, char_start, char_end),
-               begin_ms=begin, end_ms=end, text=source["text"][char_start:char_end].strip(),
-               source_lang=source.get("source_lang", "auto"), translated="",
+    begin = source_sentence["begin_ms"] if full else words[lo]["begin_ms"]
+    end = source_sentence["end_ms"] if full else words[hi - 1]["end_ms"]
+    cue = {k: source_sentence[k] for k in ("sentence_id", "language", "decision", "reason")}
+    cue["decision_origin"] = decision_origin(source_sentence)
+    cue.update(cue_id=fragment_id(source_sentence["sentence_id"], lo, hi, char_start, char_end),
+               begin_ms=begin, end_ms=end, text=source_sentence["text"][char_start:char_end].strip(),
+               source_lang=source_sentence.get("source_lang", "auto"), translated="",
                char_start=char_start, char_end=char_end, word_start=lo, word_end=hi, layout_round=layout_round)
     for name in ["asr_sentence_indices", "timing_adjustments"]:
-        if name in source:
-            cue[name] = source[name]
+        if name in source_sentence:
+            cue[name] = source_sentence[name]
     return cue
 
 
@@ -606,21 +606,21 @@ def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, 
     return [make_fragment(source, lo, hi, layout_round=layout_round) for lo, hi in sorted(ranges)]
 
 
-def split_mt_units(source, units, *, fits, alignment_version=ALIGNMENT_VERSION):
+def split_cues_for_translation(source, cues, *, fits, alignment_version=ALIGNMENT_VERSION):
     result, break_index = [], None
-    stack = list(reversed(units))
+    stack = list(reversed(cues))
     while stack:
-        unit = stack.pop()
-        if not fits(unit):
+        cue = stack.pop()
+        if not fits(cue):
             if break_index is None:
                 break_index = _WordBreakIndex(source, alignment_version=alignment_version)
-            at = break_index.best(unit['word_start'], unit['word_end'])
+            at = break_index.best(cue['word_start'], cue['word_end'])
             if at is None:
                 raise ToolError('完整请求超过模型预算且没有可靠词边界。', 'mt_input_budget')
-            stack.extend([make_fragment(source, at, unit['word_end'], layout_round=unit.get('layout_round', 0)),
-                          make_fragment(source, unit['word_start'], at, layout_round=unit.get('layout_round', 0))])
+            stack.extend([make_fragment(source, at, cue['word_end'], layout_round=cue.get('layout_round', 0)),
+                          make_fragment(source, cue['word_start'], at, layout_round=cue.get('layout_round', 0))])
             continue
-        result.append(unit)
+        result.append(cue)
     return result
 
 
@@ -658,14 +658,14 @@ def source_context(sources, position, last_position=None):
             for _, _, index, neighbor in sorted(neighbors, key=lambda n: n[:3])]
 
 
-def validate_unit_coverage(source, units):
+def validate_cue_coverage(source, cues):
     at, word = 0, 0
-    for unit in units:
-        validate_fragment(source, unit)
-        if (unit['char_start'] < at or source['text'][at:unit['char_start']].strip() or unit['word_start'] != word):
+    for cue in cues:
+        validate_fragment(source, cue)
+        if (cue['char_start'] < at or source['text'][at:cue['char_start']].strip() or cue['word_start'] != word):
             raise ToolError("同句片段的原文／词范围不连续。", "cache_mismatch")
-        at, word = unit['char_end'], unit['word_end']
-    if not units or source['text'][at:].strip() or word != len(source.get('words', [])):
+        at, word = cue['char_end'], cue['word_end']
+    if not cues or source['text'][at:].strip() or word != len(source.get('words', [])):
         raise ToolError("同句片段未覆盖完整来源，不能输出不完整字幕。", "cache_mismatch")
 
 

@@ -6,7 +6,6 @@ import re
 import unicodedata
 
 from .common import ToolError
-from .config import Settings
 from .mt_backend import MTBackend, key_fingerprint, normalize_mt_url
 from .mt_quality import DEFAULT_CAPABILITIES, INPUT_BUDGET, OUTPUT_TOKENS, valid_capabilities
 
@@ -67,12 +66,10 @@ def configured_route(config, manifest):
     if not _integer(settings.mt_policy_version, 1, 2**31 - 1):
         raise ToolError('mt_policy_version 必须是 1～2147483647 的整数；更换翻译策略时递增。', 'mt_config')
     base = normalize_mt_url(settings.mt_base_url)
-    models = [('magpie', 'mixed', settings.mt_model or Settings.mt_model),
-              ('magpie_fallback', 'paid', settings.mt_fallback_model),
-              ('magpie_review', 'mixed', settings.mt_review_model),
-              ('magpie_review_fallback', 'paid', settings.mt_review_fallback_model),
-              ('magpie_judge', 'mixed', settings.mt_judge_model),
-              ('magpie_judge_fallback', 'paid', settings.mt_judge_fallback_model)]
+    models = []
+    for role, (primary, fallback) in settings.role_models().items():
+        entry = 'magpie' if role == 'translate' else 'magpie_' + role
+        models.extend([(entry, 'mixed', primary), (entry + '_fallback', 'paid', fallback)])
     if any(not _model(model) for _, _, model in models) or len({model for _, _, model in models}) != 6:
         raise _invalid()
     quality = {'input_bytes': INPUT_BUDGET, 'output_tokens': OUTPUT_TOKENS, 'max_revisions': 2, 'manual_glossary': {}}

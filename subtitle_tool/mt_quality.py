@@ -314,7 +314,7 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False, prom
     return payload
 
 
-def stage_cache_key(stage, data, backend, *, capabilities, scope, prompt_version=QUALITY_PROMPT_VERSION):
+def request_cache_key(stage, data, backend, *, capabilities, scope, prompt_version=QUALITY_PROMPT_VERSION):
     value = {'version': prompt_version, 'strategy': 6, 'simplification': 'opencc-t2s-0.1.7',
              'backend': backend.snapshot(),
              'capabilities': capabilities, 'scope': scope,

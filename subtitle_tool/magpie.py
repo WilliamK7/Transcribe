@@ -86,31 +86,43 @@ def _pause_expired_promotion(settings, identity, provider):
         return False
 
 
-def group_models(raw, model):
+def supplies_model(provider, model=None):
+    if not provider or provider.get('off') or provider.get('noModels'):
+        return False
+    return model is None or (model not in provider.get('modelsOff', ()) and
+                             not provider.get('_models', {}).get(model, {}).get('decides'))
+
+
+def group_model_paths(raw, model):
+    """Yield the full member path, provider and model in Magpie routing order."""
     providers = {row['id']: row for row in raw['providers']}
     groups = {row['id']: row for row in raw.get('groups', [])}
-    def visit(member, seen):
-        if not isinstance(member, str) or member in seen or len(seen) > 8:
+    def visit(member, path):
+        if not isinstance(member, str) or member in path or len(path) > 8:
             raise ValueError()
         owner, name = member.split('/', 1)
         if owner == 'group':
             group = groups[name]
             if group.get('hidden'):
-                return []
+                return
             if group.get('match') or group.get('classifier') or group.get('rules'):
                 raise ValueError()
-            return [leaf for nested in group.get('members', []) if nested not in group.get('off', [])
-                    for leaf in visit(nested, seen | {member})]
+            for nested in group.get('members', []):
+                if nested not in group.get('off', []):
+                    yield from visit(nested, (*path, member))
+            return
         provider = providers[owner]
-        if provider.get('off'):
-            return []
+        plain = re.sub(r':(?:none|minimal|low|medium|high|xhigh|max)$', '', name)
+        if not supplies_model(provider, plain):
+            return
         if provider.get('fallback'):
             raise ValueError()
-        plain = re.sub(r':(?:none|minimal|low|medium|high|xhigh|max)$', '', name)
-        if plain in provider.get('modelsOff', []) or provider.get('_models', {}).get(plain, {}).get('decides'):
-            return []
-        return [(owner, plain, provider)]
-    return visit(model, set())
+        yield (*path, member), owner, plain, provider
+    return visit(model, ())
+
+
+def group_models(raw, model):
+    return [(owner, name, provider) for _, owner, name, provider in group_model_paths(raw, model)]
 
 
 def validate_group(settings, model, *, base_url=None, paid_only=False, identities=None):

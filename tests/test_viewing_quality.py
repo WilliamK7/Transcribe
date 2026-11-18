@@ -7,9 +7,8 @@ from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.mt_quality import make_stage_payload
 from subtitle_tool.subtitles import plan_fragments
-from tests.fixtures import overlapping_raw, result
+from tests.fixtures import overlapping_raw, result, timed_source
 from tests.mt_fixtures import PoolPipelineFixture
-from tests.test_planning_indexes import indexed_source
 
 
 class ViewingQualityTests(unittest.TestCase):
@@ -36,14 +35,14 @@ class ViewingQualityTests(unittest.TestCase):
         self.assertEqual(new['sentences'][1]['fragment_ids'], ['1', '2'])
 
     def test_balanced_english_break_keeps_article_with_its_noun(self):
-        source = indexed_source(['Calculate', 'the', 'total', 'charge'])
+        source = timed_source(['Calculate', 'the', 'total', 'charge'])
         cuts = plan_fragments(source, Settings(), force=True)
         self.assertEqual([cut['text'] for cut in cuts], ['Calculate', 'the total charge'])
         self.assertEqual(cuts[0]['end_ms'], source['words'][0]['end_ms'])
 
     def test_reviewed_language_takes_precedence_for_english_breaks(self):
         from subtitle_tool.review import ReviewDecision
-        source = indexed_source(['Calculate', 'the', 'total', 'charge'])
+        source = timed_source(['Calculate', 'the', 'total', 'charge'])
         for asr, manual, expected in [('zh', 'English', 'Calculate'), ('en', 'French', 'Calculate the'),
                                       ('en', 'auto', 'Calculate'), ('zh', 'auto', 'Calculate the')]:
             with self.subTest(asr=asr, manual=manual):
@@ -51,7 +50,7 @@ class ViewingQualityTests(unittest.TestCase):
                 self.assertEqual(plan_fragments(reviewed, Settings(), force=True)[0]['text'], expected)
 
     def test_equal_pauses_do_not_force_a_third_screen_for_a_preposition(self):
-        source = indexed_source(['The', 'voltage', 'depends', 'on', 'the', 'reference', 'signal', 'at', 'this', 'terminal.'],
+        source = timed_source(['The', 'voltage', 'depends', 'on', 'the', 'reference', 'signal', 'at', 'this', 'terminal.'],
                                 durations=[1820, 1600, 1900, 450, 500, 600, 500, 500, 900, 1400],
                                 pauses={3: 420, 4: 420, 5: 420})
         parts = plan_fragments(source, Settings())

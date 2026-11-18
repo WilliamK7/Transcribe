@@ -1,6 +1,9 @@
 """Incremental gateway maintenance. All inference and catalogs are simulated."""
 import copy
 import json
+import runpy
+import sys
+from pathlib import Path
 from unittest import mock
 
 from subtitle_tool.common import ToolError, atomic_json
@@ -13,6 +16,22 @@ from tests.test_bailian_free import BailianFreeFixture
 
 
 class MaintenanceTests(BailianFreeFixture):
+    def test_repeat_enable_and_disable_back_up_only_actual_changes(self):
+        self.policy()
+        path = self.config.data / 'mt-channels.json'
+        original = path.read_bytes()
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'manage-mt.py'
+        with mock.patch.object(sys, 'path', sys.path.copy()), mock.patch('builtins.print'), \
+                mock.patch('subtitle_tool.config.Config', return_value=self.config):
+            main = runpy.run_path(str(script))['main']
+            for flag, expected in [('--enable', 0), ('--disable', 1), ('--disable', 1)]:
+                with mock.patch.object(sys, 'argv', [str(script), flag]):
+                    self.assertEqual(main(), 0)
+                backups = list((self.config.data / 'gateway-backups').glob('*/mt-channels.json'))
+                self.assertEqual(len(backups), expected)
+        self.assertEqual(backups[0].read_bytes(), original)
+        self.assertFalse(json.loads(path.read_bytes())['enabled'])
+
     def exclude_providers(self):
         policy = self.policy()
         policy['excluded_providers'] = ['blocked-first', 'blocked-second']
@@ -24,14 +43,23 @@ class MaintenanceTests(BailianFreeFixture):
         atomic_json(self.registry, raw)
         return policy
 
-    def test_excluded_provider_cannot_be_enrolled_again(self):
-        from subtitle_tool.mt_channel_policy import load_policy
+    def test_excluded_provider_can_keep_its_rules_without_being_discovered_or_used(self):
+        from subtitle_tool.mt_channel_policy import check_provider_policy, load_policy
         policy = self.exclude_providers()
         policy['providers']['blocked-first'] = policy['providers']['existing']
+        policy['judges'] = ['blocked-first/model-a']
         atomic_json(self.config.data / 'mt-channels.json', policy)
+        saved = load_policy(self.config)
+        self.assertIn('blocked-first', saved['providers'])
+        check_provider_policy(self.config, 'existing/new', policy=saved)
         with self.assertRaises(ToolError) as caught:
-            load_policy(self.config)
+            check_provider_policy(self.config, 'blocked-first/model-a', policy=saved)
         self.assertEqual(caught.exception.code, 'mt_provider_excluded')
+        catalog = Catalog(self.config, self.parent)
+        with mock.patch.object(catalog, 'get', return_value={'data': []}):
+            found = catalog.discover(('blocked-first',), policy=saved)
+        self.assertFalse(found['identities'])
+        self.assertIn({'provider': 'blocked-first', 'reason': 'provider_excluded'}, catalog.skipped)
 
     def test_excluded_candidate_and_judge_never_reach_transport(self):
         from subtitle_tool.mt_admission import ModelEvaluator
@@ -118,6 +146,7 @@ class MaintenanceTests(BailianFreeFixture):
         from subtitle_tool.mt_catalog import read_registry
         policy = self.policy()
         policy['providers']['existing']['preferred'] = ['new']
+        policy['providers']['existing']['price_exceptions'] = ['new']
         atomic_json(self.config.data / 'mt-channels.json', policy)
         raw = self.guard.admin.registry()
         raw['providers'] += [{'id': 'existing', 'models': ['draft', 'reviewer', 'arbiter', 'new'], 'key': 'private'}]
@@ -502,12 +531,27 @@ class MaintenanceTests(BailianFreeFixture):
                 load_policy(self.config)
 
     def test_unknown_paid_candidates_wait_for_explicit_rule(self):
-        from subtitle_tool.mt_channel_policy import candidate_allowed
+        from subtitle_tool.mt_channel_policy import candidate_admission
         rule = self.policy()['providers']['existing']
-        self.assertEqual(candidate_allowed('new', 'commercial', {}, rule), 'price_unknown')
+        self.assertEqual(candidate_admission('new', 'commercial', {}, rule).reason, 'price_unknown')
         rule['preferred'] = ['new']
-        self.assertIsNone(candidate_allowed('new', 'commercial', {}, rule))
-        self.assertIsNone(candidate_allowed('new', 'free', {}, rule))
+        self.assertFalse(candidate_admission('new', 'commercial', {}, rule).allowed)
+        rule['price_exceptions'] = ['new']
+        self.assertTrue(candidate_admission('new', 'commercial', {}, rule).allowed)
+        self.assertTrue(candidate_admission('new', 'free', {}, rule).allowed)
+
+    def test_v1_price_permissions_are_preserved_without_rewriting_the_file(self):
+        from subtitle_tool.mt_channel_policy import load_policy
+        policy = self.policy()
+        policy['version'] = 1
+        policy['providers']['existing']['preferred'] = ['old-permission']
+        path = self.config.data / 'mt-channels.json'
+        atomic_json(path, policy)
+        before = path.read_bytes()
+        upgraded = load_policy(self.config)
+        self.assertEqual(upgraded['version'], 2)
+        self.assertEqual(upgraded['providers']['existing']['price_exceptions'], ['old-permission'])
+        self.assertEqual(path.read_bytes(), before)
 
     def test_status_never_contains_credentials(self):
         from subtitle_tool.mt_maintenance import ChannelMaintenance

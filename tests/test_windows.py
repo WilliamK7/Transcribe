@@ -48,7 +48,3 @@ class WindowsTests(TemporaryTest):
         import wave
         with wave.open(str(audio), "rb") as reader:
             self.assertAlmostEqual(reader.getnframes() / reader.getframerate(), 3, delta=0.02)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -10,16 +10,40 @@ from tests.test_bailian_free import BailianFreeFixture
 
 
 class ChannelTests(BailianFreeFixture):
+    def test_channel_rule_only_needs_limits_for_enabled_tiers(self):
+        from subtitle_tool.mt_channel_policy import candidate_admission, default_policy, load_policy
+        policy = default_policy()
+        policy['providers'] = {'sample': {'adapter': 'registry', 'billing': ['free'],
+                                          'max_candidates': {'free': 2}}}
+        path = self.config.data / 'mt-channels.json'
+        atomic_json(path, policy)
+        rule = load_policy(self.config)['providers']['sample']
+        self.assertTrue(candidate_admission('any-model', 'free', {}, rule).allowed)
+        self.assertFalse(candidate_admission('any-model', 'commercial', {}, rule).allowed)
+        self.assertFalse(candidate_admission('any-model', 'free', {}, {**rule, 'include': []}).allowed)
+
+    def test_select_none_removes_model_from_group_but_fetch_off_keeps_manual_pick(self):
+        from subtitle_tool.magpie import group_models
+        raw = {'providers': [{'id': 'manual', 'listOff': True, 'models': ['chosen']}],
+               'groups': [{'id': 'paid', 'members': ['manual/chosen']}]}
+        atomic_json(self.registry, raw)
+        validate_group(self.config.settings, 'group/paid', paid_only=True)
+        raw['providers'][0].update(noModels=True, models=[])
+        atomic_json(self.registry, raw)
+        self.assertEqual(group_models(raw, 'group/paid'), [])
+        with self.assertRaises(ToolError):
+            validate_group(self.config.settings, 'group/paid', paid_only=True)
+
     def test_channel_without_exclusions_respects_its_include_and_billing_rules(self):
-        from subtitle_tool.mt_channel_policy import candidate_allowed, default_policy, load_policy
+        from subtitle_tool.mt_channel_policy import candidate_admission, default_policy, load_policy
         policy = default_policy()
         rule = policy['providers']['transcribe-openrouter-free']
         rule.pop('exclude', None)
         atomic_json(self.config.data / 'mt-channels.json', policy)
         saved = load_policy(self.config)['providers']['transcribe-openrouter-free']
-        self.assertIsNone(candidate_allowed('example:free', 'free', {}, saved))
-        self.assertEqual(candidate_allowed('other', 'free', {}, saved), 'model_excluded')
-        self.assertEqual(candidate_allowed('example:free', 'commercial', {}, saved), 'billing_excluded')
+        self.assertTrue(candidate_admission('example:free', 'free', {}, saved).allowed)
+        self.assertEqual(candidate_admission('other', 'free', {}, saved).reason, 'model_excluded')
+        self.assertEqual(candidate_admission('example:free', 'commercial', {}, saved).reason, 'billing_excluded')
 
     def test_plugin_provider_is_a_valid_group_member_and_free_offer(self):
         atomic_json(self.folder / 'plugin-providers.json', [{'id': 'opencode-zen-free', 'signedIn': True,

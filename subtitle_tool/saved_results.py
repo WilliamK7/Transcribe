@@ -5,7 +5,7 @@ import re
 
 from .common import ToolError
 from .review import decision_origin
-from .subtitles import clean_text, normalize, validate_fragment, validate_unit_coverage
+from .subtitles import clean_text, normalize, validate_fragment, validate_cue_coverage
 
 
 def mismatch():
@@ -45,6 +45,19 @@ def validate_segments(manifest):
 
 def raw_path(cache, segment):
     return cache / ("raw-" + segment["id"] + ".json")
+
+
+def segment_recovery_action(segment, *, raw_available):
+    """Choose from durable ASR evidence before considering a new submission."""
+    if segment.get('submitting') and not segment.get('task_id'):
+        return 'confirm_submission'
+    if raw_available:
+        return 'read_raw'
+    if segment.get('task_id'):
+        return 'query_task'
+    if segment.get('raw'):
+        raise mismatch()
+    return 'submit_audio'
 
 
 def read_json(path):
@@ -119,6 +132,6 @@ def validate_normalized(manifest, sources, cues):
                 raise mismatch()
             grouped.setdefault(source['sentence_id'], []).append(cue)
         for source in sources:
-            validate_unit_coverage(source, sorted(grouped.get(source['sentence_id'], []), key=lambda c: c['char_start']))
+            validate_cue_coverage(source, sorted(grouped.get(source['sentence_id'], []), key=lambda c: c['char_start']))
     except (KeyError, ValueError, TypeError, IndexError) as error:
         raise mismatch() from error

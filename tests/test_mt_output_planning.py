@@ -71,7 +71,7 @@ class OutputPlanningTests(PoolPipelineFixture):
 
 
     def test_new_layout_uses_output_budget_with_previous_stage_records(self):
-        from subtitle_tool.mt_pipeline import Pipeline
+        from subtitle_tool.mt_pipeline import Pipeline, groups_for_layout
         self.install_many()
         self.cancel_after = 'translate'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
@@ -83,7 +83,9 @@ class OutputPlanningTests(PoolPipelineFixture):
         self.store.save_layout(self.job_id, cues, manifest)
         engine = Engine(self.config, self.store)
         _, scope = engine.identity(self.job_id, manifest, persist=False)
-        groups = Pipeline(engine, self.job_id, manifest, scope).groups_for_layout(sources, cues, manifest)
+        pipeline = Pipeline(engine, self.job_id, manifest, scope)
+        self.addCleanup(pipeline.close)
+        groups = groups_for_layout(engine, self.job_id, manifest, sources, cues, pipeline)
         self.assertGreater(len(groups), 1)
         self.assertEqual(self.store.mt_stages(self.job_id), stages)
         self.assertEqual([cue['cue_id'] for group in groups for unit in group for cue in unit['cues']],

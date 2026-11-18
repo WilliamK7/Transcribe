@@ -17,7 +17,7 @@ from .instance import ProcessLock
 from .magpie_process import MagpieProcess
 from .reports import ReportWriter
 from .store import Store
-from .lifecycle import STATES, contract as lifecycle_contract, describe as describe_lifecycle
+from .lifecycle import STATES, describe as describe_lifecycle
 from .review import MT_LANGUAGES, ReviewDecision
 
 
@@ -30,7 +30,6 @@ def parser():
     actions.add_argument("--retime", metavar="JOB_ID", help="复用最终字幕和译文重新规划显示时间；覆盖须搭配 --overwrite")
     actions.add_argument("--review", metavar="JOB_ID", help="终端确认音轨、声道或逐条语种后继续")
     actions.add_argument("--jobs", action="store_true", help="列出任务（每行 JSON）")
-    actions.add_argument('--state-machine', action='store_true', help='输出任务状态契约 JSON，无需配置或任务库')
     actions.add_argument("--export-archive", metavar="JOB_ID", help="校验并导出归档字幕，须指定 --output-dir")
     actions.add_argument("--cancel", metavar="JOB_ID", help="停止已保存的本地任务")
     actions.add_argument('--configure-key', action='store_true', help='隐藏输入百炼 Key，保存到 data/key.txt')
@@ -240,7 +239,7 @@ def hint(store, job_id):
 def main(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.state_machine or args.cancel or
+    action = (args.resume or args.reflow or args.retime or args.review or args.jobs or args.cancel or
               args.check_mt or args.self_test or args.configure_key or
               args.export_archive)
     if not args.files and not action:
@@ -256,12 +255,6 @@ def main(argv=None):
         raise ToolError("音轨索引不能为负。", "input")
     if (args.reflow or args.retime) and (args.track is not None or args.channel is not None):
         raise ToolError("重排／校时沿用已保存的识别输入，不能指定音轨／声道。", "input_committed")
-    if args.state_machine:
-        if (args.report is not None or args.output_dir is not None or args.workspace_id is not None or
-                args.track is not None or args.channel is not None or args.overwrite):
-            raise ToolError('--state-machine 仅输出 stdout JSON，不能搭配任务设置或 --report。', 'input')
-        print(json.dumps(lifecycle_contract(), ensure_ascii=False))
-        return 0
     stdout_self_test = args.self_test and args.report is None
     config = Config(read_only=stdout_self_test)
     if args.workspace_id is not None:

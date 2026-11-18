@@ -7,17 +7,17 @@ from itertools import groupby
 
 from .common import ToolError
 from .mt_quality import plan_sentence_groups
-from .subtitles import validate_unit_coverage
+from .subtitles import validate_cue_coverage
 
 
 _CUE_INPUTS = ('cue_id', 'sentence_id', 'text', 'begin_ms', 'end_ms', 'char_start', 'char_end',
                'word_start', 'word_end', 'language', 'source_lang', 'decision', 'decision_origin', 'layout_round')
 
 
-def make_unit(source, members, start, end):
-    first = 0 if start == 0 else members[start - 1]['char_end']
-    last = len(source['text']) if end == len(members) else members[end - 1]['char_end']
-    return {'source': source, 'text': source['text'][first:last], 'cues': members[start:end],
+def make_translation_unit(source_sentence, cues, start, end):
+    first = 0 if start == 0 else cues[start - 1]['char_end']
+    last = len(source_sentence['text']) if end == len(cues) else cues[end - 1]['char_end']
+    return {'source': source_sentence, 'text': source_sentence['text'][first:last], 'cues': cues[start:end],
             'char_start': first, 'char_end': last}
 
 
@@ -28,7 +28,7 @@ def _fingerprint(sources, cues, groups, layout_round):
 
 
 def save_group_plan(groups, sources, cues, layout_round):
-    boundaries = [[cue['cue_id'] for unit in group for cue in unit['cues']] for group in groups]
+    boundaries = [[cue['cue_id'] for translation_unit in group for cue in translation_unit['cues']] for group in groups]
     return {'version': 1, 'layout_round': layout_round, 'groups': boundaries,
             'fingerprint': _fingerprint(sources, cues, boundaries, layout_round)}
 
@@ -50,7 +50,7 @@ def restore_group_plan(saved, sources, cues, layout_round):
             for source in source_group:
                 identity = source['sentence_id']
                 local = sorted(by_sentence.get(identity, []), key=lambda cue: cue['char_start'])
-                validate_unit_coverage(source, local)
+                validate_cue_coverage(source, local)
                 members[identity] = source, local
                 for index, cue in enumerate(local):
                     expected.append(cue['cue_id'])
@@ -68,7 +68,7 @@ def restore_group_plan(saved, sources, cues, layout_round):
             for identity, keys in groupby(group, key=lambda key: positions[key][0]):
                 indices = [positions[key][1] for key in keys]
                 source, local = members[identity]
-                units.append(make_unit(source, local, indices[0], indices[-1] + 1))
+                units.append(make_translation_unit(source, local, indices[0], indices[-1] + 1))
             if units[-1]['cues'][-1]['end_ms'] - units[0]['cues'][0]['begin_ms'] > 60000:
                 raise ValueError()
             restored.append(units)

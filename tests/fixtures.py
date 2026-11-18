@@ -74,6 +74,23 @@ def timed_raw(tokens, *, word_ms=200, language="en", pauses=None, start=0):
         "language": language, "words": words}]}]}
 
 
+def timed_source(tokens, *, separator=" ", durations=None, pauses=None):
+    """Synthetic source with monotonic positive word times and explicit character ranges."""
+    words, pieces, char, time = [], [], 0, 1234
+    for at, token in enumerate(tokens):
+        if at:
+            pieces.append(separator)
+            char += len(separator)
+        time += (pauses or {}).get(at, 0)
+        duration = durations[at] if durations else 1000
+        words.append(dict(begin_ms=time, end_ms=time + duration, char_start=char, char_end=char + len(token)))
+        pieces.append(token)
+        char += len(token)
+        time += duration
+    return dict(sentence_id="0000:00000000", text="".join(pieces), words=words,
+                begin_ms=1234, end_ms=time, language="en", decision="translate", reason="ASR", source_lang="auto")
+
+
 def overlapping_raw(*, overlap=40, start=1000):
     raw = timed_raw([f"alpha{i}" for i in range(8)], word_ms=500, start=start)
     following = timed_raw([f"bravo{i}" for i in range(6)], word_ms=560, start=start + 4000 - overlap)
@@ -148,19 +165,11 @@ class FakeService:
 
 class TemporaryTest(unittest.TestCase):
     def setUp(self):
-        transport = mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport)
-        transport.start()
-        self.addCleanup(transport.stop)
-        self.environment = mock.patch.dict(os.environ)
-        self.environment.start()
-        for name in ("DASHSCOPE_API_KEY", "MAGPIE_API_KEY", *(field.upper() for field in MT_ENV_SETTINGS)):
+        self.enterContext(mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport))
+        self.enterContext(mock.patch.dict(os.environ))
+        for name in ('DASHSCOPE_API_KEY', 'MAGPIE_API_KEY', *(field.upper() for field in MT_ENV_SETTINGS)):
             os.environ.pop(name, None)
-        self.temp = tempfile.TemporaryDirectory(prefix="transcribe-test-")
-        self.path = Path(self.temp.name)
-
-    def tearDown(self):
-        self.temp.cleanup()
-        self.environment.stop()
+        self.path = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='transcribe-test-')))
 
 
 def seed_job_state(store, job_id, state, manifest=None, *, error='', code=''):
@@ -178,23 +187,29 @@ def point_sentence(at, text="Yes.", language="en"):
             "words": [{"begin_time": at, "end_time": at, "text": text[:-1], "punctuation": text[-1]}]}
 
 
-class SavedResultFixture(TemporaryTest):
-    """Saved ASR facts, real SQLite and fake HTTP, without creating media."""
+class SubtitleJobFixture(TemporaryTest):
     def setUp(self):
         super().setUp()
         self.config = Config(self.path)
-        self.config.settings.workspace_id = "offline-space"
-        set_asr_account(self.config, "offline-test-key-no-cloud-authorization")
+        self.config.settings.workspace_id = 'offline-space'
+        set_asr_account(self.config, 'offline-test-key-no-cloud-authorization')
+        self.store = Store(self.config.data / 'jobs.sqlite')
+        self.addCleanup(lambda: self.store.close())  # A recovery test may reopen the database.
+
+    def run_fake(self, service):
+        with mock.patch('requests.request', side_effect=service.request), \
+                mock.patch('requests.post', side_effect=service.upload), mock.patch.object(Http, 'pause'):
+            return Engine(self.config, self.store).run(self.job_id)
+
+
+class SavedResultFixture(SubtitleJobFixture):
+    def setUp(self):
+        super().setUp()
         self.source = self.path / "saved.mkv"
         self.source.write_bytes(b"saved source identity only")
-        self.store = Store(self.config.data / "jobs.sqlite")
         self.job_id = enqueue_current(self.store, self.config, self.source)
         self.cache = self.config.data / "cache" / self.job_id
         self.cache.mkdir(parents=True)
-
-    def tearDown(self):
-        self.store.close()
-        super().tearDown()
 
     def save_result(self, raw=None, *, normalized=True):
         raw = raw if raw is not None else result(("Hello.", "en"))
@@ -219,13 +234,8 @@ class SavedResultFixture(TemporaryTest):
             self.store.initialize_subtitles(self.job_id, [], [], manifest)
         return sources
 
-    def run_fake(self, service):
-        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"), mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport):
-            return Engine(self.config, self.store).run(self.job_id)
-
-
 @unittest.skipUnless(os.name == "nt" and (ROOT / "tools" / "ffmpeg.exe").exists(), "Windows/bundled tools required")
-class PipelineFixture(TemporaryTest):
+class PipelineFixture(SubtitleJobFixture):
     fixture_seconds = 10
 
     @classmethod
@@ -241,24 +251,10 @@ class PipelineFixture(TemporaryTest):
 
     def setUp(self):
         super().setUp()
-        self.media_tools = mock.patch.object(Media, "executable", lambda media, name: ROOT / "tools" / (name + ".exe"))
-        self.media_tools.start()
-        self.config = Config(self.path)
-        self.config.settings.workspace_id = "offline-space"
-        set_asr_account(self.config, "offline-test-key-no-cloud-authorization")
+        self.enterContext(mock.patch.object(Media, 'executable', lambda media, name: ROOT / 'tools' / (name + '.exe')))
         self.source = self.path / "中文 多点.片段 & (1).mkv"
         shutil.copyfile(self.fixture, self.source)
-        self.store = Store(self.config.data / "jobs.sqlite")
         self.job_id = enqueue_current(self.store, self.config, self.source)
-
-    def tearDown(self):
-        self.store.close()
-        self.media_tools.stop()
-        super().tearDown()
-
-    def run_fake(self, service):
-        with mock.patch("requests.request", side_effect=service.request), mock.patch("requests.post", side_effect=service.upload), mock.patch.object(Http, "pause"), mock.patch('subtitle_tool.mt_transport.ProcessTransport', new=FakeTransport):
-            return Engine(self.config, self.store).run(self.job_id)
 
 
 def enqueue_current(store, config, source, **kwargs):

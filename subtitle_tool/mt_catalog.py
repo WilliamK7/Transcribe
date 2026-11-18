@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .common import ToolError
+from .magpie import supplies_model
 from .mt_identity import VSR_MEMBER, canonical_model, dynamic_model
 from .mt_channel_policy import default_policy, load_policy, selected
 
@@ -23,30 +24,29 @@ def _fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def read_registry(settings, catalog=None, *, policy=None):
+def read_registry(settings, catalog=None, *, policy=None, fingerprint_accounts=True):
     folder = Path(settings.magpie_data_dir)
     raw = _read(folder / 'providers.json', {'providers': [], 'groups': []})
     providers = {p['id']: dict(p) for p in raw['providers']}
     # Auth is read only to hash identity; never include its fields in the view.
-    auth = _read(folder / 'plugin-auth.json', {})
+    auth = _read(folder / 'plugin-auth.json', {}) if fingerprint_accounts else {}
     for plugin in _read(folder / 'plugin-providers.json', []):
         owner = plugin['id']
         override = providers.get(owner, {})
         metadata = {m['id']: m for m in plugin.get('models', [])}
-        credentials = {k: v for k, v in auth.items() if k == owner or k.startswith(owner + '#')}
-        spec = plugin.get('spec', '')
-        match = re.fullmatch(r'((?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+)(?:@[^/]+)?', spec)
-        configured_package = (policy or {}).get('providers', {}).get(owner, {}).get('package')
-        package_name = configured_package or (match[1] if match and '..' not in match[1] else PLUGIN_PACKAGES.get(owner, '__unknown__'))
-        package = _read(folder / 'plugins' / 'node_modules' / package_name /
-                        'package.json', {})
-        fingerprint = {'spec': plugin.get('spec'), 'version': package.get('version'),
-            'npm': plugin.get('npm'), 'api': plugin.get('api'), 'accounts': plugin.get('accounts'), 'auth': credentials}
         providers[owner] = {'id': owner, 'chat': plugin.get('api', ''),
             'models': list(metadata), 'maxConcurrency': plugin.get('maxConcurrency'), **override,
             'off': bool(override.get('off')) or plugin.get('signedIn') is False,
-            '_models': metadata, '_plugin': plugin.get('spec'),
-            '_plugin_fingerprint': _fingerprint(fingerprint)}
+            '_models': metadata, '_plugin': plugin.get('spec')}
+        if fingerprint_accounts:
+            spec = plugin.get('spec', '')
+            match = re.fullmatch(r'((?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+)(?:@[^/]+)?', spec)
+            configured_package = (policy or {}).get('providers', {}).get(owner, {}).get('package')
+            package_name = configured_package or (match[1] if match and '..' not in match[1] else PLUGIN_PACKAGES.get(owner, '__unknown__'))
+            package = _read(folder / 'plugins' / 'node_modules' / package_name / 'package.json', {})
+            credentials = {k: v for k, v in auth.items() if k == owner or k.startswith(owner + '#')}
+            providers[owner]['_plugin_fingerprint'] = _fingerprint({'spec': plugin.get('spec'), 'version': package.get('version'),
+                'npm': plugin.get('npm'), 'api': plugin.get('api'), 'accounts': plugin.get('accounts'), 'auth': credentials})
     for owner, metadata in (catalog or {}).get('models', {}).items():
         if owner in providers:
             providers[owner]['_models'] = {**metadata, **providers[owner].get('_models', {})}
@@ -64,22 +64,26 @@ def zero_priced(pricing):
         return False
 
 
-def offer_billing(provider, name):
+def classify_offer(provider, name):
     from .magpie import known_free_model
     if provider['id'] == 'transcribe-bailian-trial' or provider['id'].startswith('transcribe-bailian-trial-'):
-        return 'trial'
+        return 'trial', 'bailian_trial'
     row = provider.get('_models', {}).get(name, {})
     if provider['id'] == 'vercel':
-        return 'free' if zero_priced(row.get('pricing')) else 'commercial'
+        return ('free' if zero_priced(row.get('pricing')) else 'commercial'), 'vercel_catalog_price'
     if provider['id'] in {'github-copilot', 'cloudflare-workers-ai'}:
-        return 'commercial'
+        return 'commercial', 'commercial_channel'
     if provider.get('_plugin') or provider['id'] in PLUGIN_PACKAGES:
-        return 'free' if row.get('free') is True else 'commercial'
+        return ('free' if row.get('free') is True else 'commercial'), 'plugin_catalog'
     if type(row.get('free')) is bool:
-        return 'free' if row['free'] else 'commercial'
+        return ('free' if row['free'] else 'commercial'), 'catalog_free_flag'
     if known_free_model(provider.get('chat', '').rstrip('/'), name):
-        return 'free'
-    return 'commercial'
+        return 'free', 'known_free_offer'
+    return 'commercial', 'default_commercial'
+
+
+def offer_billing(provider, name):
+    return classify_offer(provider, name)[0]
 
 
 def saved_catalog(config):
@@ -128,7 +132,7 @@ class Catalog:
                 continue
             rule = policy['providers'][owner]
             provider = by_id.get(owner)
-            if not provider or provider.get('off') or provider.get('noModels'):
+            if not supplies_model(provider):
                 self.skipped.append({'provider': owner, 'reason': 'disabled_or_missing'})
                 self.complete.add(owner)
                 continue
@@ -166,7 +170,7 @@ class Catalog:
                 if rule['adapter'] == 'vercel':
                     listed &= set(metadata)
                 counts = {'free': 0, 'commercial': 0}
-                names = list(dict.fromkeys(rule['preferred'] + sorted(m[len(owner) + 1:]
+                names = list(dict.fromkeys(rule.get('preferred', []) + sorted(m[len(owner) + 1:]
                              for m in available if m.startswith(owner + '/')) + sorted(listed)))
                 names.sort(key=lambda n: owner + '/' + n in deprioritize)
                 for name in names:
@@ -174,7 +178,7 @@ class Catalog:
                     row = metadata.get(name, {})
                     outputs = row.get('outputs', row.get('modalities', {}).get('output'))
                     if (safe_model_id(member) != member or member not in available and name not in listed or
-                            name in provider.get('modelsOff', []) or row.get('decides') or
+                            not supplies_model(provider, name) or row.get('decides') or
                             outputs is not None and 'text' not in outputs or row.get('type', 'language') != 'language' or
                             dynamic_model(member) and member != VSR_MEMBER or not selected(name, rule)):
                         self.skipped.append({'model': member, 'reason': 'not_available'})

@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 
 from .bailian_state import TrialState
 from .magpie_admin import MagpieAdmin
+from .magpie import supplies_model
 from .common import Cancelled, ToolError, atomic_json
 from .mt_admission import admission_key
 from .mt_catalog import Catalog, offer_billing, read_registry
-from .mt_channel_policy import candidate_allowed, load_policy, check_provider_policy
+from .mt_channel_policy import candidate_admission, load_policy, check_provider_policy
 from .mt_control import BackgroundCancel, MTControl
 from .mt_gateway_setup import GatewaySetup
 from .mt_identity import canonical_model, model_set
@@ -98,9 +99,9 @@ class ChannelMaintenance:
 
     def refresh_provider_lists(self, policy):
         providers = read_registry(self.config.settings, policy=policy)['providers']
-        eligible = [p for p in providers if p['id'] in policy['providers'] and not p.get('off')
+        eligible = [p for p in providers if p['id'] in policy['providers'] and supplies_model(p)
                     and p['id'] not in policy.get('excluded_providers', [])
-                    and not p.get('noModels') and not p.get('listOff')]
+                    and not p.get('listOff')]
         if eligible:
             self._backup()
         for provider in eligible:
@@ -180,31 +181,14 @@ class ChannelMaintenance:
         return {'enabled': policy['enabled'], 'providers': list(policy['providers']),
             'excluded_providers': policy['excluded_providers'],
             'refresh_seconds': policy['refresh_seconds'], 'budget': self.state['budget'],
+            'retry_seconds': policy['retry_seconds'], 'max_evaluations_per_cycle': policy['max_evaluations_per_cycle'],
             'max_evaluations_per_day': policy['max_evaluations_per_day'],
             'last_status': self.state.get('last_status', 'not_run'),
             'application_error': self.state.get('application_error'),
             'catalog_refresh': self.state.get('catalog_refresh', {}),
             'last_refresh': self.state.get('last_refresh'), 'next_refresh': self.state.get('next_refresh'),
-            'members': {m: {k: r[k] for k in ('status', 'retry_after', 'billing') if k in r}
+            'members': {m: {k: r[k] for k in ('status', 'retry_after', 'billing', 'admission_reason') if k in r}
                         for m, r in self.state['members'].items()}}
-
-    def _cached(self, setup, member, policy):
-        # Search only independently verifiable keys, never accept a model name
-        # match from a different account, interface or dynamic backend set.
-        judges = list(policy['judges'])
-        judges.extend(m for m, (role, _) in setup.current_members().items() if role in {'review', 'judge'})
-        for judge in dict.fromkeys(judges):
-            if judge.split('/', 1)[0] in policy.get('excluded_providers', []):
-                continue
-            try:
-                if model_set(member, setup.catalog['identities']) & model_set(judge, setup.catalog['identities']):
-                    continue
-                key, result = setup.cached_evaluation(member, judge)
-                if result is not None:
-                    return key, result, judge
-            except (KeyError, ValueError, StopIteration):
-                continue
-        return None, None, None
 
     def refresh(self, *, policy=None, discover=None, setup=None):
         self.control.check_start()
@@ -228,7 +212,7 @@ class ChannelMaintenance:
             proof = identity_key(member, before_registry, before_catalog)
             if record.get('proof') == proof and record.get('accepted'):
                 continue
-            _, result, _ = self._cached(setup, member, policy)
+            _, result, _ = setup.cached_candidate(member)
             if result and result.get('roles'):
                 record.update(proof=proof, accepted=copy.deepcopy(result))
         if discover is None:
@@ -260,7 +244,7 @@ class ChannelMaintenance:
             rule = policy['providers'].get(owner)
             proof = identity_key(member, registry, setup.catalog)
             accepted = record.get('accepted') if record.get('proof') == proof else None
-            if provider is None or provider.get('off') or provider.get('noModels') or name in provider.get('modelsOff', []):
+            if not supplies_model(provider, name):
                 record['status'] = 'disabled_or_missing'
                 continue
             if self.state.get('exposed', {}).get(member) == 'manual_hold':
@@ -274,18 +258,18 @@ class ChannelMaintenance:
                 continue
             billing = offer_billing(provider, name)
             record['billing'] = billing
-            reason = candidate_allowed(name, billing, provider.get('_models', {}).get(name, {}), rule) if rule else 'not_enrolled'
-            # Existing paid qualifications remain usable even without a published
-            # price. Exclusions and a free -> paid transition do not get that waiver.
-            if reason and not (accepted and reason in {'price_unknown', 'price_limit', 'not_enrolled'}):
-                record['status'] = reason
+            admission = candidate_admission(name, billing, provider.get('_models', {}).get(name, {}), rule,
+                                            qualified=bool(accepted))
+            record['admission_reason'] = admission.reason
+            if not admission.allowed:
+                record['status'] = admission.reason
                 continue
             if rule and owner not in catalog.complete:
                 record['status'] = 'catalog_unavailable'
             elif accepted:
                 record['status'] = 'qualified'
             else:
-                key, result, judge = self._cached(setup, member, policy)
+                key, result, judge = setup.cached_candidate(member)
                 if result is None or result.get('retry_after') and result['retry_after'] <= time.time():
                     if record.get('attempt_proof') == proof and record.get('retry_after', 0) > time.time():
                         record['status'] = 'cooldown'

@@ -215,21 +215,3 @@ class LifecycleTests(SavedResultFixture):
             hint(self.store, self.job_id)
         self.assertIn('--reflow', output.getvalue())
         self.assertNotIn('--resume', output.getvalue())
-
-    def test_state_contract_is_available_without_config_database_or_network(self):
-        with mock.patch('subtitle_tool.main.Config', side_effect=AssertionError('no configuration')), \
-                mock.patch('subtitle_tool.main.Store', side_effect=AssertionError('no database')), \
-                mock.patch('requests.request', side_effect=AssertionError('no network')), \
-                mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-            self.assertEqual(main(['--state-machine']), 0)
-        contract = json.loads(output.getvalue())
-        self.assertEqual(contract['version'], 1)
-        self.assertIn('submission_unknown', contract['states'])
-        self.assertIn('resolve_submission', contract['events'])
-
-    def test_state_contract_rejects_task_options_without_loading_configuration(self):
-        with mock.patch('subtitle_tool.main.Config', side_effect=AssertionError('no configuration')):
-            for args in (['--overwrite'], ['--output-dir', 'new'], ['--report', 'contract.json']):
-                with self.subTest(args=args), self.assertRaises(ToolError) as caught:
-                    main(['--state-machine', *args])
-                self.assertEqual(caught.exception.code, 'input')

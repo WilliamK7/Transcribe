@@ -71,7 +71,7 @@ class TranslationWorkflowTests(PoolPipelineFixture):
                 group = pipeline.plan_groups(self.store.sources(self.job_id), self.store.cues(self.job_id))[0]
                 expected = pipeline.glossary(group, [])
                 self.assertTrue(expected)
-                pipeline.group(group, (), [])
+                pipeline.translate_group(group, (), [])
                 self.assertTrue(any(s == 'judge' for s, _, _ in self.calls))
                 if cache_only:
                     with self.store.db:

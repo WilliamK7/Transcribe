@@ -9,7 +9,7 @@ import unittest
 from subtitle_tool.config import Settings
 from subtitle_tool.store import Store
 from subtitle_tool.subtitles import display_width, layout_warnings, make_fragment, normalize, plan_fragments, render_srt, source_capacity, wrap
-from tests.fixtures import timed_raw
+from tests.fixtures import timed_raw, timed_source
 from tests import fixtures
 
 
@@ -112,6 +112,33 @@ class WrappingRegressionTests(unittest.TestCase):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_unicode_punctuation_and_word_boundaries_in_subranges(self):
+        cases = [
+            (["hello", "字幕，", "ＡＰＩ", "e\u0301", "👩\u200d💻", "✈\ufe0f", "done.”", "next"], " ", [7, 7, 2]),
+            (["字。", "）", "）", "甲", "乙", "丙", "丁"], "", [3, 4, 3]),
+            (["a.\n”", "b", "c", "d", "e", "f"], " ", [1, 3, 1]),
+            (["a. \t”", "b,』", "c", "d", "e", "f"], "\u3000\t ", [2, 2, 2]),
+            (["字", "\u0301", "字", "\u200d", "字", "\ufe0f", "字", "字"], "", [6, 6, 2]),
+            (["(open", "close)", "'quote", "end'", "next:", "last"], " " * 100, [5, 5, 2]),
+            (["un", "break", "able"], "", [None, None, None]),
+        ]
+        for tokens, separator, expected in cases:
+            with self.subTest(tokens=tokens, separator=separator):
+                source = timed_source(tokens, separator=separator)
+                count = len(tokens)
+                for (lo, hi), boundary in zip(((0, count), (1, count), (0, count - 1)), expected):
+                    cue = make_fragment(source, lo, hi)
+                    parts = plan_fragments(source, Settings(), cue=cue, force=True)
+                    self.assertEqual(parts[0]['word_end'] if len(parts) > 1 else None, boundary)
+
+    def test_minimum_display_time_limits_word_splits(self):
+        for durations, expected in [([500, 499, 500, 500], 1), ([500] * 4, 2), ([500, 500, 500, 499], 1)]:
+            parts = plan_fragments(timed_source(['word'] * 4, durations=durations), Settings(), force=True)
+            self.assertEqual(len(parts), expected)
+        for pause, boundary in [(399, 4), (400, 3)]:
+            source = timed_source(['word'] * 8, durations=[500] * 8, pauses={3: pause})
+            self.assertEqual(plan_fragments(source, Settings(), force=True)[0]['word_end'], boundary)
+
     def test_source_capacity_reduces_splits_but_still_splits_overflow(self):
         narrow = self.settings
         for language, count, word_ms in [('zh', 60, 50), ('en', 24, 150), ('zh', 100, 50), ('en', 40, 100)]:
@@ -257,7 +284,3 @@ class PersistenceTests(fixtures.TemporaryTest):
             self.assertEqual(store.job(job_id)["manifest"], manifest)
         finally:
             store.close()
-
-
-if __name__ == "__main__":
-    unittest.main()

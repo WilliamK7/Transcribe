@@ -10,7 +10,7 @@ from collections import defaultdict
 from .bailian_state import TrialState, TRIAL_PROVIDER
 from .magpie_admin import MagpieAdmin
 from .common import ToolError, atomic_json
-from .magpie import bound_gateway, validate_role_pools
+from .magpie import bound_gateway, supplies_model, validate_role_pools
 from .mt_admission import ModelEvaluator, admission_key, current_role_members, select_admission_judge
 from .mt_catalog import read_registry, saved_catalog
 from .mt_identity import VSR_MEMBER, canonical_model, model_set
@@ -71,6 +71,60 @@ def choose_roles(evaluations, reserved=None):
     return pools, {model: role for name, role in assigned.items() for model in components[name]}
 
 
+class GroupPlan:
+    """Project owned membership and CLI deltas on a private copy of the registry."""
+    def __init__(self, groups, ownership):
+        self.groups = {g['id']: copy.deepcopy(g) for g in groups}
+        self.ownership = copy.deepcopy(ownership)
+        self.changes = []
+
+    def set_group(self, name, members, routing):
+        current = self.groups.get(name)
+        owned = self.ownership['groups'].get(name, [])
+        present = current['members'] if current else []
+        disabled = set(current.get('off', [])) if current else set()
+        removed = set(owned) - set(present) if current is not None else set()
+        excluded = set(self.ownership['excluded']) | {name + ':' + m for m in removed | disabled}
+        self.ownership['excluded'] = sorted(excluded)
+        desired = [m for m in dict.fromkeys(members) if name + ':' + m not in excluded]
+        if current is None:
+            if not desired:
+                return False
+            projected = {'id': name, 'members': desired, 'routing': routing, 'affinity': 'off'}
+            command = ('group', 'add', name, 'models=' + ','.join(desired), 'routing=' + routing, 'stays=off')
+        else:
+            if current.get('hidden'):
+                return False
+            additions = [m for m in desired if m not in present]
+            removals = [m for m in owned if m in present and m not in desired and m not in disabled]
+            target = [m for m in present if m not in removals] + additions
+            if not target:
+                return False  # Magpie requires at least one member.
+            if routing == 'order' and [m for m in target if m in desired] != desired:
+                removals.extend(m for m in desired if m in present)
+                additions = desired
+                target = [m for m in present if m not in removals] + additions
+            args = []
+            if removals:
+                args.append('models-=' + ','.join(removals))
+            if additions:
+                args.append('models+=' + ','.join(additions))
+            if current.get('routing') != routing:
+                args.append('routing=' + routing)
+            if current.get('affinity') != 'off':
+                args.append('stays=off')
+            projected = {**current, 'members': target, 'routing': routing, 'affinity': 'off'}
+            if routing == 'weight' and any(current.get('weights', {}).get(m, 1) != 1 for m in target):
+                projected['weights'] = dict.fromkeys(target, 1)
+                args.append('weight=' + ','.join(m + '=1' for m in target))
+            command = ('group', 'set', name, *args) if args else None
+        self.groups[name] = projected
+        self.ownership['groups'][name] = desired
+        if command:
+            self.changes.append((command, projected))
+        return True
+
+
 class GatewaySetup:
     def __init__(self, config, control, *, admin=None, trial_state=None):
         self.config, self.control = config, control
@@ -86,38 +140,10 @@ class GatewaySetup:
         self.managed = (json.loads(self.managed_path.read_bytes()) if self.managed_path.exists()
                         else {'version': 1, 'groups': {}, 'excluded': []})
         self.catalog = saved_catalog(config) or {'version': 1, 'models': {}, 'identities': {}}
-        self._staged = None
-        self._actions = []
 
     def _audit(self, reason, model='', before=None, after=None):
         if not self.admin.audit(reason, model, before, after):
             self.state['audit_status'] = 'write_failed'
-
-    def _registry(self):
-        return self._staged if self._staged is not None else self.admin.registry()
-
-    def _command(self, *args):
-        if self._staged is None:
-            return self.admin.command(*args, control=self.control)
-        self._actions.append(args)
-        group = next((g for g in self._staged['groups'] if g['id'] == args[2]), None)
-        if group is None:
-            group = {'id': args[2], 'members': []}
-            self._staged['groups'].append(group)
-        for arg in args[3:]:
-            key, value = arg.split('=', 1)
-            if key == 'models':
-                group['members'] = value.split(',')
-            elif key == 'models+':
-                group['members'] += [m for m in value.split(',') if m not in group['members']]
-            elif key == 'models-':
-                group['members'] = [m for m in group['members'] if m not in value.split(',')]
-            elif key == 'routing':
-                group['routing'] = value
-            elif key == 'stays':
-                group['affinity'] = value
-            elif key == 'weight':
-                group['weights'] = {m: float(w) for m, w in (item.rsplit('=', 1) for item in value.split(','))}
 
     def evaluate(self, member, judge):
         key, result = self.cached_evaluation(member, judge)
@@ -137,14 +163,34 @@ class GatewaySetup:
         raw = read_registry(self.config.settings, self.catalog, policy=self.policy)
         owner, model = member.split('/', 1)
         provider = next(p for p in raw['providers'] if p['id'] == owner)
-        if provider.get('off'):
+        if not supplies_model(provider, model):
             return None, None
         provider = {**provider, '_identities': self.catalog.get('identities', {}), '_admission_judge': judge}
         judge_owner, judge_name = judge.split('/', 1)
         judge_provider = next(p for p in raw['providers'] if p['id'] == judge_owner)
+        if not supplies_model(judge_provider, judge_name):
+            return None, None
         provider['_judge_fingerprint'] = admission_key(judge_provider, judge_name)
         key = admission_key(provider, model)
         return key, self.state['evaluations'].get(key)
+
+    def cached_candidate(self, member):
+        # Search only independently verifiable keys, never accept a model name
+        # match from a different account, interface or dynamic backend set.
+        judges = list(self.policy['judges'])
+        judges.extend(m for m, (role, _) in self.current_members().items() if role in {'review', 'judge'})
+        for judge in dict.fromkeys(judges):
+            if judge.split('/', 1)[0] in self.policy.get('excluded_providers', []):
+                continue
+            try:
+                if model_set(member, self.catalog['identities']) & model_set(judge, self.catalog['identities']):
+                    continue
+                key, result = self.cached_evaluation(member, judge)
+                if result is not None:
+                    return key, result, judge
+            except (KeyError, ValueError, StopIteration):
+                continue
+        return None, None, None
 
     def _validated_groups(self, registry, entries):
         """Validate both role identity and every commercial fallback before writes."""
@@ -164,50 +210,6 @@ class GatewaySetup:
 
     def current_members(self):
         return current_role_members(read_registry(self.config.settings, self.catalog, policy=self.policy))
-
-    def _group(self, name, members, routing):
-        """Incremental CLI transaction; preserve external members and switches."""
-        current = next((g for g in self._registry().get('groups', []) if g['id'] == name), None)
-        owned = self.managed['groups'].get(name, [])
-        removed = {m for m in owned if current is not None and m not in current.get('members', [])}
-        disabled = set(current.get('off', [])) if current else set()
-        excluded = set(self.managed['excluded']) | {name + ':' + m for m in removed | disabled}
-        self.managed['excluded'] = sorted(excluded)
-        members = [m for m in dict.fromkeys(members) if name + ':' + m not in excluded]
-        if current is None:
-            if not members:
-                return False
-            self._command('group', 'add', name, 'models=' + ','.join(members),
-                                  'routing=' + routing, 'stays=off')
-        else:
-            if current.get('hidden'):
-                return False
-            additions = [m for m in members if m not in current['members']]
-            removals = [m for m in owned if m in current['members'] and m not in members and m not in disabled]
-            retained = [m for m in current['members'] if m not in removals]
-            if not retained and not additions:
-                return False  # magpie disallows empty groups.
-            args = (['models+=' + ','.join(additions)] if additions else [])
-            args += ['models-=' + ','.join(removals)] if removals else []
-            projected = retained + additions
-            if routing == 'order' and [m for m in projected if m in members] != members:
-                # One atomic CLI delta preserves concurrent unrelated members.
-                moved = [m for m in members if m in current['members']]
-                args = (['models-=' + ','.join(dict.fromkeys(removals + moved))] if removals or moved else [])
-                args += ['models+=' + ','.join(members)] if members else []
-            if current.get('routing') != routing:
-                args.append('routing=' + routing)
-            if current.get('affinity') != 'off':
-                args.append('stays=off')
-            if routing == 'weight' and any(current.get('weights', {}).get(m, 1) != 1 for m in projected):
-                args.append('weight=' + ','.join(m + '=1' for m in projected))
-            if args:
-                self._command('group', 'set', name, *args)
-        self.managed['groups'][name] = members
-        if self._staged is None:
-            atomic_json(self.managed_path, self.managed)
-            self._audit('role_group_updated', name, current.get('members', []) if current else [], members)
-        return True
 
     def _disable_trial_template(self):
         """Keep the account template disabled; trials use model-specific providers."""
@@ -264,7 +266,7 @@ class GatewaySetup:
                 raise ValueError()
             recovered['excluded'] = sorted(set(recovered['excluded']) | {
                 e for e in exclusions if e.split(':', 1)[0] in applied})
-            # Let _group see any later manual deletion/disable against the
+            # Let planning see any later manual deletion/disable against the
             # ownership actually committed, not the unexecuted target plan.
             atomic_json(self.managed_path, recovered)
             self.managed = recovered
@@ -308,6 +310,75 @@ class GatewaySetup:
                 pinned.update({model: role for model in models})
         return pinned, retired
 
+    def _plan_groups(self, pools, free, retired, assignments):
+        projected = read_registry(self.config.settings, self.catalog)
+        plan = GroupPlan(projected.get('groups', []), self.managed)
+        for role, members in pools.items():
+            main = 'transcribe' + ('' if role == 'translate' else '-' + role)
+            paid_members, free_members = [], []
+            for tier, output in ((False, paid_members), (True, free_members)):
+                suppliers = defaultdict(list)
+                for member in members:
+                    if (member in free) == tier:
+                        suppliers[member.split('/', 1)[0]].append(member)
+                # Revisit owned supplier groups even if their last qualified
+                # model was retired. Preserve reachable manual siblings.
+                for member in retired:
+                    supplier = member.split('/', 1)[0]
+                    if _supplier_group(main, supplier, tier) in self.managed['groups']:
+                        suppliers.setdefault(supplier, [])
+                for supplier, models in suppliers.items():
+                    name = _supplier_group(main, supplier, tier)
+                    if plan.set_group(name, models, 'order'):
+                        output.append('group/' + name)
+            paid = main + '-paid'
+            plan.set_group(paid, paid_members, 'weight')
+            free_name = 'transcribe-free' + ('' if role == 'translate' else '-' + role)
+            has_free = plan.set_group(free_name, free_members, 'weight')
+            ordered = (['group/' + free_name] if has_free else []) + ['group/' + paid]
+            plan.set_group(main, ordered, 'order')
+        entries = {r: 'group/transcribe' + ('' if r == 'translate' else '-' + r) for r in ROLES}
+        projected['groups'] = list(plan.groups.values())
+        for provider in projected['providers']:
+            if provider['id'] == TRIAL_PROVIDER:
+                provider['off'] = True
+        from .magpie import group_models
+        if retired and any(owner + '/' + name in retired for entry in entries.values()
+                           for endpoint in (entry, entry + '-paid')
+                           for owner, name, _ in group_models(projected, endpoint)):
+            raise ToolError('动态翻译后端与其他角色冲突，无法从托管分组安全移出入口。', 'mt_dynamic_role_conflict')
+        self._validated_groups(projected, entries)
+        for role, entry in entries.items():
+            for owner, name, _ in group_models(projected, entry):
+                assignments.update({model: role for model in model_set(owner + '/' + name,
+                                    self.catalog.get('identities', {}))})
+        return plan, projected, entries
+
+    def _execute_groups(self, group_plan, projected, entries, plan):
+        roots = {m.removeprefix('group/') for m in entries.values()}
+        children_checked = False
+        for command, expected in sorted(group_plan.changes, key=lambda change: change[0][2] in roots):
+            if command[2] in roots and not children_checked:
+                live = read_registry(self.config.settings, self.catalog)
+                # Inspect the children actually written, with only the future
+                # parent links substituted. Do not publish unverified children.
+                live['groups'] = [g for g in live['groups'] if g['id'] not in roots] + [
+                    g for g in projected['groups'] if g['id'] in roots]
+                self._validated_groups(live, entries)
+                children_checked = True
+            before = next((g for g in self.admin.registry()['groups'] if g['id'] == command[2]), None)
+            plan['active'] = {'group': command[2], 'before': self._group_state(before), 'after': self._group_state(expected)}
+            atomic_json(self.plan_path, plan)  # Intent must survive a committed command with no reply.
+            self.admin.command(*command, control=self.control)
+            actual = next((g for g in self.admin.registry()['groups'] if g['id'] == command[2]), None)
+            if self._group_state(actual) != self._group_state(expected):
+                raise ToolError('子组写入后与预演不一致；已保留备份和更新记录。', 'magpie_group')
+            plan['completed'].append(command[2])
+            plan['active'] = None
+            atomic_json(self.plan_path, plan)
+            self._audit('role_group_updated', command[2], None, group_plan.ownership['groups'][command[2]])
+        self._validated_groups(read_registry(self.config.settings, self.catalog), entries)
+
     def apply(self, evaluations, free=()):
         with self.admin.lock:
             return self._apply(evaluations, free)
@@ -341,68 +412,16 @@ class GatewaySetup:
                 assignments.update({m: role for m in actual})
         if any(not set(members) - free for members in pools.values()):
             raise ToolError('每个角色必须有已验收的商业后备。', 'mt_admission')
-        previous_managed = copy.deepcopy(self.managed)
-        self._staged = copy.deepcopy(self.admin.registry())
-        self._staged.setdefault('groups', [])
-        self._actions = []
-        try:
-            for provider in self._staged['providers']:
-                if provider['id'] == TRIAL_PROVIDER:
-                    provider['off'] = True
-            for role, members in pools.items():
-                main = 'transcribe' + ('' if role == 'translate' else '-' + role)
-                paid_members, free_members = [], []
-                for tier, output in ((False, paid_members), (True, free_members)):
-                    suppliers = defaultdict(list)
-                    for member in members:
-                        if (member in free) == tier:
-                            suppliers[member.split('/', 1)[0]].append(member)
-                    # Revisit owned supplier groups even if their last qualified
-                    # model was retired. Preserve reachable manual siblings.
-                    for member in retired:
-                        supplier = member.split('/', 1)[0]
-                        if _supplier_group(main, supplier, tier) in self.managed['groups']:
-                            suppliers.setdefault(supplier, [])
-                    for supplier, models in suppliers.items():
-                        name = _supplier_group(main, supplier, tier)
-                        if self._group(name, models, 'order'):
-                            output.append('group/' + name)
-                paid = main + '-paid'
-                self._group(paid, paid_members, 'weight')
-                free_name = 'transcribe-free' + ('' if role == 'translate' else '-' + role)
-                has_free = self._group(free_name, free_members, 'weight')
-                ordered = (['group/' + free_name] if has_free else []) + ['group/' + paid]
-                self._group(main, ordered, 'order')
-            entries = {r: 'group/transcribe' + ('' if r == 'translate' else '-' + r) for r in ROLES}
-            projected = read_registry(self.config.settings, self.catalog)
-            projected['groups'] = self._staged['groups']
-            for provider in projected['providers']:
-                if provider['id'] == TRIAL_PROVIDER:
-                    provider['off'] = True
-            from .magpie import group_models
-            if retired and any(owner + '/' + name in retired for entry in entries.values()
-                               for endpoint in (entry, entry + '-paid')
-                               for owner, name, _ in group_models(projected, endpoint)):
-                raise ToolError('动态翻译后端与其他角色冲突，无法从托管分组安全移出入口。', 'mt_dynamic_role_conflict')
-            self._validated_groups(projected, entries)
-            for role, entry in entries.items():
-                for owner, name, _ in group_models(projected, entry):
-                    assignments.update({model: role for model in model_set(owner + '/' + name,
-                                        self.catalog.get('identities', {}))})
-        except Exception:
-            self.managed = previous_managed
-            raise
-        finally:
-            self._staged = None
+        group_plan, projected, entries = self._plan_groups(pools, free, retired, assignments)
         template_active = any(p['id'] == TRIAL_PROVIDER and not p.get('off')
                               for p in self.admin.registry()['providers'])
-        if (not recovering and not self._actions and not template_active and self.catalog == saved_catalog(self.config) and
+        if (not recovering and not group_plan.changes and not template_active and self.catalog == saved_catalog(self.config) and
                 self.trial_state.data.get('reserved_models') == assignments):
-            if self.managed != previous_managed:
-                atomic_json(self.managed_path, self.managed)
+            if group_plan.ownership != self.managed:
+                atomic_json(self.managed_path, group_plan.ownership)
+                self.managed = group_plan.ownership
             return {'roles': pools, 'backup': None, 'changed': False, 'role_conflicts': retired}
-        target_managed = self.managed
-        self.managed = previous_managed  # A failed attempt must not expose uncommitted ownership in memory.
+        target_managed = group_plan.ownership
         backup = self.config.data / 'gateway-backups' / str(time.time_ns())
         backup.mkdir(parents=True)
         atomic_json(backup / 'providers.json', self.admin.registry())
@@ -413,34 +432,11 @@ class GatewaySetup:
                 (backup / filename).write_bytes(path.read_bytes())
         self._disable_trial_template()
         # Parent entrypoints switch only after every child has been built.
-        roots = {m.removeprefix('group/') for m in entries.values()}
         plan = {'version': 2, 'status': 'pending', 'backup': str(backup),
                 'groups': target_managed['groups'], 'excluded': target_managed['excluded'],
                 'completed': [], 'active': None}
         atomic_json(self.plan_path, plan)
-        children_checked = False
-        for command in sorted(self._actions, key=lambda cmd: cmd[2] in roots):
-            if command[2] in roots and not children_checked:
-                live = read_registry(self.config.settings, self.catalog)
-                # Inspect the children actually written, with only the future
-                # parent links substituted. Do not publish unverified children.
-                live['groups'] = [g for g in live['groups'] if g['id'] not in roots] + [
-                    g for g in projected['groups'] if g['id'] in roots]
-                self._validated_groups(live, entries)
-                children_checked = True
-            before = next((g for g in self.admin.registry()['groups'] if g['id'] == command[2]), None)
-            expected = next(g for g in projected['groups'] if g['id'] == command[2])
-            plan['active'] = {'group': command[2], 'before': self._group_state(before), 'after': self._group_state(expected)}
-            atomic_json(self.plan_path, plan)  # Intent must survive a committed command with no reply.
-            self.admin.command(*command, control=self.control)
-            actual = next((g for g in self.admin.registry()['groups'] if g['id'] == command[2]), None)
-            if self._group_state(actual) != self._group_state(expected):
-                raise ToolError('子组写入后与预演不一致；已保留备份和更新记录。', 'magpie_group')
-            plan['completed'].append(command[2])
-            plan['active'] = None
-            atomic_json(self.plan_path, plan)
-            self._audit('role_group_updated', command[2], None, target_managed['groups'].get(command[2], []))
-        self._validated_groups(read_registry(self.config.settings, self.catalog), entries)
+        self._execute_groups(group_plan, projected, entries, plan)
         atomic_json(self.managed_path, target_managed)
         self.managed = target_managed
         self.trial_state.data['reserved_models'] = assignments

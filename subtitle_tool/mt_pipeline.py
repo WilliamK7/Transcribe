@@ -9,6 +9,7 @@ import time
 import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,18 +18,18 @@ from .mt_backend import MTBackend
 from .mt_context import group_context, sentence_context, target_span, trim_context, valid_context_subset
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
-from .mt_planning import make_unit, restore_group_plan, save_group_plan
+from .mt_planning import make_translation_unit, restore_group_plan, save_group_plan
 from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, correction_stalled,
                          estimate_stage_output, make_stage_payload, manual_terms, parse_stage_response, plan_sentence_groups,
-                         repetition_checks, review_with_checks, stage_cache_key, term_appears, term_evidence,
+                         repetition_checks, review_with_checks, request_cache_key, term_appears, term_evidence,
                          validate_stage_value, validate_judgment)
 from .mt_routing import STAGE_TIMEOUT, MagpieRoute, RouteEntry, RouteExhausted, RouteFailure
 from .mt_runtime import service_failure
 from .mt_transport import TransportError
 from .mt_identity import canonical_model, resolve_model, dynamic_model
 from .review import decision_origin
-from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, split_mt_units,
-                        validate_unit_coverage)
+from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, split_cues_for_translation,
+                        validate_cue_coverage)
 
 
 def _digest(value):
@@ -132,15 +133,35 @@ class GlossaryPrefix:
         return tuple(self.terms)
 
 
-def _valid_usage(value):
-    return (value is None or isinstance(value, dict) and set(value) == {'input_tokens', 'output_tokens'} and
-            all(type(item) is int and item >= 0 for item in value.values()))
+def _valid_stage_metadata(record):
+    model, usage = record['actual_model'], record['usage']
+    return (isinstance(model, str) and safe_model_id(model) == model and
+            (usage is None or isinstance(usage, dict) and set(usage) == {'input_tokens', 'output_tokens'} and
+             all(type(count) is int and count >= 0 for count in usage.values())))
 
 
-def _sentence(unit, identity):
-    source = unit['source']
-    start, end = target_span(unit)
-    return {'id': identity, 'text': unit['text'], 'asr_language': source.get('language', ''),
+@dataclass(frozen=True)
+class StageRequest:
+    name: str
+    data: dict
+    ids: tuple
+    originals: tuple
+    forbidden_models: frozenset
+
+    def validate_record(self, record, identities, prompt_version):
+        value = validate_stage_value(self.name, record['value'], ids=self.ids, originals=self.originals)
+        if self.name == 'judge':
+            validate_judgment(value, self.data, prompt_version=prompt_version)
+        resolved = _record_model(record, identities)
+        if not _independent_model(resolved, self.forbidden_models):
+            return None
+        return value, resolved
+
+
+def _sentence(translation_unit, identity):
+    source = translation_unit['source']
+    start, end = target_span(translation_unit)
+    return {'id': identity, 'text': translation_unit['text'], 'asr_language': source.get('language', ''),
             'source_language': source.get('source_lang', 'auto'), 'decision_origin': decision_origin(source),
             'source_id': source['sentence_id'], 'char_start': start, 'char_end': end}
 
@@ -321,10 +342,8 @@ class Pipeline:
         self.diagnostics = MTDiagnostics(engine.config.root, job_id)
         from . import mt_transport
         self.transport = mt_transport.ProcessTransport()
-        from .bailian_free import BailianFreeGuard
-        self.bailian_free = BailianFreeGuard(engine.config, engine.mt_control, job_id=job_id)
-        from .mt_maintenance import ChannelMaintenance
-        self.channel_maintenance = ChannelMaintenance(engine.config, engine.mt_control, trial_state=self.bailian_free.trial_state)
+        self.maintenance_lock = threading.Lock()
+        self.maintenance = None
         self.snapshot = saved_route(manifest)
         self.identities = self.snapshot.get('identities', {})
         self.cache_scope = dict(scope)
@@ -344,9 +363,30 @@ class Pipeline:
         return self.routers['review' if stage == 'glossary' else stage]
 
     def close(self):
-        self.bailian_free.stop.set()
-        self.channel_maintenance.close()
-        self.bailian_free.close()
+        if self.maintenance is not None:
+            trial, channels = self.maintenance
+            trial.stop.set()
+            channels.close()
+            trial.close()
+
+    def _prepare_maintenance(self, base_url):
+        from .bailian_free import BailianFreeGuard
+        from .mt_maintenance import ChannelMaintenance
+        with self.maintenance_lock:
+            if self.maintenance is None:
+                trial = BailianFreeGuard(self.engine.config, self.engine.mt_control, job_id=self.job_id)
+                channels = ChannelMaintenance(self.engine.config, self.engine.mt_control, trial_state=trial.trial_state)
+                self.maintenance = trial, channels
+            trial, channels = self.maintenance
+        channels.prepare(base_url)
+        try:
+            trial.prepare(base_url)
+            if trial.thread is not None:
+                trial.poll_routes()
+        except Cancelled:
+            raise
+        except ToolError:
+            raise RouteFailure('permission_denied', fallback_allowed=True) from None
 
     def _event(self, event):
         event = dict(event)
@@ -361,7 +401,7 @@ class Pipeline:
             self.store.count(self.job_id, 'mt_v6_' + getattr(self.context, 'stage', 'unknown') + '_failure')
 
     def _validate_gateway(self, entry):
-        from .magpie import validate_group, validate_role_pools
+        from .magpie import bound_gateway, managed_gateway, validate_group, validate_role_pools
         from .mt_catalog import saved_catalog
         from .mt_channel_policy import check_provider_policy
         try:
@@ -375,17 +415,11 @@ class Pipeline:
             magpie.ensure_ready(entry.backend.base_url, self.engine.mt_control)
         # Live pool validation sees newly admitted members while saved-stage
         # evidence remains tied to the route snapshot.
+        if not bound_gateway(self.engine.config.settings, entry.backend.base_url):
+            return
         pool_identities = {**saved_catalog(self.engine.config).get('identities', {}), **self.identities}
-        if not entry.id.endswith('_fallback'):
-            self.channel_maintenance.prepare(entry.backend.base_url)
-            try:
-                self.bailian_free.prepare(entry.backend.base_url)
-                if self.bailian_free.thread is not None:
-                    self.bailian_free.poll_routes()
-            except Cancelled:
-                raise
-            except ToolError:
-                raise RouteFailure('permission_denied', fallback_allowed=True) from None
+        if not entry.id.endswith('_fallback') and managed_gateway(self.engine.config, entry.backend.base_url):
+            self._prepare_maintenance(entry.backend.base_url)
         validate_role_pools(self.engine.config.settings, {
             role: [candidate.backend.model for candidate in router.entries
                    if candidate.backend.base_url == entry.backend.base_url] for role, router in self.routers.items()},
@@ -403,8 +437,9 @@ class Pipeline:
                 raise
             raise RouteFailure('local_error') from None
 
-    def _invoke_stage(self, name, data, ids, originals, work_key, entry, timeout, attempt, *, forbidden_models=()):
+    def _invoke_stage(self, request, stage_key, entry, timeout, attempt):
         """One HTTP request, with content-free evidence even when validation fails."""
+        name, data = request.name, request.data
         self.engine.mt_control.check_start()
         started = time.monotonic()
         try:
@@ -416,7 +451,7 @@ class Pipeline:
         session = 'transcribe-' + self.job_id + '-' + request_id
         self.context.request_id, self.context.gateway_session = request_id, session
         event = {'stage': name, 'entry': entry.id, 'model': entry.backend.model,
-                 'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', ''),
+                 'group_key': stage_key, 'run_id': getattr(self.engine, 'run_id', ''),
                  'request_id': request_id, 'gateway_session': session, 'attempt': attempt,
                  'policy_version': entry.backend.policy_version, 'dispatched': False}
         outcome = 'local_error'
@@ -488,7 +523,7 @@ class Pipeline:
                 outcome, event['category'] = 'service_error', category
                 raise RouteFailure(category, diagnostic_scope=scope) from None
             try:
-                value = parse_stage_response(name, body, ids=ids, originals=originals)
+                value = parse_stage_response(name, body, ids=request.ids, originals=request.originals)
                 if name == 'judge':
                     validate_judgment(value, data, prompt_version=self.prompt_version)
             except BatchValidationError as error:
@@ -498,7 +533,7 @@ class Pipeline:
                     self.store.count(self.job_id, 'mt_output_truncated')
                 metadata = batch_response_metadata(body)
                 self.diagnostics.write({'kind': 'invalid_response', **event, 'category': error.category,
-                    'expected_count': len(ids), 'actual_count': error.actual_count, **metadata})
+                    'expected_count': len(request.ids), 'actual_count': error.actual_count, **metadata})
                 # Regenerate a normally completed response from original
                 # evidence when local format validation fails.
                 completed = metadata['finish_reason'] == 'stop' and metadata['content_type'] == 'string'
@@ -513,7 +548,7 @@ class Pipeline:
             except ValueError:
                 outcome = 'invalid'
                 raise RouteFailure('model_not_independent', fallback_allowed=True) from None
-            if not _independent_model(event['resolved_model'], forbidden_models):
+            if not _independent_model(event['resolved_model'], request.forbidden_models):
                 outcome = 'invalid'
                 raise RouteFailure('model_not_independent', fallback_allowed=True)
             if usage is None:
@@ -577,9 +612,66 @@ class Pipeline:
             else:
                 raise ToolError('翻译阶段完整请求超过所有可用模型的输入预算。', 'mt_input_budget')
 
-    def _work_key(self, name, data):
+    def _task_stage_key(self, name, data):
         return _digest({'strategy': 6, 'prompt': self.prompt_version, 'stage': name, 'data': data,
                         'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
+
+    def _read_task_stage(self, request, stage_key, evidence):
+        try:
+            stored = self.store.mt_stage_entry(self.job_id, stage_key)
+            if stored is None:
+                return None
+            record = stored['record']
+            fields = {'value', 'backend', 'request_model', 'actual_model', 'resolved_model', 'usage', 'stage'} | evidence.keys()
+            if request.name == 'glossary':
+                fields.add('context')
+                if not valid_context_subset(request.data.get('context', []), record['context']):
+                    raise ValueError()
+            if (stored['stage'] != request.name or set(record) != fields or record['stage'] != request.name or
+                    any(record[k] != v for k, v in evidence.items()) or
+                    record['request_model'] != self.profiles[record['backend']]['backend']['model'] or
+                    not _valid_stage_metadata(record)):
+                raise ValueError()
+            entry = next((e for e in self.router_for(request.name).entries if e.id == record['backend']), None)
+            if entry is None:
+                return None
+            try:
+                entry.backend.credential(self.engine.config)
+            except ToolError:
+                return None
+            accepted = request.validate_record(record, self.identities, self.prompt_version)
+            if accepted is None:
+                return None
+            value, resolved = accepted
+            return value, entry.id, {'key': stage_key, 'actual_model': record['actual_model'],
+                                     'resolved_model': resolved, 'request_model': record['request_model']}
+        except (ValueError, TypeError, KeyError, ToolError):
+            raise ToolError('保存的翻译阶段与请求不符，请用 --reflow 从原始转写重建。', 'cache_mismatch') from None
+
+    def _read_request_cache(self, request, entry):
+        try:
+            entry.backend.credential(self.engine.config)
+            key = request_cache_key(request.name, request.data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
+                                    scope=self.cache_scope, prompt_version=self.prompt_version)
+        except ToolError as error:
+            if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
+                return None
+            raise
+        raw = self.store.cache_get(key)
+        if raw is None:
+            return None
+        try:
+            record = json.loads(raw)
+            if (not isinstance(record, dict) or set(record) != {'value', 'actual_model', 'resolved_model', 'usage'} or
+                    not _valid_stage_metadata(record)):
+                raise ValueError()
+            accepted = request.validate_record(record, self.identities, self.prompt_version)
+            if accepted is None:
+                return None
+            value, resolved = accepted
+            return {'value': value, 'actual_model': record['actual_model'], 'resolved_model': resolved, 'usage': None}
+        except (ValueError, TypeError, KeyError, ToolError):
+            raise ToolError('翻译请求缓存与请求不符，请用 --reflow 检查来源。', 'cache_mismatch') from None
 
     def stage(self, name, data, *, ids=(), originals=(), saved_only=False, fixed_semantics=False,
               forbidden_models=()):
@@ -593,97 +685,24 @@ class Pipeline:
             self.group_progress.set(group, name)
         started = time.monotonic()
         deadline = started + STAGE_TIMEOUT
-        work_key = self._work_key(name, data)
-        self.context.stage, self.context.group_key = name, work_key
+        stage_key = self._task_stage_key(name, data)
+        self.context.stage, self.context.group_key = name, stage_key
         self.context.request_id = self.context.gateway_session = None
         # Bind numbered draft outputs to source text, including on cross-task
         # cache hits. Hashes allow partial layout replacement without retaining
         # another copy of the transcript or binding reusable stages to cue IDs.
         evidence = ({'source_text_hashes': [_digest(text.strip()) for text in originals]}
                     if name == 'translate' else {})
-        input_fields = {'context'} if name == 'glossary' else set()
-        def saved_stage():
-            try:
-                stored = self.store.mt_stage_entry(self.job_id, work_key)
-            except (ValueError, TypeError):
-                raise ToolError('翻译阶段保存记录无效。', 'cache_mismatch') from None
-            if stored is None:
-                return None
-            saved = stored['record']
-            usage = saved.get('usage') if isinstance(saved, dict) else None
-            if (stored['stage'] != name or not isinstance(saved, dict) or
-                    set(saved) != {'value', 'backend', 'request_model', 'actual_model', 'resolved_model', 'usage', 'stage'} | set(evidence) | input_fields or
-                    any(saved[k] != value for k, value in evidence.items()) or
-                    saved.get('stage') != name or not isinstance(saved.get('backend'), str) or
-                    saved.get('backend') not in self.profiles or
-                    saved.get('request_model') != self.profiles[saved['backend']]['backend']['model'] or
-                    not isinstance(saved.get('actual_model'), str) or
-                    safe_model_id(saved['actual_model']) != saved['actual_model'] or
-                    not _valid_usage(usage)):
-                raise ToolError('翻译阶段保存记录无效。', 'cache_mismatch')
-            if name == 'glossary' and not valid_context_subset(data.get('context', []), saved['context']):
-                raise ToolError('术语阶段保存的上下文无效。', 'cache_mismatch')
-            entry = next((entry for entry in self.router_for(name).entries if entry.id == saved['backend']), None)
-            if entry is not None:
-                try:
-                    entry.backend.credential(self.engine.config)
-                except ToolError:
-                    pass
-                else:
-                    try:
-                        value = validate_stage_value(name, saved.get('value'), ids=ids, originals=originals)
-                        if name == 'judge':
-                            validate_judgment(value, data, prompt_version=self.prompt_version)
-                    except ToolError:
-                        raise ToolError('保存的翻译阶段记录无效。', 'cache_mismatch') from None
-                    try:
-                        resolved = _record_model(saved, self.identities)
-                    except ValueError:
-                        raise ToolError('保存的路由缺少可验证身份，请用 --reflow 从原始转写重建。',
-                                        'cache_mismatch') from None
-                    if not _independent_model(resolved, forbidden_models):
-                        return None
-                    return value, saved['backend'], {'key': work_key, 'actual_model': saved['actual_model'],
-                                                     'resolved_model': resolved,
-                                                     'request_model': saved['request_model']}
-            return None
-
-        saved = saved_stage()
+        request = StageRequest(name, data, tuple(ids), tuple(originals), forbidden_models)
+        saved = self._read_task_stage(request, stage_key, evidence)
         if saved is not None:
             return saved
 
         def cached(entry):
-            try:
-                entry.backend.credential(self.engine.config)
-                key = stage_cache_key(name, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                    scope=self.cache_scope, prompt_version=self.prompt_version)
-            except ToolError as error:
-                if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
-                    return None
-                raise
-            raw = self.store.cache_get(key)
-            if raw is None:
-                return None
-            try:
-                record = json.loads(raw)
-                if (not isinstance(record, dict) or set(record) != {'value', 'actual_model', 'resolved_model', 'usage'} or
-                        not isinstance(record['actual_model'], str) or
-                        safe_model_id(record['actual_model']) != record['actual_model'] or
-                        not _valid_usage(record['usage'])):
-                    raise ValueError()
-                value = validate_stage_value(name, record['value'], ids=ids, originals=originals)
-                if name == 'judge':
-                    validate_judgment(value, data, prompt_version=self.prompt_version)
-                resolved = _record_model(record, self.identities)
-                if not _independent_model(resolved, forbidden_models):
-                    return None
-                return {'value': value, 'actual_model': record['actual_model'], 'resolved_model': resolved, 'usage': None}
-            except (ValueError, TypeError, KeyError, ToolError):
-                raise ToolError('翻译阶段缓存无效，未复用。', 'cache_mismatch') from None
+            return self._read_request_cache(request, entry)
 
         def invoke(entry, timeout, attempt):
-            return self._invoke_stage(name, data, ids, originals, work_key, entry, timeout, attempt,
-                                      forbidden_models=forbidden_models)
+            return self._invoke_stage(request, stage_key, entry, timeout, attempt)
 
         # Preserve the exact originally requested context and glossary for both
         # free and paid cache lookup before adapting to permitted network models.
@@ -695,12 +714,13 @@ class Pipeline:
                 if saved_only and error.code == 'mt_input_budget':
                     return None
                 raise
-            new_key = self._work_key(name, data)
-            adapted = new_key != work_key
+            request = replace(request, data=data)
+            new_key = self._task_stage_key(name, data)
+            adapted = new_key != stage_key
             if adapted and name != 'glossary':
-                work_key = new_key
-                self.context.group_key = work_key
-                saved = saved_stage()
+                stage_key = new_key
+                self.context.group_key = stage_key
+                saved = self._read_task_stage(request, stage_key, evidence)
                 if saved is not None:
                     return saved
             if adapted:
@@ -715,7 +735,7 @@ class Pipeline:
             'gateway_session': self.context.gateway_session, 'request_id': self.context.request_id,
             'duration_ms': round((time.monotonic() - started) * 1000),
             'attempt': result.attempts, 'cached': result.cached,
-            'group_key': work_key, 'run_id': getattr(self.engine, 'run_id', '')})
+            'group_key': stage_key, 'run_id': getattr(self.engine, 'run_id', '')})
         record = {**result.value, **evidence, 'backend': result.entry.id, 'request_model': result.entry.backend.model,
                   'stage': name}
         if name == 'glossary':
@@ -723,16 +743,16 @@ class Pipeline:
             # keeping its actual trimmed context for inspection and validation.
             # Its cross-task cache still keys the exact fitted wire request.
             record['context'] = data.get('context', [])
-        cache_key = stage_cache_key(name, data, result.entry.backend,
+        cache_key = request_cache_key(name, data, result.entry.backend,
                                     capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope,
                                     prompt_version=self.prompt_version)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
-            self.store.commit_mt_stage(self.job_id, work_key, name, record,
+            self.store.commit_mt_stage(self.job_id, stage_key, name, record,
                 cache_key=None if result.cached else cache_key,
                 cache_value=None if result.cached else json.dumps(result.value, ensure_ascii=False),
                 counts={'mt_v6_' + name + ('_cache_hit' if result.cached else '_completed'): 1})
-        proof = {'key': work_key, 'actual_model': record['actual_model'], 'request_model': record['request_model'],
+        proof = {'key': stage_key, 'actual_model': record['actual_model'], 'request_model': record['request_model'],
                  'resolved_model': _record_model(record, self.identities)}
         if not result.cached:
             proof.update(request_id=self.context.request_id, gateway_session=self.context.gateway_session)
@@ -740,8 +760,8 @@ class Pipeline:
 
     def _fragments(self, units):
         fragments = []
-        for sentence_index, unit in enumerate(units):
-            for cue in unit['cues']:
+        for sentence_index, translation_unit in enumerate(units):
+            for cue in translation_unit['cues']:
                 part = {'id': str(len(fragments)), 'sentence': str(sentence_index), 'text': cue['text']}
                 if self.display_durations is not None:
                     part['display_ms'] = self.display_durations.get(cue['cue_id'], cue['end_ms'] - cue['begin_ms'])
@@ -751,7 +771,7 @@ class Pipeline:
     def _fits_group(self, units, *, output_budget=False):
         if units[-1]['cues'][-1]['end_ms'] - units[0]['cues'][0]['begin_ms'] > 60000:
             return False
-        sentences = [_sentence(unit, str(i)) for i, unit in enumerate(units)]
+        sentences = [_sentence(translation_unit, str(i)) for i, translation_unit in enumerate(units)]
         fragments = self._fragments(units)
         context = sentence_context(units)
         samples = [('glossary', {'sentences': sentences, 'manual_glossary': [], 'context': context})]
@@ -775,15 +795,15 @@ class Pipeline:
             pending = []
             for source in source_group:
                 members = sorted(by_sentence.get(source['sentence_id'], []), key=lambda item: item['char_start'])
-                validate_unit_coverage(source, members)
+                validate_cue_coverage(source, members)
                 def split(start, end):
-                    unit = make_unit(source, members, start, end)
-                    if self._fits_group([unit], output_budget=True):
-                        return [unit]
+                    translation_unit = make_translation_unit(source, members, start, end)
+                    if self._fits_group([translation_unit], output_budget=True):
+                        return [translation_unit]
                     if end - start < 2 or not source.get('words'):
                         # Intact targets use input-only admission, including guarded models.
-                        if self._fits_group([unit]):
-                            return [unit]
+                        if self._fits_group([translation_unit]):
+                            return [translation_unit]
                         raise ToolError('完整句超过模型预算且没有可用的可靠词时间边界。', 'mt_input_budget')
                     middle = (start + end) // 2
                     return split(start, middle) + split(middle, end)
@@ -792,43 +812,34 @@ class Pipeline:
                     if pending:
                         result.append(pending)
                         pending = []
-                    result.extend([[unit] for unit in units])
+                    result.extend([[translation_unit] for translation_unit in units])
                     continue
-                unit = units[0]
-                if pending and not self._fits_group([*pending, unit], output_budget=True):
+                translation_unit = units[0]
+                if pending and not self._fits_group([*pending, translation_unit], output_budget=True):
                     result.append(pending)
                     pending = []
-                pending.append(unit)
+                pending.append(translation_unit)
             if pending:
                 result.append(pending)
         return result
 
-    def groups_for_layout(self, sources, cues, manifest):
-        if 'mt_group_plan' in manifest:
-            return restore_group_plan(manifest['mt_group_plan'], sources, cues, manifest['layout_round'])
-        groups = self.plan_groups(sources, cues)
-        candidate = copy.deepcopy(manifest)
-        candidate['mt_group_plan'] = save_group_plan(groups, sources, cues, manifest['layout_round'])
-        self.engine.commit_local(self.job_id, manifest, candidate, self.store.save_mt_group_plan)
-        return groups
-
     def glossary_data(self, group, context, known=()):
         manual = self.snapshot['quality']['manual_glossary']
         by_source = {}
-        for unit in group:
-            identity = unit['source']['sentence_id']
+        for translation_unit in group:
+            identity = translation_unit['source']['sentence_id']
             if identity not in by_source:
-                by_source[identity] = _sentence(unit, identity)
+                by_source[identity] = _sentence(translation_unit, identity)
             else:
                 # Distinct adjacent source ranges can contain identical words.
                 # Preserve both occurrences and their exact source spacing.
                 current = by_source[identity]
-                following = _sentence(unit, identity)
+                following = _sentence(translation_unit, identity)
                 start = min(current.get('char_start', 0), following.get('char_start', 0))
                 end = max(current.get('char_end', len(current['text'])),
                           following.get('char_end', len(following['text'])))
-                current.update(text=unit['source']['text'][start:end], char_start=start, char_end=end)
-        local = [{**unit['source'], 'text': unit['text']} for unit in group]
+                current.update(text=translation_unit['source']['text'][start:end], char_start=start, char_end=end)
+        local = [{**translation_unit['source'], 'text': translation_unit['text']} for translation_unit in group]
         return {'sentences': list(by_source.values()), 'manual_glossary': manual_terms(local, manual),
                 'context': context, 'glossary': list(known)}
 
@@ -836,7 +847,7 @@ class Pipeline:
         data = self.glossary_data(group, context, known)
         # Advisory failures must remain part of this job's deterministic prefix:
         # otherwise a later retry could silently change an already saved draft's input.
-        unavailable_key = _digest({'stage': 'glossary_unavailable', 'request': self._work_key('glossary', data)})
+        unavailable_key = _digest({'stage': 'glossary_unavailable', 'request': self._task_stage_key('glossary', data)})
         try:
             unavailable = self.store.mt_stage_entry(self.job_id, unavailable_key)
         except (TypeError, ValueError):
@@ -863,7 +874,7 @@ class Pipeline:
     def _semantic_input(self, sentences, fragments, context, glossary):
         """Freeze evidence before the draft; resume must not reselect it by live capacity."""
         original = {'sentences': sentences, 'fragments': fragments, 'context': context, 'glossary': glossary}
-        key = self._work_key('semantic_input', original)
+        key = self._task_stage_key('semantic_input', original)
         try:
             saved = self.store.mt_stage_entry(self.job_id, key)
             if saved is not None:
@@ -894,15 +905,15 @@ class Pipeline:
             self.engine.mt_control.check_start()
             return None
 
-    def group(self, group, glossary, context):
+    def translate_group(self, group, glossary, context):
         self.engine.mt_control.check_start()
-        members = [cue for unit in group for cue in unit['cues']]
+        members = [cue for translation_unit in group for cue in translation_unit['cues']]
         if not members or all(cue['translated'] for cue in members):
             return
-        relevant = [term for term in glossary if any(term_appears(term['source'], unit['text']) for unit in group)]
-        local_ids = {unit['source']['sentence_id'] for unit in group}
+        relevant = [term for term in glossary if any(term_appears(term['source'], translation_unit['text']) for translation_unit in group)]
+        local_ids = {translation_unit['source']['sentence_id'] for translation_unit in group}
         relevant.sort(key=lambda term: (term['origin'] != 'manual', term['sentence'] not in local_ids))
-        sentences = [_sentence(unit, str(i)) for i, unit in enumerate(group)]
+        sentences = [_sentence(translation_unit, str(i)) for i, translation_unit in enumerate(group)]
         fragments = self._fragments(group)
         # Choose one shared subset that fits every stage skeleton. Actual output
         # may still exceed the budget; later stages must not silently discard
@@ -976,6 +987,16 @@ class Pipeline:
                                        counts=counts)
 
 
+def groups_for_layout(engine, job_id, manifest, sources, cues, pipeline):
+    if 'mt_group_plan' in manifest:
+        return restore_group_plan(manifest['mt_group_plan'], sources, cues, manifest['layout_round'])
+    groups = pipeline.plan_groups(sources, cues) if pipeline is not None else []
+    candidate = copy.deepcopy(manifest)
+    candidate['mt_group_plan'] = save_group_plan(groups, sources, cues, manifest['layout_round'])
+    engine.commit_local(job_id, manifest, candidate, engine.store.save_mt_group_plan)
+    return groups
+
+
 def process_subtitles(engine, job_id, manifest, settings, scope, stage):
     sources = engine.store.sources(job_id)
     if not sources:
@@ -986,7 +1007,8 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
         return
     source_ids = {source['sentence_id']: source for source in sources}
     positions = {source['sentence_id']: index for index, source in enumerate(sources)}
-    pipeline = Pipeline(engine, job_id, manifest, scope)
+    needs_translation = any(source['decision'] == 'translate' for source in sources)
+    pipeline = Pipeline(engine, job_id, manifest, scope) if needs_translation else None
     alignment_version = manifest['execution_snapshot']['alignment_version']
     try:
         if not manifest.get('layout_planned'):
@@ -994,7 +1016,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             for source in sources:
                 parts = plan_fragments(source, settings, alignment_version=alignment_version)
                 if source['decision'] == 'translate':
-                    parts = split_mt_units(source, parts, alignment_version=alignment_version, fits=lambda cue: pipeline._fits_group(
+                    parts = split_cues_for_translation(source, parts, alignment_version=alignment_version, fits=lambda cue: pipeline._fits_group(
                         [{'source': source, 'text': cue['text'], 'cues': [cue]}]))
                 cues.extend(parts)
             plan_display_timing(cues)
@@ -1006,11 +1028,11 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             stage('subtitle_translating')
             cues = engine.store.cues(job_id)
             display_intervals, _ = plan_display_timing(cues)
-            if pipeline.display_durations is not None:
+            if pipeline is not None and pipeline.display_durations is not None:
                 pipeline.display_durations = {item['cue_id']: item['end_ms'] - item['begin_ms'] for item in display_intervals}
-            groups = pipeline.groups_for_layout(sources, cues, manifest)
+            groups = groups_for_layout(engine, job_id, manifest, sources, cues, pipeline)
             pending = [index for index, group in enumerate(groups)
-                       if any(not cue['translated'] for unit in group for cue in unit['cues'])]
+                       if any(not cue['translated'] for translation_unit in group for cue in translation_unit['cues'])]
             if pending:
                 # Completed earlier groups still contribute their exact saved glossary
                 # to the prefix used by later unfinished groups.
@@ -1051,7 +1073,8 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             plan_display_timing(revised)
             engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, revised)
     finally:
-        pipeline.close()
+        if pipeline is not None:
+            pipeline.close()
 
 
 def _translate_groups(pipeline, groups, sources, positions, *, done, total):
@@ -1070,7 +1093,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
     def window_end(start, known):
         end = min(start + 8, len(groups))
         while end > start + 1:
-            units = [unit for group in groups[start:end] for unit in group]
+            units = [translation_unit for group in groups[start:end] for translation_unit in group]
             try:
                 pipeline._fit('glossary', pipeline.glossary_data(
                     units, group_context(sources, units, positions), known), output_budget=True)
@@ -1085,13 +1108,13 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
         engine.mt_control.check_start()
         pipeline.context.group = start
         progress.set(start, 'glossary')
-        units = [unit for group in groups[start:end] for unit in group]
+        units = [translation_unit for group in groups[start:end] for translation_unit in group]
         result = pipeline.glossary(units, group_context(sources, units, positions), known)
         assigned = {i: [] for i in range(start, end)}
         for term in result:
             for index in range(start, end):
-                if any(unit['source']['sentence_id'] == term['sentence'] and
-                       term_appears(term['source'], unit['text']) for unit in groups[index]):
+                if any(translation_unit['source']['sentence_id'] == term['sentence'] and
+                       term_appears(term['source'], translation_unit['text']) for translation_unit in groups[index]):
                     assigned[index].append(term)
                     break
         progress.set(start, 'waiting')
@@ -1102,7 +1125,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
         pipeline.context.group = index
         group = groups[index]
         context = group_context(sources, group, positions)
-        pipeline.group(group, glossary, context)
+        pipeline.translate_group(group, glossary, context)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {}
@@ -1119,7 +1142,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
                     for start, end in list(windows.items()):
                         if end <= next_group:
                             del windows[start]
-                    members = [cue for unit in groups[index] for cue in unit['cues']]
+                    members = [cue for translation_unit in groups[index] for cue in translation_unit['cues']]
                     if all(cue['translated'] for cue in members):
                         progress.finish(index)
                         continue
@@ -1149,7 +1172,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
                         if is_extraction:
                             glossaries.update(value)
                         else:
-                            done += sum(not cue['translated'] for unit in groups[index] for cue in unit['cues'])
+                            done += sum(not cue['translated'] for translation_unit in groups[index] for cue in translation_unit['cues'])
                     except ToolError as error:
                         progress.finish(index)
                         if error.code != 'cancelled':

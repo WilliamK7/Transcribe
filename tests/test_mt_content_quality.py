@@ -10,7 +10,7 @@ from unittest import mock
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.mt_pipeline import Pipeline
-from subtitle_tool.mt_quality import BatchValidationError, make_stage_payload, stage_cache_key, validate_judgment
+from subtitle_tool.mt_quality import BatchValidationError, make_stage_payload, request_cache_key, validate_judgment
 from tests.mt_fixtures import PoolPipelineFixture
 
 
@@ -124,9 +124,9 @@ class ContentQualityPipelineTests(PoolPipelineFixture):
         entry = pipeline.router_for('judge').entries[0]
         evidence = {'value': {'issues': data['issues'][:1], 'translations': {**corrected, '3': '无关改写。'}},
                     'actual_model': 'synthetic/judge', 'resolved_model': 'judge', 'usage': None}
-        cache_key = stage_cache_key('judge', data, entry.backend, capabilities=pipeline.profiles[entry.id]['capabilities'],
+        cache_key = request_cache_key('judge', data, entry.backend, capabilities=pipeline.profiles[entry.id]['capabilities'],
                                     scope=pipeline.cache_scope)
-        stage_key = pipeline._work_key('judge', data)
+        stage_key = pipeline._task_stage_key('judge', data)
         with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected network')):
             for location in ('cache', 'saved'):
                 if location == 'cache':

@@ -121,16 +121,6 @@ def validate_transition(source, target, event, before, after):
         raise ToolError('任务状态转移不合法；原状态和恢复资料已保留，请检查调用的操作。', 'invalid_transition')
 
 
-def contract():
-    """Serializable policy, generated from the exact rules used by Store."""
-    return {'version': VERSION,
-            'states': {state: {'label': label, 'kind': kind, 'auto_recover': state in RUNNING}
-                       for state, (label, kind) in _STATES.items()},
-            'events': {name: {'from': sorted(rule.sources), 'to': sorted(rule.targets),
-                              'guards': [rule.guard.__name__.removeprefix('_')] if rule.guard else []}
-                       for name, rule in EVENTS.items()}}
-
-
 def describe(job, *, reflow_required=False):
     """Command arguments and inputs derived from saved metadata."""
     state, manifest, job_id = job['state'], job['manifest'], job['id']

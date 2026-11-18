@@ -4,9 +4,9 @@ from __future__ import annotations
 from .subtitles import source_context
 
 
-def target_span(unit):
-    return (unit.get('char_start', unit['cues'][0]['char_start']),
-            unit.get('char_end', unit['cues'][-1]['char_end']))
+def target_span(translation_unit):
+    return (translation_unit.get('char_start', translation_unit['cues'][0]['char_start']),
+            translation_unit.get('char_end', translation_unit['cues'][-1]['char_end']))
 
 
 def sentence_context(units, positions=None):
@@ -17,10 +17,10 @@ def sentence_context(units, positions=None):
     logarithmic in source length. A long word stays intact even if it exceeds the chunk size.
     """
     ranked = []
-    for number, unit in enumerate(units):
-        source = unit['source']
+    for number, translation_unit in enumerate(units):
+        source = translation_unit['source']
         text, words = source['text'], source.get('words', [])
-        start, end = target_span(unit)
+        start, end = target_span(translation_unit)
         position = positions[source['sentence_id']] if positions is not None else number
         for side, lo, hi in [('before', 0, start), ('after', end, len(text))]:
             if not text[lo:hi].strip():

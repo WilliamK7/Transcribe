@@ -78,6 +78,7 @@ def current_role_members(registry):
 def select_admission_judge(config, member, catalog, *, policy=None, preferred=None):
     """Select an enabled, independent configured or established judge."""
     from .mt_catalog import read_registry
+    from .magpie import supplies_model
     policy = policy or load_policy(config)
     identities = catalog.get('identities', {})
     raw = read_registry(config.settings, catalog, policy=policy)
@@ -89,7 +90,7 @@ def select_admission_judge(config, member, catalog, *, policy=None, preferred=No
     possible = model_set(member, identities)
     for candidate in dict.fromkeys(candidates):
         owner, name = candidate.split('/', 1)
-        if owner not in enabled or enabled[owner].get('noModels') or name in enabled[owner].get('modelsOff', []):
+        if not supplies_model(enabled.get(owner), name):
             continue
         try:
             if not possible & model_set(candidate, identities):

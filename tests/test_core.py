@@ -19,7 +19,7 @@ from subtitle_tool.config import Config, Settings
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.main import main
-from subtitle_tool.subtitles import normalize, render_srt, route
+from subtitle_tool.subtitles import normalize, render_srt, decide_translation
 from subtitle_tool.publication import write_srt
 from subtitle_tool.review import ReviewDecision
 
@@ -96,25 +96,25 @@ class SubtitleTests(TemporaryTest):
 
     def test_chinese_and_brands_skip_translation(self):
         for text, lang in [("欢迎使用百炼。", "zh"), ("我们使用 Python 和 API。", "zh"), ("今天天气好。", "yue")]:
-            self.assertEqual(route(text, lang)[0], "original")
+            self.assertEqual(decide_translation(text, lang)[0], "original")
 
     def test_japanese_han_is_not_chinese(self):
-        self.assertEqual(route("東京都", "ja", ["ja"])[0], "translate")
-        self.assertEqual(route("今日は良い天気です。", "")[0], "translate")
+        self.assertEqual(decide_translation("東京都", "ja", ["ja"])[0], "translate")
+        self.assertEqual(decide_translation("今日は良い天気です。", "")[0], "translate")
 
     def test_missing_language_is_not_default_english(self):
-        self.assertEqual(route("OK", "")[0], "uncertain")
-        self.assertEqual(route("Hello world", "")[0], "uncertain")
-        self.assertEqual(route("東京都港区", "")[0], "uncertain")
-        self.assertEqual(route("欢迎来到新课程。", "")[0], "original")
+        self.assertEqual(decide_translation("OK", "")[0], "uncertain")
+        self.assertEqual(decide_translation("Hello world", "")[0], "uncertain")
+        self.assertEqual(decide_translation("東京都港区", "")[0], "uncertain")
+        self.assertEqual(decide_translation("欢迎来到新课程。", "")[0], "original")
 
     def test_substantive_mixed_sentence_is_translated(self):
-        self.assertEqual(route("然后他说 please turn on the light now。", "zh")[0], "translate")
-        self.assertEqual(route("然后他说 PLEASE TURN ON THE LIGHT NOW。", "zh")[0], "translate")
+        self.assertEqual(decide_translation("然后他说 please turn on the light now。", "zh")[0], "translate")
+        self.assertEqual(decide_translation("然后他说 PLEASE TURN ON THE LIGHT NOW。", "zh")[0], "translate")
 
     def test_wrong_language_label_requires_review(self):
-        self.assertEqual(route("This is a complete English sentence", "zh")[0], "uncertain")
-        self.assertEqual(route("欢迎来到这里。", "en")[0], "uncertain")
+        self.assertEqual(decide_translation("This is a complete English sentence", "zh")[0], "uncertain")
+        self.assertEqual(decide_translation("欢迎来到这里。", "en")[0], "uncertain")
 
     def test_offset_sentence_only_and_unicode_srt(self):
         cues, _ = normalize(result(("مرحبا بالعالم", "ar")), 1511, "01")
@@ -511,7 +511,3 @@ class PipelineTests(PipelineFixture):
         self.assertGreater(len(manifest["segments"]), 1)
         self.assertTrue(all(s["bytes"] <= 50000 for s in manifest["segments"]))
         self.assertEqual(len(fake.named("/asr/transcription")), len(manifest["segments"]))
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -38,6 +38,11 @@ class Settings:
     zh_line_width: int = 44
     other_line_width: int = 84
 
+    def role_models(self):
+        return {'translate': (self.mt_model or Settings.mt_model, self.mt_fallback_model),
+                'review': (self.mt_review_model, self.mt_review_fallback_model),
+                'judge': (self.mt_judge_model, self.mt_judge_fallback_model)}
+
     def validate(self):
         if self.workspace_id:
             self.workspace_id = validate_workspace_id(self.workspace_id)
@@ -58,9 +63,6 @@ class Config:
         try:
             if not read_only:
                 self.data.mkdir(parents=True, exist_ok=True)
-                probe = self.data / (".write-probe-" + str(os.getpid()))
-                probe.write_bytes(b"")
-                probe.unlink()
         except OSError as e:
             raise ToolError("项目 data 目录不可写，请将项目移动到可写目录后运行。", "data_readonly") from e
         path = self.data / "settings.json"
@@ -71,7 +73,7 @@ class Config:
 
     def save(self):
         self.settings.validate()
-        atomic_json(self.data / "settings.json", asdict(self.settings))
+        atomic_json(self.data / "settings.json", {k: v for k, v in asdict(self.settings).items() if v is not None})
 
     def mt_settings(self):
         # Resolve only for new tasks/reflow: current choices cannot alter a saved resume.

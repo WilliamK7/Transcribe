@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import runpy
 import sys
@@ -8,19 +9,71 @@ from pathlib import Path
 from subtitle_tool.bailian_free import TRIAL_PROVIDER
 from subtitle_tool.common import ToolError, atomic_json
 from subtitle_tool.magpie import group_models
-from subtitle_tool.mt_gateway_setup import GatewaySetup, choose_roles
+from subtitle_tool.mt_gateway_setup import GatewaySetup, GroupPlan, choose_roles
 from tests.test_bailian_free import BailianFreeFixture
 
 
 class RoleChoiceTests(BailianFreeFixture):
-    def test_configuration_report_uses_the_evaluator_suite_version(self):
-        from subtitle_tool.mt_admission import SUITE_VERSION
-        script = Path(__file__).resolve().parents[1] / 'scripts' / 'configure-mt.py'
-        with mock.patch.object(sys, 'path', sys.path.copy()), mock.patch('subtitle_tool.config.Config', return_value=self.config), \
-                mock.patch.object(sys, 'argv', [str(script), '--providers', '']), mock.patch('builtins.print'):
+    def test_role_status_counts_distinct_models_and_shows_group_ownership(self):
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'manage-mt.py'
+        raw = {'providers': [{'id': owner, 'models': ['same'], 'key': 'private-key', 'countFree': True,
+                              'proxy': 'https://private-proxy', 'listOff': True} for owner in ('a', 'b')],
+               'groups': [{'id': 'transcribe', 'members': ['group/middle']},
+                          {'id': 'middle', 'members': ['group/transcribe-paid']},
+                          {'id': 'transcribe-paid', 'members': ['a/same', 'b/same']}]}
+        atomic_json(self.registry, raw)
+        atomic_json(self.config.data / 'gateway-managed.json', {'version': 1,
+                    'groups': {'transcribe-paid': ['a/same']}, 'excluded': []})
+        (self.folder / 'plugin-auth.json').write_bytes(b'invalid private credentials')
+        with mock.patch.object(sys, 'path', sys.path.copy()), mock.patch.object(sys, 'argv', [str(script), '--status']), \
+                mock.patch('subtitle_tool.config.Config', return_value=self.config), \
+                mock.patch.object(self.config, 'get_key', side_effect=AssertionError('unneeded key')), \
+                mock.patch('sys.stdout', new_callable=io.StringIO) as out:
             self.assertEqual(runpy.run_path(str(script))['main'](), 0)
-        path = self.config.root / '.build/mt-diagnostics/channel-admission-latest.json'
-        self.assertEqual(json.loads(path.read_bytes())['suite'], SUITE_VERSION)
+        result = json.loads(out.getvalue())['gateway']
+        entry = result['roles']['translate']['primary']
+        self.assertEqual((entry['channel_count'], entry['model_count']), (2, 1))
+        self.assertEqual(entry['billing_counts'], {'commercial': 2})
+        self.assertTrue(all(r['magpie_count_free'] for r in entry['members']))
+        self.assertEqual([r['paths'][0]['member_owner'] for r in entry['members']], ['project', 'manual'])
+        self.assertEqual(entry['members'][0]['paths'][0]['groups'],
+                         ['group/transcribe', 'group/middle', 'group/transcribe-paid'])
+        self.assertNotIn('private-', out.getvalue())
+        self.assertEqual(json.loads(self.registry.read_bytes()), raw)
+        self.assertEqual(self.commands, [])
+
+    def test_manual_apply_skips_overpriced_candidate_before_exposure_and_inference(self):
+        from subtitle_tool.mt_channel_policy import default_policy
+        from subtitle_tool.mt_catalog import Catalog
+        from subtitle_tool.mt_maintenance import ChannelMaintenance
+        raw = self.guard.admin.registry()
+        raw['providers'].append({'id': 'vercel', 'models': ['expensive']})
+        raw['groups'] = []
+        atomic_json(self.registry, raw)
+        policy = default_policy()
+        policy['providers']['vercel']['preferred'] = ['expensive']
+        atomic_json(self.config.data / 'mt-channels.json', policy)
+        discovered = {'identities': {'vercel/expensive': {'models': ['expensive'], 'dynamic': False,
+                      'billing': 'commercial'}}, 'models': {'vercel': {'expensive': {
+                      'pricing': {'input': '0.0001', 'output': '0.0001'}}}}}
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'configure-mt.py'
+        def discover(catalog, *args, **kwargs):
+            catalog.pending.add('vercel/expensive')
+            return discovered
+
+        with mock.patch.object(sys, 'path', sys.path.copy()), mock.patch.object(sys, 'argv', [str(script), '--apply']), \
+                mock.patch('subtitle_tool.config.Config', return_value=self.config), \
+                mock.patch.object(Catalog, 'discover', discover), \
+                mock.patch.object(GatewaySetup, 'independent_judge', return_value='other/judge'), \
+                mock.patch.object(GatewaySetup, 'evaluate', return_value=None) as evaluate, \
+                mock.patch.object(ChannelMaintenance, 'expose') as expose, \
+                mock.patch.object(GatewaySetup, 'apply', return_value={}), mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+            self.assertEqual(runpy.run_path(str(script))['main'](), 0)
+        evaluate.assert_not_called()
+        expose.assert_not_called()
+        events = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertIn({'model': 'vercel/expensive', 'reason': 'price_limit'},
+                      next(event['skipped'] for event in events if 'skipped' in event))
 
     def test_read_only_setup_defers_trial_state_but_apply_rejects_corruption(self):
         path = self.config.data / 'bailian-trial-state.json'
@@ -48,32 +101,39 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertEqual(len(set(assignments.values())), 3)
 
     def test_incremental_update_preserves_manual_member_and_exclusion(self):
-        setup = GatewaySetup(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
-        self.assertTrue(setup._group('transcribe-free', ['manual/keep', 'project/a'], 'weight'))
-        self.command('group', 'set', 'transcribe-free', 'models-=project/a', 'models+=manual/new')
-        self.assertTrue(setup._group('transcribe-free', ['manual/keep', 'project/a', 'project/b'], 'weight'))
-        members = self.guard.admin.registry()['groups'][0]['members']
+        ownership = {'groups': {'transcribe-free': ['manual/keep', 'project/a']}, 'excluded': []}
+        current = [{'id': 'transcribe-free', 'members': ['manual/keep', 'manual/new']}]
+        plan = GroupPlan(current, ownership)
+        self.assertTrue(plan.set_group('transcribe-free', ['manual/keep', 'project/a', 'project/b'], 'weight'))
+        members = plan.groups['transcribe-free']['members']
         self.assertIn('manual/new', members)
         self.assertNotIn('project/a', members)
+        self.assertIn('project/b', members)
+        self.assertIn('transcribe-free:project/a', plan.ownership['excluded'])
+        self.assertEqual(ownership['excluded'], [])
+        self.assertEqual(current[0]['members'], ['manual/keep', 'manual/new'])
+        self.assertEqual(self.commands, [])
 
     def test_repeated_update_preserves_disabled_managed_member(self):
-        setup = GatewaySetup(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
-        setup._group('transcribe-free', ['project/a', 'project/b'], 'weight')
-        raw = self.guard.admin.registry()
-        raw['groups'][0]['off'] = ['project/a']
-        atomic_json(self.registry, raw)
+        members = ['project/a', 'project/b']
+        current = [{'id': 'transcribe-free', 'members': members, 'off': ['project/a']}]
+        plan = GroupPlan(current, {'groups': {'transcribe-free': members}, 'excluded': []})
         for _ in range(2):
-            setup._group('transcribe-free', ['project/a', 'project/b'], 'weight')
-        group = self.guard.admin.registry()['groups'][0]
+            plan.set_group('transcribe-free', members, 'weight')
+        group = plan.groups['transcribe-free']
         self.assertIn('project/a', group['members'])
         self.assertIn('project/a', group['off'])
 
     def test_existing_main_group_is_reordered_free_before_commercial(self):
-        setup = GatewaySetup(self.config, self.parent, admin=self.guard.admin, trial_state=self.guard.trial_state)
-        setup._group('transcribe', ['group/paid', 'group/free'], 'order')
-        setup._group('transcribe', ['group/free', 'group/paid'], 'order')
-        group = next(g for g in self.guard.admin.registry()['groups'] if g['id'] == 'transcribe')
+        plan = GroupPlan([], {'groups': {}, 'excluded': []})
+        plan.set_group('transcribe', ['group/paid', 'group/free'], 'order')
+        plan.set_group('transcribe', ['group/free', 'group/paid'], 'order')
+        group = plan.groups['transcribe']
         self.assertEqual(group['members'], ['group/free', 'group/paid'])
+        for command, expected in plan.changes:
+            self.command(*command)
+            actual = next(g for g in self.guard.admin.registry()['groups'] if g['id'] == 'transcribe')
+            self.assertEqual(actual, expected)
 
     def gateway_setup(self, *, paid_only=False):
         raw = self.guard.admin.registry()
@@ -155,7 +215,7 @@ class RoleChoiceTests(BailianFreeFixture):
                 setup.apply(evaluations, free)
         self.assertEqual(self.guard.admin.registry(), before)
         self.assertEqual(self.commands, [])
-        self.assertIsNone(setup._staged)
+        self.assertFalse(setup.plan_path.exists())
 
     def test_child_write_failure_keeps_parent_and_can_resume(self):
         setup, evaluations, free, _ = self.gateway_setup()

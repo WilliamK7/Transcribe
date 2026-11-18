@@ -10,6 +10,15 @@ from tests.fixtures import set_asr_account, FakeService, SavedResultFixture, res
 
 
 class SavedRecoveryTests(SavedResultFixture):
+    def test_original_subtitles_ignore_unrelated_gateway_maintenance_files(self):
+        self.save_result(result(("保留原文。", "zh")))
+        for name in ('gateway-maintenance.json', 'bailian-trial-state.json'):
+            (self.config.data / name).write_text('{"version":0}', encoding='utf-8')
+        fake = FakeService(result())
+        self.assertEqual(self.run_fake(fake), 'completed')
+        self.assertIn('保留原文。', self.source.with_suffix('.srt').read_text(encoding='utf-8'))
+        self.assertEqual(fake.calls, [])
+
     def assert_mismatch_without_requests(self, fake=None):
         fake = fake or FakeService(result())
         self.assertEqual(self.run_fake(fake), "failed")

@@ -5,7 +5,7 @@ import unittest
 from subtitle_tool.common import ToolError
 from subtitle_tool.mt_backend import MTBackend, key_fingerprint
 from subtitle_tool.mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
-                                      stage_cache_key, stage_output_size, estimate_stage_output, correction_stalled,
+                                      request_cache_key, stage_output_size, estimate_stage_output, correction_stalled,
                                       manual_terms, BatchValidationError)
 
 
@@ -127,12 +127,12 @@ class QualityContractTests(unittest.TestCase):
 
     def test_stage_cache_identity_covers_prompt_glossary_context_and_backend(self):
         data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'context': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'A cache.'}]]}
-        original = stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope=self.scope)
-        self.assertNotEqual(original, stage_cache_key('translate', {**data, 'glossary': [{'source': 'cache'}]},
+        original = request_cache_key('translate', data, self.free, capabilities=self.free_caps, scope=self.scope)
+        self.assertNotEqual(original, request_cache_key('translate', {**data, 'glossary': [{'source': 'cache'}]},
                                                      self.free, capabilities=self.free_caps, scope=self.scope))
-        self.assertNotEqual(original, stage_cache_key('translate', {**data, 'context': ['different']},
+        self.assertNotEqual(original, request_cache_key('translate', {**data, 'context': ['different']},
                                                      self.free, capabilities=self.free_caps, scope=self.scope))
-        self.assertNotEqual(original, stage_cache_key('translate', data, self.paid,
+        self.assertNotEqual(original, request_cache_key('translate', data, self.paid,
                                                      capabilities=self.free_caps, scope=self.scope))
 
     def test_review_rejects_choice_error_refusal_and_unicode_surrogates(self):
@@ -161,8 +161,8 @@ class QualityContractTests(unittest.TestCase):
         payload = make_stage_payload('translate', data, self.free, capabilities=caps)
         self.assertEqual(payload['response_format'], {'type': 'json_object'})
         self.assertEqual(payload['max_tokens'], 512)
-        self.assertNotEqual(stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope=self.scope),
-                            stage_cache_key('translate', data, self.free, capabilities=caps, scope=self.scope))
+        self.assertNotEqual(request_cache_key('translate', data, self.free, capabilities=self.free_caps, scope=self.scope),
+                            request_cache_key('translate', data, self.free, capabilities=caps, scope=self.scope))
 
     def test_stage_texts_are_simplified_before_use_and_cache_identity_includes_scope(self):
         translated = parse_stage_response('translate', body({'translations': {'0': '繁體翻譯'}}),
@@ -173,8 +173,8 @@ class QualityContractTests(unittest.TestCase):
             ids=['0000:00000000'], originals=['A cache stores results.'])
         self.assertEqual(terms['terms'][0]['translation'], '缓存')
         data = {'sentences': [{'id': '0', 'text': 'A cache.'}], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'A cache.'}]]}
-        self.assertNotEqual(stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope={'account': 'a'}),
-                            stage_cache_key('translate', data, self.free, capabilities=self.free_caps, scope={'account': 'b'}))
+        self.assertNotEqual(request_cache_key('translate', data, self.free, capabilities=self.free_caps, scope={'account': 'a'}),
+                            request_cache_key('translate', data, self.free, capabilities=self.free_caps, scope={'account': 'b'}))
 
     def test_translation_mapping_rejects_duplicate_missing_extra_and_empty_results(self):
         invalid = ['{"translations":{"0":"甲","0":"乙","1":"丙"}}',
@@ -209,7 +209,3 @@ class QualityContractTests(unittest.TestCase):
         for group in groups:
             members = [cue for unit in group for cue in unit['cues']]
             self.assertLessEqual(members[-1]['end_ms'] - members[0]['begin_ms'], 60000)
-
-
-if __name__ == '__main__':
-    unittest.main()
