@@ -10,6 +10,17 @@ from tests.test_bailian_free import BailianFreeFixture
 
 
 class ChannelTests(BailianFreeFixture):
+    def test_channel_without_exclusions_respects_its_include_and_billing_rules(self):
+        from subtitle_tool.mt_channel_policy import candidate_allowed, default_policy, load_policy
+        policy = default_policy()
+        rule = policy['providers']['transcribe-openrouter-free']
+        rule.pop('exclude', None)
+        atomic_json(self.config.data / 'mt-channels.json', policy)
+        saved = load_policy(self.config)['providers']['transcribe-openrouter-free']
+        self.assertIsNone(candidate_allowed('example:free', 'free', {}, saved))
+        self.assertEqual(candidate_allowed('other', 'free', {}, saved), 'model_excluded')
+        self.assertEqual(candidate_allowed('example:free', 'commercial', {}, saved), 'billing_excluded')
+
     def test_plugin_provider_is_a_valid_group_member_and_free_offer(self):
         atomic_json(self.folder / 'plugin-providers.json', [{'id': 'opencode-zen-free', 'signedIn': True,
             'api': 'https://opencode.ai/zen/v1', 'models': [{'id': 'deepseek-v4.1-flash-free', 'free': True}]}])

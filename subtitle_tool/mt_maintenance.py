@@ -144,16 +144,10 @@ class ChannelMaintenance:
         self._save()  # Reserve before inference; crash/restart never refunds it.
         return True
 
-    def prepare(self, settings, base_url):
-        from .magpie import bound_gateway
-        if not bound_gateway(settings, base_url):
+    def prepare(self, base_url):
+        from .magpie import managed_gateway
+        if not managed_gateway(self.config, base_url):
             return
-        effective = self.config.mt_settings()
-        for role, suffix in [('translate', ''), ('review', '_review'), ('judge', '_judge')]:
-            name = 'group/transcribe' + ('' if role == 'translate' else '-' + role)
-            if (getattr(effective, 'mt' + suffix + '_model') or name) != name or (
-                    getattr(effective, 'mt' + suffix + '_fallback_model') or name + '-paid') != name + '-paid':
-                return
         with self.lock:
             if self.thread is None:
                 self.thread = threading.Thread(target=self._run, name='mt-channels', daemon=True)

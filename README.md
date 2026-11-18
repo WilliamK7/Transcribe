@@ -59,7 +59,7 @@ vLLM-SR `auto` 用于翻译，其公开后端集合统一归属翻译角色。�
 | --- | --- |
 | `providers` | 明确登记的渠道及适配器、候选和费用规则 |
 | `excluded_providers` | 项目级渠道排除，适用于维护、验收和字幕请求 |
-| `include` / `exclude` | 型号名称通配符 |
+| `include` / `exclude` | `include` 指定候选型号，`exclude` 按需排除，两者均支持通配符 |
 | `preferred` | 优先型号及明确允许的商业候选 |
 | `billing` / `max_candidates` | 允许费用档位及每轮目录候选数 |
 | `max_input_usd_per_million` / `max_output_usd_per_million` | 新商业候选单价上限；Vercel 默认输入 2、输出 10 美元 |
@@ -104,13 +104,13 @@ ASR Key 使用 `DASHSCOPE_API_KEY`，未设置时读取 `data/key.txt`；`--conf
 
 翻译地址和组名支持 `MT_BASE_URL`、`MT_MODEL`、`MT_FALLBACK_MODEL`、`MT_REVIEW_MODEL`、`MT_REVIEW_FALLBACK_MODEL`、`MT_JUDGE_MODEL`、`MT_JUDGE_FALLBACK_MODEL` 环境覆盖。网关凭据使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机缺省为 `magpie-transcribe`；远程翻译网关须配置凭据。免费证明绑定本机注册表所属监听地址，端口修改需同步 magpie 的保存设置。
 
-新任务与 `--reflow` 使用当前配置；`--resume` 沿用任务保存的翻译身份和排版，线程数与轮询等待使用当前值。需要按新策略重新翻译时，递增 `mt_policy_version` 后执行 `--reflow`；保持版本可复用匹配缓存。
+新任务与 `--reflow` 使用当前配置。需要按新策略重译时，递增 `mt_policy_version` 后执行 `--reflow`。`--resume` 沿用保存的翻译身份、质量规则和排版，线程数与轮询等待使用当前设置。
 
 ## 字幕与交互
 
 默认生成同目录、同名 UTF-8 SRT，外语原文在上、简体中文译文在下；中文／粤语保留原文，无语音则完成任务。已有 SRT 默认跳过，`--overwrite` 先备份再替换，也可用 `--output-dir` 另存。
 
-译文逐组保存，由独立型号复核和裁决。仍有疑点时提示人工检查。原文与译文各以两行为目标，按可靠词时间拆分长句。具体规则见[接口与恢复契约](docs/API_CONTRACT.md)。
+译文逐组保存。术语按原文顺序用于翻译。复核时逐屏对照原文、译文和显示时长，同一句跨屏时连读。相邻几条不同原文出现大段重复译文时，交给独立模型裁决。只有确认出错的原句会被改动，仍有疑点的组会提示人工检查。长句按可靠的词时间拆分，英文尽量让冠词、介词与后面的短语同屏。[字幕翻译与质量](docs/API_CONTRACT.md#字幕翻译与质量)
 
 音频优先复制兼容压缩音轨，声道或时间轴需要处理时转为 16kHz 单声道 FLAC，保留偏移、静音及编码延迟。超过 12 小时或上传容量时分段；`media_pcm_limit` 表示需先分割输入。
 

@@ -97,6 +97,99 @@ class BailianFreeFixture(TemporaryTest):
 
 
 class BailianFreeTests(BailianFreeFixture):
+    def test_suite_upgrade_requalifies_full_pool_without_serving_stale_lanes(self):
+        from subtitle_tool.mt_admission import SUITE_VERSION
+        self.rows = self.rows[:3]
+        with mock.patch('subtitle_tool.mt_admission.SUITE_VERSION', SUITE_VERSION - 1):
+            self.guard.refresh()
+        self.assertEqual(len(self.active()), 3)
+        evaluate = self.evaluator.evaluate.side_effect
+        checked = []
+
+        def requalify(member):
+            checked.append(member)
+            registry = self.guard.admin.registry()
+            self.assertFalse(any(member in group['members'] and member not in group.get('off', [])
+                                 for group in registry['groups'] if group['id'].startswith('transcribe-trial')))
+            result = evaluate(member)
+            if member.endswith('/trial-b'):
+                result['roles'] = []
+            return result
+
+        self.evaluator.evaluate.side_effect = requalify
+        for _ in range(4):
+            before = len(checked)
+            self.guard.refresh()
+            self.assertLessEqual(len(checked) - before, 1)
+        self.assertCountEqual(checked, [provider_id(row['model']) + '/' + row['model'] for row in self.rows])
+        self.assertEqual(self.active(), {'trial-a', 'trial-c'})
+        self.assertEqual(self.guard.state['models']['trial-b']['status'], 'admission_rejected')
+
+    def test_interrupted_stale_provider_off_resumes_without_becoming_a_manual_hold(self):
+        self.rows = self.rows[:1]
+        self.guard.refresh()
+        self.guard.state['evaluations'].clear()
+        self.guard.trial_state.save(self.guard.control)
+
+        def interrupt(*args):
+            self.command(*args)
+            if args[:2] == ('provider', 'off'):
+                raise OSError('Interruption after the registry commit')
+
+        with mock.patch.object(self.guard.admin, 'command', side_effect=interrupt), self.assertRaises(OSError):
+            self.guard.refresh()
+        resumed = BailianFreeGuard(self.config, self.parent, source=self.source, access=self.access,
+                                   evaluator=self.evaluator, job_id='resume')
+        self.addCleanup(resumed.close)
+        resumed.admin.command = self.command
+        resumed.refresh()
+        self.assertEqual(resumed.state['models']['trial-a']['status'], 'active')
+        self.assertEqual(self.evaluator.evaluate.call_count, 2)
+
+    def test_cached_new_qualification_cannot_reenable_the_previous_role(self):
+        from subtitle_tool.magpie import group_models
+        self.rows = self.rows[:1]
+        self.guard.refresh()
+        evaluation, = self.guard.state['evaluations'].values()
+        evaluation['roles'] = ['review']
+        self.guard.state['reserved_models'] = {'trial-a': 'review'}
+        self.guard.trial_state.save(self.guard.control)
+        self.guard.refresh()
+        self.assertEqual(self.guard.state['models']['trial-a']['role'], 'review')
+        raw = self.guard.admin.registry()
+        self.assertEqual(group_models(raw, 'group/transcribe-trial'), [])
+        self.assertEqual([leaf[1] for leaf in group_models(raw, 'group/transcribe-trial-review')], ['trial-a'])
+        self.assertEqual(self.evaluator.evaluate.call_count, 1)
+
+    def test_retiring_an_old_qualification_preserves_external_group_membership(self):
+        self.rows = self.rows[:1]
+        self.guard.refresh()
+        member = provider_id('trial-a') + '/trial-a'
+        self.command('group', 'add', 'transcribe-personal', 'models=manual/keep,' + member)
+        self.guard.state['evaluations'].clear()
+        self.guard.trial_state.save(self.guard.control)
+        self.guard.refresh()
+        groups = {group['id']: group for group in self.guard.admin.registry()['groups']}
+        self.assertIn(member, groups['transcribe-personal']['members'])
+        self.assertFalse(self.active())
+        self.assertEqual(self.evaluator.evaluate.call_count, 1)
+
+    def test_stale_qualification_is_retired_before_quota_discovery_and_preserves_manual_off(self):
+        self.guard.refresh()
+        raw = self.guard.admin.registry()
+        next(p for p in raw['providers'] if p['id'] == provider_id('trial-b'))['off'] = True
+        atomic_json(self.registry, raw)
+        self.guard.state['evaluations'].clear()
+        self.guard.trial_state.save(self.guard.control)
+        with mock.patch.object(self.guard, '_run'):
+            self.guard.prepare(self.config.settings.mt_base_url)
+        self.assertFalse(self.active())
+        self.source.query.side_effect = RuntimeError('temporary outage')
+        self.guard.refresh()
+        self.assertFalse(self.active())
+        self.assertTrue(self.guard.state['models']['trial-b'].get('manual_hold'))
+        self.assertFalse(any(not p.get('off') for p in self.guard.admin.registry()['providers']))
+
     def test_first_admission_uses_policy_judge_and_skips_same_underlying_model(self):
         from subtitle_tool.mt_channel_policy import default_policy
         self.rows = self.rows[:1]
@@ -284,7 +377,7 @@ class BailianFreeTests(BailianFreeFixture):
             release.wait(3)
             return evaluate(model)
         self.evaluator.evaluate.side_effect = slow
-        self.guard.prepare(self.config.settings, self.config.settings.mt_base_url)
+        self.guard.prepare(self.config.settings.mt_base_url)
         self.assertTrue(entered.wait(2))
         folder = self.folder / 'routing'
         folder.mkdir(exist_ok=True)
@@ -307,7 +400,7 @@ class BailianFreeTests(BailianFreeFixture):
     def test_changed_binding_is_removed_before_background_query_or_dispatch(self):
         self.guard.refresh()
         self.config.set_key('other-account')
-        self.guard.prepare(self.config.settings, self.config.settings.mt_base_url)
+        self.guard.prepare(self.config.settings.mt_base_url)
         self.assertFalse(self.active())
         self.assertIsNone(self.guard.thread)
 
@@ -317,7 +410,7 @@ class BailianFreeTests(BailianFreeFixture):
         next(p for p in raw['providers'] if p['id'] == provider_id('trial-a'))['key'] = 'changed-key'
         atomic_json(self.registry, raw)
         self.guard._run = mock.Mock()
-        self.guard.prepare(self.config.settings, self.config.settings.mt_base_url)
+        self.guard.prepare(self.config.settings.mt_base_url)
         self.assertEqual(self.active(), {'trial-b', 'trial-c'})
         self.assertEqual(self.guard.state['models']['trial-a']['status'], 'identity_changed')
 
@@ -326,7 +419,7 @@ class BailianFreeTests(BailianFreeFixture):
         raw = json.loads(self.registry.read_bytes())
         raw['providers'] = [p for p in raw['providers'] if p['id'] != TRIAL_PROVIDER]
         atomic_json(self.registry, raw)
-        self.guard.prepare(self.config.settings, self.config.settings.mt_base_url)
+        self.guard.prepare(self.config.settings.mt_base_url)
         self.assertFalse(self.active())
         self.assertIsNone(self.guard.thread)
 
@@ -347,7 +440,7 @@ class BailianFreeTests(BailianFreeFixture):
         self.source.query.side_effect = query
         start = time.monotonic()
         for _ in range(16):
-            self.guard.prepare(self.config.settings, self.config.settings.mt_base_url)
+            self.guard.prepare(self.config.settings.mt_base_url)
         self.assertLess(time.monotonic() - start, .5)
         self.assertTrue(reached.wait(2))
         release.set()

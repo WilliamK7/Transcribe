@@ -8,8 +8,9 @@ from pathlib import Path
 from .common import ToolError, atomic_bytes, atomic_json, validate_workspace_id
 
 
-MT_ENV_SETTINGS = ("mt_base_url", "mt_model", "mt_fallback_model", "mt_review_model",
-                   "mt_review_fallback_model", "mt_judge_model", "mt_judge_fallback_model")
+MT_MODEL_SETTINGS = ("mt_model", "mt_fallback_model", "mt_review_model", "mt_review_fallback_model",
+                     "mt_judge_model", "mt_judge_fallback_model")
+MT_ENV_SETTINGS = ("mt_base_url", *MT_MODEL_SETTINGS)
 
 
 def app_root() -> Path:
@@ -21,7 +22,7 @@ class Settings:
     workspace_id: str = ""
     mt_workers: int = 16
     mt_base_url: str = "http://127.0.0.1:3425/v1"
-    mt_model: str = ""
+    mt_model: str = "group/transcribe"
     mt_fallback_model: str = "group/transcribe-paid"
     mt_review_model: str = "group/transcribe-review"
     mt_review_fallback_model: str = "group/transcribe-review-paid"

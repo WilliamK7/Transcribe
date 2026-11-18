@@ -22,6 +22,7 @@ VALIDATION_CATEGORIES = {
     'glossary_evidence': '术语缺少本次目标原文依据',
     'translation_invalid': '译文无效', 'unfinished': '非正常结束', 'output_truncated': '输出长度耗尽',
     'judge_evidence': '裁决没有保持已撤销疑点的译文',
+    'judge_scope': '裁决超出已复核并确认的问题原句范围',
 }
 
 
@@ -73,10 +74,13 @@ def validate_translations(value, fragments):
     return {str(i): translated[str(i)] for i in range(len(fragments))}
 
 
-QUALITY_PROMPT_VERSION = 5
-GLOSSARY_SCHEDULE = 'window-prefix-v3'
+QUALITY_PROMPT_VERSION = 7
+SUPPORTED_PROMPT_VERSIONS = (5, QUALITY_PROMPT_VERSION)
+GLOSSARY_SCHEDULE = 'window-independent-v4'
+LEGACY_GLOSSARY_SCHEDULE = 'window-prefix-v3'
 INPUT_BUDGET = 32 * 1024
 OUTPUT_TOKENS = 4096
+DEFAULT_CAPABILITIES = {'response_format': 'json_object', 'input_bytes': INPUT_BUDGET, 'output_tokens': OUTPUT_TOKENS}
 ISSUE_CATEGORIES = ('omission', 'addition', 'terminology', 'number', 'negation', 'condition', 'repetition', 'meaning')
 PROMPTS = {
     'glossary': ('从课程原文提取有原句依据的技术术语、缩写和定义，给出简体中文译法。'
@@ -96,6 +100,29 @@ PROMPTS = {
               '若全部为误报，issues 为空，translations 必须原样返回。'
               'translations 的键与 fragments 的 id 一一对应，译文非空。仅返回 JSON。'),
 }
+
+CONTENT_PROMPTS = {
+    'translate': ('sentences.id 是原句编号，fragment_ids 列出该句所属字幕；只按 fragments.id 输出，'
+                  '一句多片也不得合并编号。口语可自然表达，不概括、不补充原文未说出的结论。'),
+    'review': ('按 fragment_ids 逐句核对原文和译文；多片句的 joined_translation 按显示顺序连读，换行仅分片。'
+               '再检查内容是否错放到其他原句。合理跨片分配、原文本身的重复或上下文未译不算问题。疑点用 fragments.id。'),
+    'judge': ('按 fragment_ids 逐句核对，多片句可连读 joined_translation，换行仅分片。'
+              'issues 只能涉及输入疑点所在原句；仅已确认问题所在原句允许修改，'
+              '已撤销问题及其他原句的全部片段必须原样保留。'),
+}
+
+
+def _current_prompt(version):
+    if type(version) is not int or version not in SUPPORTED_PROMPT_VERSIONS:
+        raise ToolError('翻译提示词版本不受支持。', 'cache_version')
+    return version == QUALITY_PROMPT_VERSION
+
+
+def valid_capabilities(value):
+    return (isinstance(value, dict) and value.keys() == DEFAULT_CAPABILITIES.keys() and
+            value['response_format'] == 'json_object' and
+            type(value['input_bytes']) is int and 1 <= value['input_bytes'] <= 1048576 and
+            type(value['output_tokens']) is int and 1 <= value['output_tokens'] <= 32768)
 
 
 def plan_sentence_groups(sources):
@@ -154,6 +181,31 @@ def correction_stalled(previous, current):
                for item in current['fragments'] if item['sentence'] in affected)
 
 
+def repetition_checks(translations, source_keys):
+    """Advisory evidence, reproducible from source fingerprints without keeping another transcript."""
+    if len(source_keys) != len(translations):
+        raise ValueError('Mismatched translation group')
+    flagged = set()
+    normalized = []
+    for index, source_key in enumerate(source_keys):
+        text = translations[str(index)]
+        current = ''.join(char for char in unicodedata.normalize('NFKC', text).casefold() if char.isalnum())
+        for other in range(max(0, index - 3), index):
+            shorter, longer = sorted((normalized[other], current), key=len)
+            if (source_keys[other] != source_key and len(shorter) >= 12 and shorter in longer and
+                    (shorter == longer or len(longer) >= len(shorter) + 6)):
+                flagged.update((other, index))
+        normalized.append(current)
+    return [{'id': str(index), 'category': 'repetition',
+             'evidence': '附近不同原文片段的长译文相同或完整包含另一条译文。请核对原文有无复述，以及译文是否提前或错位。'}
+            for index in sorted(flagged)]
+
+
+def review_with_checks(review, checks):
+    existing = {(issue['id'], issue['category']) for issue in review['issues']}
+    return {'issues': [*review['issues'], *(issue for issue in checks if (issue['id'], issue['category']) not in existing)]}
+
+
 def _schema(stage, data):
     if stage == 'judge':
         schema = _schema('translate', data)
@@ -182,15 +234,21 @@ def _schema(stage, data):
             'required': ['translations'], 'additionalProperties': False}
 
 
-def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
+def make_stage_payload(stage, data, backend, *, capabilities, repair=False, prompt_version=QUALITY_PROMPT_VERSION):
+    current = _current_prompt(prompt_version)
     if stage not in PROMPTS:
         raise ValueError('Unknown translation stage')
-    if (not isinstance(capabilities, dict) or set(capabilities) != {'response_format', 'input_bytes', 'output_tokens'} or
-            capabilities['response_format'] != 'json_object' or
-            type(capabilities['input_bytes']) is not int or not 1 <= capabilities['input_bytes'] <= 1048576 or
-            type(capabilities['output_tokens']) is not int or not 1 <= capabilities['output_tokens'] <= 32768):
+    if not valid_capabilities(capabilities):
         raise ToolError('翻译模型能力档案无效。', 'mt_config')
     prompt = PROMPTS[stage]
+    if current:
+        prompt += CONTENT_PROMPTS.get(stage, '')
+        if stage == 'translate':
+            prompt += ('只给数字片段编号写译文：每条紧跟该时刻说出的内容，不要提前翻译下一原句，也不要把整句复制到每一片。'
+                       '参照 display_ms 用自然简明的中文，短问句简短译出，保留数字、条件和自我纠正的最终含义。'
+                       '术语、符号和单位按上下文保持一致；识别含混时不要编造技术结论。')
+        elif stage in {'review', 'judge'}:
+            prompt += '逐条对照 fragments 中同一编号的 text 与 translation；结合 display_ms 核对短屏是否错配长解释，以及连续多条是否串句、提前或重复。'
     prompt += '直接返回所需 JSON，不附解释、Markdown 或思考过程。'
     if data.get('context'):
         prompt += ('context 只供消歧，不翻译或提取术语；same_sentence 的 sentence 指目标编号，'
@@ -211,7 +269,8 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
         context = data['context']
         if all(isinstance(item, dict) and 'source_position' in item for item in context):
             context = sorted(context, key=lambda item: (item['source_position'], item.get('char_start', 0)))
-        targets = {item.get('source_id'): item['id'] for item in data.get('sentences', []) if item.get('source_id')}
+        targets = {item['source_id']: ('s' + item['id'] if current and stage != 'glossary' else item['id'])
+                   for item in data.get('sentences', []) if item.get('source_id')}
         wire_context = []
         for item in context:
             if not isinstance(item, dict):
@@ -223,6 +282,24 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
                 item.pop('position', None)  # Character ranges already describe the side of this target.
             wire_context.append(item)
         wire_data['context'] = wire_context
+    if current and stage != 'glossary' and data.get('sentences'):
+        by_sentence = {}
+        for fragment in data['fragments']:
+            by_sentence.setdefault(fragment['sentence'], []).append(fragment['id'])
+        sentences = []
+        for sentence in data['sentences']:
+            ids = by_sentence.get(sentence['id'], [])
+            sentence = {**sentence, 'id': 's' + sentence['id'], 'fragment_ids': ids}
+            if stage in {'review', 'judge'} and len(ids) > 1 and 'translations' in data:
+                sentence['joined_translation'] = '\n'.join(data['translations'][identity] for identity in ids)
+            sentences.append(sentence)
+        wire_data['sentences'] = sentences
+        wire_data['fragments'] = [{**fragment, 'sentence': 's' + fragment['sentence']} for fragment in data['fragments']]
+        if stage in {'review', 'judge'} and 'translations' in data:
+            for fragment in wire_data['fragments']:
+                fragment['translation'] = data['translations'][fragment['id']]
+            if stage == 'review':
+                del wire_data['translations']
     payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
                'reasoning_effort': 'low' if stage == 'judge' else 'none',
                'messages': [{'role': 'system', 'content': prompt},
@@ -237,11 +314,11 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
     return payload
 
 
-def stage_cache_key(stage, data, backend, *, capabilities, scope):
-    value = {'version': QUALITY_PROMPT_VERSION, 'strategy': 6, 'simplification': 'opencc-t2s-0.1.7',
+def stage_cache_key(stage, data, backend, *, capabilities, scope, prompt_version=QUALITY_PROMPT_VERSION):
+    value = {'version': prompt_version, 'strategy': 6, 'simplification': 'opencc-t2s-0.1.7',
              'backend': backend.snapshot(),
              'capabilities': capabilities, 'scope': scope,
-             'request': make_stage_payload(stage, data, backend, capabilities=capabilities)}
+             'request': make_stage_payload(stage, data, backend, capabilities=capabilities, prompt_version=prompt_version)}
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 
 
@@ -317,9 +394,18 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
         raise BatchValidationError('response_structure') from None
 
 
-def validate_judgment(value, data):
+def validate_judgment(value, data, *, prompt_version=QUALITY_PROMPT_VERSION):
+    current = _current_prompt(prompt_version)
     if not value['issues'] and value['translations'] != data['translations']:
         raise BatchValidationError('judge_evidence')
+    if current:
+        sentences = {fragment['id']: fragment['sentence'] for fragment in data['fragments']}
+        reviewed = {sentences[issue['id']] for issue in data['issues']}
+        confirmed = {sentences[issue['id']] for issue in value['issues']}
+        if (not confirmed <= reviewed or any(
+                text != data['translations'][identity] and sentences[identity] not in confirmed
+                for identity, text in value['translations'].items())):
+            raise BatchValidationError('judge_scope')
     return value
 
 

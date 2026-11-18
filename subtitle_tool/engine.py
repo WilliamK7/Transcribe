@@ -14,15 +14,14 @@ import uuid
 from pathlib import Path
 
 from .api import Bailian, upload_limit
-from .common import DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, SUBTITLE_VERSION, Cancelled, NeedsReview, SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key
+from .common import DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, Cancelled, NeedsReview, SubmissionUnknown, ToolError, atomic_json, check_cancel, connection_identity, fingerprint, output_key
 from .config import Config
 from .media import Media
 from .mt_control import MTControl
-from .mt_quality import GLOSSARY_SCHEDULE
 from .store import Store
 from .lifecycle import INACTIVE, recovery_target, unknown_submission
 from .review import decision_origin
-from .policy import asr_contract, current_execution_snapshot, load_policy, validate_raw_contract
+from .policy import asr_contract, load_policy, subtitle_contract, validate_raw_contract
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
                             validate_normalized, validate_segments)
 from .publication import inspect_intent, prepare_intent, write_srt
@@ -195,12 +194,7 @@ class Engine:
                      "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
                      "backup", "cue_count", "no_speech"]:
             manifest.pop(name, None)
-        manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=6,
-                        mt_glossary_schedule=GLOSSARY_SCHEDULE,
-                        display_timing_version=DISPLAY_TIMING_VERSION,
-                        execution_snapshot=current_execution_snapshot(),
-                        subtitle_settings={k: getattr(self.config.settings, k) for k in
-                                           ["zh_line_width", "other_line_width", "chinese_first"]},
+        manifest.update(subtitle_contract(self.config.settings),
                         normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
                         warnings=warnings, overwrite=bool(overwrite), contract=contract,
                         reflow={"snapshot": str(snapshot.relative_to(self.config.root)), "prepared_at": time.time(),
@@ -223,12 +217,8 @@ class Engine:
         manifest = {'region': 'beijing', 'access_mode': 'workspace',
                     'workspace_id': validate_workspace_id(self.config.settings.workspace_id),
                     'account': hashlib.sha256(key.encode()).hexdigest(), 'processing_version': PROCESSING_VERSION,
-                    'subtitle_version': SUBTITLE_VERSION, 'display_timing_version': DISPLAY_TIMING_VERSION,
-                    'translation_strategy_version': 6, 'execution_snapshot': current_execution_snapshot(),
-                    'mt_glossary_schedule': GLOSSARY_SCHEDULE, 'contract': asr_contract(),
-                    'overwrite': bool(overwrite), 'rebuilt_from_archive': job_id,
-                    'subtitle_settings': {k: getattr(self.config.settings, k) for k in
-                                         ['zh_line_width', 'other_line_width', 'chinese_first']}}
+                    **subtitle_contract(self.config.settings), 'contract': asr_contract(),
+                    'overwrite': bool(overwrite), 'rebuilt_from_archive': job_id}
         route = configured_route(self.config, manifest)
         manifest['mt_route_snapshot'] = route
         for name in ['fingerprint', 'media', 'track', 'channel']:

@@ -22,6 +22,7 @@ class PoolPipelineFixture(SavedResultFixture):
         self.fail_second_group = False
         self.stage_hook = None
         self.glossary_terms = lambda data: []
+        self.draft_text = lambda fragment: '完整句译文。'
         self.corrected_translations = None
         self.actual_model = lambda stage, request: {'glossary': 'review-model'}.get(stage, stage + '-model')
         self.response_headers = lambda stage, request: {}
@@ -51,12 +52,14 @@ class PoolPipelineFixture(SavedResultFixture):
                 if stage == 'glossary':
                     value = {'terms': parent.glossary_terms(data)}
                 elif stage == 'translate':
-                    value = {'translations': {item['id']: '完整句译文。' for item in data['fragments']}}
+                    value = {'translations': {item['id']: parent.draft_text(item) for item in data['fragments']}}
                 elif stage == 'judge':
                     suffix = (str(sum(call[0] == 'judge' for call in parent.calls))
                               if not parent.no_change_correction else '')
-                    value = {'translations': (dict(data['translations']) if parent.no_change_correction
-                             else {item['id']: '字幕完整译文。' + suffix for item in data['fragments']})}
+                    value = {'translations': dict(data['translations'])}
+                    if not parent.no_change_correction:
+                        for issue in data['issues']:
+                            value['translations'][issue['id']] = '字幕完整译文。' + suffix
                     if parent.corrected_translations is not None:
                         value = {'translations': parent.corrected_translations(data)}
                 else:

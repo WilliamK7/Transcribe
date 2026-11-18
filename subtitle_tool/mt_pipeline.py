@@ -12,15 +12,16 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 
-from .common import DISPLAY_TIMING_VERSION, MAX_LAYOUT_ROUNDS, Cancelled, ToolError, check_cancel
+from .common import MAX_LAYOUT_ROUNDS, PROCESSING_VERSION, Cancelled, ToolError, check_cancel
 from .mt_backend import MTBackend
 from .mt_context import group_context, sentence_context, target_span, trim_context, valid_context_subset
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
 from .mt_planning import make_unit, restore_group_plan, save_group_plan
-from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION, correction_stalled,
+from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, correction_stalled,
                          estimate_stage_output, make_stage_payload, manual_terms, parse_stage_response, plan_sentence_groups,
-                         stage_cache_key, term_appears, term_evidence, validate_stage_value, validate_judgment)
+                         repetition_checks, review_with_checks, stage_cache_key, term_appears, term_evidence,
+                         validate_stage_value, validate_judgment)
 from .mt_routing import STAGE_TIMEOUT, MagpieRoute, RouteEntry, RouteExhausted, RouteFailure
 from .mt_runtime import service_failure
 from .mt_transport import TransportError
@@ -156,15 +157,9 @@ def check_pool(config, identity, route, cancel, *, magpie=None):
     """Online smoke test using an in-memory task and one synthetic sentence."""
     from .mt_control import MTControl
     from .store import Store
-    from .policy import current_execution_snapshot
-    from dataclasses import asdict
-    manifest = {**identity, 'mt_route_snapshot': route,
-                'processing_version': 2, 'subtitle_version': 2, 'display_timing_version': DISPLAY_TIMING_VERSION,
-                'subtitle_settings': {k: asdict(config.settings)[k] for k in
-                                      ['zh_line_width', 'other_line_width', 'chinese_first']},
-                 'translation_strategy_version': 6, 'execution_snapshot': current_execution_snapshot(),
-                 'mt_glossary_schedule': GLOSSARY_SCHEDULE}
-    scope = {**identity, 'processing_version': 2}
+    from .policy import subtitle_contract
+    scope = {**identity, 'processing_version': PROCESSING_VERSION}
+    manifest = {**scope, **subtitle_contract(config.settings), 'mt_route_snapshot': route}
     store = Store(Path(':memory:'))
     try:
         now = time.time()
@@ -190,6 +185,41 @@ def check_pool(config, identity, route, cancel, *, magpie=None):
         if 'pipeline' in locals():
             pipeline.close()
         store.close()
+
+
+def _validate_saved_reviews(final, history, source_hashes, prompt_version):
+    reviews, corrections = final['review_stage_keys'], final['correction_stage_keys']
+    if not len(corrections) <= len(reviews) <= len(corrections) + 1:
+        raise ValueError()
+    # A later layout may have replaced some cues; their stable IDs still carry the original sentence.
+    fragments = [{'id': str(index), 'sentence': cue_id.rpartition(':')[0]}
+                 for index, cue_id in enumerate(final['cue_ids'])]
+    ids = {fragment['id'] for fragment in fragments}
+    current = history[final['translation_stage_key']]['value']['translations']
+    if not isinstance(current, dict) or set(current) != ids:
+        raise ValueError()
+    unresolved = True
+    for index, review_key in enumerate(reviews):
+        review = validate_stage_value('review', history[review_key]['value'], ids=ids)
+        if prompt_version >= 7:
+            review = review_with_checks(review, repetition_checks(current, source_hashes))
+        unresolved = bool(review['issues'])
+        if index == len(corrections):
+            break
+        if not unresolved:
+            raise ValueError()
+        correction = history[corrections[index]]['value']
+        validate_stage_value('review', {'issues': correction['issues']}, ids=ids)
+        if not isinstance(correction['translations'], dict) or set(correction['translations']) != ids:
+            raise ValueError()
+        validate_judgment(correction, {**review, 'fragments': fragments, 'translations': current},
+                          prompt_version=prompt_version)
+        current = correction['translations']
+        unresolved = bool(correction['issues'])
+        if not unresolved and index + 1 < len(reviews):
+            raise ValueError()
+    if final['warning'] != unresolved:
+        raise ValueError()
 
 
 def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
@@ -238,16 +268,8 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                 identities = route.get('identities', {})
                 if _record_model(proof['record'], identities) != _record_model(final, identities):
                     raise ValueError()
-                source_hashes = None
-                if proof['stage'] == 'translate':
-                    source_hashes = proof['record'].get('source_text_hashes')
-                    if (final['production_stage_key'] != final['translation_stage_key'] or
-                            final['correction_stage_keys'] or not isinstance(source_hashes, list) or
-                            len(source_hashes) != len(final['cue_ids']) or
-                            any(not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None
-                                for value in source_hashes)):
-                        raise ValueError()
                 resolved_roles = {}
+                history = {}
                 for stage_name, keys in [('translate', [final['translation_stage_key']]),
                                          ('review', final['review_stage_keys']),
                                          ('judge', final['correction_stage_keys'])]:
@@ -264,16 +286,24 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         if resolved in resolved_roles and resolved_roles[resolved] != stage_name:
                             raise ValueError()
                         resolved_roles[resolved] = stage_name
+                        history[stage_key] = entry['record']
+                corrections = final['correction_stage_keys']
+                if final['production_stage_key'] != (corrections[-1] if corrections else final['translation_stage_key']):
+                    raise ValueError()
+                source_hashes = history[final['translation_stage_key']].get('source_text_hashes')
+                if (not isinstance(source_hashes, list) or len(source_hashes) != len(final['cue_ids']) or
+                        any(not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) for digest in source_hashes)):
+                    raise ValueError()
+                _validate_saved_reviews(final, history, source_hashes, manifest['execution_snapshot']['prompt_version'])
                 finals[key] = final, source_hashes
             final, source_hashes = finals[key]
             if (final['backend'] != origin or final['request_model'] != profiles[origin]['backend']['model'] or
                     cue['cue_id'] not in final['cue_ids'] or
                     final['value']['translations'][str(final['cue_ids'].index(cue['cue_id']))] != cue['translated']):
                 raise ValueError()
-            if (source_hashes is not None and
-                    source_hashes[final['cue_ids'].index(cue['cue_id'])] != _digest(cue['text'].strip())):
+            if source_hashes[final['cue_ids'].index(cue['cue_id'])] != _digest(cue['text'].strip()):
                 raise ValueError()
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (KeyError, TypeError, ValueError, BatchValidationError):
         raise ToolError('译文阶段来源或底层型号与快照不一致；请用 --reflow 从原始转写重建。',
                         'cache_mismatch') from None
 
@@ -285,6 +315,9 @@ class Pipeline:
         load_policy(manifest)
         self.context = threading.local()
         self.group_progress = None
+        self.glossary_schedule = manifest['mt_glossary_schedule']
+        self.prompt_version = manifest['execution_snapshot']['prompt_version']
+        self.display_durations = {} if self.prompt_version >= 7 else None
         self.diagnostics = MTDiagnostics(engine.config.root, job_id)
         from . import mt_transport
         self.transport = mt_transport.ProcessTransport()
@@ -344,9 +377,9 @@ class Pipeline:
         # evidence remains tied to the route snapshot.
         pool_identities = {**saved_catalog(self.engine.config).get('identities', {}), **self.identities}
         if not entry.id.endswith('_fallback'):
-            self.channel_maintenance.prepare(self.engine.config.settings, entry.backend.base_url)
+            self.channel_maintenance.prepare(entry.backend.base_url)
             try:
-                self.bailian_free.prepare(self.engine.config.settings, entry.backend.base_url)
+                self.bailian_free.prepare(entry.backend.base_url)
                 if self.bailian_free.thread is not None:
                     self.bailian_free.poll_routes()
             except Cancelled:
@@ -363,7 +396,8 @@ class Pipeline:
     def _request_payload(self, stage, data, entry, *, repair=False):
         try:
             return make_stage_payload(stage, data, entry.backend,
-                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair)
+                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair,
+                                      prompt_version=self.prompt_version)
         except ToolError as error:
             if error.code != 'mt_input_budget':
                 raise
@@ -456,7 +490,7 @@ class Pipeline:
             try:
                 value = parse_stage_response(name, body, ids=ids, originals=originals)
                 if name == 'judge':
-                    validate_judgment(value, data)
+                    validate_judgment(value, data, prompt_version=self.prompt_version)
             except BatchValidationError as error:
                 outcome, event['validation_category'] = 'invalid', error.category
                 self.store.count(self.job_id, 'mt_invalid_response')
@@ -522,7 +556,7 @@ class Pipeline:
             # Reserve the fixed repair instruction without dropping evidence
             # between the initial request and its possible regeneration.
             make_stage_payload(stage, data, entry.backend, capabilities=capabilities,
-                               repair=stage in {'translate'})
+                               repair=stage in {'translate'}, prompt_version=self.prompt_version)
         while True:
             fits = bool(candidates)
             for entry in candidates:
@@ -544,7 +578,7 @@ class Pipeline:
                 raise ToolError('翻译阶段完整请求超过所有可用模型的输入预算。', 'mt_input_budget')
 
     def _work_key(self, name, data):
-        return _digest({'strategy': 6, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
+        return _digest({'strategy': 6, 'prompt': self.prompt_version, 'stage': name, 'data': data,
                         'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
 
     def stage(self, name, data, *, ids=(), originals=(), saved_only=False, fixed_semantics=False,
@@ -599,7 +633,7 @@ class Pipeline:
                     try:
                         value = validate_stage_value(name, saved.get('value'), ids=ids, originals=originals)
                         if name == 'judge':
-                            validate_judgment(value, data)
+                            validate_judgment(value, data, prompt_version=self.prompt_version)
                     except ToolError:
                         raise ToolError('保存的翻译阶段记录无效。', 'cache_mismatch') from None
                     try:
@@ -622,7 +656,7 @@ class Pipeline:
             try:
                 entry.backend.credential(self.engine.config)
                 key = stage_cache_key(name, data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                    scope=self.cache_scope)
+                    scope=self.cache_scope, prompt_version=self.prompt_version)
             except ToolError as error:
                 if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
                     return None
@@ -639,7 +673,7 @@ class Pipeline:
                     raise ValueError()
                 value = validate_stage_value(name, record['value'], ids=ids, originals=originals)
                 if name == 'judge':
-                    validate_judgment(value, data)
+                    validate_judgment(value, data, prompt_version=self.prompt_version)
                 resolved = _record_model(record, self.identities)
                 if not _independent_model(resolved, forbidden_models):
                     return None
@@ -690,7 +724,8 @@ class Pipeline:
             # Its cross-task cache still keys the exact fitted wire request.
             record['context'] = data.get('context', [])
         cache_key = stage_cache_key(name, data, result.entry.backend,
-                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope)
+                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope,
+                                    prompt_version=self.prompt_version)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             self.store.commit_mt_stage(self.job_id, work_key, name, record,
@@ -703,12 +738,21 @@ class Pipeline:
             proof.update(request_id=self.context.request_id, gateway_session=self.context.gateway_session)
         return record['value'], record['backend'], proof
 
+    def _fragments(self, units):
+        fragments = []
+        for sentence_index, unit in enumerate(units):
+            for cue in unit['cues']:
+                part = {'id': str(len(fragments)), 'sentence': str(sentence_index), 'text': cue['text']}
+                if self.display_durations is not None:
+                    part['display_ms'] = self.display_durations.get(cue['cue_id'], cue['end_ms'] - cue['begin_ms'])
+                fragments.append(part)
+        return fragments
+
     def _fits_group(self, units, *, output_budget=False):
         if units[-1]['cues'][-1]['end_ms'] - units[0]['cues'][0]['begin_ms'] > 60000:
             return False
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(units)]
-        fragments = [{'id': str(n), 'sentence': str(i), 'text': cue['text']}
-                     for n, (i, cue) in enumerate((i, cue) for i, unit in enumerate(units) for cue in unit['cues'])]
+        fragments = self._fragments(units)
         context = sentence_context(units)
         samples = [('glossary', {'sentences': sentences, 'manual_glossary': [], 'context': context})]
         samples.extend(_group_samples(sentences, fragments, context, []))
@@ -841,6 +885,15 @@ class Pipeline:
                                        {'stage': 'semantic_input', 'context': context, 'glossary': glossary})
         return context, glossary
 
+    def _advisory_stage(self, name, data, **options):
+        try:
+            return self.stage(name, data, fixed_semantics=True, **options)
+        except ToolError as error:
+            if not isinstance(error, RouteExhausted) and error.code != 'mt_input_budget':
+                raise
+            self.engine.mt_control.check_start()
+            return None
+
     def group(self, group, glossary, context):
         self.engine.mt_control.check_start()
         members = [cue for unit in group for cue in unit['cues']]
@@ -850,9 +903,7 @@ class Pipeline:
         local_ids = {unit['source']['sentence_id'] for unit in group}
         relevant.sort(key=lambda term: (term['origin'] != 'manual', term['sentence'] not in local_ids))
         sentences = [_sentence(unit, str(i)) for i, unit in enumerate(group)]
-        source_index = {cue['cue_id']: str(i) for i, unit in enumerate(group) for cue in unit['cues']}
-        fragments = [{'id': str(i), 'sentence': source_index[cue['cue_id']], 'text': cue['text']}
-                     for i, cue in enumerate(members)]
+        fragments = self._fragments(group)
         # Choose one shared subset that fits every stage skeleton. Actual output
         # may still exceed the budget; later stages must not silently discard
         # evidence on which the accepted draft was based.
@@ -878,40 +929,34 @@ class Pipeline:
             forbidden_models = {_proof_model(translation_proof)}
             if production is not translation_proof:
                 forbidden_models.add(_proof_model(production))
-            try:
-                review, _, review_proof = self.stage('review', review_data, ids=ids,
-                                                    fixed_semantics=True, forbidden_models=forbidden_models)
-                review_keys.append(review_proof['key'])
-                reviewed.append(current)
-            except RouteExhausted:
-                self.engine.mt_control.check_start()
+            result = self._advisory_stage('review', review_data, ids=ids, forbidden_models=forbidden_models)
+            if result is None:
                 warning = True
                 break
+            review, _, review_proof = result
+            review_keys.append(review_proof['key'])
+            reviewed.append(current)
+            if self.prompt_version >= 7:
+                review = review_with_checks(review, repetition_checks(current, originals))
             if not review['issues']:
                 break
             if round_number == self.snapshot['quality']['max_revisions']:
                 warning = True
                 break
-            try:
-                correction_data = {**review_data, 'issues': review['issues']}
-                forbidden_models = {_proof_model(translation_proof), _proof_model(review_proof)}
-                stalled = correction_stalled(previous_correction, correction_data)
-                correction = self.stage('judge', correction_data, ids=ids, originals=originals,
-                                        saved_only=stalled, fixed_semantics=True,
-                                        forbidden_models=forbidden_models)
-                if correction is None:
-                    warning = True
-                    break
-                stalled = False  # A complete saved correction still takes precedence.
-                corrected, origin, production = correction
-                correction_keys.append(production['key'])
-                previous_correction = correction_data
-                current = corrected['translations']
-                if not corrected['issues']:
-                    break
-            except RouteExhausted:
-                self.engine.mt_control.check_start()
+            correction_data = {**review_data, 'issues': review['issues']}
+            forbidden_models = {_proof_model(translation_proof), _proof_model(review_proof)}
+            stalled = correction_stalled(previous_correction, correction_data)
+            correction = self._advisory_stage('judge', correction_data, ids=ids, originals=originals,
+                                              saved_only=stalled, forbidden_models=forbidden_models)
+            if correction is None:
                 warning = True
+                break
+            stalled = False
+            corrected, origin, production = correction
+            correction_keys.append(production['key'])
+            previous_correction = correction_data
+            current = corrected['translations']
+            if not corrected['issues']:
                 break
         final_key = _digest({'stage': 'final', 'strategy': 6, 'cues': [c['cue_id'] for c in members],
                              'data': data, 'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
@@ -942,13 +987,14 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
     source_ids = {source['sentence_id']: source for source in sources}
     positions = {source['sentence_id']: index for index, source in enumerate(sources)}
     pipeline = Pipeline(engine, job_id, manifest, scope)
+    alignment_version = manifest['execution_snapshot']['alignment_version']
     try:
         if not manifest.get('layout_planned'):
             cues = []
             for source in sources:
-                parts = plan_fragments(source, settings)
+                parts = plan_fragments(source, settings, alignment_version=alignment_version)
                 if source['decision'] == 'translate':
-                    parts = split_mt_units(source, parts, fits=lambda cue: pipeline._fits_group(
+                    parts = split_mt_units(source, parts, alignment_version=alignment_version, fits=lambda cue: pipeline._fits_group(
                         [{'source': source, 'text': cue['text'], 'cues': [cue]}]))
                 cues.extend(parts)
             plan_display_timing(cues)
@@ -959,7 +1005,9 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             check_cancel(engine.cancel)
             stage('subtitle_translating')
             cues = engine.store.cues(job_id)
-            plan_display_timing(cues)
+            display_intervals, _ = plan_display_timing(cues)
+            if pipeline.display_durations is not None:
+                pipeline.display_durations = {item['cue_id']: item['end_ms'] - item['begin_ms'] for item in display_intervals}
             groups = pipeline.groups_for_layout(sources, cues, manifest)
             pending = [index for index, group in enumerate(groups)
                        if any(not cue['translated'] for unit in group for cue in unit['cues'])]
@@ -985,7 +1033,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             round_number = manifest['layout_round']
             if round_number < MAX_LAYOUT_ROUNDS:
                 stage('layout_adjusting', round_number + 1, MAX_LAYOUT_ROUNDS)
-                revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1)
+                revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1, alignment_version=alignment_version)
             if revised is None:
                 warnings = layout_warnings(cues, settings)
                 if any(item['record'].get('warning') for item in engine.store.mt_stages(job_id)):
@@ -1014,7 +1062,10 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
     prefix = GlossaryPrefix(pipeline, sources)
     glossaries, errors = {}, []
     next_glossary = next_group = 0
-    extracting_window = False
+    independent = pipeline.glossary_schedule == GLOSSARY_SCHEDULE
+    # Include completed but unconsumed windows in the lookahead limit. A slow
+    # early window must not let later results accumulate across the whole job.
+    windows = {}
 
     def window_end(start, known):
         end = min(start + 8, len(groups))
@@ -1057,7 +1108,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
         futures = {}
 
         def schedule():
-            nonlocal next_glossary, next_group, extracting_window
+            nonlocal next_glossary, next_group
             while len(futures) < workers and not errors and not engine.mt_control.stopping:
                 if next_group in glossaries:
                     index = next_group
@@ -1065,21 +1116,23 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
                     # terminology and retained memory independent of completion order.
                     glossary = prefix.extend(glossaries.pop(index))
                     next_group += 1
+                    for start, end in list(windows.items()):
+                        if end <= next_group:
+                            del windows[start]
                     members = [cue for unit in groups[index] for cue in unit['cues']]
                     if all(cue['translated'] for cue in members):
                         progress.finish(index)
                         continue
                     futures[executor.submit(translate, index, glossary)] = (index, False)
-                elif (not extracting_window and next_glossary < len(groups) and
-                      next_glossary == next_group and
-                      sum(not extracting for _, extracting in futures.values()) < 16):
-                    # A single ordered extractor sees the complete prior prefix.
-                    # At most two eight-group windows overlap with translations.
+                elif next_glossary < len(groups) and len(windows) < (2 if independent else 1):
+                    # New windows extract from local evidence independently;
+                    # only prefix consumption depends on source order. Legacy
+                    # resumes retain the exact prior-prefix request identity.
                     index = next_glossary
-                    known = tuple(prefix.terms)
+                    known = () if independent else tuple(prefix.terms)
                     end = window_end(index, known)
                     next_glossary = end
-                    extracting_window = True
+                    windows[index] = end
                     futures[executor.submit(extract, index, end, known)] = (index, True)
                 else:
                     break
@@ -1090,12 +1143,11 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
                 engine.mt_control.stopping  # Observe external cancellation during silent requests.
                 completed, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
                 for future in completed:
-                    index, extracting = futures.pop(future)
+                    index, is_extraction = futures.pop(future)
                     try:
                         value = future.result()
-                        if extracting:
+                        if is_extraction:
                             glossaries.update(value)
-                            extracting_window = False
                         else:
                             done += sum(not cue['translated'] for unit in groups[index] for cue in unit['cues'])
                     except ToolError as error:
@@ -1103,7 +1155,7 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
                         if error.code != 'cancelled':
                             engine.mt_control.stop(error)
                         errors.append(error)
-                    if not extracting:
+                    if not is_extraction:
                         progress.finish(index)
                         engine.progress(job_id, 'subtitle_translating', done, total)
                 schedule()

@@ -1,5 +1,7 @@
 import copy
 import json
+import runpy
+import sys
 from unittest import mock
 from pathlib import Path
 
@@ -11,6 +13,15 @@ from tests.test_bailian_free import BailianFreeFixture
 
 
 class RoleChoiceTests(BailianFreeFixture):
+    def test_configuration_report_uses_the_evaluator_suite_version(self):
+        from subtitle_tool.mt_admission import SUITE_VERSION
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'configure-mt.py'
+        with mock.patch.object(sys, 'path', sys.path.copy()), mock.patch('subtitle_tool.config.Config', return_value=self.config), \
+                mock.patch.object(sys, 'argv', [str(script), '--providers', '']), mock.patch('builtins.print'):
+            self.assertEqual(runpy.run_path(str(script))['main'](), 0)
+        path = self.config.root / '.build/mt-diagnostics/channel-admission-latest.json'
+        self.assertEqual(json.loads(path.read_bytes())['suite'], SUITE_VERSION)
+
     def test_read_only_setup_defers_trial_state_but_apply_rejects_corruption(self):
         path = self.config.data / 'bailian-trial-state.json'
         path.write_bytes(b'invalid trial state')

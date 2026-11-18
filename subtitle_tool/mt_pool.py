@@ -6,12 +6,13 @@ import re
 import unicodedata
 
 from .common import ToolError
+from .config import Settings
 from .mt_backend import MTBackend, key_fingerprint, normalize_mt_url
+from .mt_quality import DEFAULT_CAPABILITIES, INPUT_BUDGET, OUTPUT_TOKENS, valid_capabilities
 
 
 _ENTRY_FIELDS = {'id', 'tier', 'credential_ref', 'backend', 'capabilities'}
 _BACKEND_FIELDS = {'format_version', 'provider', 'base_url', 'model', 'key_fingerprint', 'request_version', 'policy_version'}
-_CAPABILITY_FIELDS = {'response_format', 'input_bytes', 'output_tokens'}
 _ROUTING_STRATEGY = 'free_first'
 _QUALITY_FIELDS = {'input_bytes', 'output_tokens', 'max_revisions', 'manual_glossary'}
 _FORBIDDEN_UNICODE = {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'}
@@ -52,15 +53,9 @@ def _manual_glossary(value):
             all(_text(source, 200) and _text(target, 500) for source, target in value.items()))
 
 
-def _capabilities(value):
-    return (isinstance(value, dict) and set(value) == _CAPABILITY_FIELDS and
-            value['response_format'] == 'json_object' and
-            _integer(value['input_bytes'], 1, 1048576) and _integer(value['output_tokens'], 1, 32768))
-
-
 def _quality(value):
     return (isinstance(value, dict) and set(value) == _QUALITY_FIELDS and
-            _fixed_integer(value['input_bytes'], 32768) and _fixed_integer(value['output_tokens'], 4096) and
+            _fixed_integer(value['input_bytes'], INPUT_BUDGET) and _fixed_integer(value['output_tokens'], OUTPUT_TOKENS) and
             _fixed_integer(value['max_revisions'], 2) and _manual_glossary(value['manual_glossary']))
 
 
@@ -72,7 +67,7 @@ def configured_route(config, manifest):
     if not _integer(settings.mt_policy_version, 1, 2**31 - 1):
         raise ToolError('mt_policy_version 必须是 1～2147483647 的整数；更换翻译策略时递增。', 'mt_config')
     base = normalize_mt_url(settings.mt_base_url)
-    models = [('magpie', 'mixed', settings.mt_model or 'group/transcribe'),
+    models = [('magpie', 'mixed', settings.mt_model or Settings.mt_model),
               ('magpie_fallback', 'paid', settings.mt_fallback_model),
               ('magpie_review', 'mixed', settings.mt_review_model),
               ('magpie_review_fallback', 'paid', settings.mt_review_fallback_model),
@@ -80,7 +75,7 @@ def configured_route(config, manifest):
               ('magpie_judge_fallback', 'paid', settings.mt_judge_fallback_model)]
     if any(not _model(model) for _, _, model in models) or len({model for _, _, model in models}) != 6:
         raise _invalid()
-    quality = {'input_bytes': 32768, 'output_tokens': 4096, 'max_revisions': 2, 'manual_glossary': {}}
+    quality = {'input_bytes': INPUT_BUDGET, 'output_tokens': OUTPUT_TOKENS, 'max_revisions': 2, 'manual_glossary': {}}
     if settings.mt_quality is not None:
         if not isinstance(settings.mt_quality, dict) or set(settings.mt_quality) - {'manual_glossary'}:
             raise _invalid()
@@ -93,7 +88,7 @@ def configured_route(config, manifest):
     entries = [{'id': identity, 'tier': tier, 'credential_ref': 'magpie',
                 'backend': MTBackend('magpie', base, model, fingerprint,
                                      policy_version=settings.mt_policy_version).snapshot(),
-                'capabilities': {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}}
+                'capabilities': DEFAULT_CAPABILITIES.copy()}
                for identity, tier, model in models]
     from .magpie import bound_gateway
     from .mt_catalog import saved_catalog
@@ -142,7 +137,7 @@ def saved_route(manifest):
         identity = entry['id']
         if (not isinstance(identity, str) or identity not in _ENTRY_TIERS or identity in identities or
                 entry['credential_ref'] != 'magpie' or
-                entry['tier'] != _ENTRY_TIERS[identity] or not _capabilities(entry['capabilities'])):
+                entry['tier'] != _ENTRY_TIERS[identity] or not valid_capabilities(entry['capabilities'])):
             raise _invalid()
         identities.add(identity)
         saved = entry['backend']

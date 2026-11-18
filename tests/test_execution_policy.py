@@ -21,6 +21,8 @@ class ExecutionPolicyTests(SavedResultFixture):
         invalid = [(path, value) for path in paths for value in [0, 999, True, '2', None]]
         invalid += [(('execution_snapshot', field), float(value))
                     for field, value in current_execution_snapshot().items()]
+        invalid += [(('execution_snapshot', 'prompt_version'), 6),
+                    (('execution_snapshot', 'alignment_version'), 4)]
         invalid.append((('mt_glossary_schedule',), 'unsupported'))
         invalid.append((('mt_glossary_schedule',), None))
         for path, value in invalid:

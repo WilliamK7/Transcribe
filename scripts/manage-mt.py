@@ -47,7 +47,7 @@ def main():
                 if owner not in providers:
                     raise ToolError('请先在 Magpie 中接入该渠道。', 'mt_config')
                 policy['providers'].setdefault(owner, {'adapter': 'registry', 'preferred': [], 'include': ['*'],
-                    'exclude': [], 'billing': ['free', 'commercial'], 'max_candidates': {'free': 3, 'commercial': 3}})
+                    'billing': ['free', 'commercial'], 'max_candidates': {'free': 3, 'commercial': 3}})
             else:
                 policy['enabled'] = bool(args.enable)
             path = config.data / 'mt-channels.json'

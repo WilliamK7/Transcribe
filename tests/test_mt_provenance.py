@@ -7,6 +7,7 @@ from unittest import mock
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.mt_quality import PROMPTS
+from subtitle_tool.subtitles import ALIGNMENT_VERSION
 from tests.fixtures import FakeService, SavedResultFixture, response, result, timed_raw
 
 
@@ -39,6 +40,8 @@ class ProductionService(FakeService):
             value = {'translations': {item['id']: stage + ' 译文 ' + item['id'] for item in items}}
         if stage == 'judge':
             value['issues'] = data['issues']
+            value['translations'] = {**data['translations'], **{issue['id']: 'judge 译文 ' + issue['id']
+                                     for issue in value['issues']}}
         if self.cancel_stage == stage:
             self.cancel.set()
         return response({'model': 'synthetic/' + stage, 'choices': [{'finish_reason': 'stop', 'message': {
@@ -123,7 +126,7 @@ class ProductionProvenanceTests(SavedResultFixture):
                 _, final = self.final()
                 self.assertEqual(self.store.mt_stage_entry(self.job_id, final['production_stage_key'])['stage'],
                                  'judge' if boundary == 'judge' else 'translate')
-                self.assertEqual(self.store.job(self.job_id)['manifest']['execution_snapshot']['alignment_version'], 3)
+                self.assertEqual(self.store.job(self.job_id)['manifest']['execution_snapshot']['alignment_version'], ALIGNMENT_VERSION)
                 self.fake.stages.clear()
                 Engine(self.config, self.store).retime(self.job_id, overwrite=True)
                 self.assertEqual(self.execute(), 'completed')

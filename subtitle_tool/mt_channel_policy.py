@@ -38,13 +38,13 @@ def load_policy(config):
                 raise ValueError()
         fields = {'adapter', 'package', 'preferred', 'include', 'exclude', 'billing', 'max_candidates',
                   'max_input_usd_per_million', 'max_output_usd_per_million'}
-        required = {'adapter', 'preferred', 'include', 'exclude', 'billing', 'max_candidates'}
+        required = {'adapter', 'preferred', 'include', 'billing', 'max_candidates'}
         for owner, rule in value['providers'].items():
             if (not re.fullmatch(r'[A-Za-z0-9_.-]+', owner) or not isinstance(rule, dict) or
                     set(rule) - fields or not required <= set(rule) or
                     rule['adapter'] not in {'registry', 'openrouter', 'vercel', 'vllm-sr'}):
                 raise ValueError()
-            for field in ('preferred', 'include', 'exclude', 'billing'):
+            for field in rule.keys() & {'preferred', 'include', 'exclude', 'billing'}:
                 if not isinstance(rule[field], list) or not all(isinstance(m, str) and m for m in rule[field]):
                     raise ValueError()
             if set(rule['billing']) - {'free', 'commercial'} or set(rule['max_candidates']) != {'free', 'commercial'}:
@@ -65,7 +65,7 @@ def load_policy(config):
 
 def selected(name, rule):
     return any(fnmatchcase(name, p) for p in rule['include']) and not any(
-        fnmatchcase(name, p) for p in rule['exclude'])
+        fnmatchcase(name, p) for p in rule.get('exclude', ()))
 
 
 def check_provider_policy(config, models, *, policy=None, registry=None, base_url=None):

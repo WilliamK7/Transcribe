@@ -144,8 +144,11 @@ class SemanticPipelineTests(PoolPipelineFixture):
                 self.assertEqual(item['sentence'], target['id'])
                 self.assertEqual(item['text'], whole[item['char_start']:item['char_end']])
                 self.assertTrue(item['char_end'] <= target['char_start'] or item['char_start'] >= target['char_end'])
-            review = next(value for stage, _, value in self.calls
-                          if stage == 'review' and value['sentences'] == data['sentences'])
+            review = next(value for stage, _, value in self.calls if stage == 'review' and
+                          [{key: field for key, field in part.items() if key != 'translation'}
+                           for part in value['fragments']] == data['fragments'])
+            self.assertEqual([{key: value for key, value in sentence.items() if key != 'joined_translation'}
+                              for sentence in review['sentences']], data['sentences'])
             self.assertEqual(review['context'], data['context'])
 
     def test_bad_glossary_is_not_saved_or_used_by_later_groups(self):

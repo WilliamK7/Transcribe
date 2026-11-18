@@ -267,8 +267,14 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
         self.assertTrue(any('复核' in warning for warning in self.store.job(self.job_id)['manifest']['warnings']))
 
-    def test_correction_that_ignores_unchanged_reviewed_cues_stops_after_followup_review(self):
+    def install_legacy_corrections(self):
         self.install()
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['execution_snapshot']['prompt_version'] = 5
+        self.store.update(self.job_id, manifest=manifest)
+
+    def test_legacy_correction_that_ignores_reviewed_cues_stops_after_followup_review(self):
+        self.install_legacy_corrections()
         self.review_issue = True
         self.corrected_translations = lambda data: {**data['translations'], '1': '只改了未被指出的另一句。'}
         self.assertEqual(self.run_pool(), 'completed')
@@ -280,8 +286,8 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.assertEqual(self.store.counts(self.job_id)['mt_correction_stalled'], 1)
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
 
-    def test_stalled_correction_resumes_from_saved_followup_review_without_new_requests(self):
-        self.install()
+    def test_legacy_stalled_correction_resumes_from_saved_followup_review_without_new_requests(self):
+        self.install_legacy_corrections()
         self.review_issue = True
         self.corrected_translations = lambda data: {**data['translations'], '1': '只改了另一句。'}
         def hook(stage, data):
@@ -296,8 +302,8 @@ class PoolPipelineTests(PoolPipelineFixture):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.store.counts(self.job_id)['mt_correction_stalled'], 1)
 
-    def test_stalled_detection_preserves_an_already_saved_second_correction(self):
-        self.install()
+    def test_legacy_stalled_detection_preserves_an_already_saved_second_correction(self):
+        self.install_legacy_corrections()
         self.review_issue = True
         def corrected(data):
             if sum(stage == 'judge' for stage, _, _ in self.calls) == 2:

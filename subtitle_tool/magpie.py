@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .common import ToolError
+from .config import MT_MODEL_SETTINGS, Settings
 from .mt_backend import normalize_mt_url
 
 
@@ -34,6 +35,13 @@ def bound_gateway(settings, base_url):
                 endpoint.path == '/v1' and endpoint.port == port)
     except (OSError, ValueError, TypeError, ToolError):
         return False
+
+
+def managed_gateway(config, base_url):
+    if not bound_gateway(config.settings, base_url):
+        return False
+    settings = config.mt_settings()
+    return all(getattr(settings, field) in ('', getattr(Settings, field)) for field in MT_MODEL_SETTINGS)
 
 
 def known_free_model(base_url, model):

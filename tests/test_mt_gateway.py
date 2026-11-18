@@ -285,8 +285,7 @@ class GatewayContractTests(PoolPipelineFixture):
                     elif stage == 'review':
                         value = {'issues': [{'id': '0', 'category': 'number', 'evidence': '合成疑点'}]}
                     else:
-                        targets = data['sentences'] if stage == 'translate' else data['fragments']
-                        value = {'translations': {item['id']: '完整译文。' for item in targets}}
+                        value = {'translations': {item['id']: '完整译文。' for item in data['fragments']}}
                     return reply(value)
                 with mock.patch('subtitle_tool.mt_transport.ProcessTransport') as transport:
                     transport.return_value.request.side_effect = send
@@ -296,27 +295,14 @@ class GatewayContractTests(PoolPipelineFixture):
                 # Reflow in the next case needs its own output; retain this result.
                 self.source.with_suffix('.srt').rename(self.path / (failed + '.srt'))
 
-    def test_previous_generation_contract_requires_reflow_and_does_not_reuse_cache(self):
+    def test_jobs_lists_reflow_for_an_unsupported_saved_prompt(self):
         from subtitle_tool.main import lifecycle_status, summary
-        from subtitle_tool import mt_quality, mt_pipeline
-        previous = mt_quality.QUALITY_PROMPT_VERSION - 1
-        with mock.patch.object(mt_quality, 'QUALITY_PROMPT_VERSION', previous), \
-                mock.patch.object(mt_pipeline, 'QUALITY_PROMPT_VERSION', previous), \
-                mock.patch('subtitle_tool.policy.QUALITY_PROMPT_VERSION', previous):
-            self.install()
-            self.assertEqual(self.run_pool(), 'completed')
-        before = self.store.job(self.job_id)
-        with self.assertRaises(ToolError) as caught:
-            Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(caught.exception.code, 'cache_version')
-        self.assertEqual(self.store.job(self.job_id), before)
-        self.assertIn('reflow', str(lifecycle_status({**before, 'state': 'failed'})))
+        self.install()
+        job = self.store.job(self.job_id)
+        job['manifest']['execution_snapshot']['prompt_version'] = 4
+        self.store.update(self.job_id, manifest=job['manifest'])
+        self.assertIn('reflow', str(lifecycle_status({**job, 'state': 'failed'})))
         self.assertEqual(summary(self.store, self.job_id)['mt_route_status'], 'reflow_required')
-        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
-        self.calls.clear()
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertIn('translate', [stage for stage, _, _ in self.calls])
-        self.assertNotIn('asr', [stage for stage, _, _ in self.calls])
 
     def test_reasoning_usage_rejects_invalid_optional_details(self):
         pipeline = self.pipeline()

@@ -19,6 +19,8 @@ CHINESE_MARKERS = re.compile(r"的|了|我们|你们|这个|欢迎|今天|你好
 FOREIGN_FUNCTIONS = {"the", "and", "is", "are", "was", "you", "your", "please", "turn", "on", "off",
                      "with", "have", "this", "that", "what", "where", "why", "when", "how", "from", "to", "for"}
 MAX_SEGMENT_END_OVERRUN_MS = 200
+ALIGNMENT_VERSION = 5
+_EN_BOUND_PREFIXES = frozenset('a an the my your its our their of to with from for by into on at and or'.split())
 
 
 def route(text: str, language: str, neighbors=()) -> tuple[str, str]:
@@ -507,8 +509,13 @@ def make_fragment(source, lo=0, hi=None, *, layout_round=0):
 
 class _WordBreakIndex:
     """Index one source in O(characters + words); each range search scans its words."""
-    def __init__(self, source):
+    def __init__(self, source, *, alignment_version=ALIGNMENT_VERSION):
         text, words = source["text"], source.get("words", [])
+        self._time_aware = alignment_version == ALIGNMENT_VERSION
+        language = source['language']
+        if self._time_aware and decision_origin(source) == 'manual' and source.get('source_lang', 'auto') != 'auto':
+            language = source['source_lang']
+        use_phrases = self._time_aware and language.lower() in {'en', 'english'}
         widths = [0]
         for char in text:
             width = (0 if unicodedata.category(char).startswith("M") or char in "\u200d\ufe0f" else
@@ -531,8 +538,9 @@ class _WordBreakIndex:
             tail = text[punctuation_end - 1] if punctuation_end else ""
             priority = 0 if tail and tail in "。！？.!?" else 1 if tail and tail in "，,；;：:" else 2
             pause = words[at]["begin_ms"] - words[at - 1]["end_ms"] >= 400
+            tokens = text[words[at - 1]['char_start']:before_end].lower().rsplit(None, 1) if use_phrases else []
             candidates[at] = (widths[before_end], punctuation_end, priority, pause,
-                              widths[words[at]["char_start"]])
+                              widths[words[at]["char_start"]], bool(tokens) and tokens[-1] in _EN_BOUND_PREFIXES)
         self._words, self._widths, self._candidates = words, widths, candidates
 
     def best(self, lo, hi):
@@ -548,21 +556,24 @@ class _WordBreakIndex:
             if (candidate is None or words[at - 1]["end_ms"] - begin_ms < 1000 or
                     end_ms - words[at]["begin_ms"] < 1000):
                 continue
-            before_width, punctuation_end, punctuation_priority, pause, after_start_width = candidate
+            before_width, punctuation_end, punctuation_priority, pause, after_start_width, bound_prefix = candidate
             priority = 0 if pause else punctuation_priority if punctuation_end > start else 2
             # rstrip and quote removal stop at this range's left edge; the right slice is untrimmed.
             balance = abs(max(0, before_width - start_width) - (end_width - after_start_width))
-            score = (priority, balance, at)
+            penalty = min(32, (end_width - start_width) // 3) if bound_prefix else 0
+            needs_another_split = self._time_aware and max(words[at - 1]['end_ms'] - begin_ms,
+                                                             end_ms - words[at]['begin_ms']) > 7000
+            score = (priority, needs_another_split, balance + penalty, balance, at)
             if choice is None or score < choice:
                 choice = score
-        return choice[2] if choice else None
+        return choice[-1] if choice else None
 
 
 def source_capacity(source, settings):
     return settings.zh_line_width * 2 if source["language"] in {"zh", "yue"} else settings.other_line_width
 
 
-def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, force=False):
+def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, force=False, alignment_version=ALIGNMENT_VERSION):
     root = cue or make_fragment(source)
     words = source.get("words", [])
     if len(words) < 2 or root["end_ms"] - root["begin_ms"] < 1000:
@@ -584,7 +595,7 @@ def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, 
         at = None
         if needs:
             if break_index is None:
-                break_index = _WordBreakIndex(source)
+                break_index = _WordBreakIndex(source, alignment_version=alignment_version)
             at = break_index.best(lo, hi)
         if at is None:
             ranges.append((lo, hi))
@@ -595,14 +606,14 @@ def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, 
     return [make_fragment(source, lo, hi, layout_round=layout_round) for lo, hi in sorted(ranges)]
 
 
-def split_mt_units(source, units, *, fits):
+def split_mt_units(source, units, *, fits, alignment_version=ALIGNMENT_VERSION):
     result, break_index = [], None
     stack = list(reversed(units))
     while stack:
         unit = stack.pop()
         if not fits(unit):
             if break_index is None:
-                break_index = _WordBreakIndex(source)
+                break_index = _WordBreakIndex(source, alignment_version=alignment_version)
             at = break_index.best(unit['word_start'], unit['word_end'])
             if at is None:
                 raise ToolError('完整请求超过模型预算且没有可靠词边界。', 'mt_input_budget')
@@ -672,14 +683,14 @@ def validate_fragment(source, cue):
         raise ToolError("字幕片段与完整句来源／词范围记录不一致。", "cache_mismatch")
 
 
-def revise_layout(cues, sources, settings, *, layout_round):
+def revise_layout(cues, sources, settings, *, layout_round, alignment_version=ALIGNMENT_VERSION):
     """Split overflowing translations; joint groups must be translated together again."""
     revised, affected = [], set()
     for cue in cues:
         parts = [cue]
         if cue['decision'] == 'translate' and len(wrap(cue['translated'], settings.zh_line_width * 2)) > 2:
             parts = plan_fragments(sources[cue['sentence_id']], settings, cue=cue,
-                                   reference=cue['translated'], layout_round=layout_round, force=True)
+                                   reference=cue['translated'], layout_round=layout_round, force=True, alignment_version=alignment_version)
         if len(parts) > 1:
             affected.add(cue['sentence_id'])
         revised.extend(parts)

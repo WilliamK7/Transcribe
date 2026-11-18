@@ -7,12 +7,11 @@ import time
 import uuid
 from pathlib import Path
 
-from .common import DISPLAY_TIMING_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION, ToolError, atomic_json, output_key, validate_workspace_id
+from .common import PROCESSING_VERSION, ToolError, atomic_json, output_key, validate_workspace_id
 from .config import Settings
 from .review import ReviewDecision, decision_origin
-from .policy import current_execution_snapshot
+from .policy import subtitle_contract
 from .mt_pool import saved_route
-from .mt_quality import GLOSSARY_SCHEDULE
 from .lifecycle import INACTIVE, validate_transition
 
 _CUE_COLUMNS = ("cue_id", "begin_ms", "end_ms", "text", "language", "decision", "reason",
@@ -91,17 +90,11 @@ class Store:
             now = time.time()
             manifest = {"region": "beijing", "workspace_id": workspace_id, "access_mode": "workspace",
                         "processing_version": PROCESSING_VERSION, "account": account,
-                        "overwrite": bool(overwrite), "segments": [], "warnings": []}
+                        "overwrite": bool(overwrite), "segments": [], "warnings": [],
+                        **subtitle_contract(settings or Settings())}
             if mt_route_snapshot is not None:
                 manifest['mt_route_snapshot'] = mt_route_snapshot
-                saved_route({**manifest, 'translation_strategy_version': 6})
-            settings = settings or Settings()
-            manifest.update(subtitle_version=SUBTITLE_VERSION, translation_strategy_version=6,
-                            display_timing_version=DISPLAY_TIMING_VERSION,
-                            execution_snapshot=current_execution_snapshot(),
-                            mt_glossary_schedule=GLOSSARY_SCHEDULE,
-                            subtitle_settings={k: getattr(settings, k) for k in
-                                               ["zh_line_width", "other_line_width", "chinese_first"]})
+                saved_route(manifest)
             self.db.execute("INSERT INTO jobs(id,source,output,output_key,state,manifest,created,updated) "
                             "VALUES(?,?,?,?,?,?,?,?)", (job_id, str(source), str(output), key, "queued",
                             json.dumps(manifest, ensure_ascii=False), now, now))

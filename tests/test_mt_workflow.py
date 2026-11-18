@@ -108,6 +108,9 @@ class TranslationWorkflowTests(PoolPipelineFixture):
         self.addCleanup(patch.stop)
         self.config.settings.mt_workers = 1
         self.install_groups(10)
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['mt_glossary_schedule'] = 'window-prefix-v3'
+        self.store.update(self.job_id, manifest=manifest)
         self.glossary_terms = lambda data: [{'source': 'Cache', 'translation': '缓存',
             'sentence': data['sentences'][-1]['id']}]
         self.cancel_after = 'translate'

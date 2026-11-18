@@ -202,6 +202,7 @@ class QualityContractTests(unittest.TestCase):
         source = normalize(raw, 0, '0000', duration_ms=80000)[0][0]
         cues = plan_fragments(source, Settings())
         pipeline = Pipeline.__new__(Pipeline)
+        pipeline.display_durations = {}
         pipeline._fit = lambda stage, data, **kwargs: data
         groups = pipeline.plan_groups([source], cues)
         self.assertGreater(len(groups), 1)

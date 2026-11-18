@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from subtitle_tool.common import Cancelled, ToolError
 from subtitle_tool.config import Config
 from subtitle_tool.instance import ProcessLock
+from subtitle_tool.mt_admission import SUITE_VERSION
 from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_gateway_setup import GatewaySetup
 from subtitle_tool.mt_catalog import Catalog, offer_billing, read_registry
@@ -87,7 +88,7 @@ def main():
         print(json.dumps({'skipped': catalog.skipped}, ensure_ascii=False), flush=True)
         from subtitle_tool.common import atomic_json
         from datetime import datetime, timezone
-        report = {'version': 1, 'suite': 3, 'evaluated_at': datetime.now(timezone.utc).isoformat(),
+        report = {'version': 1, 'suite': SUITE_VERSION, 'evaluated_at': datetime.now(timezone.utc).isoformat(),
                   'evaluations': evaluations, 'free': free, 'skipped': catalog.skipped, 'unavailable': unavailable,
                   'offers': {m: {'billing': offer_billing(by_id[m.split('/', 1)[0]], m.split('/', 1)[1]),
                                   'entitlement_usage': 'unknown', 'cash_spend': 'unknown'} for m in evaluations}}

@@ -5,7 +5,10 @@ from dataclasses import dataclass, replace
 from .common import (ASR_MODEL, DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, PROCESSING_VERSION,
                      SUBTITLE_VERSION, ToolError)
 from .media import EXTRACT_RECIPE_VERSION
-from .mt_quality import GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION
+from .mt_quality import GLOSSARY_SCHEDULE, LEGACY_GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION, SUPPORTED_PROMPT_VERSIONS
+from .subtitles import ALIGNMENT_VERSION
+
+_LAYOUT_FIELDS = ('zh_line_width', 'other_line_width', 'chinese_first')
 
 
 def current_execution_snapshot():
@@ -13,7 +16,14 @@ def current_execution_snapshot():
                 prompt_version=QUALITY_PROMPT_VERSION,
                 recovery_version=6,
                 context_version=3,
-                alignment_version=3)
+                alignment_version=ALIGNMENT_VERSION)
+
+
+def subtitle_contract(settings):
+    return {'subtitle_version': SUBTITLE_VERSION, 'display_timing_version': DISPLAY_TIMING_VERSION,
+            'translation_strategy_version': 6, 'execution_snapshot': current_execution_snapshot(),
+            'mt_glossary_schedule': GLOSSARY_SCHEDULE,
+            'subtitle_settings': {key: getattr(settings, key) for key in _LAYOUT_FIELDS}}
 
 
 def asr_contract():
@@ -24,7 +34,6 @@ def asr_contract():
 def _version(value, expected):
     if type(value) is not int or value != expected:
         raise ToolError("任务执行版本不受支持，请用 --reflow 显式重排。", "cache_version")
-    return value
 
 
 @dataclass(frozen=True)
@@ -61,7 +70,7 @@ def load_policy(manifest):
     _version(manifest.get('display_timing_version'), DISPLAY_TIMING_VERSION)
     _version(manifest.get("translation_strategy_version"), 6)
     saved_layout = manifest.get("subtitle_settings", {})
-    if not isinstance(saved_layout, dict) or set(saved_layout) != {"zh_line_width", "other_line_width", "chinese_first"}:
+    if not isinstance(saved_layout, dict) or saved_layout.keys() != set(_LAYOUT_FIELDS):
         raise ToolError("任务的排版快照无效，请用 --reflow 重排。", "cache_version")
     saved = manifest.get("contract")
     if saved:
@@ -69,10 +78,11 @@ def load_policy(manifest):
     if "normalized_version" in manifest:
         _version(manifest["normalized_version"], NORMALIZER_VERSION)
     snapshot = manifest.get('execution_snapshot')
-    current = current_execution_snapshot()
-    if (not isinstance(snapshot, dict) or set(snapshot) != set(current) or
-            any(type(snapshot[k]) is not int or snapshot[k] != current[k] for k in current)):
+    supported = {key: (value,) for key, value in current_execution_snapshot().items()}
+    supported.update(prompt_version=SUPPORTED_PROMPT_VERSIONS, alignment_version=(3, ALIGNMENT_VERSION))
+    if (not isinstance(snapshot, dict) or snapshot.keys() != supported.keys() or
+            any(type(value) is not int or value not in supported[key] for key, value in snapshot.items())):
         raise ToolError('任务执行版本已退役；请用 --reflow 从原始转写重建当前版本任务。', 'cache_version')
-    if manifest.get('mt_glossary_schedule') != GLOSSARY_SCHEDULE:
+    if manifest.get('mt_glossary_schedule') not in (GLOSSARY_SCHEDULE, LEGACY_GLOSSARY_SCHEDULE):
         raise ToolError('任务术语调度版本不受支持，请用 --reflow 从原始转写重建。', 'cache_version')
     return ExecutionPolicy(**saved_layout)

@@ -20,6 +20,7 @@ from .mt_control import BackgroundCancel, MTControl
 from .mt_channel_policy import ROLES
 
 MANAGED_PREFIX = TRIAL_PROVIDER + '-'
+TRIAL_GROUPS = {'transcribe-trial' + ('' if role == 'translate' else '-' + role) for role in ROLES}
 
 
 def provider_id(model):
@@ -72,17 +73,11 @@ class BailianFreeGuard:
             raise ValueError('identity')
         return proof
 
-    def prepare(self, settings, base_url):
-        from .magpie import bound_gateway
+    def prepare(self, base_url):
+        from .magpie import managed_gateway
         self.parent.check_start()
-        if not bound_gateway(settings, base_url):
+        if not managed_gateway(self.config, base_url):
             return
-        effective = self.config.mt_settings()
-        expected = {'mt_model': 'group/transcribe', 'mt_fallback_model': 'group/transcribe-paid',
-                    'mt_review_model': 'group/transcribe-review', 'mt_review_fallback_model': 'group/transcribe-review-paid',
-                    'mt_judge_model': 'group/transcribe-judge', 'mt_judge_fallback_model': 'group/transcribe-judge-paid'}
-        if any((getattr(effective, field) or expected[field]) != value for field, value in expected.items()):
-            return  # Custom/remote role groups remain administrator-managed.
         with self.admin.lock:
             raw = self.admin.registry()
             template = next((p for p in raw['providers'] if p['id'] == TRIAL_PROVIDER), None)
@@ -106,8 +101,9 @@ class BailianFreeGuard:
                              lane['headers'] != {'X-Transcribe-Trial-Model': model}):
                     self.exhausted.add(model)
                     self.remove(model, 'identity_changed')
+            self._retire_stale_admissions(template, raw)
             if self.thread is None:
-                for path in (Path(settings.magpie_data_dir) / 'routing').glob('*.jsonl'):
+                for path in (Path(self.config.settings.magpie_data_dir) / 'routing').glob('*.jsonl'):
                     self.offsets[str(path)] = path.stat().st_size
                 self.thread = threading.Thread(target=self._run, name='bailian-trial', daemon=True)
                 self.thread.start()
@@ -198,6 +194,8 @@ class BailianFreeGuard:
         member = item['provider'] + '/' + model
         groups = self.admin.registry().get('groups', [])
         for group in groups:
+            if reason == 'admission_stale' and group['id'] not in TRIAL_GROUPS:
+                continue
             if group['id'].startswith('transcribe') and member in group.get('members', []):
                 if len(group['members']) > 1:
                     self.admin.command('group', 'set', group['id'], 'models-=' + member)
@@ -214,15 +212,34 @@ class BailianFreeGuard:
         if before != reason:
             self._audit(reason, model, before, reason)
 
-    def _lane(self, template, model, limits):
-        with self.admin.lock:
-            return self._lane_locked(template, model, limits)
+    def _isolate_trial_lane(self, raw, model, identity):
+        member = identity + '/' + model
+        groups = [group for group in raw.get('groups', []) if member in group.get('members', []) and
+                  not group.get('hidden') and member not in group.get('off', [])]
+        if any(group['id'] not in TRIAL_GROUPS for group in groups):
+            raise ToolError('试用入口仍在其他分组中，暂缓重新分配。', 'mt_trial_route_conflict')
+        template_off = any(lane['id'] == TRIAL_PROVIDER and lane.get('off') for lane in raw['providers'])
+        for group in groups:
+            changes = []
+            if len(group['members']) == 1:
+                if not template_off:
+                    raise ToolError('重新验收前须停用试用账户模板。', 'mt_trial_route_conflict')
+                placeholder = TRIAL_PROVIDER + '/' + model
+                self.state.setdefault('admission_placeholders', {})[group['id']] = placeholder
+                self.trial_state.save(self.control)
+                changes.append('models+=' + placeholder)
+            self.admin.command('group', 'set', group['id'], *changes, 'models-=' + member)
 
-    def _lane_locked(self, template, model, limits):
+    def _lane(self, template, model, limits, *, isolate=False):
+        with self.admin.lock:
+            return self._lane_locked(template, model, limits, isolate=isolate)
+
+    def _lane_locked(self, template, model, limits, *, isolate=False):
         if model in self.exhausted:
             raise ToolError('本任务已退出该试用模型。', 'mt_config')
         identity = provider_id(model)
-        providers = {p['id']: p for p in self.admin.registry()['providers']}
+        raw = self.admin.registry()
+        providers = {p['id']: p for p in raw['providers']}
         ceiling = self.state.setdefault('aggregate_rpm', template.get('maxRPM') or 60)
         known_limits = [limits] + [item.get('limits', {}) for item in self.state['evaluations'].values()]
         for known in known_limits:
@@ -245,6 +262,8 @@ class BailianFreeGuard:
             owned_off = self.state['models'].get(model, {}).get('disabled_by_manager')
             if lane.get('off') and not owned_off or lane.get('key') != template['key'] or lane.get('chat') != template['chat']:
                 raise ToolError('试用模型入口已被人工修改。', 'mt_config')
+            if isolate:
+                self._isolate_trial_lane(raw, model, identity)
             if lane.get('off') and owned_off:
                 self.admin.command('provider', 'on', identity)
                 self.state['models'][model]['disabled_by_manager'] = False
@@ -317,10 +336,18 @@ class BailianFreeGuard:
                 if before != 'role_conflict':
                     self._audit('role_conflict', model, before, 'role_conflict')
                 return
+        placeholders = self.state.get('admission_placeholders', {})
         if trial_group not in groups:
             self.admin.command('group', 'add', trial_group, 'models=' + member, 'routing=order', 'stays=off')
-        elif member not in groups[trial_group].get('members', []):
-            self.admin.command('group', 'set', trial_group, 'models+=' + member)
+        else:
+            members = groups[trial_group].get('members', [])
+            changes = ['models+=' + member] if member not in members else []
+            placeholder = placeholders.get(trial_group)
+            if placeholder in members:
+                changes.append('models-=' + placeholder)
+            if changes:
+                self.admin.command('group', 'set', trial_group, *changes)
+        placeholders.pop(trial_group, None)
         trial = 'group/' + trial_group
         if free_group not in groups:
             self.admin.command('group', 'add', free_group, 'models=' + trial, 'routing=weight', 'stays=off')
@@ -333,8 +360,7 @@ class BailianFreeGuard:
             changes = (['models-=' + paid] if paid in groups[main].get('members', []) else [])
             self.admin.command('group', 'set', main, *changes, 'models+=group/' + free_group + ',' + paid)
         before = item.get('status')
-        item['status'] = 'active'
-        item['joined'] = True
+        item.update(status='active', joined=True, disabled_by_manager=False)
         owned_edges = self.state.setdefault('owned_edges', [])
         for parent, child in edges:
             if parent in groups or parent == free_group:
@@ -344,6 +370,39 @@ class BailianFreeGuard:
         self.trial_state.save(self.control)
         if before != 'active':
             self._audit('model_admitted', model, before, 'active')
+
+    def _manually_held(self, model, item, providers, groups):
+        lane = providers.get(item['provider'])
+        suffix = '' if item['role'] == 'translate' else '-' + item['role']
+        group = groups.get('transcribe-trial' + suffix, {})
+        member = item['provider'] + '/' + model
+        removed = (item.get('joined') and item.get('status') == 'active' and
+                   (member not in group.get('members', []) or member in group.get('off', []) or group.get('hidden')))
+        edges = ('transcribe-free' + suffix + ':group/transcribe-trial' + suffix,
+                 'transcribe' + suffix + ':group/transcribe-free' + suffix)
+        return (lane is None or lane.get('off') and not item.get('disabled_by_manager') or
+                model in self.state['excluded'] or removed or any(edge in self.state.get('excluded_groups', []) for edge in edges))
+
+    def _retire_stale_admissions(self, template, raw):
+        providers = {lane['id']: lane for lane in raw['providers']}
+        groups = {group['id']: group for group in raw.get('groups', [])}
+        for model, item in list(self.state['models'].items()):
+            if item.get('status') == 'retiring_admission':
+                self.remove(model, 'admission_stale')
+                continue
+            if item.get('status') != 'active':
+                continue
+            evaluation = self.state['evaluations'].get(admission_key(template, model), {})
+            if item['role'] in evaluation.get('roles', []) and not evaluation.get('retry_after'):
+                continue
+            if self._manually_held(model, item, providers, groups):
+                item['manual_hold'] = True
+                self.exhausted.add(model)
+                self.remove(model, 'user_paused')
+            else:
+                item.update(status='retiring_admission', disabled_by_manager=True)
+                self.trial_state.save(self.control)
+                self.remove(model, 'admission_stale')
 
     def refresh(self):
         self.control.check_start()
@@ -382,6 +441,8 @@ class BailianFreeGuard:
             for model in list(self.state['models']):
                 self.remove(model, 'identity_changed')
             return
+        with self.admin.lock:
+            self._retire_stale_admissions(template, self.admin.registry())
         # A process may have exited after provider creation and before the
         # local admission record committed. Only recover our exact tagged lane.
         for lane in raw['providers']:
@@ -409,20 +470,11 @@ class BailianFreeGuard:
         self.failures = 0
         self.state['quota_status'] = 'known'
         today = beijing_today()
+        raw = self.admin.registry()
         providers = {p['id']: p for p in raw['providers']}
         groups = {g['id']: g for g in raw.get('groups', [])}
         for model, item in list(self.state['models'].items()):
-            lane = providers.get(item['provider'])
-            suffix = '' if item['role'] == 'translate' else '-' + item['role']
-            group = groups.get('transcribe-trial' + suffix, {})
-            member = item['provider'] + '/' + model
-            manually_removed = (item.get('joined') and item.get('status') == 'active' and
-                (member not in group.get('members', []) or member in group.get('off', []) or group.get('hidden')))
-            manually_removed = manually_removed or any(edge in exclusions for edge in (
-                'transcribe-free' + suffix + ':group/transcribe-trial' + suffix,
-                'transcribe' + suffix + ':group/transcribe-free' + suffix))
-            if (lane is None or lane.get('off') and not item.get('disabled_by_manager') or
-                    model in self.state['excluded'] or manually_removed):
+            if self._manually_held(model, item, providers, groups):
                 item['manual_hold'] = True
                 self.exhausted.add(model)
                 self.remove(model, 'user_paused')
@@ -432,10 +484,12 @@ class BailianFreeGuard:
         active = [m for m, item in self.state['models'].items() if item.get('status') == 'active']
         if len(active) >= 3 and not any(self.state['models'][m]['role'] == 'translate' for m in active):
             self.remove(active.pop(), 'standby')
+        pending = {m for m, item in self.state['models'].items() if item.get('status') == 'admission_stale'}
         candidates = sorted((m for m, row in self.rows.items() if row.usable(today) and
             m not in self.exhausted and m not in self.state['excluded'] and
             not self.state['models'].get(m, {}).get('manual_hold')),
-            key=lambda m: (self.rows[m].expires, -self.rows[m].remaining, m))
+            key=lambda m: (m not in pending, self.rows[m].expires, -self.rows[m].remaining, m))
+        rechecked = False
         for model in candidates:
             self.control.check_start()
             if len(active) >= 3:
@@ -447,6 +501,8 @@ class BailianFreeGuard:
             if evaluation and evaluation.get('retry_after') and evaluation['retry_after'] <= time.time():
                 evaluation = None
             if evaluation is None:
+                if model in pending and rechecked:
+                    break
                 self.state['pool_status'] = 'replenishing'
                 self.trial_state.save(self.control)
                 evaluator = self.evaluator
@@ -462,15 +518,17 @@ class BailianFreeGuard:
                                                identities=catalog.get('identities', {}))
                 try:
                     limits = self.access.inspect(self.config, model, self.control)
-                    identity = self._lane(template, model, limits)
+                    identity = self._lane(template, model, limits, isolate=True)
                 except Cancelled:
                     raise
-                except Exception:
-                    self._audit('limits_unknown', model)
+                except Exception as error:
+                    reason = 'admission_route_conflict' if getattr(error, 'code', None) == 'mt_trial_route_conflict' else 'limits_unknown'
+                    self._audit(reason, model)
                     continue
                 item = self.state['models'].setdefault(model, {'provider': identity, 'role': 'translate'})
                 item['status'] = 'evaluating'
                 self.trial_state.save(self.control)
+                rechecked = rechecked or model in pending
                 evaluation = evaluator.evaluate(identity + '/' + model)
                 evaluation['limits'] = limits
                 self.state['evaluations'][key] = evaluation
@@ -499,7 +557,15 @@ class BailianFreeGuard:
                 thinking = evaluation.get('non_thinking', {})
                 role = min(eligible, key=lambda r: (sum(self.state['models'][m]['role'] == r for m in active),
                     r == 'review' and isinstance(thinking, dict) and not thinking.get('review')))
-                identity = self._lane(template, model, evaluation.get('limits', {}))
+                previous = self.state['models'].get(model, {})
+                try:
+                    identity = self._lane(template, model, evaluation.get('limits', {}),
+                                          isolate=previous.get('role', role) != role)
+                except ToolError as error:
+                    if error.code != 'mt_trial_route_conflict':
+                        raise
+                    self._audit('admission_route_conflict', model)
+                    continue
                 item = self.state['models'].setdefault(model, {'provider': identity, 'role': role, 'status': 'ready'})
                 item['role'] = role
                 for actual_model in actual:
