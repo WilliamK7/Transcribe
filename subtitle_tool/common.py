@@ -8,7 +8,8 @@ import tempfile
 import threading
 from pathlib import Path
 
-ASR_MODEL = "qwen3-asr-flash-filetrans"
+ASR_MODEL = "qwen-audio-3.1-asr-flash-filetrans"
+LEGACY_ASR_MODEL = "qwen3-asr-flash-filetrans"
 NORMALIZER_VERSION = 4
 PROCESSING_VERSION = 2
 SUBTITLE_VERSION = 2
@@ -16,6 +17,17 @@ DISPLAY_TIMING_VERSION = 3
 MAX_LAYOUT_ROUNDS = 2
 MAX_UPLOAD_BYTES = 1_000_000_000
 MAX_ASR_SECONDS = 12 * 3600
+
+
+def asr_contract(model=ASR_MODEL):
+    if model == ASR_MODEL:
+        parameters = {"channel_id": [0], "keep_dialect": True,
+                      "special_word_filter": '{"system_reserved_filter":false}'}
+    elif model == LEGACY_ASR_MODEL:
+        parameters = {"channel_id": [0], "enable_words": True, "enable_itn": False}
+    else:
+        raise ToolError("任务的识别模型契约不受支持，请检查保存记录。", "cache_version")
+    return {"asr": model, "normalizer": NORMALIZER_VERSION, "parameters": parameters}
 
 
 def validate_workspace_id(value: str) -> str:

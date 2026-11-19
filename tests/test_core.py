@@ -226,7 +226,7 @@ class PipelineTests(PipelineFixture):
         self.assertEqual(self.store.counts(self.job_id).get("mt", 0), 0)
         request = fake.named("/asr/transcription")[0][2]
         self.assertEqual(request["json"]["model"], ASR_MODEL)
-        self.assertEqual(set(request["json"]["input"]), {"file_url"})
+        self.assertEqual(set(request["json"]["input"]), {"file_urls"})
         self.assertNotIn("language", request["json"]["parameters"])
         self.assertEqual(request["headers"]["X-DashScope-OssResourceResolve"], "enable")
         self.assertEqual(fake.named("/uploads")[0][2]["params"]["model"], ASR_MODEL)
@@ -298,20 +298,6 @@ class PipelineTests(PipelineFixture):
         fake = FakeService(result(("欢迎使用百炼。", "zh")))
         self.assertEqual(self.run_fake(fake), "submission_unknown")
         self.assertEqual(fake.calls, [])
-
-    def test_success_in_other_asr_result_layout_is_not_accepted(self):
-        fake = FakeService(result(("欢迎使用百炼。", "zh")))
-        original = fake.request
-        def wrong_layout(method, url, **kwargs):
-            if "/tasks/" in url:
-                fake.calls.append((method, url, kwargs))
-                return response({"output": {"task_status": "SUCCEEDED", "results": [{
-                    "transcription_url": "https://example.test/other.json"}]}})
-            return original(method, url, **kwargs)
-        fake.request = wrong_layout
-        self.assertEqual(self.run_fake(fake), "failed")
-        self.assertEqual(self.store.job(self.job_id)["error_code"], "response_schema")
-        self.assertFalse(self.source.with_suffix(".srt").exists())
 
     def test_network_query_resume_does_not_resubmit_asr(self):
         fake = FakeService(result(("欢迎使用百炼。", "zh")))

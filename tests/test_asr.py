@@ -1,15 +1,25 @@
 """Offline checks for direct ASR transport and storage credential separation."""
 from __future__ import annotations
 
+import copy
+import json
 import threading
 from unittest import mock
 
 import requests
 
 from subtitle_tool.api import Bailian
-from subtitle_tool.common import ASR_MODEL, SubmissionUnknown, ToolError
-from tests.fixtures import TemporaryTest, response
+from subtitle_tool.common import ASR_MODEL, SubmissionUnknown, ToolError, asr_contract
+from subtitle_tool.engine import Engine
+from subtitle_tool.review import ReviewDecision
+from subtitle_tool.subtitles import make_fragment
+from tests.fixtures import FakeService, PipelineFixture, SavedResultFixture, TemporaryTest, response, result, unlabeled_raw
 
+
+LEGACY_MODEL = 'qwen3-asr-flash-filetrans'
+LEGACY_CONTRACT = {'asr': LEGACY_MODEL, 'normalizer': 4,
+                   'parameters': {'channel_id': [0], 'enable_words': True, 'enable_itn': False}}
+RESULT_URL = 'https://offline-result.oss-cn-beijing.aliyuncs.com/raw.json?Signature=offline'
 
 ASR_KEY = 'synthetic-upstream-key'
 POLICY = {
@@ -26,6 +36,7 @@ class ASRTests(TemporaryTest):
                        workspace_id='offline-space', key=key)
 
     def test_policy_submit_query_use_direct_endpoints_and_asr_credentials(self):
+        self.assertEqual(ASR_MODEL, 'qwen-audio-3.1-asr-flash-filetrans')
         cloud = self.cloud()
         replies = [response({'data': POLICY}),
                    response({'output': {'task_id': 'task/a'}, 'request_id': 'synthetic-request'}),
@@ -47,8 +58,9 @@ class ASRTests(TemporaryTest):
         submit = request.call_args_list[1].kwargs
         self.assertEqual(submit['headers']['X-DashScope-Async'], 'enable')
         self.assertEqual(submit['headers']['X-DashScope-OssResourceResolve'], 'enable')
-        self.assertEqual(submit['json'], {'model': ASR_MODEL, 'input': {'file_url': 'oss://synthetic/audio.flac'},
-                                         'parameters': {'channel_id': [0], 'enable_words': True, 'enable_itn': False}})
+        self.assertEqual(submit['json'], {'model': ASR_MODEL, 'input': {'file_urls': ['oss://synthetic/audio.flac']},
+                                         'parameters': {'channel_id': [0], 'keep_dialect': True,
+                                                        'special_word_filter': '{"system_reserved_filter":false}'}})
 
     def test_invalid_key_is_rejected_without_network_or_secret(self):
         with mock.patch('requests.request') as request:
@@ -99,3 +111,137 @@ class ASRTests(TemporaryTest):
         self.assertIsNone(request.call_args.kwargs['headers'])
         self.assertNotIn(ASR_KEY, str(upload.call_args))
         self.assertNotIn(ASR_KEY, str(request.call_args))
+
+
+class ASRRecoveryTests(SavedResultFixture):
+    def prepare_query(self):
+        self.save_result(normalized=False)
+        (self.cache / 'raw-0000.json').unlink()
+
+    def test_current_query_downloads_one_successful_subtask_with_unlabeled_words(self):
+        self.prepare_query()
+        raw = unlabeled_raw(['欢迎', '使用', '百炼。'])
+        fake = FakeService(raw, query_output={'task_status': 'SUCCEEDED', 'results': [
+            {'subtask_status': 'SUCCEEDED', 'transcription_url': RESULT_URL}]})
+        self.assertEqual(self.run_fake(fake), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(fake.named('/asr/transcription'), [])
+        self.assertEqual(json.loads((self.cache / 'raw-0000.json').read_bytes()), raw)
+        source = self.store.sources(self.job_id)[0]
+        self.assertEqual(source['language'], '')
+        self.assertEqual(source['word_timing_status'], 'reliable')
+        self.assertEqual(len(source['words']), 3)
+
+    def test_invalid_or_failed_subtask_never_downloads_or_publishes(self):
+        self.prepare_query()
+        good = {'subtask_status': 'SUCCEEDED', 'transcription_url': RESULT_URL}
+        cases = [({'result': {'transcription_url': RESULT_URL}}, 'response_schema'),
+                 ({'results': []}, 'response_schema'),
+                 ({'results': [good, good]}, 'response_schema'),
+                 ({'results': [None]}, 'response_schema'),
+                 ({'results': [{'transcription_url': RESULT_URL}]}, 'response_schema'),
+                 ({'results': [{'subtask_status': 'RUNNING', 'transcription_url': RESULT_URL}]}, 'response_schema'),
+                 ({'results': [{'subtask_status': 'SUCCEEDED'}]}, 'response_schema'),
+                 ({'results': [{'subtask_status': 'FAILED', 'code': 'InvalidAudio',
+                                'message': 'private sample text', 'transcription_url': RESULT_URL}]}, 'InvalidAudio')]
+        for fields, code in cases:
+            with self.subTest(fields=fields):
+                fake = FakeService(result(), query_output={'task_status': 'SUCCEEDED', **fields})
+                self.assertEqual(self.run_fake(fake), 'failed')
+                job = self.store.job(self.job_id)
+                self.assertEqual(job['error_code'], code)
+                self.assertEqual(job['request_id'], 'offline-query')
+                self.assertNotIn('private sample text', job['error'])
+                self.assertEqual(len(fake.calls), 1)
+                self.assertFalse((self.cache / 'raw-0000.json').exists())
+                self.assertFalse(self.source.with_suffix('.srt').exists())
+
+    def test_unknown_model_or_changed_parameters_stop_before_cloud_calls(self):
+        self.save_result(normalized=False)
+        original = self.store.job(self.job_id)['manifest']
+        cases = [('asr', 'unrecognized-asr-model'), ('parameters', {'channel_id': [0, 1]})]
+        for field, value in cases:
+            with self.subTest(field=field):
+                manifest = copy.deepcopy(original)
+                manifest['contract'][field] = value
+                self.store.update(self.job_id, manifest=manifest)
+                fake = FakeService(result())
+                self.assertEqual(self.run_fake(fake), 'failed')
+                self.assertEqual(self.store.job(self.job_id)['error_code'], 'cache_version')
+                self.assertEqual(fake.calls, [])
+
+    def test_legacy_known_task_resumes_with_legacy_result_and_no_resubmit(self):
+        self.prepare_query()
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['contract'] = copy.deepcopy(LEGACY_CONTRACT)
+        self.store.update(self.job_id, manifest=manifest)
+        fake = FakeService(result(('保留原文。', 'zh')), query_output={
+            'task_status': 'SUCCEEDED', 'result': {'transcription_url': RESULT_URL}})
+        Engine(self.config, self.store).resume(self.job_id)
+        self.assertEqual(self.run_fake(fake), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.store.job(self.job_id)['manifest']['contract'], LEGACY_CONTRACT)
+        self.assertEqual(fake.named('/asr/transcription'), [])
+        self.assertEqual(len(fake.named('/tasks/offline-task')), 1)
+
+    def test_legacy_normalized_result_and_reflow_keep_recognition_provenance(self):
+        self.save_result(result(('保留原文。', 'zh')))
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['contract'] = copy.deepcopy(LEGACY_CONTRACT)
+        self.store.update(self.job_id, manifest=manifest)
+        raw = (self.cache / 'raw-0000.json').read_bytes()
+        fake = FakeService(result())
+        self.assertEqual(self.run_fake(fake), 'completed', self.store.job(self.job_id)['error'])
+        Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
+        self.assertEqual(self.run_fake(fake), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(self.store.job(self.job_id)['manifest']['contract'], LEGACY_CONTRACT)
+        self.assertEqual((self.cache / 'raw-0000.json').read_bytes(), raw)
+        self.assertEqual(fake.calls, [])
+
+    def test_foreign_unlabeled_words_survive_manual_language_review_and_reflow(self):
+        self.prepare_query()
+        raw = unlabeled_raw(['First', 'sentence.'], language='en')
+        fake = FakeService(raw, query_output={'task_status': 'SUCCEEDED', 'results': [
+            {'subtask_status': 'SUCCEEDED', 'transcription_url': RESULT_URL}]})
+        self.assertEqual(self.run_fake(fake), 'needs_review')
+        source = self.store.sources(self.job_id)[0]
+        self.assertEqual((source['language'], source['decision']), ('', 'uncertain'))
+        self.assertEqual(len(source['words']), 2)
+        # Exercise the same stored decision as interactive review without a real translation call.
+        source.update(ReviewDecision('original').values())
+        manifest = self.store.job(self.job_id)['manifest']
+        self.store.initialize_subtitles(self.job_id, [source], [make_fragment(source)], manifest)
+        engine = Engine(self.config, self.store)
+        engine.finish_review(self.job_id)
+        self.assertEqual(self.run_fake(fake), 'completed')
+        engine.reflow(self.job_id, overwrite=True)
+        self.assertEqual(self.run_fake(fake), 'completed')
+        self.assertEqual(self.store.sources(self.job_id)[0]['words'], source['words'])
+        self.assertEqual(len(fake.calls), 2)
+
+
+class ASRPipelineTests(PipelineFixture):
+    def test_new_job_saves_current_model_before_any_cloud_request(self):
+        manifest = self.store.job(self.job_id)['manifest']
+        self.assertEqual(manifest.get('contract'), asr_contract())
+
+    def test_legacy_unsubmitted_job_uses_legacy_upload_and_submit(self):
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['contract'] = copy.deepcopy(LEGACY_CONTRACT)
+        self.store.update(self.job_id, manifest=manifest)
+        fake = FakeService(result(('保留原文。', 'zh')), query_output={
+            'task_status': 'SUCCEEDED', 'result': {'transcription_url': RESULT_URL}})
+        self.assertEqual(self.run_fake(fake), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(fake.named('/uploads')[0][2]['params']['model'], LEGACY_MODEL)
+        submitted = fake.named('/asr/transcription')[0][2]['json']
+        self.assertEqual(submitted['model'], LEGACY_MODEL)
+        self.assertEqual(set(submitted['input']), {'file_url'})
+        self.assertEqual(submitted['parameters'], LEGACY_CONTRACT['parameters'])
+
+    def test_preupgrade_queue_without_snapshot_keeps_legacy_model(self):
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest.pop('contract')
+        self.store.update(self.job_id, manifest=manifest)
+        fake = FakeService(result(('保留原文。', 'zh')), query_output={
+            'task_status': 'SUCCEEDED', 'result': {'transcription_url': RESULT_URL}})
+        self.assertEqual(self.run_fake(fake), 'completed', self.store.job(self.job_id)['error'])
+        self.assertEqual(fake.named('/asr/transcription')[0][2]['json']['model'], LEGACY_MODEL)
+        self.assertEqual(self.store.job(self.job_id)['manifest']['contract'], LEGACY_CONTRACT)

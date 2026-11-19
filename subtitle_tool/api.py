@@ -10,8 +10,8 @@ from urllib.parse import quote, urlsplit
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
-from .common import (ASR_MODEL, MAX_UPLOAD_BYTES, SubmissionUnknown,
-                     ToolError, check_cancel, connection_identity)
+from .common import (ASR_MODEL, LEGACY_ASR_MODEL, MAX_UPLOAD_BYTES, SubmissionUnknown,
+                     ToolError, asr_contract, check_cancel, connection_identity)
 from .config import Config
 
 
@@ -106,8 +106,10 @@ class Http:
 class Bailian:
     def __init__(self, region: str, cancel: threading.Event,
                  count=lambda name: None, progress=lambda *args: None,
-                 *, workspace_id, key, access_mode="workspace"):
+                 *, workspace_id, key, access_mode="workspace", model=ASR_MODEL):
         connection_identity({"region": region, "workspace_id": workspace_id, "access_mode": access_mode})
+        self.model = model
+        self.parameters = asr_contract(model)['parameters']
         self.base = f'https://{workspace_id}.cn-beijing.maas.aliyuncs.com'
         self.upload_policy_url = 'https://dashscope.aliyuncs.com/api/v1/uploads'
         self.headers = {"Authorization": "Bearer " + Config.validate_key(key), "Content-Type": "application/json",
@@ -118,7 +120,7 @@ class Bailian:
     def policy(self):
         body = self.http.json("GET", self.upload_policy_url,
                               name="upload_policy", headers=self.headers,
-                              params={"action": "getPolicy", "model": ASR_MODEL})
+                              params={"action": "getPolicy", "model": self.model})
         policy = body.get("data", {})
         required = {"policy", "signature", "upload_dir", "upload_host", "oss_access_key_id",
                     "x_oss_object_acl", "x_oss_forbid_overwrite"}
@@ -182,13 +184,12 @@ class Bailian:
             self.http.pause(attempt)
 
     def submit(self, oss_url: str):
+        audio_input = ({"file_url": oss_url} if self.model == LEGACY_ASR_MODEL else {"file_urls": [oss_url]})
         body = self.http.json("POST", self.base + "/api/v1/services/audio/asr/transcription",
                               name="asr_submit", retry=False,
                               headers={**self.headers, "X-DashScope-Async": "enable",
                                        "X-DashScope-OssResourceResolve": "enable"},
-                              json={"model": ASR_MODEL, "input": {"file_url": oss_url},
-                                    "parameters": {"channel_id": [0], "enable_words": True,
-                                                   "enable_itn": False}})
+                              json={"model": self.model, "input": audio_input, "parameters": self.parameters})
         output = body.get("output")
         task_id = output.get("task_id") if isinstance(output, dict) else None
         if not isinstance(task_id, str) or not task_id:
@@ -198,6 +199,30 @@ class Bailian:
     def query(self, task_id: str):
         return self.http.json("GET", self.base + "/api/v1/tasks/" + quote(task_id, safe=""),
                               name="asr_query", headers=self.headers)
+
+    def transcription_url(self, result):
+        """Extract exactly one successful result using the saved model's response schema."""
+        output = result['output']
+        request_id = result.get('request_id', '')
+        if self.model == LEGACY_ASR_MODEL:
+            item = output.get('result')
+            field = 'output.result.transcription_url'
+        else:
+            items = output.get('results')
+            if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+                raise ToolError('任务成功但 output.results 不是单文件结果列表。', 'response_schema', request_id)
+            item = items[0]
+            status = item.get('subtask_status')
+            if status in ('FAILED', 'CANCELED', 'CANCELLED', 'UNKNOWN'):
+                code = item.get('code', 'asr_' + status.lower())
+                raise ToolError(f'云端识别子任务 {status}（{code}）；已保存 task_id。', code, request_id)
+            if status != 'SUCCEEDED':
+                raise ToolError('任务成功但子任务没有确认成功。', 'response_schema', request_id)
+            field = 'output.results[0].transcription_url'
+        url = item.get('transcription_url') if isinstance(item, dict) else None
+        if not isinstance(url, str) or not url:
+            raise ToolError(f'任务成功但缺少 {field}。', 'response_schema', request_id)
+        return url
 
     def download(self, url: str):
         parsed = urlsplit(url)

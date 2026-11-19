@@ -11,10 +11,15 @@ from tests.fixtures import FakeService, SavedResultFixture, result, seed_job_sta
 
 
 class ArchiveTests(SavedResultFixture):
-    def archive(self, *, manual=False):
+    def archive(self, *, manual=False, legacy_asr=False, legacy_mt=False):
         text, language = ('Keep this original.', 'en') if manual else ('保留这句原文。', 'zh')
         sources = self.save_result(result((text, language)))
         manifest = self.store.job(self.job_id)['manifest']
+        if legacy_asr:
+            manifest['contract'] = {'asr': 'qwen3-asr-flash-filetrans', 'normalizer': 4,
+                                    'parameters': {'channel_id': [0], 'enable_words': True, 'enable_itn': False}}
+        if legacy_mt:
+            manifest['contract']['mt'] = 'retired-translation-model'
         if manual:
             from subtitle_tool.review import ReviewDecision
             from subtitle_tool.subtitles import make_fragment
@@ -68,13 +73,14 @@ class ArchiveTests(SavedResultFixture):
         self.assertEqual(self.store.job(self.job_id), before)
 
     def test_rebuild_creates_current_task_and_preserves_archive_without_asr(self):
-        folder, _ = self.archive()
+        folder, _ = self.archive(legacy_asr=True)
         previous = self.store.job(self.job_id)
         frozen = (folder / 'task.json').read_bytes()
         self.source.unlink()
         new_id = Engine(self.config, self.store).reflow(self.job_id, output_dir=self.path / 'rebuilt')
         self.assertNotEqual(new_id, self.job_id)
         load_policy(self.store.job(new_id)['manifest'])
+        self.assertEqual(self.store.job(new_id)['manifest']['contract'], previous['manifest']['contract'])
         self.assertEqual(self.store.job(new_id)['manifest']['execution_snapshot']['alignment_version'], ALIGNMENT_VERSION)
         self.assertEqual(self.store.job(self.job_id), previous)
         self.assertEqual((folder / 'task.json').read_bytes(), frozen)
@@ -114,6 +120,19 @@ class ArchiveTests(SavedResultFixture):
         self.job_id = new_id
         fake = FakeService(result())
         self.assertEqual(self.run_fake(fake), 'completed')
+        self.assertEqual(fake.calls, [])
+
+    def test_legacy_archive_with_retired_translation_contract_can_rebuild(self):
+        folder, _ = self.archive(legacy_asr=True, legacy_mt=True)
+        frozen = (folder / 'task.json').read_bytes()
+        new_id = Engine(self.config, self.store).reflow(self.job_id, output_dir=self.path / 'rebuilt')
+        contract = self.store.job(new_id)['manifest']['contract']
+        self.assertEqual(contract['asr'], 'qwen3-asr-flash-filetrans')
+        self.assertNotIn('mt', contract)
+        self.job_id = new_id
+        fake = FakeService(result())
+        self.assertEqual(self.run_fake(fake), 'completed')
+        self.assertEqual((folder / 'task.json').read_bytes(), frozen)
         self.assertEqual(fake.calls, [])
 
     def test_cli_rebuild_reports_new_id_and_report_cannot_replace_export(self):

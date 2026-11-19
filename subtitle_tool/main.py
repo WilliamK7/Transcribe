@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from .common import ASR_MODEL, ToolError, validate_workspace_id
+from .common import LEGACY_ASR_MODEL, ToolError, validate_workspace_id
 from .config import Config
 from .engine import Engine
 from .instance import ProcessLock
@@ -206,7 +206,7 @@ def summary(store, job_id):
                                             for entry in route['entries']]}
     else:
         mt = manifest.get("mt_snapshot", {})
-    item["models"] = {"asr": manifest.get("contract", {}).get("asr", ASR_MODEL), "mt": mt.get("model", manifest.get("contract", {}).get("mt"))}
+    item["models"] = {"asr": manifest.get("contract", {}).get("asr", LEGACY_ASR_MODEL), "mt": mt.get("model", manifest.get("contract", {}).get("mt"))}
     item["mt_provider"] = mt.get("provider")
     item["task_ids"] = [s["task_id"] for s in manifest["segments"] if s.get("task_id")]
     counts = item["counts"]

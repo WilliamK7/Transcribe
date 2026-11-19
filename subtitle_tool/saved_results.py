@@ -4,6 +4,7 @@ import json
 import re
 
 from .common import ToolError
+from .policy import saved_asr_contract
 from .review import decision_origin
 from .subtitles import clean_text, normalize, validate_fragment, validate_cue_coverage
 
@@ -69,7 +70,7 @@ def read_json(path):
 
 def normalize_raw(cache, manifest, segment):
     return normalize(read_json(raw_path(cache, segment)), segment_offset(manifest) + segment["offset_ms"], segment["id"],
-                     duration_ms=segment.get("duration_ms"))
+                     duration_ms=segment.get("duration_ms"), asr_model=saved_asr_contract(manifest)['asr'])
 
 
 def _validate_source(source, segments, manifest):

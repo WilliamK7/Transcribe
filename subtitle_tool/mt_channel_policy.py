@@ -1,4 +1,4 @@
-"""Explicit provider allowlist; adding a provider never requires editing Python."""
+"""Provider selection, evaluation budgets and price permissions."""
 from __future__ import annotations
 
 import json
@@ -25,7 +25,7 @@ def load_policy(config):
         if isinstance(value, dict):
             value.setdefault('excluded_providers', [])
         if (not isinstance(value, dict) or value.keys() != defaults.keys() or type(value['version']) is not int or
-                value['version'] not in (1, 2) or
+                value['version'] != 2 or
                 type(value['enabled']) is not bool or not isinstance(value['providers'], dict) or
                 not isinstance(value['judges'], list) or not all(isinstance(m, str) and '/' in m for m in value['judges'])):
             raise ValueError()
@@ -36,10 +36,8 @@ def load_policy(config):
                 ('max_evaluations_per_cycle', 0, 20), ('max_evaluations_per_day', 0, 100)]:
             if type(value[field]) is not int or not minimum <= value[field] <= maximum:
                 raise ValueError()
-        fields = {'adapter', 'package', 'preferred', 'include', 'exclude', 'billing', 'max_candidates',
+        fields = {'adapter', 'package', 'preferred', 'price_exceptions', 'include', 'exclude', 'billing', 'max_candidates',
                   'max_input_usd_per_million', 'max_output_usd_per_million'}
-        if value['version'] == 2:
-            fields.add('price_exceptions')
         required = {'adapter', 'billing', 'max_candidates'}
         for owner, rule in value['providers'].items():
             if (not re.fullmatch(r'[A-Za-z0-9_.-]+', owner) or not isinstance(rule, dict) or
@@ -49,8 +47,6 @@ def load_policy(config):
             for field in rule.keys() & {'preferred', 'price_exceptions', 'include', 'exclude', 'billing'}:
                 if not isinstance(rule[field], list) or not all(isinstance(m, str) and m for m in rule[field]):
                     raise ValueError()
-            if value['version'] == 1 and 'commercial' in rule['billing']:
-                rule['price_exceptions'] = list(rule.get('preferred', ()))
             tiers = set(rule['billing'])
             limits = rule['max_candidates']
             if (not isinstance(limits, dict) or tiers - {'free', 'commercial'} or
@@ -65,7 +61,6 @@ def load_policy(config):
                 if field in rule and (type(rule[field]) not in (int, float) or
                         not math.isfinite(rule[field]) or not 0 <= rule[field] <= 1000):
                     raise ValueError()
-        value['version'] = 2
         return value
     except (OSError, ValueError, TypeError, KeyError):
         raise ToolError('渠道维护配置无效，请检查 data/mt-channels.json。', 'mt_config') from None

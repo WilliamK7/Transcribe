@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from .common import ToolError
+from .common import ASR_MODEL, LEGACY_ASR_MODEL, ToolError
 from .review import decision_origin
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
@@ -233,14 +233,15 @@ def prepare_sentence_timings(sentences, duration_ms, segment_id, *, end_clips=No
     return records, warnings
 
 
-def _segment_end_clip(sentence, index, duration_ms):
+def _segment_end_clip(sentence, index, duration_ms, *, require_word_language=True):
     """Require complete word evidence before bounding a short final overrun."""
     b, e = sentence.get("begin_time"), sentence.get("end_time")
-    if (type(b) is not int or type(e) is not int or not isinstance(sentence.get("language"), str) or
+    if (type(b) is not int or type(e) is not int or
+            (require_word_language and not isinstance(sentence.get("language"), str)) or
             not 0 <= b < duration_ms < e or
             e > duration_ms + MAX_SEGMENT_END_OVERRUN_MS):
         return None
-    words, status = aligned_words(sentence, 0)
+    words, status = aligned_words(sentence, 0, require_language=require_word_language)
     raw_words = sentence.get("words")
     if (not words or status not in {"reliable", "reliable_grouped_points"} or
             raw_words[-1]["begin_time"] >= duration_ms or raw_words[-1]["end_time"] != e):
@@ -249,9 +250,12 @@ def _segment_end_clip(sentence, index, duration_ms):
             "new_end_ms": duration_ms, "kind": "clipped_segment_end"}
 
 
-def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -> tuple[list[dict], list[str]]:
+def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
+              asr_model=LEGACY_ASR_MODEL) -> tuple[list[dict], list[str]]:
     if not isinstance(raw, dict) or not isinstance(raw.get("transcripts"), list):
-        raise ToolError("Qwen3 结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
+        raise ToolError("识别结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
+    # Qwen-Audio returns word times without promising sentence-level language labels.
+    require_word_language = asr_model != ASR_MODEL
     source_sentences, warnings = [], []
     sentences = []
     for transcript in raw["transcripts"]:
@@ -277,7 +281,8 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
             b, e = sentence.get("begin_time"), sentence.get("end_time")
             if clean_text(sentence.get("text")) and (type(b) is not int or type(e) is not int or
                                                       b >= duration_ms or e > duration_ms + 1):
-                clip = _segment_end_clip(sentence, index, duration_ms) if index == len(sentences) - 1 else None
+                clip = (_segment_end_clip(sentence, index, duration_ms, require_word_language=require_word_language)
+                        if index == len(sentences) - 1 else None)
                 if not clip:
                     raise ToolError(f"第 {index + 1} 句超出本段时间范围；原始结果已保留。", "timeline")
                 end_clips[index] = clip
@@ -300,7 +305,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None) -
             continue
         if start < 0:
             warnings.append(f"第 {index + 1} 句跨越时间零点，开始时间裁到 0")
-        words, status = aligned_words(sentence, offset_ms)
+        words, status = aligned_words(sentence, offset_ms, require_language=require_word_language)
         if start < 0:
             words, status = [], "clipped_timeline"
         sentence_id = f"{segment_id}:{index:08}"
@@ -436,12 +441,12 @@ def wrap(text, width):
     return lines
 
 
-def aligned_words(sentence, offset_ms):
+def aligned_words(sentence, offset_ms, *, require_language=True):
     """Map complete, monotonic ASR words onto the unchanged cleaned source text."""
     if sentence.get("_adjustments"):
         return [], "repaired_sentence"
     words = sentence.get("words")
-    if sentence.get("language") not in WORD_LANGS or not isinstance(words, list) or not words:
+    if (require_language and sentence.get("language") not in WORD_LANGS) or not isinstance(words, list) or not words:
         return [], "missing_words"
     text = clean_text(sentence["text"])
     positions = [i for i, c in enumerate(text) if not c.isspace()]

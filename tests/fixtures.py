@@ -17,7 +17,7 @@ from subtitle_tool.config import Config, MT_ENV_SETTINGS
 from subtitle_tool.engine import Engine
 from subtitle_tool.media import Media, run_process
 from subtitle_tool.store import Store
-from subtitle_tool.common import ASR_MODEL, NORMALIZER_VERSION, atomic_json, fingerprint
+from subtitle_tool.common import ASR_MODEL, NORMALIZER_VERSION, asr_contract, atomic_json, fingerprint
 from subtitle_tool.subtitles import make_fragment, normalize
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,6 +73,14 @@ def timed_raw(tokens, *, word_ms=200, language="en", pauses=None, start=0):
         "begin_time": start, "end_time": at, "text": ("" if language in {"zh", "yue", "ja"} else " ").join(tokens),
         "language": language, "words": words}]}]}
 
+def unlabeled_raw(tokens, *, language='zh', word_ms=500):
+    raw = timed_raw(tokens, language=language, word_ms=word_ms)
+    raw['properties'] = {'audio_format': 'flac', 'channels': [0], 'original_sampling_rate': 16000}
+    sentence = raw['transcripts'][0]['sentences'][0]
+    sentence.pop('language')
+    sentence['sentence_id'] = 1
+    return raw
+
 
 def timed_source(tokens, *, separator=" ", durations=None, pauses=None):
     """Synthetic source with monotonic positive word times and explicit character ranges."""
@@ -108,8 +116,11 @@ def srt_intervals(content):
 
 class FakeService:
     """Offline service with injectable HTTP failures and out-of-order MT completion."""
-    def __init__(self, raw):
+    def __init__(self, raw, *, query_output=None):
         self.raw, self.calls, self.uploads, self.submit_error = raw, [], [], None
+        self.query_output = query_output if query_output is not None else {
+            'task_status': 'SUCCEEDED', 'results': [{'subtask_status': 'SUCCEEDED',
+                'transcription_url': 'https://offline-result.oss-cn-beijing.aliyuncs.com/raw.json?Signature=offline'}]}
         self.mt_failure = set()
         self.query_failure = False
         self.download_failure = False
@@ -129,8 +140,7 @@ class FakeService:
         if "/tasks/" in url:
             if self.query_failure:
                 raise requests.ConnectionError()
-            return response({"request_id": "offline-query", "output": {"task_status": "SUCCEEDED", "result": {
-                "transcription_url": "https://offline-result.oss-cn-beijing.aliyuncs.com/raw.json?Signature=offline"}}})
+            return response({"request_id": "offline-query", "output": self.query_output})
         if "offline-result" in url:
             if self.download_failure:
                 raise requests.ConnectionError()
@@ -219,10 +229,9 @@ class SavedResultFixture(SubtitleJobFixture):
                                                  "tracks": [{"index": 0, "channels": 1, "start_ms": 0}]},
                         segments=[{"id": "0000", "offset_ms": 0, "duration_ms": 10000,
                                    "task_id": "offline-task", "raw": "raw-0000.json"}],
-                        contract={"asr": ASR_MODEL, "normalizer": NORMALIZER_VERSION,
-                                  "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}})
+                        contract=asr_contract())
         atomic_json(self.cache / "raw-0000.json", raw)
-        sources, warnings = normalize(raw, 0, "0000", duration_ms=10000)
+        sources, warnings = normalize(raw, 0, "0000", duration_ms=10000, asr_model=ASR_MODEL)
         if normalized:
             manifest.update(normalized=True, normalized_count=len(sources), normalized_version=NORMALIZER_VERSION,
                             warnings=warnings)

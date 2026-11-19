@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from .common import (ASR_MODEL, DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, PROCESSING_VERSION,
-                     SUBTITLE_VERSION, ToolError)
+from .common import (LEGACY_ASR_MODEL, DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, PROCESSING_VERSION,
+                     SUBTITLE_VERSION, ToolError, asr_contract)
 from .media import EXTRACT_RECIPE_VERSION
 from .mt_quality import GLOSSARY_SCHEDULE, LEGACY_GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION, SUPPORTED_PROMPT_VERSIONS
 from .subtitles import ALIGNMENT_VERSION
@@ -26,9 +26,18 @@ def subtitle_contract(settings):
             'subtitle_settings': {key: getattr(settings, key) for key in _LAYOUT_FIELDS}}
 
 
-def asr_contract():
-    return {"asr": ASR_MODEL, "normalizer": NORMALIZER_VERSION,
-            "parameters": {"channel_id": [0], "enable_words": True, "enable_itn": False}}
+def saved_asr_contract(manifest):
+    """Keep the original recognition identity while allowing a local re-normalization."""
+    saved = manifest.get("contract")
+    if saved is None:
+        # Before the 3.1 upgrade, queued jobs did not yet have an ASR snapshot.
+        return asr_contract(LEGACY_ASR_MODEL)
+    if not isinstance(saved, dict):
+        raise ToolError("任务的识别契约无效，请检查保存记录。", "cache_version")
+    expected = asr_contract(saved.get('asr'))
+    if {**saved, 'normalizer': NORMALIZER_VERSION} != expected:
+        raise ToolError("任务的识别模型／参数契约不受支持，请检查保存记录。", "cache_version")
+    return expected
 
 
 def _version(value, expected):
@@ -58,9 +67,7 @@ def validate_raw_contract(manifest):
     plan = manifest.get("media_plan")
     if plan:
         _version(plan.get("extract_recipe_version") if isinstance(plan, dict) else None, EXTRACT_RECIPE_VERSION)
-    saved = manifest.get("contract")
-    if saved and (not isinstance(saved, dict) or {**saved, 'normalizer': NORMALIZER_VERSION} != asr_contract()):
-        raise ToolError("任务的识别模型／参数契约不受支持，请检查保存记录。", "cache_version")
+    saved_asr_contract(manifest)
 
 
 def load_policy(manifest):

@@ -524,7 +524,7 @@ class MaintenanceTests(BailianFreeFixture):
     def test_policy_rejects_unknown_settings_and_invalid_limits(self):
         from subtitle_tool.mt_channel_policy import load_policy
         policy = self.policy()
-        for key, value in [('max_evaluations_per_day', -1), ('refresh_seconds', 0), ('enabledd', True)]:
+        for key, value in [('version', 1), ('max_evaluations_per_day', -1), ('refresh_seconds', 0), ('enabledd', True)]:
             changed = {**policy, key: value}
             atomic_json(self.config.data / 'mt-channels.json', changed)
             with self.assertRaises(ToolError):
@@ -539,19 +539,6 @@ class MaintenanceTests(BailianFreeFixture):
         rule['price_exceptions'] = ['new']
         self.assertTrue(candidate_admission('new', 'commercial', {}, rule).allowed)
         self.assertTrue(candidate_admission('new', 'free', {}, rule).allowed)
-
-    def test_v1_price_permissions_are_preserved_without_rewriting_the_file(self):
-        from subtitle_tool.mt_channel_policy import load_policy
-        policy = self.policy()
-        policy['version'] = 1
-        policy['providers']['existing']['preferred'] = ['old-permission']
-        path = self.config.data / 'mt-channels.json'
-        atomic_json(path, policy)
-        before = path.read_bytes()
-        upgraded = load_policy(self.config)
-        self.assertEqual(upgraded['version'], 2)
-        self.assertEqual(upgraded['providers']['existing']['price_exceptions'], ['old-permission'])
-        self.assertEqual(path.read_bytes(), before)
 
     def test_status_never_contains_credentials(self):
         from subtitle_tool.mt_maintenance import ChannelMaintenance

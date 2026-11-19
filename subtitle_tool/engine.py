@@ -21,7 +21,7 @@ from .mt_control import MTControl
 from .store import Store
 from .lifecycle import INACTIVE, recovery_target, unknown_submission
 from .review import decision_origin
-from .policy import asr_contract, load_policy, subtitle_contract, validate_raw_contract
+from .policy import load_policy, saved_asr_contract, subtitle_contract, validate_raw_contract
 from .saved_results import (mismatch, normalize_raw, raw_path as saved_raw_path, segment_offset,
                             segment_recovery_action, validate_normalized, validate_segments)
 from .publication import inspect_intent, prepare_intent, write_srt
@@ -169,7 +169,7 @@ class Engine:
         self.config.settings.validate()
         from .mt_pool import configured_route
         route = configured_route(self.config, manifest)
-        contract = asr_contract()
+        contract = saved_asr_contract(manifest)
         cache = self.config.data / "cache" / job_id
         sources, warnings = [], []
         for segment in manifest["segments"]:
@@ -213,11 +213,16 @@ class Engine:
             raise ToolError('旧任务重建须用 --output-dir 指定新输出目录；原归档保留。', 'output_path_required')
         task, files = read_archive(self.config, job_id)
         old = task['job']['manifest']
+        raw_contract = old.get('contract')
+        if isinstance(raw_contract, dict):
+            # Early archives stored the retired translation model alongside ASR fields.
+            raw_contract = {key: value for key, value in raw_contract.items() if key != 'mt'}
+        contract = saved_asr_contract({'contract': raw_contract})
         key = self.config.get_key()
         manifest = {'region': 'beijing', 'access_mode': 'workspace',
                     'workspace_id': validate_workspace_id(self.config.settings.workspace_id),
                     'account': hashlib.sha256(key.encode()).hexdigest(), 'processing_version': PROCESSING_VERSION,
-                    **subtitle_contract(self.config.settings), 'contract': asr_contract(),
+                    **subtitle_contract(self.config.settings), 'contract': contract,
                     'overwrite': bool(overwrite), 'rebuilt_from_archive': job_id}
         route = configured_route(self.config, manifest)
         manifest['mt_route_snapshot'] = route
@@ -232,7 +237,7 @@ class Engine:
             check_cancel(self.cancel)
             raw = json.loads(files['raw-' + segment['id'] + '.json'])
             items, notes = normalize(raw, manifest['audio_offset_ms'] + segment['offset_ms'], segment['id'],
-                                     duration_ms=segment.get('duration_ms'))
+                                     duration_ms=segment.get('duration_ms'), asr_model=manifest['contract']['asr'])
             sources.extend(items)
             warnings.extend(notes)
         sources.sort(key=lambda s: (s['begin_ms'], s['end_ms'], s['sentence_id']))
@@ -499,10 +504,7 @@ class Engine:
             self.store.update(job_id, manifest=manifest)
             self.progress(job_id, "recognizing", status, None)
             if status == "SUCCEEDED":
-                cloud_result = cloud_output.get("result")
-                url = cloud_result.get("transcription_url") if isinstance(cloud_result, dict) else None
-                if not isinstance(url, str) or not url:
-                    raise ToolError("任务成功但缺少 output.result.transcription_url。", "response_schema", result.get("request_id", ""))
+                url = client().transcription_url(result)
                 stage("downloading_result")
                 raw = client().download(url)
                 # The exact response is preserved; signed result URLs are never persisted.
@@ -578,11 +580,8 @@ class Engine:
         stage("segmenting")
         candidate = copy.deepcopy(manifest)
         source_sentences = []
-        audio_offset = segment_offset(manifest)
         for segment in manifest["segments"]:
-            raw = json.loads(saved_raw_path(cache, segment).read_text(encoding="utf-8"))
-            items, warnings = normalize(raw, audio_offset + segment["offset_ms"], segment["id"],
-                                        duration_ms=segment.get("duration_ms"))
+            items, warnings = normalize_raw(cache, manifest, segment)
             source_sentences.extend(items)
             candidate["warnings"].extend(warnings)
         source_sentences.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
@@ -634,7 +633,7 @@ class Engine:
                     count=lambda name: self.store.count(job_id, name),
                     progress=lambda name, done, total: self.progress(job_id, name, done, total),
                     workspace_id=manifest["workspace_id"], access_mode=manifest["access_mode"],
-                    key=key)
+                    key=key, model=manifest['contract']['asr'])
             return api
 
         def save_failure(state, error, code, request_id=""):
@@ -676,7 +675,7 @@ class Engine:
                 raise mismatch()
             if manifest.get("reflow") and not manifest.get("normalized"):
                 raise ToolError("重排的本地来源／恢复标记不完整。", "cache_mismatch")
-            manifest["contract"] = asr_contract()
+            manifest["contract"] = saved_asr_contract(manifest)
             # Even normalized/translated cache hits must validate the current account and saved endpoint.
             key, scope = self.identity(job_id, manifest)
             self.mt_runtime_active = not bool(manifest.get('retime'))

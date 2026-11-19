@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
+import unittest
 from unittest import mock
 
-from subtitle_tool.common import ToolError
+from subtitle_tool.common import ASR_MODEL, LEGACY_ASR_MODEL, ToolError
+from subtitle_tool.config import Settings
 from subtitle_tool.engine import Engine
-from subtitle_tool.subtitles import normalize
-from tests.fixtures import FakeService, PipelineFixture, TemporaryTest, point_sentence, result
+from subtitle_tool.subtitles import normalize, plan_fragments
+from tests.fixtures import unlabeled_raw, FakeService, PipelineFixture, TemporaryTest, point_sentence, result
 
 
 class NormalizerBoundaryTests(TemporaryTest):
@@ -110,7 +112,7 @@ class NormalizerVersionPipelineTests(PipelineFixture):
             words=[{"begin_time": 8000, "end_time": 9900, "text": "完整", "punctuation": ""},
                    {"begin_time": 9960, "end_time": 10117, "text": "字幕", "punctuation": "。"}])
         fake = FakeService(raw)
-        with mock.patch("subtitle_tool.engine.normalize", side_effect=ToolError("时间越界", "timeline")):
+        with mock.patch("subtitle_tool.saved_results.normalize", side_effect=ToolError("时间越界", "timeline")):
             self.assertEqual(self.run_fake(fake), "failed")
         raw_path = self.config.data / "cache" / self.job_id / "raw-0000.json"
         self.assertEqual(json.loads(raw_path.read_text(encoding="utf-8")), raw)
@@ -132,3 +134,41 @@ class NormalizerVersionPipelineTests(PipelineFixture):
         self.assertEqual(self.run_fake(fake), "failed")
         self.assertEqual(len(fake.named("/asr/transcription")), 1)
         self.assertTrue((self.config.data / "cache" / self.job_id / "raw-0000.json").is_file())
+
+
+class WordTimestampTests(unittest.TestCase):
+    def test_unlabeled_words_split_long_sentences_only_for_new_model(self):
+        raw = unlabeled_raw(['word'] * 20, language='en')
+        before = copy.deepcopy(raw)
+        current = normalize(raw, 0, 's', asr_model=ASR_MODEL)[0][0]
+        legacy = normalize(raw, 0, 's', asr_model=LEGACY_ASR_MODEL)[0][0]
+        self.assertEqual(current['word_timing_status'], 'reliable')
+        self.assertEqual(legacy['word_timing_status'], 'missing_words')
+        self.assertEqual(current['language'], '')
+        fragments = plan_fragments(current, Settings())
+        self.assertGreater(len(fragments), 1)
+        self.assertEqual(' '.join(cue['text'] for cue in fragments), current['text'])
+        self.assertEqual(raw, before)
+
+    def test_new_model_still_rejects_incomplete_or_disordered_words(self):
+        for kind in ('incomplete', 'disordered'):
+            with self.subTest(kind=kind):
+                raw = unlabeled_raw(['欢迎', '使用', '百炼。'])
+                words = raw['transcripts'][0]['sentences'][0]['words']
+                if kind == 'incomplete':
+                    words.pop()
+                else:
+                    words[1]['begin_time'] = 0
+                source = normalize(raw, 0, 's', asr_model=ASR_MODEL)[0][0]
+                self.assertEqual(source['words'], [])
+
+    def test_segment_end_clip_keeps_the_same_word_evidence_requirements(self):
+        raw = unlabeled_raw(['欢迎', '使用', '百炼。'], word_ms=400)
+        sources, warnings = normalize(raw, 0, 's', duration_ms=1100, asr_model=ASR_MODEL)
+        self.assertEqual(sources[0]['end_ms'], 1100)
+        self.assertEqual(sources[0]['original_timings'][0]['end_ms'], 1200)
+        self.assertTrue(warnings)
+        raw['transcripts'][0]['sentences'][0]['words'].pop()
+        with self.assertRaises(ToolError) as caught:
+            normalize(raw, 0, 's', duration_ms=1100, asr_model=ASR_MODEL)
+        self.assertEqual(caught.exception.code, 'timeline')

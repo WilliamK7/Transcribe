@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .common import PROCESSING_VERSION, ToolError, atomic_json, output_key, validate_workspace_id
+from .common import PROCESSING_VERSION, ToolError, asr_contract, atomic_json, output_key, validate_workspace_id
 from .config import Settings
 from .review import ReviewDecision, decision_origin
 from .policy import subtitle_contract
@@ -91,7 +91,7 @@ class Store:
             manifest = {"region": "beijing", "workspace_id": workspace_id, "access_mode": "workspace",
                         "processing_version": PROCESSING_VERSION, "account": account,
                         "overwrite": bool(overwrite), "segments": [], "warnings": [],
-                        **subtitle_contract(settings or Settings())}
+                        **subtitle_contract(settings or Settings()), 'contract': asr_contract()}
             if mt_route_snapshot is not None:
                 manifest['mt_route_snapshot'] = mt_route_snapshot
                 saved_route(manifest)

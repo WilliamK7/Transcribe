@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description='验收并更新项目托管的 magpie 三角色组；自动备份。')
     parser.add_argument('--apply', action='store_true', help='将已验收候选应用到角色组')
     parser.add_argument('--providers', help='逗号分隔的已登记渠道 ID；默认读取 data/mt-channels.json')
-    parser.add_argument('--list-candidates', action='store_true', help='只读目录预览，不推理、不写验收缓存或分组')
+    parser.add_argument('--list-candidates', action='store_true', help='预览候选目录与验收许可')
     parser.add_argument('--refresh-trial', action='store_true', help='刷新百炼试用库存并补充候选')
     args = parser.parse_args()
     if args.list_candidates and (args.apply or args.refresh_trial):
