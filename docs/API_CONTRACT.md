@@ -12,7 +12,11 @@
 | 提交 | `POST https://{workspace_id}.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/asr/transcription`。发送前保存提交标记，请求携带 `X-DashScope-Async: enable` 和 `X-DashScope-OssResourceResolve: enable`。结果不确定时进入 `submission_unknown`。 |
 | 查询与下载 | 在原工作空间 `GET /api/v1/tasks/{task_id}` 轮询已保存的 ID。3.1 校验 `output.results` 恰有一个 `subtask_status:SUCCEEDED` 的结果，再读其 `transcription_url`；旧模型读取 `output.result.transcription_url`。成功后下载原始转写，下载请求省略百炼认证头。 |
 
-结果读取 `transcripts[].sentences[].words`。3.1 的逐句 `language` 可缺失：词时间通过完整性和顺序校验后可用于拆句，语种由文字规则或人工复核决定。零时长句的跨句合并需要同语种证据。
+结果读取 `transcripts[].sentences[].words`。3.1 的逐句 `language` 可缺失；词时间通过完整性和顺序校验后用于拆句。明确外文按 `source_lang:auto` 翻译，中文保留原文，ASR 标签保持原值。本地短句判断参考同类文字的独立证据，每侧最多两句、相邻间隔最多 15 秒。零时长句的跨句合并需要原始同语种证据。
+
+当前语种规则为 `language_inference:2`。本地无法判断的无标签原句交给 Magpie 复核组，每批最多 8 句；上下文取同分段前后各最多 4 句，相邻间隔最多 60 秒。模型完整返回各编号的 `original`、`translate` 或 `uncertain`。模型和输入依据随阶段保存，再原子更新来源与字幕。人工决定优先，显式标签冲突、自动复核未决或服务不可用时转人工。
+
+恢复仅请求尚无模型决定的目标，已保存决定继续校验依据。输出预算按编号和决定值计算，原文及上下文计入输入预算。
 
 ## Magpie 网关契约
 
@@ -37,11 +41,11 @@
 
 ## 字幕翻译与质量
 
-术语提取、正文、独立复核和疑难裁决使用非流式 JSON。每组输入最多 32768 字节，输出最多 4096 token。术语和正文共用 `mt_workers`。新任务的 `window-independent-v4` 每个术语窗口最多 8 组，最多提前准备两个窗口，按原文顺序合入术语，人工译法优先。旧 `window-prefix-v3` 沿用原任务的串行前缀。
+语种判断、术语提取、正文、独立复核和疑难裁决使用非流式 JSON。每组输入最多 32768 字节，输出最多 4096 token。术语和正文共用 `mt_workers`。`window-independent-v4` 每个术语窗口最多 8 组，最多提前准备两个窗口，按原文顺序合入术语，人工译法优先。
 
 完整原句、片段编号、字符范围和显示时长构成请求依据。相邻上下文在语种和人工决定一致时扩展，每侧最多 12 句。超预算时依次裁剪远处邻句、可选的同句证据和术语，保留完整目标和拆句边界两侧最近的同句证据。首个请求前保存分组，正文前保存共用的语义输入，恢复时按已保存的范围继续。
 
-复核逐片配对原文和译文，并连读跨屏句。相邻不同原文出现大段重复译文时交独立型号裁决。只修改确认出错的原句，最多纠正两轮；无变化、停滞或循环时提前结束。证据不足保留完整译文并告警。
+复核逐片配对原文和译文，并连读跨屏句。相邻不同原文出现大段重复译文时交独立型号裁决。只修改确认出错的原句，最多纠正两轮；译文无变化或循环时提前结束。证据不足保留完整译文并告警。
 
 ## 数据与恢复
 
@@ -54,7 +58,7 @@
 | `--retime` | 从已有的最终字幕和通过校验的译文计算显示时间。准备快照和发布意图后，全程在本机完成。 |
 | `--export-archive` | 校验 `data/archives/{任务ID}` 的逐文件 SHA-256 索引、原始转写和 SRT，再导出原字幕字节。 |
 
-执行快照支持提示词 5、7 和断句 3、5。并发和轮询等待取当前设置。`cache_version` 表示需从原始转写重建，`cache_mismatch` 表示来源、片段范围或翻译证据不一致。翻译缓存绑定实际请求、后端身份、能力、账户和策略版本。来源、分组摘要、译文和产出阶段相互校验。人工语种复核或重新分片时，同事务清除失效结果。
+当前执行快照使用提示词 7、断句 5 和独立术语窗口。旧版本用 `--reflow` 从原始转写重建，历史产出可从归档导出。并发和轮询等待取当前设置。`cache_version` 表示执行版本需更新，`cache_mismatch` 表示来源、片段范围或翻译证据不一致。翻译缓存绑定实际请求、后端身份、能力、账户和策略版本；人工复核或重新分片时，同事务清除失效译文并保留仍有效的语种依据。
 
 发布顺序为渲染校验、保存发布意图、备份并原子替换、提交完成、清理音频。中断恢复时按目标路径、期望哈希、原哈希和预定备份核对。目标已包含期望字节就补记完成，目标或备份被外部改动返回 `output_conflict`。`Ctrl+C` 停止新请求，在途翻译共享最多 5 秒收尾时间，再次中断立即结束等待。
 
@@ -81,7 +85,7 @@
 | `mt_response_*` | 全部已收响应的输入、输出、推理 token 或缺失用量 |
 | `mt_format_repair_*` / `mt_paid_fallback_*` | 格式修复及商业后备的请求和成功次数 |
 | `mt_{trial,free,commercial,unknown}_response` | 按实际成员的费用分类计数，现金支出和权益抵扣以账单为准 |
-| `mt_quality_warning` / `mt_glossary_unavailable` / `mt_correction_stalled` | 复核警告、术语不可用及纠正停滞 |
+| `mt_quality_warning` / `mt_glossary_unavailable` | 复核警告及术语不可用 |
 | `stage_*_ms` / `run_ms` | 跨恢复累计耗时 |
 
 `.build/mt-diagnostics/{job_id}.jsonl` 中的 `request_start` 表示登记尝试，`request_end` 记录结果分类、HTTP 状态、耗时和可读用量。`route_complete.attempt` 是阶段总尝试数，缓存命中为 0。用 `gateway_session` 在 Magpie 的 Routing／Usage 中核对上游实际尝试。诊断和普通报告省略凭据、签名链接及字幕正文。

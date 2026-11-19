@@ -19,7 +19,7 @@ from .mt_context import group_context, sentence_context, target_span, trim_conte
 from .mt_diagnostics import MTDiagnostics, batch_response_metadata, safe_model_id
 from .mt_pool import saved_route
 from .mt_planning import make_translation_unit, restore_group_plan, save_group_plan
-from .mt_quality import (BatchValidationError, GLOSSARY_SCHEDULE, correction_stalled,
+from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION,
                          estimate_stage_output, make_stage_payload, manual_terms, parse_stage_response, plan_sentence_groups,
                          repetition_checks, review_with_checks, request_cache_key, term_appears, term_evidence,
                          validate_stage_value, validate_judgment)
@@ -148,10 +148,10 @@ class StageRequest:
     originals: tuple
     forbidden_models: frozenset
 
-    def validate_record(self, record, identities, prompt_version):
+    def validate_record(self, record, identities):
         value = validate_stage_value(self.name, record['value'], ids=self.ids, originals=self.originals)
         if self.name == 'judge':
-            validate_judgment(value, self.data, prompt_version=prompt_version)
+            validate_judgment(value, self.data)
         resolved = _record_model(record, identities)
         if not _independent_model(resolved, self.forbidden_models):
             return None
@@ -208,7 +208,7 @@ def check_pool(config, identity, route, cancel, *, magpie=None):
         store.close()
 
 
-def _validate_saved_reviews(final, history, source_hashes, prompt_version):
+def _validate_saved_reviews(final, history, source_hashes):
     reviews, corrections = final['review_stage_keys'], final['correction_stage_keys']
     if not len(corrections) <= len(reviews) <= len(corrections) + 1:
         raise ValueError()
@@ -222,8 +222,7 @@ def _validate_saved_reviews(final, history, source_hashes, prompt_version):
     unresolved = True
     for index, review_key in enumerate(reviews):
         review = validate_stage_value('review', history[review_key]['value'], ids=ids)
-        if prompt_version >= 7:
-            review = review_with_checks(review, repetition_checks(current, source_hashes))
+        review = review_with_checks(review, repetition_checks(current, source_hashes))
         unresolved = bool(review['issues'])
         if index == len(corrections):
             break
@@ -233,8 +232,7 @@ def _validate_saved_reviews(final, history, source_hashes, prompt_version):
         validate_stage_value('review', {'issues': correction['issues']}, ids=ids)
         if not isinstance(correction['translations'], dict) or set(correction['translations']) != ids:
             raise ValueError()
-        validate_judgment(correction, {**review, 'fragments': fragments, 'translations': current},
-                          prompt_version=prompt_version)
+        validate_judgment(correction, {**review, 'fragments': fragments, 'translations': current})
         current = correction['translations']
         unresolved = bool(correction['issues'])
         if not unresolved and index + 1 < len(reviews):
@@ -315,7 +313,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                 if (not isinstance(source_hashes, list) or len(source_hashes) != len(final['cue_ids']) or
                         any(not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) for digest in source_hashes)):
                     raise ValueError()
-                _validate_saved_reviews(final, history, source_hashes, manifest['execution_snapshot']['prompt_version'])
+                _validate_saved_reviews(final, history, source_hashes)
                 finals[key] = final, source_hashes
             final, source_hashes = finals[key]
             if (final['backend'] != origin or final['request_model'] != profiles[origin]['backend']['model'] or
@@ -336,9 +334,7 @@ class Pipeline:
         load_policy(manifest)
         self.context = threading.local()
         self.group_progress = None
-        self.glossary_schedule = manifest['mt_glossary_schedule']
-        self.prompt_version = manifest['execution_snapshot']['prompt_version']
-        self.display_durations = {} if self.prompt_version >= 7 else None
+        self.display_durations = {}
         self.diagnostics = MTDiagnostics(engine.config.root, job_id)
         from . import mt_transport
         self.transport = mt_transport.ProcessTransport()
@@ -360,7 +356,7 @@ class Pipeline:
             self.routers[role] = MagpieRoute(selected, control=engine.mt_control, on_event=self._event)
 
     def router_for(self, stage):
-        return self.routers['review' if stage == 'glossary' else stage]
+        return self.routers['review' if stage in {'glossary', 'language'} else stage]
 
     def close(self):
         if self.maintenance is not None:
@@ -430,8 +426,7 @@ class Pipeline:
     def _request_payload(self, stage, data, entry, *, repair=False):
         try:
             return make_stage_payload(stage, data, entry.backend,
-                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair,
-                                      prompt_version=self.prompt_version)
+                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair)
         except ToolError as error:
             if error.code != 'mt_input_budget':
                 raise
@@ -525,7 +520,7 @@ class Pipeline:
             try:
                 value = parse_stage_response(name, body, ids=request.ids, originals=request.originals)
                 if name == 'judge':
-                    validate_judgment(value, data, prompt_version=self.prompt_version)
+                    validate_judgment(value, data)
             except BatchValidationError as error:
                 outcome, event['validation_category'] = 'invalid', error.category
                 self.store.count(self.job_id, 'mt_invalid_response')
@@ -591,7 +586,7 @@ class Pipeline:
             # Reserve the fixed repair instruction without dropping evidence
             # between the initial request and its possible regeneration.
             make_stage_payload(stage, data, entry.backend, capabilities=capabilities,
-                               repair=stage in {'translate'}, prompt_version=self.prompt_version)
+                               repair=stage in {'translate'})
         while True:
             fits = bool(candidates)
             for entry in candidates:
@@ -613,7 +608,7 @@ class Pipeline:
                 raise ToolError('翻译阶段完整请求超过所有可用模型的输入预算。', 'mt_input_budget')
 
     def _task_stage_key(self, name, data):
-        return _digest({'strategy': 6, 'prompt': self.prompt_version, 'stage': name, 'data': data,
+        return _digest({'strategy': 6, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
                         'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
 
     def _read_task_stage(self, request, stage_key, evidence):
@@ -639,7 +634,7 @@ class Pipeline:
                 entry.backend.credential(self.engine.config)
             except ToolError:
                 return None
-            accepted = request.validate_record(record, self.identities, self.prompt_version)
+            accepted = request.validate_record(record, self.identities)
             if accepted is None:
                 return None
             value, resolved = accepted
@@ -652,7 +647,7 @@ class Pipeline:
         try:
             entry.backend.credential(self.engine.config)
             key = request_cache_key(request.name, request.data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                                    scope=self.cache_scope, prompt_version=self.prompt_version)
+                                    scope=self.cache_scope)
         except ToolError as error:
             if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
                 return None
@@ -665,7 +660,7 @@ class Pipeline:
             if (not isinstance(record, dict) or set(record) != {'value', 'actual_model', 'resolved_model', 'usage'} or
                     not _valid_stage_metadata(record)):
                 raise ValueError()
-            accepted = request.validate_record(record, self.identities, self.prompt_version)
+            accepted = request.validate_record(record, self.identities)
             if accepted is None:
                 return None
             value, resolved = accepted
@@ -673,11 +668,11 @@ class Pipeline:
         except (ValueError, TypeError, KeyError, ToolError):
             raise ToolError('翻译请求缓存与请求不符，请用 --reflow 检查来源。', 'cache_mismatch') from None
 
-    def stage(self, name, data, *, ids=(), originals=(), saved_only=False, fixed_semantics=False,
+    def stage(self, name, data, *, ids=(), originals=(), fixed_semantics=False,
               forbidden_models=()):
         self.engine.mt_control.check_start()
         forbidden_models = frozenset(forbidden_models)
-        if name == 'glossary':
+        if name in {'glossary', 'language'}:
             ids = [item['id'] for item in data['sentences']]
             originals = [item['text'] for item in data['sentences']]
         group = getattr(self.context, 'group', None)
@@ -692,7 +687,9 @@ class Pipeline:
         # cache hits. Hashes allow partial layout replacement without retaining
         # another copy of the transcript or binding reusable stages to cue IDs.
         evidence = ({'source_text_hashes': [_digest(text.strip()) for text in originals]}
-                    if name == 'translate' else {})
+                    if name in {'translate', 'language'} else {})
+        if name == 'language':
+            evidence['source_records'] = [_digest(item) for item in data['sentences']]
         request = StageRequest(name, data, tuple(ids), tuple(originals), forbidden_models)
         saved = self._read_task_stage(request, stage_key, evidence)
         if saved is not None:
@@ -708,12 +705,7 @@ class Pipeline:
         # free and paid cache lookup before adapting to permitted network models.
         result = self.router_for(name).cached_result(cached, deadline=deadline)
         if result is None:
-            try:
-                data = self._fit(name, data, fixed_semantics=fixed_semantics)
-            except ToolError as error:
-                if saved_only and error.code == 'mt_input_budget':
-                    return None
-                raise
+            data = self._fit(name, data, fixed_semantics=fixed_semantics)
             request = replace(request, data=data)
             new_key = self._task_stage_key(name, data)
             adapted = new_key != stage_key
@@ -726,8 +718,6 @@ class Pipeline:
             if adapted:
                 result = self.router_for(name).cached_result(cached, deadline=deadline)
             if result is None:
-                if saved_only:
-                    return None
                 result = self.router_for(name).run(invoke, validate=self._validate_gateway, deadline=deadline)
         self.diagnostics.write_route({'kind': 'route_complete', 'stage': name, 'entry': result.entry.id,
             'model': result.entry.backend.model, 'actual_model': result.value['actual_model'],
@@ -744,8 +734,7 @@ class Pipeline:
             # Its cross-task cache still keys the exact fitted wire request.
             record['context'] = data.get('context', [])
         cache_key = request_cache_key(name, data, result.entry.backend,
-                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope,
-                                    prompt_version=self.prompt_version)
+                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             self.store.commit_mt_stage(self.job_id, stage_key, name, record,
@@ -763,8 +752,7 @@ class Pipeline:
         for sentence_index, translation_unit in enumerate(units):
             for cue in translation_unit['cues']:
                 part = {'id': str(len(fragments)), 'sentence': str(sentence_index), 'text': cue['text']}
-                if self.display_durations is not None:
-                    part['display_ms'] = self.display_durations.get(cue['cue_id'], cue['end_ms'] - cue['begin_ms'])
+                part['display_ms'] = self.display_durations.get(cue['cue_id'], cue['end_ms'] - cue['begin_ms'])
                 fragments.append(part)
         return fragments
 
@@ -823,7 +811,7 @@ class Pipeline:
                 result.append(pending)
         return result
 
-    def glossary_data(self, group, context, known=()):
+    def glossary_data(self, group, context):
         manual = self.snapshot['quality']['manual_glossary']
         by_source = {}
         for translation_unit in group:
@@ -841,10 +829,10 @@ class Pipeline:
                 current.update(text=translation_unit['source']['text'][start:end], char_start=start, char_end=end)
         local = [{**translation_unit['source'], 'text': translation_unit['text']} for translation_unit in group]
         return {'sentences': list(by_source.values()), 'manual_glossary': manual_terms(local, manual),
-                'context': context, 'glossary': list(known)}
+                'context': context, 'glossary': []}
 
-    def glossary(self, group, context, known=()):
-        data = self.glossary_data(group, context, known)
+    def glossary(self, group, context):
+        data = self.glossary_data(group, context)
         # Advisory failures must remain part of this job's deterministic prefix:
         # otherwise a later retry could silently change an already saved draft's input.
         unavailable_key = _digest({'stage': 'glossary_unavailable', 'request': self._task_stage_key('glossary', data)})
@@ -926,8 +914,6 @@ class Pipeline:
         production = translation_proof
         current = translated['translations']
         warning = False
-        stalled = False
-        previous_correction = None
         review_keys, correction_keys, reviewed = [], [], []
         for round_number in range(self.snapshot['quality']['max_revisions'] + 1):
             self.engine.mt_control.check_start()
@@ -947,8 +933,7 @@ class Pipeline:
             review, _, review_proof = result
             review_keys.append(review_proof['key'])
             reviewed.append(current)
-            if self.prompt_version >= 7:
-                review = review_with_checks(review, repetition_checks(current, originals))
+            review = review_with_checks(review, repetition_checks(current, originals))
             if not review['issues']:
                 break
             if round_number == self.snapshot['quality']['max_revisions']:
@@ -956,16 +941,13 @@ class Pipeline:
                 break
             correction_data = {**review_data, 'issues': review['issues']}
             forbidden_models = {_proof_model(translation_proof), _proof_model(review_proof)}
-            stalled = correction_stalled(previous_correction, correction_data)
             correction = self._advisory_stage('judge', correction_data, ids=ids, originals=originals,
-                                              saved_only=stalled, forbidden_models=forbidden_models)
+                                              forbidden_models=forbidden_models)
             if correction is None:
                 warning = True
                 break
-            stalled = False
             corrected, origin, production = correction
             correction_keys.append(production['key'])
-            previous_correction = correction_data
             current = corrected['translations']
             if not corrected['issues']:
                 break
@@ -981,8 +963,6 @@ class Pipeline:
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             counts = {'mt_subtitle_completed': len(values), 'mt_quality_warning': int(warning)}
-            if stalled:
-                counts['mt_correction_stalled'] = 1
             self.store.commit_mt_stage(self.job_id, final_key, 'final', record, translations=values, origin=origin,
                                        counts=counts)
 
@@ -1009,14 +989,13 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
     positions = {source['sentence_id']: index for index, source in enumerate(sources)}
     needs_translation = any(source['decision'] == 'translate' for source in sources)
     pipeline = Pipeline(engine, job_id, manifest, scope) if needs_translation else None
-    alignment_version = manifest['execution_snapshot']['alignment_version']
     try:
         if not manifest.get('layout_planned'):
             cues = []
             for source in sources:
-                parts = plan_fragments(source, settings, alignment_version=alignment_version)
+                parts = plan_fragments(source, settings)
                 if source['decision'] == 'translate':
-                    parts = split_cues_for_translation(source, parts, alignment_version=alignment_version, fits=lambda cue: pipeline._fits_group(
+                    parts = split_cues_for_translation(source, parts, fits=lambda cue: pipeline._fits_group(
                         [{'source': source, 'text': cue['text'], 'cues': [cue]}]))
                 cues.extend(parts)
             plan_display_timing(cues)
@@ -1028,7 +1007,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             stage('subtitle_translating')
             cues = engine.store.cues(job_id)
             display_intervals, _ = plan_display_timing(cues)
-            if pipeline is not None and pipeline.display_durations is not None:
+            if pipeline is not None:
                 pipeline.display_durations = {item['cue_id']: item['end_ms'] - item['begin_ms'] for item in display_intervals}
             groups = groups_for_layout(engine, job_id, manifest, sources, cues, pipeline)
             pending = [index for index, group in enumerate(groups)
@@ -1055,7 +1034,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             round_number = manifest['layout_round']
             if round_number < MAX_LAYOUT_ROUNDS:
                 stage('layout_adjusting', round_number + 1, MAX_LAYOUT_ROUNDS)
-                revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1, alignment_version=alignment_version)
+                revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1)
             if revised is None:
                 warnings = layout_warnings(cues, settings)
                 if any(item['record'].get('warning') for item in engine.store.mt_stages(job_id)):
@@ -1085,18 +1064,17 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
     prefix = GlossaryPrefix(pipeline, sources)
     glossaries, errors = {}, []
     next_glossary = next_group = 0
-    independent = pipeline.glossary_schedule == GLOSSARY_SCHEDULE
     # Include completed but unconsumed windows in the lookahead limit. A slow
     # early window must not let later results accumulate across the whole job.
     windows = {}
 
-    def window_end(start, known):
+    def window_end(start):
         end = min(start + 8, len(groups))
         while end > start + 1:
             units = [translation_unit for group in groups[start:end] for translation_unit in group]
             try:
                 pipeline._fit('glossary', pipeline.glossary_data(
-                    units, group_context(sources, units, positions), known), output_budget=True)
+                    units, group_context(sources, units, positions)), output_budget=True)
                 break
             except ToolError as error:
                 if error.code != 'mt_input_budget':
@@ -1104,12 +1082,12 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
                 end -= 1
         return end
 
-    def extract(start, end, known):
+    def extract(start, end):
         engine.mt_control.check_start()
         pipeline.context.group = start
         progress.set(start, 'glossary')
         units = [translation_unit for group in groups[start:end] for translation_unit in group]
-        result = pipeline.glossary(units, group_context(sources, units, positions), known)
+        result = pipeline.glossary(units, group_context(sources, units, positions))
         assigned = {i: [] for i in range(start, end)}
         for term in result:
             for index in range(start, end):
@@ -1147,16 +1125,12 @@ def _translate_groups(pipeline, groups, sources, positions, *, done, total):
                         progress.finish(index)
                         continue
                     futures[executor.submit(translate, index, glossary)] = (index, False)
-                elif next_glossary < len(groups) and len(windows) < (2 if independent else 1):
-                    # New windows extract from local evidence independently;
-                    # only prefix consumption depends on source order. Legacy
-                    # resumes retain the exact prior-prefix request identity.
+                elif next_glossary < len(groups) and len(windows) < 2:
                     index = next_glossary
-                    known = () if independent else tuple(prefix.terms)
-                    end = window_end(index, known)
+                    end = window_end(index)
                     next_glossary = end
                     windows[index] = end
-                    futures[executor.submit(extract, index, end, known)] = (index, True)
+                    futures[executor.submit(extract, index, end)] = (index, True)
                 else:
                     break
 

@@ -54,6 +54,13 @@ def result(*sentences):
                 for i, (text, lang) in enumerate(sentences)]}]}
 
 
+def unlabeled_result(*texts):
+    raw = result(*[(text, '') for text in texts])
+    for sentence in raw['transcripts'][0]['sentences']:
+        sentence.pop('language')
+    return raw
+
+
 def response(body, status=200, headers=None):
     resp = requests.Response()
     resp.status_code = status
@@ -152,10 +159,11 @@ class FakeService:
                           if payload['messages'][0]['content'].startswith(prompt)), None)
             if stage is not None:
                 data = json.loads(payload['messages'][1]['content'])
-                targets = data['sentences'] if stage == 'glossary' else data['fragments']
+                targets = data['sentences'] if stage in {'glossary', 'language'} else data['fragments']
                 if any(item['text'] in self.mt_failure for item in targets):
                     return response({'error': {'code': 'InvalidApiKey'}}, 401)
-                value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
+                value = ({'decisions': {item['id']: 'uncertain' for item in targets}} if stage == 'language' else
+                         {'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
                          {'translations': {item['id']: '繁體譯文：' + item['text'] for item in targets}})
                 return response({'model': 'synthetic/' + stage, 'choices': [{'finish_reason': 'stop', 'message': {
                     'content': json.dumps(value, ensure_ascii=False)}}]})

@@ -11,7 +11,7 @@ from tests.mt_fixtures import PoolPipelineFixture
 
 
 class GlossarySchedulingTests(PoolPipelineFixture):
-    def install_windows(self, *, legacy=False, count=32):
+    def install_windows(self, *, count=32):
         self.config.settings.mt_workers = 4
         raw = result(*[(f'Cache stores item {i}.', 'en') for i in range(count)])
         step = min(100, 10000 // count)
@@ -19,10 +19,6 @@ class GlossarySchedulingTests(PoolPipelineFixture):
             sentence.update(begin_time=i * step, end_time=(i + 1) * step - 10)
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id)
-        if legacy:
-            manifest = self.store.job(self.job_id)['manifest']
-            manifest['mt_glossary_schedule'] = 'window-prefix-v3'
-            self.store.update(self.job_id, manifest=manifest)
         fit = Pipeline._fit
 
         def one_group(pipeline, stage, data, **kwargs):
@@ -53,12 +49,12 @@ class GlossarySchedulingTests(PoolPipelineFixture):
         second_saved = threading.Event()
         overlap, completion = [], []
 
-        def reordered(pipeline, group, context, known=()):
+        def reordered(pipeline, group, context):
             first = group[0]['text'] == 'Cache stores item 0.'
             second = group[0]['text'] == 'Cache stores item 8.'
             if first:
                 overlap.append(second_saved.wait(2))
-            value = extract(pipeline, group, context, known)
+            value = extract(pipeline, group, context)
             completion.append(group[0]['text'])
             if second:
                 second_saved.set()
@@ -85,11 +81,11 @@ class GlossarySchedulingTests(PoolPipelineFixture):
         engine = Engine(self.config, self.store)
         overlap = []
 
-        def cancelled(pipeline, group, context, known=()):
+        def cancelled(pipeline, group, context):
             if group[0]['text'] == 'Cache stores item 0.':
                 overlap.append(second_saved.wait(2))
                 engine.request_cancel()
-            value = extract(pipeline, group, context, known)
+            value = extract(pipeline, group, context)
             if group[0]['text'] == 'Cache stores item 8.':
                 second_saved.set()
             return value
@@ -114,10 +110,10 @@ class GlossarySchedulingTests(PoolPipelineFixture):
         second_saved, release_first = threading.Event(), threading.Event()
         seen_completion, outstanding = False, []
 
-        def blocked(pipeline, group, context, known=()):
+        def blocked(pipeline, group, context):
             if group[0]['text'] == 'Cache stores item 0.':
                 release_first.wait(5)
-            value = extract(pipeline, group, context, known)
+            value = extract(pipeline, group, context)
             if group[0]['text'] == 'Cache stores item 8.':
                 second_saved.set()
             return value
@@ -141,20 +137,3 @@ class GlossarySchedulingTests(PoolPipelineFixture):
         finally:
             release_first.set()
         self.assertEqual(outstanding, [1])
-
-    def test_legacy_resume_keeps_the_saved_serial_prefix_contract(self):
-        self.install_windows(legacy=True)
-        self.config.settings.mt_workers = 1
-        self.cancel_after = 'translate'
-        self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
-        before = next(data for stage, _, data in self.calls if stage == 'translate')
-        self.calls.clear()
-        self.cancel_after = None
-        self.config.settings.mt_workers = 4
-        Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_pool(), 'completed')
-        windows = [data for stage, _, data in self.calls if stage == 'glossary']
-        self.assertEqual(len(windows), 3)
-        self.assertTrue(all(data['glossary'] for data in windows))
-        self.assertEqual(windows[0]['glossary'], before['glossary'])
-        self.assertEqual(self.store.job(self.job_id)['manifest']['mt_glossary_schedule'], 'window-prefix-v3')

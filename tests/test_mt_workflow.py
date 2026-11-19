@@ -108,9 +108,6 @@ class TranslationWorkflowTests(PoolPipelineFixture):
         self.addCleanup(patch.stop)
         self.config.settings.mt_workers = 1
         self.install_groups(10)
-        manifest = self.store.job(self.job_id)['manifest']
-        manifest['mt_glossary_schedule'] = 'window-prefix-v3'
-        self.store.update(self.job_id, manifest=manifest)
         self.glossary_terms = lambda data: [{'source': 'Cache', 'translation': '缓存',
             'sentence': data['sentences'][-1]['id']}]
         self.cancel_after = 'translate'
@@ -124,7 +121,7 @@ class TranslationWorkflowTests(PoolPipelineFixture):
         windows = [data for name, _, data in self.calls if name == 'glossary']
         self.assertEqual(len(windows), 1)  # First 8-group window reused.
         self.assertEqual(len(windows[0]['sentences']), 16)
-        self.assertTrue(windows[0]['glossary'])
+        self.assertFalse(windows[0]['glossary'])
         translated = [data for name, _, data in self.calls if name == 'translate']
         self.assertTrue(all(not data['glossary'] for data in translated[:6]))
         self.assertTrue(all(data['glossary'] for data in translated[6:]))

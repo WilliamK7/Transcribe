@@ -177,7 +177,7 @@ class Engine:
             if not saved_raw_path(cache, segment).is_file():
                 raise ToolError("重排缺少完整本地转写；不会重新上传或识别。", "reflow_cache_missing")
             try:
-                items, notes = normalize_raw(cache, manifest, segment)
+                items, notes = normalize_raw(cache, {**manifest, 'contract': contract}, segment)
             except ToolError as error:
                 if error.code != 'cache_mismatch':
                     raise
@@ -727,6 +727,8 @@ class Engine:
         validate_normalized(manifest, self.store.sources(job_id), self.store.cues(job_id))
         from .mt_pipeline import validate_provenance
         validate_provenance(self, job_id, manifest)
+        from .mt_language import validate_language_reviews
+        validate_language_reviews(self, job_id, manifest, self.store.sources(job_id))
 
     def verify_source_output(self, job_id, manifest, output):
         source = Path(self.store.job(job_id)["source"])
@@ -749,6 +751,10 @@ class Engine:
             if not (manifest.get("reflow") or manifest.get("retime")):
                 self.cleanup_completed_audio(job_id, manifest, cache)
             return "completed"
+        if any(c["decision"] == "uncertain" for c in cues) and not manifest.get('retime'):
+            from .mt_language import review_languages
+            review_languages(self, job_id, manifest, scope)
+            cues = self.store.cues(job_id)
         if any(c["decision"] == "uncertain" for c in cues):
             raise NeedsReview("部分字幕语种不确定，请用 --review 逐条确认原文或翻译。", "language_uncertain")
         if "publication_intent" not in manifest and not manifest.get("retime"):

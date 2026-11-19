@@ -23,11 +23,17 @@ ALIGNMENT_VERSION = 5
 _EN_BOUND_PREFIXES = frozenset('a an the my your its our their of to with from for by into on at and or'.split())
 
 
-def decide_translation(text: str, language: str, neighbors=()) -> tuple[str, str]:
-    """Conservative local rules. No Latin=>English default; uncertainty requires explicit review."""
+def _latin_words(text):
+    latin = ''.join(c if 'LATIN' in unicodedata.name(c, '') or c in "'’-" else ' '
+                    for c in unicodedata.normalize('NFC', text))
+    return re.findall(r"[^\W\d_]+(?:['’-][^\W\d_]+)*", latin)
+
+
+def decide_translation(text: str, language: str, neighbors=(), *, infer_latin=False) -> tuple[str, str]:
+    """Use ASR labels first, with opt-in text inference for label-free 3.1 results."""
     language = (language or "").lower().strip()
     chinese = len(ZH.findall(text))
-    words = LATIN.findall(text)
+    words = _latin_words(text) if infer_latin and not language else LATIN.findall(text)
     substantive = [w for w in words if w.lower() not in BRANDS and
                    (not w.isupper() or w.lower() in FOREIGN_FUNCTIONS or len(w) >= 5)]
     if KANA.search(text):
@@ -57,7 +63,64 @@ def decide_translation(text: str, language: str, neighbors=()) -> tuple[str, str
             return "original", "本地中文文字规则和上下文"
     if re.search(r"[\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f\u0400-\u04ff]", text):
         return "translate", "本地非中文文字规则；MT 自动源语言"
+    if not language and infer_latin:
+        latin_letters = sum(len(word) for word in substantive)
+        if chinese:
+            if len(substantive) >= 4 and latin_letters >= 16:
+                return "translate", "中文句内实质外语；MT 自动源语言"
+            if (chinese >= 2 and CHINESE_MARKERS.search(text) and
+                    chinese / max(1, chinese + latin_letters) >= 0.65):
+                return "original", "本地中文文字规则；品牌和缩写不触发翻译"
+        elif ((len(substantive) >= 2 and latin_letters >= 8) or
+              (len(substantive) == 1 and latin_letters >= 6)):
+            return "translate", "ASR 语种标签缺失；本地拉丁文字规则，MT 自动识别源语言"
+        return "uncertain", "文字或上下文不足以确定是否需要翻译"
     return "uncertain", "语种缺失／不支持／文字过短；不默认英文"
+
+
+def _text_family(text):
+    """Script evidence for local short-cue decisions, never an ASR language tag."""
+    if KANA.search(text):
+        return 'kana'
+    if HANGUL.search(text):
+        return 'hangul'
+    if re.search(r"[\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f\u0400-\u04ff]", text):
+        return 'other'
+    if ZH.search(text):
+        return 'han'
+    return 'latin' if _latin_words(text) else ''
+
+
+def _resolve_short_unlabeled(sources):
+    # Only independently classified cues provide evidence. An inferred short
+    # cue cannot propagate a decision indefinitely through an ambiguous run.
+    decisions = [source['decision'] for source in sources]
+    families = [_text_family(source['text']) for source in sources]
+    for index, source in enumerate(sources):
+        if source['language'] or decisions[index] != 'uncertain' or families[index] not in {'latin', 'han'}:
+            continue
+        expected = 'translate' if families[index] == 'latin' else 'original'
+        evidence = set()
+        for direction in [-1, 1]:
+            previous = source
+            for distance in [1, 2]:
+                at = index + direction * distance
+                if not 0 <= at < len(sources):
+                    break
+                neighbor = sources[at]
+                gap = max(previous['begin_ms'] - neighbor['end_ms'], neighbor['begin_ms'] - previous['end_ms'], 0)
+                if gap > 15000 or families[at] != families[index]:
+                    break
+                if decisions[at] != 'uncertain':
+                    evidence.add(decisions[at])
+                    break
+                # A conflicting explicit tag is a boundary, not usable evidence.
+                if neighbor['language']:
+                    break
+                previous = neighbor
+        if evidence == {expected}:
+            source.update(decision=expected, reason=('相邻明确外文支持短句翻译；MT 自动源语言' if expected == 'translate'
+                                                    else '相邻明确中文支持保留原文'))
 
 
 def clean_text(text):
@@ -256,6 +319,7 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
         raise ToolError("识别结果缺少 transcripts 数组，不能套用其他 ASR 结构。", "response_schema")
     # Qwen-Audio returns word times without promising sentence-level language labels.
     require_word_language = asr_model != ASR_MODEL
+    infer_language = asr_model == ASR_MODEL
     source_sentences, warnings = [], []
     sentences = []
     for transcript in raw["transcripts"]:
@@ -298,7 +362,10 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
         if not text:
             warnings.append(f"分段 {segment_id} 第 {index + 1} 句为空，未生成字幕")
             continue
-        decision, reason = decide_translation(text, sentence.get("language", ""), languages[max(0, index - 2):index] + languages[last_index + 1:last_index + 3])
+        decision, reason = decide_translation(
+            text, sentence.get("language", ""),
+            languages[max(0, index - 2):index] + languages[last_index + 1:last_index + 3],
+            infer_latin=infer_language)
         start, stop = sentence["begin_time"] + offset_ms, sentence["end_time"] + offset_ms
         if stop <= 0:
             warnings.append(f"第 {index + 1} 句在播放器时间零点之前，保留原始结果并跳过负时间字幕")
@@ -323,6 +390,8 @@ def normalize(raw: dict, offset_ms: int, segment_id: str, *, duration_ms=None,
             source_sentence["timing_adjustments"] = sentence["_adjustments"]
         source_sentences.append(source_sentence)
     source_sentences.sort(key=lambda c: (c["begin_ms"], c["end_ms"], c["cue_id"]))
+    if infer_language:
+        _resolve_short_unlabeled(source_sentences)
     for previous, current in zip(source_sentences, source_sentences[1:]):
         if current["begin_ms"] < previous["end_ms"]:
             warnings.append("识别时间存在重叠；保留原始时间依据，最终显示区间按任务策略处理")
@@ -514,13 +583,12 @@ def make_fragment(source_sentence, lo=0, hi=None, *, layout_round=0):
 
 class _WordBreakIndex:
     """Index one source in O(characters + words); each range search scans its words."""
-    def __init__(self, source, *, alignment_version=ALIGNMENT_VERSION):
+    def __init__(self, source):
         text, words = source["text"], source.get("words", [])
-        self._time_aware = alignment_version == ALIGNMENT_VERSION
         language = source['language']
-        if self._time_aware and decision_origin(source) == 'manual' and source.get('source_lang', 'auto') != 'auto':
+        if decision_origin(source) == 'manual' and source.get('source_lang', 'auto') != 'auto':
             language = source['source_lang']
-        use_phrases = self._time_aware and language.lower() in {'en', 'english'}
+        use_phrases = language.lower() in {'en', 'english'}
         widths = [0]
         for char in text:
             width = (0 if unicodedata.category(char).startswith("M") or char in "\u200d\ufe0f" else
@@ -566,8 +634,7 @@ class _WordBreakIndex:
             # rstrip and quote removal stop at this range's left edge; the right slice is untrimmed.
             balance = abs(max(0, before_width - start_width) - (end_width - after_start_width))
             penalty = min(32, (end_width - start_width) // 3) if bound_prefix else 0
-            needs_another_split = self._time_aware and max(words[at - 1]['end_ms'] - begin_ms,
-                                                             end_ms - words[at]['begin_ms']) > 7000
+            needs_another_split = max(words[at - 1]['end_ms'] - begin_ms, end_ms - words[at]['begin_ms']) > 7000
             score = (priority, needs_another_split, balance + penalty, balance, at)
             if choice is None or score < choice:
                 choice = score
@@ -578,7 +645,7 @@ def source_capacity(source, settings):
     return settings.zh_line_width * 2 if source["language"] in {"zh", "yue"} else settings.other_line_width
 
 
-def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, force=False, alignment_version=ALIGNMENT_VERSION):
+def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, force=False):
     root = cue or make_fragment(source)
     words = source.get("words", [])
     if len(words) < 2 or root["end_ms"] - root["begin_ms"] < 1000:
@@ -600,7 +667,7 @@ def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, 
         at = None
         if needs:
             if break_index is None:
-                break_index = _WordBreakIndex(source, alignment_version=alignment_version)
+                break_index = _WordBreakIndex(source)
             at = break_index.best(lo, hi)
         if at is None:
             ranges.append((lo, hi))
@@ -611,14 +678,14 @@ def plan_fragments(source, settings, *, reference="", cue=None, layout_round=0, 
     return [make_fragment(source, lo, hi, layout_round=layout_round) for lo, hi in sorted(ranges)]
 
 
-def split_cues_for_translation(source, cues, *, fits, alignment_version=ALIGNMENT_VERSION):
+def split_cues_for_translation(source, cues, *, fits):
     result, break_index = [], None
     stack = list(reversed(cues))
     while stack:
         cue = stack.pop()
         if not fits(cue):
             if break_index is None:
-                break_index = _WordBreakIndex(source, alignment_version=alignment_version)
+                break_index = _WordBreakIndex(source)
             at = break_index.best(cue['word_start'], cue['word_end'])
             if at is None:
                 raise ToolError('完整请求超过模型预算且没有可靠词边界。', 'mt_input_budget')
@@ -688,14 +755,14 @@ def validate_fragment(source, cue):
         raise ToolError("字幕片段与完整句来源／词范围记录不一致。", "cache_mismatch")
 
 
-def revise_layout(cues, sources, settings, *, layout_round, alignment_version=ALIGNMENT_VERSION):
+def revise_layout(cues, sources, settings, *, layout_round):
     """Split overflowing translations; joint groups must be translated together again."""
     revised, affected = [], set()
     for cue in cues:
         parts = [cue]
         if cue['decision'] == 'translate' and len(wrap(cue['translated'], settings.zh_line_width * 2)) > 2:
             parts = plan_fragments(sources[cue['sentence_id']], settings, cue=cue,
-                                   reference=cue['translated'], layout_round=layout_round, force=True, alignment_version=alignment_version)
+                                   reference=cue['translated'], layout_round=layout_round, force=True)
         if len(parts) > 1:
             affected.add(cue['sentence_id'])
         revised.extend(parts)

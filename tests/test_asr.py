@@ -12,7 +12,6 @@ from subtitle_tool.api import Bailian
 from subtitle_tool.common import ASR_MODEL, SubmissionUnknown, ToolError, asr_contract
 from subtitle_tool.engine import Engine
 from subtitle_tool.review import ReviewDecision
-from subtitle_tool.subtitles import make_fragment
 from tests.fixtures import FakeService, PipelineFixture, SavedResultFixture, TemporaryTest, response, result, unlabeled_raw
 
 
@@ -198,24 +197,22 @@ class ASRRecoveryTests(SavedResultFixture):
 
     def test_foreign_unlabeled_words_survive_manual_language_review_and_reflow(self):
         self.prepare_query()
-        raw = unlabeled_raw(['First', 'sentence.'], language='en')
+        # A one-token interjection remains deliberately ambiguous without an ASR label.
+        raw = unlabeled_raw(['OK'], language='en')
         fake = FakeService(raw, query_output={'task_status': 'SUCCEEDED', 'results': [
             {'subtask_status': 'SUCCEEDED', 'transcription_url': RESULT_URL}]})
         self.assertEqual(self.run_fake(fake), 'needs_review')
         source = self.store.sources(self.job_id)[0]
         self.assertEqual((source['language'], source['decision']), ('', 'uncertain'))
-        self.assertEqual(len(source['words']), 2)
-        # Exercise the same stored decision as interactive review without a real translation call.
-        source.update(ReviewDecision('original').values())
-        manifest = self.store.job(self.job_id)['manifest']
-        self.store.initialize_subtitles(self.job_id, [source], [make_fragment(source)], manifest)
+        self.assertEqual(len(source['words']), 1)
+        self.store.apply_review(self.job_id, source['cue_id'], ReviewDecision('original'))
         engine = Engine(self.config, self.store)
         engine.finish_review(self.job_id)
         self.assertEqual(self.run_fake(fake), 'completed')
         engine.reflow(self.job_id, overwrite=True)
         self.assertEqual(self.run_fake(fake), 'completed')
         self.assertEqual(self.store.sources(self.job_id)[0]['words'], source['words'])
-        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(len(fake.calls), 3)
 
 
 class ASRPipelineTests(PipelineFixture):

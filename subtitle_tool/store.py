@@ -252,6 +252,16 @@ class Store:
             self._replace_records(job_id, cues)
             self.db.execute("UPDATE jobs SET manifest=? WHERE id=?", (json.dumps(manifest, ensure_ascii=False), job_id))
 
+    def save_language_review(self, job_id, sources, cues, manifest):
+        """Commit model decisions and every fragment together, retaining their stage evidence."""
+        with self.lock, self.db:
+            if any(cue.get('translated') for cue in self.cues(job_id)):
+                raise ToolError('已有译文时不能重新自动判断语种，请用 --reflow 重建。', 'cache_mismatch')
+            for name in ['layout_planned', 'layout_complete', 'layout_round']:
+                manifest.pop(name, None)
+            self.db.execute("DELETE FROM mt_stages WHERE job_id=? AND stage!='language'", (job_id,))
+            self._initialize_subtitles(job_id, sources, cues, manifest)
+
     def save_mt_group_plan(self, job_id, manifest):
         """Freeze planning before any stage request; cues and evidence stay intact."""
         with self.lock, self.db:
@@ -290,13 +300,14 @@ class Store:
             if source is None:
                 raise ToolError("待复核字幕缺少完整句来源。", "cache_mismatch")
             source.update(decision.values())
+            source.pop('language_review', None)
             self.db.execute("UPDATE subtitle_sources SET record=? WHERE job_id=? AND sentence_id=?",
                             (json.dumps(source, ensure_ascii=False), job_id, source["sentence_id"]))
             for item in cues:
                 if item.get("sentence_id") == source["sentence_id"]:
                     item.update(decision.values())
                 item.update(translated="")
-            self.db.execute('DELETE FROM mt_stages WHERE job_id=?', (job_id,))
+            self.db.execute("DELETE FROM mt_stages WHERE job_id=? AND stage!='language'", (job_id,))
             manifest = job["manifest"]
             for name in ["layout_planned", "layout_complete", "layout_round", "mt_group_plan",
                          "expected_srt_sha256", "publication_intent", "display_timing_adjustments", "retime",
@@ -321,7 +332,7 @@ class Store:
                         cache_key=None, cache_value=None):
         """Persist a complete private stage and, when present, all cue updates in one transaction."""
         if (not isinstance(key, str) or len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or
-                stage not in {'glossary', 'glossary_unavailable', 'semantic_input', 'translate', 'review', 'judge', 'final'} or not isinstance(record, dict) or
+                stage not in {'language', 'glossary', 'glossary_unavailable', 'semantic_input', 'translate', 'review', 'judge', 'final'} or not isinstance(record, dict) or
                 (cache_key is None) != (cache_value is None) or
                 translations is not None and (not translations or
                     any(not isinstance(text, str) or not text.strip() for text in translations.values()))):

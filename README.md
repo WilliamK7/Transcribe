@@ -28,7 +28,7 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 
 也可在资源管理器选择“发送到 → !百炼字幕”。多个文件顺序处理。音轨、声道或语种有歧义时按提示选择，输入 `q` 可暂停。`--non-interactive` 把歧义留作待复核任务。`--track` 使用 FFprobe 音轨索引，`--channel` 可选 `left`、`right`、`mix`。`--output-dir` 指定输出目录，`--overwrite` 在覆盖前备份原字幕。完整参数见 `--help`。
 
-识别保留方言表达和字词时间戳，按 token 计费；语种标签缺失且文字规则无法确定时进入复核。[官方指南](https://docs.bailian.console.aliyun.com/zh/model-studio/non-realtime-speech-recognition-user-guide)
+识别保留方言表达和字词时间戳，按 token 计费。语种标签缺失时，程序先按文字判断；疑难内容通过 Magpie 结合上下文自动复核，仍有歧义或服务不可用时询问人工。[官方指南](https://docs.bailian.console.aliyun.com/zh/model-studio/non-realtime-speech-recognition-user-guide)
 
 ## 配置 Magpie
 

@@ -10,7 +10,7 @@ from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.mt_control import MTControl
 from subtitle_tool.mt_pipeline import GlossaryPrefix, Pipeline
-from subtitle_tool.mt_quality import BatchValidationError, correction_stalled, term_evidence, validate_stage_value
+from subtitle_tool.mt_quality import BatchValidationError, term_evidence, validate_stage_value
 from subtitle_tool.subtitles import normalize, source_context
 from tests.fixtures import result, timed_raw
 from tests.mt_fixtures import PoolPipelineFixture
@@ -46,15 +46,6 @@ class SemanticValidationTests(unittest.TestCase):
         self.assertEqual(valid['terms'][0]['translation'], '缓存')
         with self.assertRaises(BatchValidationError):
             validate_stage_value('glossary', value, ids=['same-source'], originals=['The next call reuses them.'])
-
-    def test_context_change_invalidates_stalled_correction(self):
-        previous = {'sentences': [], 'translate': {}, 'fragments': [{'id': '0', 'sentence': '0'}],
-                    'glossary': [], 'translations': {'0': '原译文'},
-                    'context': [{'position': 'before', 'text': 'The subject is electric charge.'}],
-                    'issues': [{'id': '0', 'category': 'meaning', 'evidence': 'Synthetic evidence.'}]}
-        changed = copy.deepcopy(previous)
-        changed['context'][0]['text'] = 'The subject is a service charge.'
-        self.assertFalse(correction_stalled(previous, changed))
 
     def test_group_context_reaches_both_edges_and_excludes_targets(self):
         sources = normalize(result(*[(f'Sentence {i}.', 'en') for i in range(10)]), 0, '0000')[0]

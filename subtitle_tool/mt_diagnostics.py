@@ -139,7 +139,7 @@ class MTDiagnostics:
             model = safe_model_id(event.get(field))
             if model:
                 record[field] = model
-        if event.get('stage') in {'glossary', 'translate', 'review', 'judge'}:
+        if event.get('stage') in {'glossary', 'language', 'translate', 'review', 'judge'}:
             record['stage'] = event['stage']
         for field, pattern in [('run_id', r'[0-9a-f]{32}'), ('group_key', r'[0-9a-f]{64}'),
                                ('request_id', r'[0-9a-f]{32}'),

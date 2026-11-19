@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from .common import (LEGACY_ASR_MODEL, DISPLAY_TIMING_VERSION, NORMALIZER_VERSION, PROCESSING_VERSION,
-                     SUBTITLE_VERSION, ToolError, asr_contract)
+from .common import (ASR_MODEL, ASR_LANGUAGE_INFERENCE_VERSION, LEGACY_ASR_MODEL, DISPLAY_TIMING_VERSION,
+                     NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION, ToolError, asr_contract)
 from .media import EXTRACT_RECIPE_VERSION
-from .mt_quality import GLOSSARY_SCHEDULE, LEGACY_GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION, SUPPORTED_PROMPT_VERSIONS
+from .mt_quality import GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION
 from .subtitles import ALIGNMENT_VERSION
 
 _LAYOUT_FIELDS = ('zh_line_width', 'other_line_width', 'chinese_first')
@@ -35,7 +35,10 @@ def saved_asr_contract(manifest):
     if not isinstance(saved, dict):
         raise ToolError("任务的识别契约无效，请检查保存记录。", "cache_version")
     expected = asr_contract(saved.get('asr'))
-    if {**saved, 'normalizer': NORMALIZER_VERSION} != expected:
+    local_versions = {'normalizer': NORMALIZER_VERSION}
+    if saved.get('asr') == ASR_MODEL:
+        local_versions['language_inference'] = ASR_LANGUAGE_INFERENCE_VERSION
+    if {**saved, **local_versions} != expected:
         raise ToolError("任务的识别模型／参数契约不受支持，请检查保存记录。", "cache_version")
     return expected
 
@@ -82,14 +85,15 @@ def load_policy(manifest):
     saved = manifest.get("contract")
     if saved:
         _version(saved.get("normalizer"), NORMALIZER_VERSION)
+        if saved.get('asr') == ASR_MODEL:
+            _version(saved.get('language_inference'), ASR_LANGUAGE_INFERENCE_VERSION)
     if "normalized_version" in manifest:
         _version(manifest["normalized_version"], NORMALIZER_VERSION)
     snapshot = manifest.get('execution_snapshot')
-    supported = {key: (value,) for key, value in current_execution_snapshot().items()}
-    supported.update(prompt_version=SUPPORTED_PROMPT_VERSIONS, alignment_version=(3, ALIGNMENT_VERSION))
-    if (not isinstance(snapshot, dict) or snapshot.keys() != supported.keys() or
-            any(type(value) is not int or value not in supported[key] for key, value in snapshot.items())):
+    expected = current_execution_snapshot()
+    if (not isinstance(snapshot, dict) or snapshot != expected or
+            any(type(value) is not int for value in snapshot.values())):
         raise ToolError('任务执行版本已退役；请用 --reflow 从原始转写重建当前版本任务。', 'cache_version')
-    if manifest.get('mt_glossary_schedule') not in (GLOSSARY_SCHEDULE, LEGACY_GLOSSARY_SCHEDULE):
+    if manifest.get('mt_glossary_schedule') != GLOSSARY_SCHEDULE:
         raise ToolError('任务术语调度版本不受支持，请用 --reflow 从原始转写重建。', 'cache_version')
     return ExecutionPolicy(**saved_layout)

@@ -5,7 +5,7 @@ import unittest
 from subtitle_tool.common import ToolError
 from subtitle_tool.mt_backend import MTBackend, key_fingerprint
 from subtitle_tool.mt_quality import (make_stage_payload, parse_stage_response, plan_sentence_groups,
-                                      request_cache_key, stage_output_size, estimate_stage_output, correction_stalled,
+                                      request_cache_key, stage_output_size, estimate_stage_output,
                                       manual_terms, BatchValidationError)
 
 
@@ -27,31 +27,6 @@ class QualityContractTests(unittest.TestCase):
         self.free_caps = {'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096}
         self.paid_caps = dict(self.free_caps)
         self.scope = {'account': 'synthetic'}
-
-    def test_stalled_correction_requires_exact_issues_and_unchanged_affected_sentences(self):
-        import copy
-        previous = {'sentences': [], 'translate': {}, 'glossary': [],
-                    'fragments': [{'id': '0', 'sentence': '0', 'text': 'First part.'},
-                                  {'id': '1', 'sentence': '0', 'text': 'Second part.'},
-                                  {'id': '2', 'sentence': '1', 'text': 'Other sentence.'}],
-                    'translations': {'0': '首片', '1': '尾片', '2': '另一句'},
-                    'issues': [{'id': '0', 'category': 'number', 'evidence': '值有误'}]}
-        current = copy.deepcopy(previous)
-        current['translations']['2'] = '修改另一句'
-        self.assertTrue(correction_stalled(previous, current))
-        self.assertFalse(correction_stalled(None, current))
-        current['translations']['1'] = '同句的相邻片已修改'
-        self.assertFalse(correction_stalled(previous, current))
-        for name, value in [('id', '1'), ('category', 'meaning'), ('evidence', '新的具体证据')]:
-            current = copy.deepcopy(previous)
-            current['issues'][0][name] = value
-            self.assertFalse(correction_stalled(previous, current))
-        current = copy.deepcopy(previous)
-        current['issues'] = []
-        self.assertFalse(correction_stalled(previous, current))
-        current['issues'] = previous['issues'] * 2
-        self.assertTrue(correction_stalled(previous, current))
-
 
     def test_groups_respect_sentence_count_span_segment_language_and_human_decision(self):
         records = [source(i) for i in range(9)] + [source(9, language='fr'), source(10, origin='manual'),
@@ -109,6 +84,20 @@ class QualityContractTests(unittest.TestCase):
         expanded = {**data, 'translations': {'0': '更长的完整译文' * 100}}
         self.assertGreater(estimate_stage_output('judge', expanded), draft)
         self.assertEqual(estimate_stage_output('translate', {**data, 'context': [{'text': 'Other ' * 1000}]}), draft)
+
+    def test_language_output_budget_depends_on_ids_and_count_instead_of_source_length(self):
+        short = {'sentences': [{'id': '0', 'text': 'π/4.'}]}
+        long = {'sentences': [{'id': '0', 'text': '(1+2)*' * 500}],
+                'context': [{'text': 'Background. ' * 1000}]}
+        estimate = estimate_stage_output('language', short)
+        self.assertEqual(estimate_stage_output('language', long), estimate)
+        self.assertLess(estimate, 4096 * 3 // 4)
+        for targets in [[*short['sentences'], {'id': '1', 'text': '2'}],
+                        [{'id': '123456789', 'text': '2'}]]:
+            self.assertGreater(estimate_stage_output('language', {'sentences': targets}), estimate)
+            for decision in ['original', 'translate', 'uncertain']:
+                response = json.dumps({'decisions': {item['id']: decision for item in targets}}).encode()
+                self.assertGreaterEqual(estimate_stage_output('language', {'sentences': targets}), len(response))
 
     def test_json_object_review_supplies_the_fields_and_categories_it_validates(self):
         from subtitle_tool.mt_quality import ISSUE_CATEGORIES

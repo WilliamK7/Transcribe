@@ -333,7 +333,8 @@ class PipelineTests(PipelineFixture):
         cue = self.store.cues(self.job_id)[0]
         self.store.apply_review(self.job_id, cue["cue_id"], ReviewDecision("original"))
         self.assertEqual(self.run_fake(fake), "completed")
-        self.assertEqual(len(fake.named("/chat/completions")), 0)
+        self.assertEqual(len(fake.named("/chat/completions")), 1)
+        self.assertEqual(self.store.counts(self.job_id)['mt_v6_language_completed'], 1)
 
     def test_existing_srt_skips_before_any_cloud_request(self):
         self.source.with_suffix(".srt").write_bytes(b"existing")

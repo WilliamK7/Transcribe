@@ -80,7 +80,7 @@ class Progress:
             elif stage == "retry":
                 message = f"网络重试 {done}/{total}，有限退避"
             elif stage == 'mt_v6_progress':
-                names = {'glossary': '术语分析', 'waiting': '等待前序术语', 'translate': '字幕翻译',
+                names = {'language': '语种复核', 'glossary': '术语分析', 'waiting': '等待前序术语', 'translate': '字幕翻译',
                          'review': '译文复核', 'judge': '疑点裁决'}
                 parts = [f"{names[name]} {count} 组" for name, count in done['stages'].items() if name in names]
                 message = f"翻译进行中：{'、'.join(parts)}；当前阶段最长 {done['elapsed']} 秒"

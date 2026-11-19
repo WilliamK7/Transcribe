@@ -1,7 +1,6 @@
 """Content evidence boundaries, using fictional material and offline storage."""
 import copy
 import json
-import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -189,23 +188,3 @@ class ContentQualityPipelineTests(PoolPipelineFixture):
         self.assertFalse(final['warning'])
         self.assertEqual(final['backend'], 'magpie_judge_fallback')
         self.assertEqual(len(final['correction_stage_keys']), 1)
-
-    def test_legacy_prompt_resume_keeps_saved_requests_and_results(self):
-        self.install()
-        manifest = self.store.job(self.job_id)['manifest']
-        manifest['execution_snapshot']['prompt_version'] = 5
-        self.store.update(self.job_id, manifest=manifest)
-        self.cancel_after = 'translate'
-        self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
-        self.cancel_after = None
-        self.calls.clear()
-        Engine(self.config, self.store).resume(self.job_id)
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertEqual([stage for stage, _, _ in self.calls], ['review'])
-        self.assertNotIn('joined_translation', self.calls[0][2]['sentences'][0])
-        self.assertEqual(self.store.job(self.job_id)['manifest']['execution_snapshot']['prompt_version'], 5)
-        self.calls.clear()
-        Engine(self.config, self.store).reflow(self.job_id, output_dir=self.path / 'rebuilt')
-        self.assertEqual(self.run_pool(), 'completed')
-        self.assertEqual([stage for stage, _, _ in self.calls], ['glossary', 'translate', 'review'])
-        self.assertIn('fragment_ids', self.calls[-1][2]['sentences'][0])

@@ -11,6 +11,7 @@ from pathlib import Path
 ASR_MODEL = "qwen-audio-3.1-asr-flash-filetrans"
 LEGACY_ASR_MODEL = "qwen3-asr-flash-filetrans"
 NORMALIZER_VERSION = 4
+ASR_LANGUAGE_INFERENCE_VERSION = 2
 PROCESSING_VERSION = 2
 SUBTITLE_VERSION = 2
 DISPLAY_TIMING_VERSION = 3
@@ -27,7 +28,10 @@ def asr_contract(model=ASR_MODEL):
         parameters = {"channel_id": [0], "enable_words": True, "enable_itn": False}
     else:
         raise ToolError("任务的识别模型契约不受支持，请检查保存记录。", "cache_version")
-    return {"asr": model, "normalizer": NORMALIZER_VERSION, "parameters": parameters}
+    contract = {"asr": model, "normalizer": NORMALIZER_VERSION, "parameters": parameters}
+    if model == ASR_MODEL:
+        contract["language_inference"] = ASR_LANGUAGE_INFERENCE_VERSION
+    return contract
 
 
 def validate_workspace_id(value: str) -> str:

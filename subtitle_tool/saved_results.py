@@ -69,8 +69,9 @@ def read_json(path):
 
 
 def normalize_raw(cache, manifest, segment):
+    contract = saved_asr_contract(manifest)
     return normalize(read_json(raw_path(cache, segment)), segment_offset(manifest) + segment["offset_ms"], segment["id"],
-                     duration_ms=segment.get("duration_ms"), asr_model=saved_asr_contract(manifest)['asr'])
+                     duration_ms=segment.get("duration_ms"), asr_model=contract['asr'])
 
 
 def _validate_source(source, segments, manifest):
