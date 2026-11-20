@@ -49,6 +49,33 @@ def _stream_events(chunks):
     raise ValueError('Stream ended before DONE')
 
 
+def _stream_failure(body, error, model, usage, *, refused):
+    """Keep terminal evidence for classification, never an incomplete answer."""
+    result = {'error': error}
+    identity = body.get('model', model)
+    if isinstance(identity, str) and identity and (model is None or identity == model):
+        result['model'] = identity
+    accounting = body.get('usage') or usage
+    if accounting is not None:
+        result['usage'] = accounting
+    terminal = {'message': {'content': ''}}
+    choices = body.get('choices')
+    if (isinstance(choices, list) and len(choices) == 1 and isinstance(choices[0], dict) and
+            type(choices[0].get('index')) is int and choices[0]['index'] == 0):
+        choice = choices[0]
+        if choice.get('finish_reason') == 'length':
+            terminal['finish_reason'] = 'length'
+            if choice.get('error') is not None:
+                terminal['error'] = choice['error']
+        if isinstance(choice.get('delta'), dict) and choice['delta'].get('refusal'):
+            refused = True
+    if refused:
+        terminal['message']['refusal'] = True
+    if refused or 'finish_reason' in terminal:
+        result['choices'] = [terminal]
+    return result
+
+
 def gather_chat_stream(chunks):
     """Return a whole Chat response only after a terminal choice and DONE.
 
@@ -71,7 +98,7 @@ def gather_chat_stream(chunks):
         if not isinstance(body, dict):
             raise ValueError('Invalid stream object')
         if body.get('error') is not None:
-            return {'error': body['error']}
+            return _stream_failure(body, body['error'], model, usage, refused=any(refusal))
         if 'model' in body:
             identity = body['model']
             if not isinstance(identity, str) or not identity or model is not None and model != identity:
@@ -88,7 +115,7 @@ def gather_chat_stream(chunks):
         if not isinstance(choice, dict) or type(choice.get('index')) is not int or choice['index'] != 0:
             raise ValueError('Invalid stream choice')
         if choice.get('error') is not None:
-            return {'error': choice['error']}
+            return _stream_failure(body, choice['error'], model, usage, refused=any(refusal))
         delta = choice.get('delta')
         if not isinstance(delta, dict) or delta.get('role', 'assistant') != 'assistant':
             raise ValueError('Invalid stream delta')

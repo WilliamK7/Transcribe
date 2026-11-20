@@ -79,6 +79,11 @@ class CliTests(TemporaryTest):
         self.config_patch.stop()
         super().tearDown()
 
+    def test_quality_failure_option_requires_explicit_resume(self):
+        with self.assertRaises(ToolError) as caught:
+            main(['--jobs', '--quality-failure', 'warn'])
+        self.assertEqual(caught.exception.code, 'input')
+
 
     def test_pool_progress_describes_active_stages(self):
         progress = Progress()

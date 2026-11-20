@@ -48,12 +48,32 @@ class GatewayContractTests(PoolPipelineFixture):
         pipeline = self.pipeline()
         entry = pipeline.router_for('translate').entries[0]
         for stage in ('glossary', 'translate', 'review', 'judge'):
-            for repair in ((False, True) if stage == 'translate' else (False,)):
+            for repair in ((False, True) if stage in {'translate', 'judge'} else (False,)):
                 with self.subTest(stage=stage, repair=repair):
                     payload = pipeline._request_payload(stage, self.data(stage), entry, repair=repair)
-                    self.assertEqual(payload.get('reasoning_effort'), 'low' if stage == 'judge' else 'none')
+                    self.assertEqual(payload.get('reasoning_effort'),
+                                     ('medium' if repair else 'low') if stage == 'judge' else 'none')
                     self.assertEqual(payload['max_tokens'], 4096)
                     self.assertEqual(payload['model'], entry.backend.model)
+
+    def test_explicit_generation_budget_is_used_and_changes_stage_identity(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        data = self.data('review')
+        before = pipeline._task_stage_key('review', data)
+        self.config.settings.mt_quality = {'output_tokens': 16384}
+        Engine(self.config, self.store).reflow(self.job_id)
+        manifest = self.store.job(self.job_id)['manifest']
+        engine = Engine(self.config, self.store)
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        changed = Pipeline(engine, self.job_id, manifest, scope)
+        self.addCleanup(changed.close)
+        for stage in ('glossary', 'language', 'translate', 'review', 'judge'):
+            entry = changed.router_for(stage).entries[0]
+            payload = changed._request_payload(stage, self.data(stage), entry)
+            self.assertEqual(payload['max_tokens'], 16384)
+        self.assertNotEqual(changed._task_stage_key('review', data), before)
+        self.assertEqual(pipeline._request_payload('review', data, pipeline.router_for('review').entries[0])['max_tokens'], 4096)
 
     def test_every_stage_requests_streamed_delivery_and_final_usage(self):
         pipeline = self.pipeline()
@@ -64,6 +84,188 @@ class GatewayContractTests(PoolPipelineFixture):
                 payload = pipeline._request_payload(stage, self.data(stage), entry)
                 self.assertIs(payload['stream'], True)
                 self.assertEqual(payload.get('stream_options'), {'include_usage': True})
+
+    def test_review_length_error_uses_paid_fallback_and_preserves_usage(self):
+        from subtitle_tool._mt_http_worker import gather_chat_stream
+        from tests.test_mt_stream import event, part
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        terminal = {**part('', finish='length'),
+                    'error': {'metadata': {'error_type': 'max_tokens_exceeded'}},
+                    'usage': {'prompt_tokens': 30, 'completion_tokens': 4096,
+                              'completion_tokens_details': {'reasoning_tokens': 4096}}}
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            if kwargs['json']['model'].endswith('-paid'):
+                return reply({'issues': [], 'checks': {'0': 'ok'}})
+            body = gather_chat_stream([event(terminal), event('[DONE]')])
+            return HTTPReply(200, json.dumps(body).encode())
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send) as request:
+            value, _, _ = self.stage(pipeline, 'review')
+        self.assertEqual(value, {'issues': [], 'checks': {'0': 'ok'}})
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(self.store.counts(self.job_id)['mt_output_truncated'], 1)
+        self.assertEqual(self.store.counts(self.job_id)['mt_response_reasoning_tokens'], 4096)
+        self.assertEqual(sum(s['stage'] == 'review' for s in self.store.mt_stages(self.job_id)), 1)
+
+    def test_stream_refusal_before_length_error_never_uses_paid_fallback(self):
+        from subtitle_tool._mt_http_worker import gather_chat_stream
+        from tests.test_mt_stream import event, part
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        terminal = {**part('', finish='length'),
+                    'error': {'metadata': {'error_type': 'max_tokens_exceeded'}}}
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            if kwargs['json']['model'].endswith('-paid'):
+                return reply({'issues': [], 'checks': {'0': 'ok'}})
+            body = gather_chat_stream([event(part(refusal='private refusal')), event(terminal)])
+            return HTTPReply(200, json.dumps(body).encode())
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send) as request:
+            with self.assertRaises(RouteExhausted) as caught:
+                self.stage(pipeline, 'review')
+        self.assertEqual(caught.exception.category, 'content_policy_violation')
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(self.store.mt_stages(self.job_id), [])
+        self.assertNotIn('private refusal', pipeline.diagnostics.path.read_text(encoding='utf-8'))
+
+    def test_judge_repairs_scope_violation_and_preserves_unreviewed_text_locally(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        data = self.data('judge')
+        data['sentences'].append({'id': '1', 'text': 'A different sentence.'})
+        data['fragments'].append({'id': '1', 'sentence': '1', 'text': 'A different sentence.'})
+        data['translations']['1'] = '其他句子的原译文。'
+        data['issues'] = [{'id': '0', 'category': 'meaning', 'evidence': '合成疑点'}]
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs['json'])
+            return reply({'issues': data['issues'], 'translations': {
+                '0': '修正后的译文。', **({'1': '越界的改写。'} if len(calls) == 1 else {})}})
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            value, origin, _ = pipeline.stage('judge', data, ids=['0', '1'],
+                originals=[f['text'] for f in data['fragments']])
+        self.assertEqual(origin, 'magpie_judge')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]['model'], calls[1]['model'])
+        self.assertEqual(calls[0]['messages'][1], calls[1]['messages'][1])
+        schema = json.loads(calls[1]['messages'][0]['content'].split('输出必须符合此 JSON Schema：')[1])
+        self.assertEqual(set(schema['properties']['translations']['properties']), {'0'})
+        self.assertEqual(schema['properties']['translations']['required'], ['0'])
+        self.assertEqual(schema['properties']['issues']['items']['properties']['id']['enum'], ['0'])
+        self.assertEqual(value['translations']['1'], data['translations']['1'])
+
+    def test_judge_repairs_missing_screen_from_original_input(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        data = self.data('judge')
+        data['sentences'] = [{'id': str(i), 'text': f'Synthetic sentence {i}.'} for i in range(12)]
+        data['fragments'] = [{'id': str(i), 'sentence': str(i), 'text': s['text']}
+                             for i, s in enumerate(data['sentences'])]
+        data['translations'] = {str(i): f'合成译文{i}。' for i in range(12)}
+        data['issues'] = [{'id': '6', 'category': 'meaning', 'evidence': '合成疑点'}]
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs['json'])
+            translations = {**data['translations'], '6': '修正后的译文。'}
+            if len(calls) == 1:
+                translations.pop('10')
+            else:
+                translations = {'6': translations['6']}
+            return reply({'issues': data['issues'], 'translations': translations})
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            value, origin, _ = pipeline.stage('judge', data, ids=list(data['translations']),
+                originals=[f['text'] for f in data['fragments']], fixed_semantics=True)
+        self.assertEqual(origin, 'magpie_judge')
+        self.assertEqual([p['model'] for p in calls], ['group/transcribe-judge'] * 2)
+        self.assertEqual(calls[0]['messages'][1], calls[1]['messages'][1])
+        self.assertEqual(value['translations']['10'], data['translations']['10'])
+        self.assertEqual(self.store.counts(self.job_id)['mt_format_repair_success'], 1)
+
+    def test_judge_repair_rejects_missing_editable_screens_and_unreviewed_edits(self):
+        from subtitle_tool.mt_quality import parse_stage_response, BatchValidationError
+        data = self.data('judge')
+        data['sentences'].append({'id': '1', 'text': 'Unreviewed sentence.'})
+        data['fragments'].append({'id': '1', 'sentence': '1', 'text': 'Unreviewed sentence.'})
+        data['translations']['1'] = '未经修改的原译文。'
+        data['issues'] = [{'id': '0', 'category': 'meaning', 'evidence': '合成疑点'}]
+        for translations, category in [({}, 'id_missing'),
+                ({'0': '修正后的译文。', '1': '不允许的修改。'}, 'id_out_of_range')]:
+            body = json.loads(reply({'issues': data['issues'], 'translations': translations}).body)
+            with self.subTest(category=category), self.assertRaises(BatchValidationError) as caught:
+                parse_stage_response('judge', body, ids=['0', '1'],
+                    originals=[f['text'] for f in data['fragments']], fidelity=True, repair_data=data)
+            self.assertEqual(caught.exception.category, category)
+
+    def test_source_uncertainty_repair_has_no_edit_permission(self):
+        from subtitle_tool.mt_quality import parse_stage_response, validate_judgment
+        data = self.data('judge')
+        data['issues'] = [{'id': '0', 'category': 'source_uncertain', 'evidence': '原转写疑点'}]
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        payload = pipeline._request_payload('judge', data, pipeline.router_for('judge').entries[0], repair=True)
+        schema = json.loads(payload['messages'][0]['content'].split('输出必须符合此 JSON Schema：')[1])
+        self.assertEqual(schema['properties']['translations']['properties'], {})
+        body = json.loads(reply({'issues': data['issues'], 'translations': {}}).body)
+        value = parse_stage_response('judge', body, ids=['0'], originals=[data['sentences'][0]['text']],
+                                     fidelity=True, repair_data=data)
+        self.assertEqual(value['translations'], data['translations'])
+        validate_judgment(value, data, fidelity=True)
+
+    def test_judge_repair_fits_the_initial_budget_and_preserves_evidence(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        data = self.data('judge')
+        data['issues'] = [{'id': '0', 'category': 'meaning', 'evidence': '合成疑点'}]
+        entry = pipeline.router_for('judge').entries[0]
+        capabilities = pipeline.profiles[entry.id]['capabilities']
+        initial = pipeline._request_payload('judge', data, entry)
+        capabilities['input_bytes'] = len(json.dumps(initial, ensure_ascii=False).encode('utf-8'))
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs['json'])
+            return reply({'issues': [], 'translations': {} if len(calls) == 1 else data['translations']})
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            value, origin, _ = pipeline.stage('judge', data, ids=['0'],
+                originals=[data['sentences'][0]['text']], fixed_semantics=True)
+        self.assertEqual(origin, 'magpie_judge')
+        self.assertEqual([p['model'] for p in calls], ['group/transcribe-judge'] * 2)
+        self.assertTrue(all(p['messages'][1] == initial['messages'][1] for p in calls))
+        self.assertEqual(value['translations'], data['translations'])
+
+    def test_judge_repairs_completed_schema_errors_but_never_saves_invalid_fields(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        data = self.data('judge')
+        data['issues'] = [{'id': '0', 'category': 'meaning', 'evidence': '合成疑点'}]
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs['json'])
+            issues = [{**data['issues'][0], **({'correction': '不符合契约的字段'} if len(calls) == 1 else {})}]
+            return reply({'issues': issues, 'translations': {'0': '修正后的译文。'}})
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            value, origin, _ = self.stage(pipeline, 'judge', data)
+        self.assertEqual(origin, 'magpie_judge')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]['messages'][1], calls[1]['messages'][1])
+        self.assertEqual(set(value['issues'][0]), {'id', 'category', 'evidence'})
+        self.assertNotIn('correction', str(self.store.mt_stages(self.job_id)))
+
+    def test_unrepairable_judge_schema_is_bounded_and_not_persisted(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            return reply({'translations': {}})
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send) as request, \
+                self.assertRaises(RouteExhausted):
+            self.stage(pipeline, 'judge')
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(self.store.mt_stages(self.job_id), [])
 
     def test_old_task_keeps_whole_response_payload_and_saved_stage_identity(self):
         pipeline = self.pipeline()
@@ -143,6 +345,22 @@ class GatewayContractTests(PoolPipelineFixture):
         self.assertEqual(self.store.counts(self.job_id)['mt_paid_fallback_request'], 1)
         self.assertEqual(self.store.counts(self.job_id)['mt_paid_fallback_success'], 1)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM mt_cache').fetchone()[0], 1)
+
+    def test_explicit_generation_failure_uses_fallback_without_accepting_partial_text(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        calls = []
+        def send(*args, **kwargs):
+            kwargs['on_dispatch']()
+            calls.append(kwargs['json'])
+            return (reply({'translations': {'0': '不完整的错误输出。'}}, finish='error') if len(calls) == 1 else
+                    reply({'translations': {'0': '完整后备译文。'}}))
+        with mock.patch.object(pipeline.transport, 'request', side_effect=send):
+            value, origin, _ = self.stage(pipeline)
+        self.assertEqual(origin, 'magpie_fallback')
+        self.assertEqual(value['translations']['0'], '完整后备译文。')
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(any('不完整' in str(s) for s in self.store.mt_stages(self.job_id)))
 
     def test_exhausted_format_repair_moves_to_paid_fallback_once(self):
         pipeline = self.pipeline()
@@ -497,7 +715,7 @@ class GatewayContractTests(PoolPipelineFixture):
                      ('translate', HTTPReply(200, b'{"choices":[{"message":{"refusal":"blocked"}}]}')),
                      ('translate', HTTPReply(200, b'{"choices":[{"finish_reason":"stop",'
                                               b'"message":{"content":"{}","refusal":"blocked"}}]}')),
-                     ('review', reply({'issues': 'invalid'})), ('judge', reply({'translations': {}}))]
+                     ('review', reply({'issues': 'invalid'}))]
         for stage, answer in scenarios:
             with self.subTest(stage=stage, answer=type(answer).__name__):
                 pipeline = self.pipeline()

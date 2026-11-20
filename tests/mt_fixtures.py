@@ -15,6 +15,9 @@ class PoolPipelineFixture(SavedResultFixture):
         self.review_failure = False
         self.review_issue = False
         self.dismiss_review = False
+        self.review_issues = lambda data: ([{'id': '0', 'category': 'number', 'evidence': '数字有疑点'}]
+                                           if self.review_issue else [])
+        self.judged_issues = lambda data: [] if self.dismiss_review else data['issues']
         self.no_change_correction = False
         self.fail_stage = None
         self.cancel_after = None
@@ -62,13 +65,17 @@ class PoolPipelineFixture(SavedResultFixture):
                     if parent.corrected_translations is not None:
                         value = {'translations': parent.corrected_translations(data)}
                 else:
-                    value = {'issues': ([{'id': '0', 'category': 'number', 'evidence': '数字有疑点'}]
-                                        if parent.review_issue else [])}
+                    value = {'issues': parent.review_issues(data)}
                 if stage == 'judge':
-                    value['issues'] = [] if parent.dismiss_review else data['issues']
+                    value['issues'] = parent.judged_issues(data)
+                    if data.get('repair_reason') == 'no_progress':
+                        schema = json.loads(payload['messages'][0]['content'].split('输出必须符合此 JSON Schema：')[1])
+                        selected = schema['properties']['translations']['required']
+                        value['translations'] = {key: value['translations'][key] for key in selected}
                 if stage == 'review' and '"checks"' in payload['messages'][0]['content']:
-                    flagged = {i['id'] for i in value['issues']}
-                    value['checks'] = {f['id']: 'issue' if f['id'] in flagged else 'ok' for f in data['fragments']}
+                    flagged = {i['id']: 'uncertain' if i['category'] == 'source_uncertain' else 'issue'
+                               for i in value['issues']}
+                    value['checks'] = {f['id']: flagged.get(f['id'], 'ok') for f in data['fragments']}
                 content = json.dumps(value, ensure_ascii=False)
                 response = {'model': parent.actual_model(stage, payload['model']), 'usage': {'prompt_tokens': 10, 'completion_tokens': 4},
                             'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}

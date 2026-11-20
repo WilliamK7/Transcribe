@@ -61,17 +61,29 @@ class ReportProtectionTests(TemporaryTest):
         cache = self.config.data / "cache" / self.job_id / "raw-0000.json"
         snapshot = self.path / ".build" / "reflow" / self.job_id / "snapshot.json"
         retime_snapshot = self.path / ".build" / "retime" / self.job_id / "snapshot.json"
-        for path in [output, backup, cache, snapshot, retime_snapshot]:
+        policy_snapshot = self.path / ".build" / "quality-policy" / self.job_id / "snapshot.json"
+        for path in [output, backup, cache, snapshot, retime_snapshot, policy_snapshot]:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"private saved bytes")
         manifest = self.store.job(self.job_id)["manifest"]
         manifest["backup"] = str(backup)
         self.store.update(self.job_id, manifest=manifest)
-        for path in [output, backup, cache, snapshot, retime_snapshot, self.config.data / "magpie-key.txt",
+        for path in [output, backup, cache, snapshot, retime_snapshot, policy_snapshot, self.config.data / "magpie-key.txt",
                      self.config.data / "jobs.sqlite", self.config.data / "future.json",
-                     self.path / ".build" / "reflow" / "future.json", self.path / ".build" / "retime" / "future.json"]:
+                     self.path / ".build" / "reflow" / "future.json", self.path / ".build" / "retime" / "future.json",
+                     self.path / ".build" / "quality-policy" / "future.json"]:
             with self.subTest(path=path.name):
                 self.assert_conflict(["--jobs"], path)
+
+    def test_quality_policy_snapshot_hardlink_is_protected(self):
+        snapshot = self.path / '.build' / 'quality-policy' / self.job_id / 'snapshot.json'
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_bytes(b'private recovery snapshot')
+        alias = self.path / 'report.json'
+        os.link(snapshot, alias)
+        self.assert_conflict(['--jobs'], alias)
+        self.assertEqual(snapshot.read_bytes(), b'private recovery snapshot')
+        self.assertTrue(alias.samefile(snapshot))
 
     def test_new_inputs_and_expected_outputs_are_protected_before_enqueue(self):
         source = self.path / "new.mkv"

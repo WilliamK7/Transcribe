@@ -38,6 +38,7 @@ class RouteFailure(ToolError):
 
 class RouteExhausted(ToolError):
     def __init__(self, *, deadline=False, category='', request_id=''):
+        self.category = category if category in FAILURE_CATEGORIES else ('deadline' if deadline else '')
         if category == 'output_truncated':
             message, code = ('翻译响应达到输出上限而被截断，进度已保存；可用 --resume 重试。',
                              'mt_output_truncated')

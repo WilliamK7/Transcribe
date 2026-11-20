@@ -56,12 +56,32 @@ class Engine:
                 self.store.update(job["id"], target, event='recover')
 
     def resume(self, job_id, *, track=None, channel=None, output_dir=None, overwrite=False,
-               task_id=None, allow_resubmit=False):
+               task_id=None, allow_resubmit=False, quality_failure=None):
         """Prepare an explicitly requested resume; run() remains the sole executor."""
         manifest = self.store.job(job_id)['manifest']
         load_policy(manifest)
         from .mt_pool import saved_route
         saved_route(manifest)
+        if quality_failure is not None:
+            if quality_failure not in {'block', 'warn'}:
+                raise ToolError('字幕质量失败策略无效。', 'input')
+            job = self.store.job(job_id)
+            if job['state'] in {'completed', 'skipped', 'archived'} or manifest.get('layout_complete'):
+                raise ToolError('已完成字幕的质量策略需用 --reflow 重新生成。', 'input_committed')
+            quality = manifest['mt_route_snapshot']['quality']
+            if quality.get('on_failure', 'block') != quality_failure:
+                from .mt_pipeline import validate_provenance
+                validate_provenance(self, job_id, manifest)
+                snapshot = self.config.root / '.build' / 'quality-policy' / job_id / (str(time.time_ns()) + '.json')
+                self.store.snapshot(job_id, snapshot)
+                candidate = copy.deepcopy(manifest)
+                candidate['mt_route_snapshot']['quality']['on_failure'] = quality_failure
+                validate_provenance(self, job_id, candidate)
+                candidate.setdefault('quality_policy_changes', []).append({
+                    'from': quality.get('on_failure', 'block'), 'to': quality_failure,
+                    'snapshot': str(snapshot.relative_to(self.config.root)), 'changed_at': time.time()})
+                self.store.update(job_id, manifest=candidate)
+                manifest = candidate
         self.select_input(job_id, track, channel)
         job = self.store.job(job_id)
         if job["state"] in {"completed", "skipped"}:

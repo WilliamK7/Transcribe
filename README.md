@@ -56,7 +56,19 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 
 普通渠道维护默认每 15 分钟刷新，单轮最多验收 1 个候选，UTC 当天最多 2 个。`--once` 共用预算。百炼试用从已绑定的查询账户获取额度，`bailian-trial-state.json` 的 `paused` 和 `excluded` 控制暂停与排除。`configure-mt.py --refresh-trial` 可立即刷新库存。
 
-字幕逐屏复核含义、术语和公式关系，代码、符号和名称可按原样保留。复核失败或疑点未解决时返回 `mt_quality_unresolved` 并保存草稿。服务恢复后用 `--resume` 续查；原转写或语义疑点需要核对音视频，调整人工术语或 `mt_policy_version` 后用 `--reflow` 重建。完整传输、校验及历史兼容规则见[接口与恢复契约](docs/API_CONTRACT.md)。
+字幕生成后逐屏复核含义、术语和公式关系，并自动修订。日常使用可在 `data/settings.json` 加入以下配置，让剩余疑点随时间段告警一起发布：
+
+```json
+{
+  "mt_quality": {
+    "output_tokens": 16384,
+    "source_uncertain": "warn",
+    "on_failure": "warn"
+  }
+}
+```
+
+草稿和完成阶段随任务保存，告警可在 `--jobs` 或 `--report` 查看。失败后的恢复方法见[质量与恢复](docs/API_CONTRACT.md#字幕翻译与质量)。
 
 ## 项目配置
 
@@ -66,11 +78,16 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 | `mt_model` / `mt_fallback_model` | 正文主组与商业后备。另两个角色使用 `mt_review_*` 和 `mt_judge_*` |
 | `mt_policy_version` | 更换策略并希望重译时递增，然后执行 `--reflow` |
 | `mt_quality.manual_glossary` | 优先使用的人工术语映射，最多 200 项 |
+| `mt_quality.output_tokens` | 每次响应的生成预算，含推理，默认 4096，范围 4096～32768 |
+| `mt_quality.source_uncertain` | 原转写疑点经独立裁决后的处理：`block`（默认）或 `warn` |
+| `mt_quality.on_failure` | 复核、裁决或修订未通过时的处理：`block`（默认）或保留完整译文并告警发布的 `warn` |
 | `mt_workers` | 同时在途的翻译阶段数，默认 16。供应商的并发和每分钟请求数另行生效 |
 | `zh_line_width` / `other_line_width` | 默认 44 / 84，范围 12～72 / 24～160 |
 | `chinese_first` | 设为 `true` 时把译文排在原文上方 |
 
 识别凭据优先使用 `DASHSCOPE_API_KEY`，也可通过 `--configure-key` 保存到 `data/key.txt`。翻译使用 `MAGPIE_API_KEY` 或 `data/magpie-key.txt`，本机默认 `magpie-transcribe`。翻译地址和六个组名支持对应的大写环境变量覆盖。
+
+生成预算和质量策略在新任务或 `--reflow` 时保存，`--resume` 沿用任务快照。
 
 ## 任务管理
 
@@ -79,6 +96,7 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 | `--jobs` | 查看保存的任务和下一步可用命令 |
 | `--review ID` | 确认音轨、声道或语种后继续 |
 | `--resume ID` | 沿原任务的排版、账户与翻译契约继续。已有转写就读本地，已有云端任务 ID 就查询原任务 |
+| `--resume ID --quality-failure warn` | 备份未完成任务的策略，复用已有草稿和阶段，允许附告警发布 |
 | `--reflow ID` | 从完整原始转写按当前配置重建，保留能对应到原句的人工决定，必要时重新翻译 |
 | `--retime ID` | 校验已保存的完整字幕和译文，按当前规则更新显示时间（含短句停留），全程在本机执行 |
 | `--cancel ID` | 停止本地任务。已提交的云端请求仍可能计费 |

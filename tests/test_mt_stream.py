@@ -79,6 +79,43 @@ class StreamWorkerTests(unittest.TestCase):
         self.assertEqual(service_failure(200, response), 'timeout')
         self.assertNotIn('choices', response)
 
+    def test_length_error_keeps_terminal_metadata_without_accepting_partial_content(self):
+        from subtitle_tool.mt_runtime import service_failure
+        usage = {'prompt_tokens': 30, 'completion_tokens': 4096,
+                 'completion_tokens_details': {'reasoning_tokens': 4096}}
+        terminal = {**part('', finish='length'), 'usage': usage,
+                    'error': {'metadata': {'error_type': 'max_tokens_exceeded'}}}
+        for placement in ('top', 'choice'):
+            frame = json.loads(json.dumps(terminal))
+            if placement == 'choice':
+                frame['choices'][0]['error'] = frame.pop('error')
+            with self.subTest(placement=placement):
+                response = self.gather([event(part('private partial output', refusal='')),
+                                       event(frame), event('[DONE]')])
+                self.assertEqual(service_failure(200, response), 'output_truncated')
+                self.assertEqual(response['model'], 'synthetic/reviewer')
+                self.assertEqual(response['usage'], usage)
+                self.assertNotIn('private partial output', json.dumps(response))
+                with self.assertRaises(BatchValidationError):
+                    parse_stage_response('review', response, ids=['0'])
+
+    def test_earlier_refusal_survives_terminal_errors_without_private_text(self):
+        from subtitle_tool.mt_runtime import service_failure
+        error = {'metadata': {'error_type': 'max_tokens_exceeded'}}
+        frames = [{'error': error}]
+        for finish in ('length', 'error'):
+            frames.append({**part('', finish=finish), 'error': error})
+            frame = part('', finish=finish)
+            frame['choices'][0]['error'] = error
+            frames.append(frame)
+        for frame in frames:
+            with self.subTest(frame=frame):
+                response = self.gather([event(part('private partial output', refusal='private refusal')),
+                                       event(frame), event('[DONE]')])
+                self.assertEqual(service_failure(200, response), 'content_policy_violation')
+                self.assertIs(response['choices'][0]['message']['refusal'], True)
+                self.assertNotIn('private', json.dumps(response))
+
     def test_multiline_data_and_absent_usage_remain_valid_without_inventing_counts(self):
         wire = b'event: message\ndata: {"model":"synthetic/reviewer",\ndata: "choices":['
         wire += b'{"index":0,"delta":{"content":"{\\"issues\\":[]}"},"finish_reason":"stop"}]}\n\n'
@@ -129,6 +166,18 @@ class StreamProcessTests(unittest.TestCase):
         with self.assertRaises(TransportError) as caught:
             self.send()
         self.assertEqual(caught.exception.category, 'transport')
+        self.assertEqual(self.children.active_count, 0)
+
+    def test_real_worker_keeps_length_error_evidence_for_fallback(self):
+        from subtitle_tool.mt_runtime import service_failure
+        terminal = {**part('', finish='length'),
+                    'error': {'metadata': {'error_type': 'max_tokens_exceeded'}},
+                    'usage': {'prompt_tokens': 30, 'completion_tokens': 4096}}
+        self.server.body = b''.join([event(part('private partial output')), event(terminal), event('[DONE]')])
+        body = json.loads(self.send().body)
+        self.assertEqual(service_failure(200, body), 'output_truncated')
+        self.assertEqual(body['usage'], terminal['usage'])
+        self.assertNotIn('private partial output', json.dumps(body))
         self.assertEqual(self.children.active_count, 0)
 
     def test_size_cap_counts_discarded_reasoning_and_keepalives(self):

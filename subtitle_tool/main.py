@@ -38,6 +38,8 @@ def parser():
     result.add_argument("--workspace-id", help="本次新任务使用的北京 Workspace ID（域名标签）")
     result.add_argument("--bind-task-id", help="给提交未知的任务绑定已知云端 ID，需 --resume")
     result.add_argument("--allow-resubmit", action="store_true", help="明确接受未知提交可能重复计费的重发，需 --resume")
+    result.add_argument('--quality-failure', choices=['block', 'warn'],
+                        help='显式变更未完成任务的质量失败策略并保留快照，需 --resume')
     result.add_argument("--overwrite", action="store_true", help="先备份再覆盖现有字幕")
     result.add_argument("--track", type=int, help="ffprobe 返回的音轨索引")
     result.add_argument("--channel", choices=["mix", "left", "right"], help="明确混音／首声道／第二声道")
@@ -249,6 +251,8 @@ def main(argv=None):
         raise ToolError("处理文件与管理／恢复命令不能同时使用。", "input")
     if (args.bind_task_id or args.allow_resubmit) and not args.resume:
         raise ToolError("绑定或确认重发必须指定 --resume JOB_ID。", "input")
+    if args.quality_failure and not args.resume:
+        raise ToolError('变更质量失败策略必须指定 --resume JOB_ID。', 'input')
     if args.bind_task_id and args.allow_resubmit:
         raise ToolError("绑定已知 ID 与重新提交只能选择一种。", "input")
     if args.track is not None and args.track < 0:
@@ -359,7 +363,8 @@ def main(argv=None):
                 engine.retime(current_job, overwrite=args.overwrite, output_dir=args.output_dir)
             elif args.resume:
                 engine.resume(current_job, track=args.track, channel=args.channel, output_dir=args.output_dir,
-                              overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit)
+                              overwrite=args.overwrite, task_id=args.bind_task_id, allow_resubmit=args.allow_resubmit,
+                              quality_failure=args.quality_failure)
             else:
                 engine.select_input(current_job, args.track, args.channel)
                 if args.overwrite or args.output_dir:

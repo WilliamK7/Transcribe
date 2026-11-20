@@ -23,12 +23,15 @@ FAILURE_CATEGORIES = frozenset(TRANSIENT_TYPES | PERMANENT_TYPES | {
 
 def service_failure(status, body) -> str | None:
     errors = []
+    length_ended = False
     top_error = choice_error = finish_error = malformed_type = False
     if isinstance(body, dict):
         if 'error' in body:
             top_error = True
             errors.append(body['error'])
         choices = body.get('choices')
+        length_ended = (isinstance(choices, list) and len(choices) == 1 and
+                        isinstance(choices[0], dict) and choices[0].get('finish_reason') == 'length')
         if isinstance(choices, list):
             for choice in choices:
                 if not isinstance(choice, dict):
@@ -51,6 +54,12 @@ def service_failure(status, body) -> str | None:
     if finish_error and not top_error:
         # A top-level error explains its finish markers, but never an explicit choice.error.
         kinds.append(None)
+    # A successful HTTP stream may end with both an error and a length marker.
+    # Preserve explicit output exhaustion without treating input, account or
+    # policy errors as permission to try another model.
+    if (status == 200 and length_ended and kinds and not malformed_type and
+            all(kind is None or kind in {'max_tokens_exceeded', 'token_limit_exceeded'} for kind in kinds)):
+        return 'output_truncated'
     for kind in kinds:
         if kind in PERMANENT_TYPES:
             return kind

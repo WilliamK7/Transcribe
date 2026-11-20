@@ -90,7 +90,7 @@ class ReportWriter:
             protect(path)
 
         for root in [self.config.data, self.config.root / ".build" / "reflow", self.config.root / ".build" / "retime",
-                     self.config.root / '.build' / 'mt-fallback']:
+                     self.config.root / '.build' / 'mt-fallback', self.config.root / '.build' / 'quality-policy']:
             protect(root, directory=True)
             if target_stat is None or not root.exists():
                 continue

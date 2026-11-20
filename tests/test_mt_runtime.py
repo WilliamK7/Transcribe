@@ -287,6 +287,20 @@ class ProcessTransportTests(TemporaryTest):
 
 
 class ServiceFailureTests(TemporaryTest):
+    def test_explicit_length_error_is_truncation_but_other_failures_keep_their_cause(self):
+        for kind in (None, 'max_tokens_exceeded', 'token_limit_exceeded'):
+            error = {'message': 'private error'} if kind is None else {'metadata': {'error_type': kind}}
+            body = {'error': error, 'choices': [{'finish_reason': 'length'}]}
+            with self.subTest(kind=kind):
+                self.assertEqual(service_failure(200, body), 'output_truncated')
+                self.assertNotEqual(service_failure(400, body), 'output_truncated')
+        for kind in ('authentication', 'payment_required', 'context_length_exceeded',
+                     'content_policy_violation', 'server', 'unmapped'):
+            body = {'error': {'metadata': {'error_type': kind}},
+                    'choices': [{'finish_reason': 'length'}]}
+            with self.subTest(kind=kind):
+                self.assertNotEqual(service_failure(200, body), 'output_truncated')
+
     def test_gateway_errors_are_classified_without_exposing_messages_or_raw_codes(self):
         for kind in ['timeout', 'provider_unavailable', 'not_found', 'authentication', 'permission_denied']:
             with self.subTest(kind=kind):

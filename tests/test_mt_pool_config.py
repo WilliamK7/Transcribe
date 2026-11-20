@@ -21,6 +21,36 @@ class GatewaySnapshotValidationTests(TemporaryTest):
     def manifest_with(self, route):
         return {**self.manifest, 'translation_strategy_version': 6, 'mt_route_snapshot': copy.deepcopy(route)}
 
+    def test_generation_budget_and_uncertainty_choice_are_frozen_for_resume(self):
+        previous = configured_route(self.config, self.manifest)
+        self.config.settings.mt_quality = {'output_tokens': 16384, 'source_uncertain': 'warn'}
+        route = configured_route(self.config, self.manifest)
+        self.assertEqual(route['quality']['output_tokens'], 16384)
+        self.assertEqual(route['quality']['source_uncertain'], 'warn')
+        self.assertEqual({p['capabilities']['output_tokens'] for p in route['entries']}, {16384})
+        self.config.settings.mt_quality = None
+        self.assertEqual(saved_route(self.manifest_with(route)), route)
+        self.assertEqual(saved_route(self.manifest_with(previous)), previous)
+        self.assertNotIn('source_uncertain', previous['quality'])
+
+    def test_invalid_generation_budget_and_uncertainty_choices_are_rejected(self):
+        for setting in ({'output_tokens': 4096.0}, {'output_tokens': True}, {'output_tokens': 2048},
+                        {'output_tokens': 32769}, {'source_uncertain': True}, {'source_uncertain': 'ignore'}):
+            with self.subTest(setting=setting), self.assertRaises(ToolError):
+                self.config.settings.mt_quality = setting
+                configured_route(self.config, self.manifest)
+
+    def test_warning_publication_policy_is_explicit_and_saved(self):
+        self.config.settings.mt_quality = {'on_failure': 'warn', 'source_uncertain': 'warn'}
+        route = configured_route(self.config, self.manifest)
+        self.config.settings.mt_quality = None
+        self.assertEqual(saved_route(self.manifest_with(route))['quality']['on_failure'], 'warn')
+        self.assertNotIn('on_failure', configured_route(self.config, self.manifest)['quality'])
+        for value in (True, 'ignore', None):
+            with self.subTest(value=value), self.assertRaises(ToolError):
+                self.config.settings.mt_quality = {'on_failure': value}
+                configured_route(self.config, self.manifest)
+
     def test_enqueue_and_report_preserve_the_saved_route_on_reuse(self):
         from subtitle_tool.main import summary
         route = configured_route(self.config, self.manifest)

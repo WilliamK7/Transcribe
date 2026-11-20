@@ -30,7 +30,7 @@ from .mt_identity import canonical_model, resolve_model, dynamic_model
 from .mt_fidelity import FIDELITY_VERSION, source_anchors, anchor_checks
 from .review import decision_origin
 from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, split_cues_for_translation,
-                        validate_cue_coverage)
+                        timestamp, validate_cue_coverage)
 
 
 def _digest(value):
@@ -228,7 +228,25 @@ def _local_review_record(translations, source_hashes, anchors=None):
             **({'source_anchors': anchors} if anchors is not None else {})}
 
 
-def _validate_saved_reviews(final, history, source_hashes, *, fidelity=False):
+def _only_source_uncertain(issues):
+    return bool(issues) and all(issue['category'] == 'source_uncertain' for issue in issues)
+
+
+def _remember_uncertainty(issues, translations, fragments, confirmed):
+    sentences = {fragment['id']: fragment['sentence'] for fragment in fragments}
+    for issue in issues:
+        if issue['category'] == 'source_uncertain':
+            confirmed[issue['id']] = {key: translations[key] for key, sentence in sentences.items()
+                                      if sentence == sentences[issue['id']]}
+
+
+def _confirmed_uncertainty(issues, translations, confirmed):
+    return _only_source_uncertain(issues) and all(issue['id'] in confirmed and all(
+        translations[key] == value for key, value in confirmed[issue['id']].items()) for issue in issues)
+
+
+def _validate_saved_reviews(final, history, source_hashes, *, fidelity=False, allow_source_uncertain=False,
+                            allow_quality_warning=False):
     reviews, corrections = final['review_stage_keys'], final['correction_stage_keys']
     if not len(corrections) <= len(reviews) <= len(corrections) + 1:
         raise ValueError()
@@ -239,7 +257,8 @@ def _validate_saved_reviews(final, history, source_hashes, *, fidelity=False):
     current = history[final['translation_stage_key']]['value']['translations']
     if not isinstance(current, dict) or set(current) != ids:
         raise ValueError()
-    unresolved = True
+    unresolved, accepted_uncertainty = True, False
+    confirmed_uncertainty = {}
     anchors = history[final['translation_stage_key']].get('source_anchors') if fidelity else None
     if fidelity and (not isinstance(anchors, list) or len(anchors) != len(ids) or any(
             not isinstance(group, list) or any(not isinstance(a, str) or not re.fullmatch(r'[a-z]{1,2}\d{1,3}', a)
@@ -253,6 +272,8 @@ def _validate_saved_reviews(final, history, source_hashes, *, fidelity=False):
         review = validate_stage_value('review', record['value'], ids=ids, fidelity=fidelity and not local)
         review = review_with_checks(review, _quality_checks(current, source_hashes, anchors))
         unresolved = bool(review['issues'])
+        accepted_uncertainty = (allow_source_uncertain and not local and
+                               _confirmed_uncertainty(review['issues'], current, confirmed_uncertainty))
         if index == len(corrections):
             break
         if not unresolved:
@@ -264,12 +285,15 @@ def _validate_saved_reviews(final, history, source_hashes, *, fidelity=False):
             raise ValueError()
         validate_judgment(correction, {**review, 'fragments': fragments, 'translations': current}, fidelity=fidelity)
         current = correction['translations']
+        if not local:
+            _remember_uncertainty(correction['issues'], current, fragments, confirmed_uncertainty)
         # A local check covers its own signal only; a dismissed signal cannot
         # certify the rest of the group as independently reviewed.
         unresolved = bool(correction['issues']) or local
-        if not correction['issues'] and index + 1 < len(reviews):
+        accepted_uncertainty = allow_source_uncertain and not local and _only_source_uncertain(correction['issues'])
+        if (not correction['issues'] or accepted_uncertainty) and index + 1 < len(reviews):
             raise ValueError()
-    if final['warning'] != unresolved or fidelity and unresolved:
+    if final['warning'] != unresolved or fidelity and unresolved and not (accepted_uncertainty or allow_quality_warning):
         raise ValueError()
 
 
@@ -299,7 +323,8 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                 final = saved['record']
                 required = {'backend', 'request_model', 'actual_model', 'production_stage_key', 'translation_stage_key',
                             'review_stage_keys', 'correction_stage_keys', 'cue_ids', 'value', 'warning', 'stage'}
-                if (set(final) != required | {'resolved_model'} or final['stage'] != 'final' or type(final['warning']) is not bool or
+                warning_fields = {'warning_reason', 'warning_ids'} if 'warning_reason' in final else set()
+                if (set(final) != required | {'resolved_model'} | warning_fields or final['stage'] != 'final' or type(final['warning']) is not bool or
                         not isinstance(final['actual_model'], str) or
                         safe_model_id(final['actual_model']) != final['actual_model'] or
                         not isinstance(final['cue_ids'], list) or not final['cue_ids'] or
@@ -308,6 +333,12 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         not isinstance(final['value'], dict) or set(final['value']) != {'translations'} or
                         not isinstance(final['value']['translations'], dict) or
                         set(final['value']['translations']) != {str(i) for i in range(len(final['cue_ids']))}):
+                    raise ValueError()
+                if warning_fields and (route['quality'].get('on_failure') != 'warn' or not final['warning'] or
+                        final['warning_reason'] not in {'review_unavailable', 'judge_unavailable', 'review_incomplete',
+                                                       'source_uncertain', 'revision_cycle', 'revision_limit'} or
+                        not isinstance(final['warning_ids'], list) or
+                        any(identity not in final['value']['translations'] for identity in final['warning_ids'])):
                     raise ValueError()
                 proof = engine.store.mt_stage_entry(job_id, final['production_stage_key'])
                 if (not isinstance(proof, dict) or proof['stage'] not in {'translate', 'judge'} or
@@ -352,7 +383,9 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                 if (not isinstance(source_hashes, list) or len(source_hashes) != len(final['cue_ids']) or
                         any(not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) for digest in source_hashes)):
                     raise ValueError()
-                _validate_saved_reviews(final, history, source_hashes, fidelity=fidelity)
+                _validate_saved_reviews(final, history, source_hashes, fidelity=fidelity,
+                                        allow_source_uncertain=route['quality'].get('source_uncertain') == 'warn',
+                                        allow_quality_warning=route['quality'].get('on_failure') == 'warn')
                 anchors = history[final['translation_stage_key']].get('source_anchors')
                 finals[key] = final, source_hashes, anchors
             final, source_hashes, anchors = finals[key]
@@ -389,8 +422,15 @@ class Pipeline:
         self.maintenance_lock = threading.Lock()
         self.maintenance = None
         self.snapshot = saved_route(manifest)
+        self.output_tokens = self.snapshot['quality']['output_tokens']
+        self.allow_source_uncertain = self.fidelity and self.snapshot['quality'].get('source_uncertain') == 'warn'
+        self.allow_quality_warning = self.fidelity and self.snapshot['quality'].get('on_failure') == 'warn'
         self.identities = self.snapshot.get('identities', {})
         self.cache_scope = dict(scope)
+        if self.output_tokens != 4096:
+            self.cache_scope['output_tokens'] = self.output_tokens
+        if self.allow_source_uncertain:
+            self.cache_scope['source_uncertain'] = 'warn'
         if self.check_content:
             self.cache_scope['content_validation'] = 2
         self.cache_scope['model_identity'] = _digest(self.identities)
@@ -474,14 +514,9 @@ class Pipeline:
                        paid_only=entry.id.endswith('_fallback'), identities=self.identities)
 
     def _request_payload(self, stage, data, entry, *, repair=False):
-        try:
-            return make_stage_payload(stage, data, entry.backend,
-                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair, stream=self.stream,
-                                      fidelity=self.fidelity)
-        except ToolError as error:
-            if error.code != 'mt_input_budget':
-                raise
-            raise RouteFailure('local_error') from None
+        return make_stage_payload(stage, data, entry.backend,
+                                  capabilities=self.profiles[entry.id]['capabilities'], repair=repair, stream=self.stream,
+                                  fidelity=self.fidelity, output_tokens=self.output_tokens)
 
     def _invoke_stage(self, request, stage_key, entry, timeout, attempt):
         """One HTTP request, with content-free evidence even when validation fails."""
@@ -567,9 +602,14 @@ class Pipeline:
                 elif status == 404:
                     scope = 'model'
                 outcome, event['category'] = 'service_error', category
-                raise RouteFailure(category, diagnostic_scope=scope) from None
+                if category == 'output_truncated':
+                    self.store.count(self.job_id, 'mt_output_truncated')
+                raise RouteFailure(category, diagnostic_scope=scope,
+                                   fallback_allowed=category in {'output_truncated', 'generation_error'}) from None
             try:
-                value = parse_stage_response(name, body, ids=request.ids, originals=request.originals, fidelity=request.fidelity)
+                value = parse_stage_response(name, body, ids=request.ids, originals=request.originals, fidelity=request.fidelity,
+                                             repair_data=data if name == 'judge' and
+                                             (attempt == 2 or data.get('repair_reason') == 'no_progress') else None)
                 request.validate_content(value)
             except BatchValidationError as error:
                 outcome, event['validation_category'] = 'invalid', error.category
@@ -582,7 +622,7 @@ class Pipeline:
                 # Regenerate a normally completed response from original
                 # evidence when local format validation fails.
                 completed = metadata['finish_reason'] == 'stop' and metadata['content_type'] == 'string'
-                repairable = name in {'translate'} and completed
+                repairable = completed and (name == 'translate' or name == 'judge' and self.fidelity)
                 raise RouteFailure('output_truncated' if error.category == 'output_truncated' else
                                    'format_exhausted', repairable=repairable,
                                    fallback_allowed=completed or error.category == 'output_truncated') from None
@@ -633,10 +673,11 @@ class Pipeline:
             capabilities = self.profiles[entry.id]['capabilities']
             if output_budget and output_estimate > min(4096, capabilities['output_tokens']) * 3 // 4:
                 raise ToolError('翻译组预计输出超过规划余量。', 'mt_input_budget')
-            # Reserve the fixed repair instruction without dropping evidence
-            # between the initial request and its possible regeneration.
+            # Translation repair has always been part of group planning. Optional
+            # judgment repair must not regroup saved work or trim frozen evidence.
             make_stage_payload(stage, data, entry.backend, capabilities=capabilities,
-                               repair=stage in {'translate'}, stream=self.stream, fidelity=self.fidelity)
+                               repair=stage == 'translate', stream=self.stream, fidelity=self.fidelity,
+                               output_tokens=self.output_tokens)
         while True:
             fits = bool(candidates)
             for entry in candidates:
@@ -699,7 +740,8 @@ class Pipeline:
         try:
             entry.backend.credential(self.engine.config)
             key = request_cache_key(request.name, request.data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                                    scope=self.cache_scope, stream=self.stream, fidelity=self.fidelity)
+                                    scope=self.cache_scope, stream=self.stream, fidelity=self.fidelity,
+                                    output_tokens=self.output_tokens)
         except ToolError as error:
             if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
                 return None
@@ -789,7 +831,7 @@ class Pipeline:
             record['context'] = data.get('context', [])
         cache_key = request_cache_key(name, data, result.entry.backend,
                                     capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope,
-                                    stream=self.stream, fidelity=self.fidelity)
+                                    stream=self.stream, fidelity=self.fidelity, output_tokens=self.output_tokens)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             self.store.commit_mt_stage(self.job_id, stage_key, name, record,
@@ -940,12 +982,14 @@ class Pipeline:
         return context, glossary
 
     def _advisory_stage(self, name, data, **options):
+        self.context.advisory_failure = None
         try:
             return self.stage(name, data, fixed_semantics=True, **options)
         except ToolError as error:
             if not isinstance(error, RouteExhausted) and error.code != 'mt_input_budget':
                 raise
             self.engine.mt_control.check_start()
+            self.context.advisory_failure = error
             return None
 
     def _review(self, data, ids, originals, forbidden_models):
@@ -975,6 +1019,34 @@ class Pipeline:
                                        counts={'mt_local_review': 1})
         return expected['value'], None, {'key': key, 'local': True}
 
+    def _quality_error(self, members, reason, issues, failure=None):
+        unavailable = reason in {'review_unavailable', 'judge_unavailable', 'review_incomplete'}
+        group = getattr(self.context, 'group', None)
+        location = [f'第 {group + 1} 组'] if type(group) is int else []
+        location.append(f'{len(members)} 屏')
+        ids = set() if unavailable else {issue['id'] for issue in issues}
+        affected = [cue for i, cue in enumerate(members) if str(i) in ids] or members
+        if ids:
+            location.append(f'疑点 {len(affected)} 屏')
+        location.append('时间 ' + timestamp(min(cue['begin_ms'] for cue in affected)) + '–' +
+                        timestamp(max(cue['end_ms'] for cue in affected)))
+        details = '；'.join(location)
+        if unavailable:
+            role = '裁决' if reason == 'judge_unavailable' else '复核'
+            code = 'mt_judge_unavailable' if reason == 'judge_unavailable' else 'mt_review_unavailable'
+            cause = getattr(failure, 'category', '') or getattr(failure, 'code', '')
+            detail = f'；原因 {cause}' if cause else ''
+            return ToolError(f'字幕逐屏{role}未完成（{details}{detail}），该组草稿和已完成阶段已保存，未发布。'
+                             '排除服务、输出上限或请求预算问题后可用 --resume 继续。', code,
+                             getattr(failure, 'request_id', ''))
+        labels = {'source_uncertain': '原转写存在未确认疑点', 'revision_cycle': '裁决未改变译文或出现循环',
+                  'revision_limit': '达到修订上限后仍有疑点'}
+        return ToolError(f'字幕逐屏复核尚未通过（{reason}：{labels[reason]}；{details}）。'
+                         '该组草稿和已完成阶段已保存，未发布。请核对上述时间段的音视频与原转写；'
+                         '单独 --resume 会复用已保存的复核，不能消除该疑点。'
+                         '确认依据并调整人工术语或 mt_policy_version 后用 --reflow 重建；'
+                         '--reflow 不会重新识别音频。', 'mt_quality_unresolved')
+
     def translate_group(self, group, glossary, context):
         self.engine.mt_control.check_start()
         members = [cue for translation_unit in group for cue in translation_unit['cues']]
@@ -996,6 +1068,9 @@ class Pipeline:
         production = translation_proof
         current = translated['translations']
         warning = False
+        reason, issues, failure = '', [], None
+        accepted_uncertainty = False
+        confirmed_uncertainty = {}
         review_keys, correction_keys, reviewed = [], [], []
         for round_number in range(self.snapshot['quality']['max_revisions'] + 1):
             self.engine.mt_control.check_start()
@@ -1003,6 +1078,7 @@ class Pipeline:
             # no-op correction or a cycle would only replay saved issues.
             if current in reviewed:
                 warning = True
+                reason = 'revision_cycle'
                 break
             review_data = {**data, 'translations': current}
             forbidden_models = {_proof_model(translation_proof)}
@@ -1011,19 +1087,32 @@ class Pipeline:
             result = self._review(review_data, ids, originals, forbidden_models)
             if result is None:
                 warning = True
+                reason, failure = 'review_unavailable', getattr(self.context, 'advisory_failure', None)
                 break
             review, _, review_proof = result
+            failure = getattr(self.context, 'advisory_failure', None)
             review_keys.append(review_proof['key'])
             reviewed.append(current)
             review = review_with_checks(review, _quality_checks(current, originals,
                                         source_anchors(originals) if self.fidelity else None))
-            if self.fidelity and any(i['category'] == 'source_uncertain' for i in review['issues']):
+            issues = review['issues']
+            if (self.allow_source_uncertain and not review_proof.get('local') and
+                    _confirmed_uncertainty(issues, current, confirmed_uncertainty)):
+                accepted_uncertainty, warning = True, True
+                break
+            if self.fidelity and not self.allow_source_uncertain and any(
+                    i['category'] == 'source_uncertain' for i in review['issues']):
                 warning = True
+                reason = 'source_uncertain'
+                issues = [issue for issue in issues if issue['category'] == 'source_uncertain']
                 break
             if not review['issues']:
                 break
-            if round_number == self.snapshot['quality']['max_revisions']:
+            if (round_number == self.snapshot['quality']['max_revisions'] and
+                    not (self.allow_source_uncertain and not review_proof.get('local') and
+                         _only_source_uncertain(issues))):
                 warning = True
+                reason = 'revision_limit'
                 break
             correction_data = {**review_data, 'issues': review['issues']}
             forbidden_models = {_proof_model(translation_proof)}
@@ -1033,16 +1122,41 @@ class Pipeline:
                                               forbidden_models=forbidden_models)
             if correction is None:
                 warning = True
+                reason, failure = 'judge_unavailable', getattr(self.context, 'advisory_failure', None)
                 break
             corrected, origin, production = correction
+            if (self.fidelity and round_number < self.snapshot['quality']['max_revisions'] and
+                    corrected['translations'] in reviewed and
+                    any(issue['category'] != 'source_uncertain' for issue in corrected['issues'])):
+                # Preserve the stalled judgment, but give its frozen review one
+                # explicitly identified retry. A saved retry is reused on resume.
+                correction = self._advisory_stage('judge', {**correction_data, 'repair_reason': 'no_progress'},
+                    ids=ids, originals=originals, forbidden_models=forbidden_models)
+                if correction is None:
+                    warning = True
+                    reason, failure = 'judge_unavailable', getattr(self.context, 'advisory_failure', None)
+                    correction_keys.append(production['key'])
+                    current = corrected['translations']
+                    break
+                corrected, origin, production = correction
             correction_keys.append(production['key'])
             current = corrected['translations']
+            if not review_proof.get('local'):
+                _remember_uncertainty(corrected['issues'], current, fragments, confirmed_uncertainty)
+            if (self.allow_source_uncertain and not review_proof.get('local') and
+                    _only_source_uncertain(corrected['issues'])):
+                accepted_uncertainty, warning = True, True
+                break
             if not corrected['issues']:
                 warning = bool(review_proof.get('local'))
+                reason = 'review_incomplete' if warning else ''
                 break
-        if self.fidelity and warning:
-            raise ToolError('字幕逐屏复核尚未通过，完整草稿和阶段已保存，未发布。服务恢复后可用 --resume；'
-                            '持续的语义或原转写疑点须核对证据、调整人工术语或策略版本后 --reflow。', 'mt_quality_unresolved')
+            if round_number == self.snapshot['quality']['max_revisions']:
+                warning = True
+                reason, issues = 'revision_limit', corrected['issues']
+                break
+        if self.fidelity and warning and not (accepted_uncertainty or self.allow_quality_warning):
+            raise self._quality_error(members, reason, issues, failure)
         final_key = _digest({'stage': 'final', 'strategy': 6, 'cues': [c['cue_id'] for c in members],
                              'data': data, 'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
         record = {'backend': origin, 'request_model': production['request_model'],
@@ -1051,6 +1165,8 @@ class Pipeline:
                   'translation_stage_key': translation_proof['key'], 'review_stage_keys': review_keys,
                   'correction_stage_keys': correction_keys, 'cue_ids': [cue['cue_id'] for cue in members],
                   'value': {'translations': current}, 'warning': warning, 'stage': 'final'}
+        if warning and self.allow_quality_warning and not accepted_uncertainty:
+            record.update(warning_reason=reason, warning_ids=sorted({issue['id'] for issue in issues}))
         values = {cue['cue_id']: current[str(i)] for i, cue in enumerate(members)}
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
@@ -1067,6 +1183,54 @@ def groups_for_layout(engine, job_id, manifest, sources, cues, pipeline):
     candidate['mt_group_plan'] = save_group_plan(groups, sources, cues, manifest['layout_round'])
     engine.commit_local(job_id, manifest, candidate, engine.store.save_mt_group_plan)
     return groups
+
+
+def _source_uncertainty_warnings(stages, cues):
+    """Expose only locations of independently confirmed source uncertainty."""
+    history = {stage['key']: stage['record'] for stage in stages}
+    active = {cue['cue_id']: cue.get('mt_stage_key') for cue in cues}
+    affected = set()
+    for stage in stages:
+        final = stage['record']
+        if stage['stage'] != 'final' or not final.get('warning') or not final['correction_stage_keys']:
+            continue
+        last = (final['review_stage_keys'][-1] if len(final['review_stage_keys']) > len(final['correction_stage_keys'])
+                else final['correction_stage_keys'][-1])
+        issues = history[last]['value']['issues']
+        fragments = [{'id': str(index), 'sentence': cue_id.rpartition(':')[0]}
+                     for index, cue_id in enumerate(final['cue_ids'])]
+        confirmed = {}
+        for review_key, correction_key in zip(final['review_stage_keys'], final['correction_stage_keys']):
+            if history[review_key]['stage'] != 'local_review':
+                judgment = history[correction_key]['value']
+                _remember_uncertainty(judgment['issues'], judgment['translations'], fragments, confirmed)
+        if _confirmed_uncertainty(issues, final['value']['translations'], confirmed):
+            affected.update(cue_id for issue in issues
+                            if active.get(cue_id := final['cue_ids'][int(issue['id'])]) == stage['key'])
+    return [f'原转写疑点（source_uncertain；时间 {timestamp(cue["begin_ms"])}–{timestamp(cue["end_ms"])}）：'
+             '独立裁决后仍依据不足，按保存策略保留忠实译文，请听辨音视频。'
+            for cue in cues if cue['cue_id'] in affected]
+
+
+def _quality_warnings(stages, cues):
+    active = {}
+    for cue in cues:
+        active.setdefault(cue.get('mt_stage_key'), []).append(cue)
+    labels = {'review_unavailable': '未完成复核', 'judge_unavailable': '疑点裁决未完成',
+              'review_incomplete': '仅完成本地检查，未完成复核', 'source_uncertain': '原转写依据不足',
+              'revision_cycle': '自动修订未取得进展', 'revision_limit': '自动修订达到上限'}
+    warnings = []
+    for stage in stages:
+        record = stage['record']
+        members = active.get(stage['key'], [])
+        if stage['stage'] != 'final' or not record.get('warning_reason') or not members:
+            continue
+        selected = {record['cue_ids'][int(i)] for i in record['warning_ids']}
+        affected = [cue for cue in members if cue['cue_id'] in selected] or members
+        begin, end = min(c['begin_ms'] for c in affected), max(c['end_ms'] for c in affected)
+        warnings.append(f'字幕质量告警（{record["warning_reason"]}；时间 {timestamp(begin)}–{timestamp(end)}）：'
+                        f'{labels[record["warning_reason"]]}，按保存策略保留完整译文并发布。')
+    return warnings
 
 
 def process_subtitles(engine, job_id, manifest, settings, scope, stage):
@@ -1130,7 +1294,12 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                 revised = revise_layout(cues, source_ids, settings, layout_round=round_number + 1)
             if revised is None:
                 warnings = layout_warnings(cues, settings)
-                if any(item['record'].get('warning') for item in engine.store.mt_stages(job_id)):
+                stages = engine.store.mt_stages(job_id)
+                if pipeline is not None and pipeline.allow_source_uncertain:
+                    warnings.extend(_source_uncertainty_warnings(stages, cues))
+                if pipeline is not None and pipeline.allow_quality_warning:
+                    warnings.extend(_quality_warnings(stages, cues))
+                elif not (pipeline is not None and pipeline.allow_source_uncertain) and any(item['record'].get('warning') for item in stages):
                     warnings.append('部分翻译组自动复核未通过或复核服务不可用，已保留完整译文；建议人工检查。')
                 if engine.store.counts(job_id).get('mt_glossary_unavailable'):
                     warnings.append('部分术语分析未完成，已保留完整译文；建议人工检查术语。')

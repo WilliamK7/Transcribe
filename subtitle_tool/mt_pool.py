@@ -53,9 +53,12 @@ def _manual_glossary(value):
 
 
 def _quality(value):
-    return (isinstance(value, dict) and set(value) == _QUALITY_FIELDS and
-            _fixed_integer(value['input_bytes'], INPUT_BUDGET) and _fixed_integer(value['output_tokens'], OUTPUT_TOKENS) and
-            _fixed_integer(value['max_revisions'], 2) and _manual_glossary(value['manual_glossary']))
+    return (isinstance(value, dict) and _QUALITY_FIELDS <= set(value) <= _QUALITY_FIELDS | {'source_uncertain', 'on_failure'} and
+            _fixed_integer(value['input_bytes'], INPUT_BUDGET) and _integer(value['output_tokens'], OUTPUT_TOKENS, 32768) and
+            _fixed_integer(value['max_revisions'], 2) and _manual_glossary(value['manual_glossary']) and
+            isinstance(value.get('source_uncertain', 'block'), str) and
+            value.get('source_uncertain', 'block') in {'block', 'warn'} and
+            isinstance(value.get('on_failure', 'block'), str) and value.get('on_failure', 'block') in {'block', 'warn'})
 
 
 def configured_route(config, manifest):
@@ -74,7 +77,8 @@ def configured_route(config, manifest):
         raise _invalid()
     quality = {'input_bytes': INPUT_BUDGET, 'output_tokens': OUTPUT_TOKENS, 'max_revisions': 2, 'manual_glossary': {}}
     if settings.mt_quality is not None:
-        if not isinstance(settings.mt_quality, dict) or set(settings.mt_quality) - {'manual_glossary'}:
+        if (not isinstance(settings.mt_quality, dict) or
+                set(settings.mt_quality) - {'manual_glossary', 'output_tokens', 'source_uncertain', 'on_failure'}):
             raise _invalid()
         quality.update(copy.deepcopy(settings.mt_quality))
     if not _quality(quality):
@@ -85,7 +89,7 @@ def configured_route(config, manifest):
     entries = [{'id': identity, 'tier': tier, 'credential_ref': 'magpie',
                 'backend': MTBackend('magpie', base, model, fingerprint,
                                      policy_version=settings.mt_policy_version).snapshot(),
-                'capabilities': DEFAULT_CAPABILITIES.copy()}
+                'capabilities': {**DEFAULT_CAPABILITIES, 'output_tokens': quality['output_tokens']}}
                for identity, tier, model in models]
     from .magpie import bound_gateway
     from .mt_catalog import saved_catalog
