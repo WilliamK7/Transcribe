@@ -23,6 +23,7 @@ class ExecutionPolicyTests(SavedResultFixture):
                     for field, value in current_execution_snapshot().items()]
         invalid += [(('execution_snapshot', 'prompt_version'), value) for value in (5, 6)]
         invalid += [(('execution_snapshot', 'alignment_version'), value) for value in (3, 4)]
+        invalid += [(('execution_snapshot', 'fidelity_version'), 1)]
         invalid += [(('contract', 'language_inference'), value) for value in (None, 1)]
         invalid.append((('mt_glossary_schedule',), 'window-prefix-v3'))
         invalid.append((('mt_glossary_schedule',), 'unsupported'))

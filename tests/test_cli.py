@@ -16,6 +16,20 @@ from tests.fixtures import set_asr_account, TemporaryTest
 
 class ConfigTests(TemporaryTest):
 
+    def test_saved_settings_contain_only_overrides_and_reload_identically(self):
+        from dataclasses import asdict
+        config = Config(self.path)
+        config.save()
+        self.assertEqual(json.loads((config.data / 'settings.json').read_text(encoding='utf-8')), {})
+        config.settings.mt_workers = 3
+        config.settings.chinese_first = True
+        config.settings.mt_quality = {'manual_glossary': {'cache': '缓存'}}
+        expected = asdict(config.settings)
+        config.save()
+        saved = json.loads((config.data / 'settings.json').read_text(encoding='utf-8'))
+        self.assertEqual(set(saved), {'mt_workers', 'chinese_first', 'mt_quality'})
+        self.assertEqual(asdict(Config(self.path).settings), expected)
+
     def test_line_width_defaults_and_saved_overrides(self):
         config = Config(self.path)
         self.assertEqual((config.settings.zh_line_width, config.settings.other_line_width), (44, 84))

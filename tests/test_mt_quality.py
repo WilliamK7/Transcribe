@@ -101,17 +101,40 @@ class QualityContractTests(unittest.TestCase):
 
     def test_json_object_review_supplies_the_fields_and_categories_it_validates(self):
         from subtitle_tool.mt_quality import ISSUE_CATEGORIES
-        data = {'fragments': [{'id': '0', 'text': 'The value is two.'}]}
-        payload = make_stage_payload('review', data, self.free, capabilities=self.free_caps)
-        instruction = payload['messages'][0]['content']
-        for field in ('issues', 'id', 'category', 'evidence', *ISSUE_CATEGORIES):
-            self.assertIn('"' + field + '"', instruction)
-
-    def test_review_schema_limits_evidence_to_actual_fragment_ids(self):
         data = {'fragments': [{'id': '0', 'text': 'One.'}, {'id': '1', 'text': 'Two.'}]}
-        payload = make_stage_payload('review', data, self.paid, capabilities=self.paid_caps)
-        schema = json.loads(payload['messages'][0]['content'].split('输出必须符合此 JSON Schema：', 1)[1])
-        self.assertEqual(schema['properties']['issues']['items']['properties']['id']['enum'], ['0', '1'])
+        for fidelity in (False, True):
+            with self.subTest(fidelity=fidelity):
+                payload = make_stage_payload('review', data, self.free, capabilities=self.free_caps, fidelity=fidelity)
+                schema = json.loads(payload['messages'][0]['content'].split('输出必须符合此 JSON Schema：', 1)[1])
+                issue = schema['properties']['issues']['items']
+                self.assertEqual(set(issue['required']), {'id', 'category', 'evidence'})
+                self.assertEqual(issue['properties']['id']['enum'], ['0', '1'])
+                self.assertEqual(issue['properties']['category']['enum'],
+                                 list(ISSUE_CATEGORIES if fidelity else ISSUE_CATEGORIES[:-1]))
+
+    def test_historical_request_cache_keys_survive_prompt_cleanup(self):
+        backend = MTBackend('magpie', 'http://127.0.0.1:3425/v1', 'group/transcribe', key_fingerprint('synthetic'))
+        data = {'sentences': [{'id': '0', 'text': 'A cache stores a result.'}],
+                'fragments': [{'id': '0', 'sentence': '0', 'text': 'A cache stores a result.', 'display_ms': 1500}],
+                'context': [], 'glossary': []}
+        expected = {
+            'language': 'f5007bf900b7e06fee24dafc3ec69b443f67006a9bb94f8e31350ae4c866039a',
+            'glossary': '74493f5b0ded7e815de5650d64da84821dfe7ea9a21d6a8082e175e23556a5ec',
+            'translate': '2da68b04fab9c271ede7b64ecda4165c189e59582bcf1d987a93a4f8061ee2bb',
+            'review': 'd88def02cb200da1c9adb8412c10710fce3b791b408bc17853f5830467357dde',
+            'judge': '4c33e84f0cec8781c92362ee7e111dcfb576351cb8f6a51f93a6b2c062a4ceac',
+        }
+        for stage, digest in expected.items():
+            value = dict(data)
+            if stage in {'review', 'judge'}:
+                value['translations'] = {'0': '缓存保存结果。'}
+            if stage == 'judge':
+                value['issues'] = []
+            with self.subTest(stage=stage):
+                self.assertEqual(request_cache_key(stage, value, backend, capabilities=self.free_caps,
+                                                  scope={'synthetic': 1}, stream=False), digest)
+                self.assertNotEqual(request_cache_key(stage, value, backend, capabilities=self.free_caps,
+                                                     scope={'synthetic': 1}, stream=False, fidelity=True), digest)
 
 
     def test_stage_cache_identity_covers_prompt_glossary_context_and_backend(self):

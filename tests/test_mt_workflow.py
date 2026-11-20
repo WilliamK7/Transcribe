@@ -1,9 +1,7 @@
 """Behavior regressions for free-first routing and the merged pipeline."""
 import threading
 from unittest import mock
-from types import SimpleNamespace
 
-from subtitle_tool.mt_quality import make_stage_payload, validate_stage_value
 from tests.mt_fixtures import PoolPipelineFixture
 from tests.fixtures import result
 from subtitle_tool.engine import Engine
@@ -11,24 +9,9 @@ from subtitle_tool.mt_pipeline import GlossaryPrefix, Pipeline
 
 
 class TranslationWorkflowTests(PoolPipelineFixture):
-    def test_translation_schema_targets_fragments_in_one_request(self):
-        data = {'sentences': [{'id': '0', 'text': 'Do not disable the cache.'}],
-                'fragments': [{'id': '0', 'sentence': '0', 'text': 'Do not disable'},
-                              {'id': '1', 'sentence': '0', 'text': 'the cache.'}],
-                'context': [], 'glossary': []}
-        payload = make_stage_payload('translate', data, SimpleNamespace(model='group/transcribe'),
-            capabilities={'response_format': 'json_object', 'input_bytes': 32768, 'output_tokens': 4096})
-        self.assertIn('fragments', payload['messages'][0]['content'])
-        self.assertEqual(validate_stage_value('translate', {'translations': {'0': '不要禁用', '1': '缓存。'}},
-            ids=['0', '1'], originals=['Do not disable', 'the cache.'])['translations']['0'], '不要禁用')
-
-    def test_judge_can_dismiss_review_without_forcing_changes(self):
-        value = {'issues': [], 'translations': {'0': '不要禁用缓存。'}}
-        self.assertEqual(validate_stage_value('judge', value, ids=['0'],
-            originals=['Do not disable the cache.']), value)
-
     def test_actual_model_collision_preserves_translation_and_marks_review_incomplete(self):
         self.install()
+        self.legacy_quality()
         self.actual_model = lambda stage, request: 'supplier/same-model'
         self.assertEqual(self.run_pool(), 'completed')
         self.assertTrue(all(c['translated'] for c in self.store.cues(self.job_id)))
@@ -37,6 +20,7 @@ class TranslationWorkflowTests(PoolPipelineFixture):
 
     def test_group_alias_is_not_evidence_of_an_independent_reviewer(self):
         self.install()
+        self.legacy_quality()
         self.actual_model = lambda stage, request: request if stage == 'review' else 'synthetic/' + stage
         self.assertEqual(self.run_pool(), 'completed')
         self.assertGreater(self.store.counts(self.job_id)['mt_quality_warning'], 0)

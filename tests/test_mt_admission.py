@@ -26,6 +26,8 @@ class AdmissionTests(TemporaryTest):
                                    if case.incorrect is not None else [])
                 if stage == 'review':
                     del value['translations']
+                    flagged = {issue['id'] for issue in value['issues']}
+                    value['checks'] = {f['id']: 'issue' if f['id'] in flagged else 'ok' for f in data['fragments']}
             return {'model': actual, 'choices': [{'finish_reason': 'stop', 'message': {
                 'content': json.dumps(value, ensure_ascii=False)}}], 'usage': {
                 'completion_tokens_details': {'reasoning_tokens': reasoning}}}
@@ -42,6 +44,23 @@ class AdmissionTests(TemporaryTest):
         self.assertEqual(len(self.calls), 12)
         self.assertTrue(all(result['non_thinking'].values()))
         evaluator.transport.request.assert_called_once()
+
+    def test_admission_rejects_a_reviewer_without_per_screen_coverage(self):
+        evaluator = self.evaluator()
+        request = evaluator.request
+
+        def missing_checks(model, stage, data):
+            body = request(model, stage, data)
+            if stage == 'review':
+                message = body['choices'][0]['message']
+                value = json.loads(message['content'])
+                value.pop('checks')
+                message['content'] = json.dumps(value)
+            return body
+
+        evaluator.request = missing_checks
+        evaluator._judge = lambda cases, actual: [True] * len(cases)
+        self.assertNotIn('review', evaluator.evaluate('candidate')['roles'])
 
     def test_complete_but_shifted_drafts_cannot_pass_on_batch_totals(self):
         evaluator = self.evaluator()

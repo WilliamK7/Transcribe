@@ -74,6 +74,7 @@ class ViewingPipelineTests(PoolPipelineFixture):
 
     def test_resume_completes_with_a_warning_if_repetition_evidence_exceeds_judge_budget(self):
         self.prepare()
+        self.legacy_quality()
         manifest = self.store.job(self.job_id)['manifest']
         for entry in manifest['mt_route_snapshot']['entries']:
             if entry['id'] in ('magpie_judge', 'magpie_judge_fallback'):

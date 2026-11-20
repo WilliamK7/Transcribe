@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from .common import Cancelled, ToolError
-from .mt_quality import DEFAULT_CAPABILITIES, QUALITY_PROMPT_VERSION, make_stage_payload, parse_stage_response, parse_content, validate_judgment
+from .mt_quality import (DEFAULT_CAPABILITIES, QUALITY_PROMPT_VERSION, make_stage_payload, parse_stage_response,
+                         parse_content, validate_judgment, validate_translation_content)
+from .mt_fidelity import FIDELITY_VERSION
 from .mt_transport import ProcessTransport, TransportError
 from .mt_identity import resolve_model, model_set
 from .mt_channel_policy import ROLES, check_provider_policy, load_policy
 
-SUITE_VERSION = 6
+SUITE_VERSION = 7
 ADMISSION_TIMEOUT = 120  # Bounded total time for one synthetic request through the gateway.
 SAFE_SERVICE_CODES = {'model_not_supported', 'model_not_found', 'invalid_api_key', 'insufficient_quota',
                       'rate_limit_exceeded', 'insufficient_credits', 'authentication_error', 'permission_denied',
@@ -126,7 +128,8 @@ class ModelEvaluator:
 
     def request(self, model, stage, data):
         check_provider_policy(self.config, model)
-        payload = make_stage_payload(stage, data, SimpleNamespace(model=model), capabilities=DEFAULT_CAPABILITIES)
+        payload = make_stage_payload(stage, data, SimpleNamespace(model=model),
+                                     capabilities=DEFAULT_CAPABILITIES, fidelity=True)
         reply = self.transport.request('POST', self.config.settings.mt_base_url + '/chat/completions',
             headers={'Authorization': 'Bearer ' + self.config.get_magpie_key(), 'Content-Type': 'application/json',
                      'X-Magpie-Response-Model': 'member', 'X-Magpie-Session': 'transcribe-admission-' + uuid.uuid4().hex},
@@ -176,7 +179,10 @@ class ModelEvaluator:
                                            'evidence': '请核对数字、否定或条件关系。'}]
                 try:
                     body = self.request(model, stage, data)
-                    value = parse_stage_response(stage, body, ids=ids, originals=[f['text'] for f in data['fragments']])
+                    originals = [f['text'] for f in data['fragments']]
+                    value = parse_stage_response(stage, body, ids=ids, originals=originals, fidelity=True)
+                    if stage in {'translate', 'judge'}:
+                        validate_translation_content(value['translations'], originals)
                     name = body.get('model')
                     if not isinstance(name, str) or not name or name.startswith('group/'):
                         raise ToolError('验收未返回实际型号。', 'mt_admission')
@@ -203,7 +209,7 @@ class ModelEvaluator:
                         passed = False
                         self.failures.append({'stage': stage, 'category': 'classification_error', 'case': index})
                     if stage == 'judge':
-                        validate_judgment(value, data)
+                        validate_judgment(value, data, fidelity=True)
                         if (case.incorrect is not None and
                                 re.sub(r'[\W_]', '', value['translations'][case.issue_id]) ==
                                 re.sub(r'[\W_]', '', case.incorrect)):
@@ -246,7 +252,8 @@ class ModelEvaluator:
 
     def _judge(self, cases, actual):
         check_provider_policy(self.config, self.judge)
-        payload = {'model': self.judge, 'stream': False, 'max_tokens': 1024, 'reasoning_effort': 'none',
+        payload = {'model': self.judge, 'stream': True, 'stream_options': {'include_usage': True},
+            'max_tokens': 1024, 'reasoning_effort': 'none',
             'response_format': {'type': 'json_object'}, 'messages': [
                 {'role': 'system', 'content': '逐句核对 source 与 subtitles 的对应关系、完整性和自然度；特别检查数字、条件、否定、术语、跨片重复和跨句错位。'
                     f'输入顶层数组有 {len(cases)} 个样例，每个样例按编号连读其全部片段，与该样例原文一起评价一次。'
@@ -290,5 +297,6 @@ def admission_key(provider, model):
         fields['identities'] = {k: v for k, v in fields['identities'].items() if k != 'admitted'}
     fields.update({k: provider[k] for k in ('replyHeaders', 'passHeaders', 'extraBody') if k in provider})
     return hashlib.sha256(json.dumps({'model': model, 'provider': fields,
-        'suite': SUITE_VERSION, 'prompt': QUALITY_PROMPT_VERSION, 'capabilities': DEFAULT_CAPABILITIES, 'effort': ['none', 'low']},
+        'suite': SUITE_VERSION, 'prompt': QUALITY_PROMPT_VERSION, 'fidelity': FIDELITY_VERSION,
+        'capabilities': DEFAULT_CAPABILITIES, 'effort': ['none', 'low']},
         sort_keys=True).encode()).hexdigest()

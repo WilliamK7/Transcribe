@@ -20,7 +20,7 @@
 
 ## Magpie 网关契约
 
-翻译走 `POST /v1/chat/completions`。请求使用 `X-Magpie-Response-Model: member` 取得实际成员，通过 `X-Magpie-Session: transcribe-<任务ID>-<请求ID>` 对应网关记录。主组依次选择免费或试用、商业入口。同档供应商等权，供应商内部有序尝试，各组 `stays=off`。六个角色入口见 [README](../README.md#配置-magpie)。[Magpie 分组命令](https://github.com/yetone/magpie/blob/v0.1.4468/internal/cli/groups_cli.go)
+翻译走 `POST /v1/chat/completions`，用 `X-Magpie-Response-Model: member` 获取实际成员，以 `X-Magpie-Session: transcribe-<任务ID>-<请求ID>` 对应网关记录。主组按免费或试用、商业的顺序选入口；正文同档等权，复核和裁决同档用 `fast`，供应商内部有序尝试，各组 `stays=off`。六个入口见 [README](../README.md#配置-magpie)。[Magpie 分组](https://github.com/yetone/magpie/blob/v0.1.4479/internal/cli/groups_cli.go) · [速度统计](https://github.com/yetone/magpie/blob/v0.1.4479/internal/gateway/speed.go)
 
 | 主组结果 | 本阶段处理 |
 | --- | --- |
@@ -29,23 +29,33 @@
 | 截断或请求超时 | 结束超时子进程后尝试商业后备 |
 | 连接、HTTP、拒绝或内容过滤错误 | 记录阶段失败，上游重试由网关负责 |
 
-阶段总时限 180 秒，通常给主组 120 秒，后备可使用全部剩余时间。正文后备也可修复一次，一阶段最多四次请求。正文失败会保存进度并停止发布。术语失败时使用可用的人工术语，复核或裁决失败时保留完整译文并告警。
+阶段总时限 180 秒，通常给主组 120 秒，后备可使用全部剩余时间。正文后备也可修复一次，一阶段最多四次请求。正文失败会保存进度并停止发布。术语失败时使用可用的人工术语。新任务的复核或裁决失败会保留完整草稿并停止发布；没有 `fidelity_version` 的历史任务继续按原约定保留译文并告警。
+
+`transport_version:2` 请求 `stream:true` 和最终用量。网络子进程收齐 SSE 中编号 0 的选择，验证成员一致、结束原因和 `[DONE]` 后，交给结构、内容和身份校验；普通 JSON 响应共用后续校验。推理内容仅计用量，所有字节受 4 MiB 上限和阶段时限约束。断流保留已完成阶段。无此版本字段的任务保持整包 JSON 请求及原缓存键。
 
 本机根据请求地址找到对应的 Magpie 注册表。`actual_model` 表示网关成员，`resolved_model` 表示底层型号。正文、复核和裁决使用独立型号。动态入口 vLLM-SR `auto` 用于正文，`X-Vsr-Selected-Model` 给出已验收的底层型号。阶段恢复和跨任务缓存采用同样的身份与内容校验。
 
-渠道策略存于 `data/mt-channels.json`，格式版本为 2。`include` 默认匹配全部型号，`exclude` 优先。`preferred` 决定发现顺序；`billing`、单价和 `price_exceptions` 决定新验收许可。`excluded_providers` 优先于登记和评判者清单，推理时展开嵌套组核对。目录故障时保留身份仍有效的既有资格。[Magpie 渠道选项](https://github.com/yetone/magpie/blob/v0.1.4468/internal/provider/provider.go) · [Vercel 价格](https://vercel.com/docs/ai-gateway/models-and-providers) · [OpenRouter 目录](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)
+渠道策略存于 `data/mt-channels.json`，格式版本为 2。`include` 默认匹配全部型号，`exclude` 和 `excluded_providers` 优先；`preferred` 决定发现顺序，`billing`、单价和 `price_exceptions` 决定验收许可。推理时展开嵌套组核对，目录故障时保留身份有效的既有资格。Magpie 的 `listOff` 停止抓取目录，`noModels` 停止供应型号，`off` 停用渠道。[渠道选项](https://github.com/yetone/magpie/blob/v0.1.4468/internal/provider/provider.go) · [Vercel 价格](https://vercel.com/docs/ai-gateway/models-and-providers) · [OpenRouter 目录](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)
 
-候选和独立评判者使用合成样例验收，每次请求时限 120 秒。维护预算按候选计数，在发起验收前扣除。百炼试用最多同时接入三个合格型号，绑定原账户、工作空间及可信查询身份，共享 RPM。通常每 60 秒查询额度，失败时标为 `unknown` 并退避。暂停、人工排除、已确认的额度或账户拒绝优先于旧资格。[百炼用量](https://help.aliyun.com/zh/model-studio/cli/usage-quota) · [模型限额](https://help.aliyun.com/zh/model-studio/list-quotas)
+候选和独立评判者使用合成样例验收，采用当前正文、逐屏复核和裁决契约，每次请求时限 120 秒。维护预算按候选计数，在发起验收前扣除；提示和验收版本参与资格缓存键。百炼试用最多同时接入三个合格型号，绑定原账户、工作空间及可信查询身份，共享 RPM。通常每 60 秒查询额度，失败时标为 `unknown` 并退避。暂停、人工排除、已确认的额度或账户拒绝优先于旧资格。[百炼用量](https://help.aliyun.com/zh/model-studio/cli/usage-quota) · [模型限额](https://help.aliyun.com/zh/model-studio/list-quotas)
 
 分组写入先备份、预演并校验，然后写子组，最后切换主入口。每条命令的前后状态写入 `gateway-apply-pending.json`。若命令成功但回执丢失，下次重新核对实际成员、人工开关和托管归属。无法判断时返回 `magpie_group` 并保留记录。`gateway-managed.json` 保存归属，`gateway-maintenance.json` 保存候选资格、冷却和日预算，`bailian-trial-state.json` 保存试用记录。网关分组写入和试用角色分配共用一把锁，推理在锁外执行。
 
 ## 字幕翻译与质量
 
-语种判断、术语提取、正文、独立复核和疑难裁决使用非流式 JSON。每组输入最多 32768 字节，输出最多 4096 token。术语和正文共用 `mt_workers`。`window-independent-v4` 每个术语窗口最多 8 组，最多提前准备两个窗口，按原文顺序合入术语，人工译法优先。
+语种判断、术语提取、正文、独立复核和疑难裁决均生成一个完整 JSON 对象，新任务经流式传输收齐后验证。每组输入最多 32768 字节，输出最多 4096 token。术语和正文共用 `mt_workers`。`window-independent-v4` 每个术语窗口最多 8 组，最多提前准备两个窗口，按原文顺序合入术语，人工译法优先。
 
 完整原句、片段编号、字符范围和显示时长构成请求依据。相邻上下文在语种和人工决定一致时扩展，每侧最多 12 句。超预算时依次裁剪远处邻句、可选的同句证据和术语，保留完整目标和拆句边界两侧最近的同句证据。首个请求前保存分组，正文前保存共用的语义输入，恢复时按已保存的范围继续。
 
-复核逐片配对原文和译文，并连读跨屏句。相邻不同原文出现大段重复译文时交独立型号裁决。只修改确认出错的原句，最多纠正两轮；译文无变化或循环时提前结束。证据不足保留完整译文并告警。
+正文、实时裁决与缓存复用共用内容校验。`content_validation_version:2` 拦截明确英文叙述原样回传，容许代码、数字公式、标识符、名称和中文保留原文。代码检测仅解析语法。
+
+`fidelity_version:2` 为每阶段提供一份完整提示。复核逐屏配对原文与译文，再连读跨屏句；`checks` 覆盖所有编号，值为 `ok`、`issue` 或 `uncertain`，后两者的编号与 `issues` 对应。`source_uncertain` 表示原转写依据不足，保留有据内容等待音视频确认。复核和裁决使用冻结的原句、上下文及人工术语，模型生成的术语候选仅供正文参考。
+
+每屏保存 `source_anchors`，核对带编号符号并容许上下标、大小写和汉字数字等价写法。符号遗漏及不同原文的长译文重复是裁决线索。`local_review_version:1` 在远端复核失败时保存这些线索，绑定原文指纹与译文摘要后送交独立裁决；完整模型复核负责整组质量。恢复及校时重新验证所有依据。
+
+裁决仅修改确认出错的原句，最多两轮，无变化或循环时结束。复核失败、疑点未决或缺少完整复核时返回 `mt_quality_unresolved`，保存草稿及完成阶段，发布在复核通过后进行。服务恢复后用 `--resume`；持久语义疑点需核对证据，调整人工术语或策略版本后 `--reflow`。
+
+请求与阶段键按版本隔离。缺少上述字段的历史任务保持原请求和告警发布行为；已退役的质量版本须从原始转写 `--reflow`，历史文件保留。
 
 ## 数据与恢复
 
@@ -55,7 +65,7 @@
 | --- | --- |
 | `--resume` | 校验原账户、模型、语种决定、排版和执行版本。分段有完整转写就读取本地，有云端 ID 就查询原任务，需要提交时才要求原媒体。未知提交只可绑定已有 ID 或明确同意重发。 |
 | `--reflow` | 从完整原始转写重新规范化，按当前配置重排，保存能对应原句的人工决定。重建前写恢复快照，在同一事务中替换来源、布局和阶段标记。对归档执行时指定输出目录并创建新任务。 |
-| `--retime` | 从已有的最终字幕和通过校验的译文计算显示时间。准备快照和发布意图后，全程在本机完成。 |
+| `--retime` | 从已有的最终字幕和通过校验的译文按当前规则计算显示时间，可将显示版本 3 升级至 4。准备快照和发布意图后，全程在本机完成。 |
 | `--export-archive` | 校验 `data/archives/{任务ID}` 的逐文件 SHA-256 索引、原始转写和 SRT，再导出原字幕字节。 |
 
 当前执行快照使用提示词 7、断句 5 和独立术语窗口。旧版本用 `--reflow` 从原始转写重建，历史产出可从归档导出。并发和轮询等待取当前设置。`cache_version` 表示执行版本需更新，`cache_mismatch` 表示来源、片段范围或翻译证据不一致。翻译缓存绑定实际请求、后端身份、能力、账户和策略版本；人工复核或重新分片时，同事务清除失效译文并保留仍有效的语种依据。
@@ -69,6 +79,8 @@
 规范化保留原始文字、句索引及时间。只有完整词级证据支持时才修复同点句或裁剪段末最后一句。可靠词时间应完整覆盖原文、保持单调并落在句内。长句沿真实词边界拆分，优先句末标点或至少 400ms 的停顿。超过两行或 7 秒尝试拆分，译文超限最多追加两轮。缺少可靠断点时保留全文并记录告警。
 
 显示时间与来源时间分别保存。同段相邻来源句的有限交叉可收短前条终点或推迟后条起点。单次重叠最多 500ms，每片累计限缩最多 500ms 且不超过原时长的 10%，调整后至少 1000ms。`display_timing_adjustments` 记录片段、前后端点、调整量和原因。每轮翻译前及发布前校验时间轴，无法消解的冲突返回 `timeline`。SRT 使用 UTF-8 无 BOM、CRLF 和毫秒时间戳。无语音时任务完成且不生成字幕文件。
+
+显示版本 4 在消解重叠后，把不足 1000ms 的片段尽量延长到 1000ms。终点受同分段、来源顺序正常的下一片原始语音起点与显示起点共同限制；末条、跨段或身份不明时保留原终点。原因记为 `minimum_reading_time`，延长量以负数 `adjustment_ms` 记录。新任务及显式校时使用版本 4，版本 3 恢复保持原时间和待发布字节。
 
 ## 报告字段
 
@@ -86,6 +98,7 @@
 | `mt_format_repair_*` / `mt_paid_fallback_*` | 格式修复及商业后备的请求和成功次数 |
 | `mt_{trial,free,commercial,unknown}_response` | 按实际成员的费用分类计数，现金支出和权益抵扣以账单为准 |
 | `mt_quality_warning` / `mt_glossary_unavailable` | 复核警告及术语不可用 |
+| `mt_local_review` | 远端复核失败后保存的本地重复检查阶段数，不表示完整模型复核通过 |
 | `stage_*_ms` / `run_ms` | 跨恢复累计耗时 |
 
 `.build/mt-diagnostics/{job_id}.jsonl` 中的 `request_start` 表示登记尝试，`request_end` 记录结果分类、HTTP 状态、耗时和可读用量。`route_complete.attempt` 是阶段总尝试数，缓存命中为 0。用 `gateway_session` 在 Magpie 的 Routing／Usage 中核对上游实际尝试。诊断和普通报告省略凭据、签名链接及字幕正文。

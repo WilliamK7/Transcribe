@@ -763,7 +763,7 @@ class Engine:
         cues = self.store.cues(job_id)
         check_cancel(self.cancel)
         stage("writing")
-        content, adjustments = self.render_subtitles(cues, settings)
+        content, adjustments = self.render_subtitles(cues, settings, timing_version=manifest['display_timing_version'])
         if "publication_intent" not in manifest:
             candidate = copy.deepcopy(manifest)
             intent = prepare_intent(output, content, manifest["overwrite"])
@@ -782,8 +782,8 @@ class Engine:
         return "completed"
 
     @staticmethod
-    def render_subtitles(cues, settings):
-        intervals, adjustments = plan_display_timing(cues)
+    def render_subtitles(cues, settings, *, timing_version=DISPLAY_TIMING_VERSION):
+        intervals, adjustments = plan_display_timing(cues, version=timing_version)
         return render_srt(cues, settings, display_intervals=intervals), adjustments
 
     def cleanup_completed_audio(self, job_id, manifest, cache):

@@ -3,9 +3,8 @@ import json
 from unittest import mock
 
 from subtitle_tool.engine import Engine
-from subtitle_tool.mt_quality import PROMPTS
 from subtitle_tool.mt_transport import HTTPReply
-from tests.fixtures import SavedResultFixture, result, timed_raw
+from tests.fixtures import SavedResultFixture, request_stage, result, timed_raw
 
 
 class PoolPipelineFixture(SavedResultFixture):
@@ -36,7 +35,7 @@ class PoolPipelineFixture(SavedResultFixture):
                 if kwargs.get('on_dispatch') is not None:
                     kwargs['on_dispatch']()
                 payload = kwargs['json']
-                stage = next(name for name, prompt in PROMPTS.items() if payload['messages'][0]['content'].startswith(prompt))
+                stage = request_stage(payload)
                 data = json.loads(payload['messages'][1]['content'])
                 data['_model'] = payload['model']
                 parent.calls.append((stage, url, data))
@@ -67,6 +66,9 @@ class PoolPipelineFixture(SavedResultFixture):
                                         if parent.review_issue else [])}
                 if stage == 'judge':
                     value['issues'] = [] if parent.dismiss_review else data['issues']
+                if stage == 'review' and '"checks"' in payload['messages'][0]['content']:
+                    flagged = {i['id'] for i in value['issues']}
+                    value['checks'] = {f['id']: 'issue' if f['id'] in flagged else 'ok' for f in data['fragments']}
                 content = json.dumps(value, ensure_ascii=False)
                 response = {'model': parent.actual_model(stage, payload['model']), 'usage': {'prompt_tokens': 10, 'completion_tokens': 4},
                             'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}

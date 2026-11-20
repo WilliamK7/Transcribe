@@ -75,7 +75,8 @@ class PoolPipelineTests(PoolPipelineFixture):
         data = {'sentences': [{'id': '0', 'text': 'Cache.'}], 'context': [], 'glossary': [], 'fragments': [dict(item, sentence=item['id']) for item in [{'id': '0', 'text': 'Cache.'}]]}
         entry = pipeline.router_for('translate').entries[0]
         key = request_cache_key('translate', data, entry.backend,
-                              capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.cache_scope)
+                              capabilities=pipeline.profiles[entry.id]['capabilities'], scope=pipeline.cache_scope,
+                              fidelity=pipeline.fidelity)
         record = {'value': {'translations': {'0': '缓存。'}}, 'actual_model': 'synthetic',
                   'resolved_model': 'synthetic', 'usage': None}
         with self.store.db:
@@ -135,6 +136,7 @@ class PoolPipelineTests(PoolPipelineFixture):
 
     def test_review_service_failure_keeps_complete_translation_and_safe_warning(self):
         self.install()
+        self.legacy_quality()
         self.review_failure = True
         self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertTrue(all(cue['translated'] for cue in self.store.cues(self.job_id)))
@@ -251,6 +253,7 @@ class PoolPipelineTests(PoolPipelineFixture):
 
     def test_two_repairs_stop_with_full_output_and_safe_warning(self):
         self.install()
+        self.legacy_quality()
         self.review_issue = True
         self.assertEqual(self.run_pool(), 'completed', self.store.job(self.job_id)['error'])
         self.assertEqual([stage for stage, _, _ in self.calls].count('judge'), 2)
@@ -260,6 +263,7 @@ class PoolPipelineTests(PoolPipelineFixture):
 
     def test_unchanged_correction_stops_without_repeating_identical_stage_evidence(self):
         self.install()
+        self.legacy_quality()
         self.review_issue = self.no_change_correction = True
         self.assertEqual(self.run_pool(), 'completed')
         finals = [item['record'] for item in self.store.mt_stages(self.job_id) if item['stage'] == 'final']
@@ -277,6 +281,7 @@ class PoolPipelineTests(PoolPipelineFixture):
 
     def test_cancelled_unchanged_correction_resumes_with_its_saved_result(self):
         self.install()
+        self.legacy_quality()
         self.review_issue = self.no_change_correction = True
         self.cancel_after = 'judge'
         self.assertEqual(self.run_pool(threading.Event()), 'cancelled')
@@ -293,6 +298,7 @@ class PoolPipelineTests(PoolPipelineFixture):
 
     def test_correction_cycle_stops_before_replaying_an_earlier_review(self):
         self.install()
+        self.legacy_quality()
         self.review_issue = True
         def cycle(stage, data):
             if stage == 'judge' and sum(name == 'judge' for name, _, _ in self.calls) == 2:

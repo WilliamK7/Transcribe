@@ -50,7 +50,10 @@ class PointSentenceGroupTests(TemporaryTest):
             "kind": "merged_asr_nearby_point", "direction": "next", "distance_ms": 80,
             "original_neighbor_begin_ms": 2080, "original_neighbor_end_ms": 3360}])
         self.assertTrue(warnings)
-        self.assertEqual(plan_display_timing(sources)[1], [])
+        intervals, adjustments = plan_display_timing(sources)
+        self.assertEqual([(i['begin_ms'], i['end_ms']) for i in intervals], [(1250, 2250), (3250, 4610)])
+        self.assertEqual([a['reason'] for a in adjustments], ['minimum_reading_time'])
+        self.assertEqual(sources[0]['end_ms'], 1890)
 
     def test_nearby_original_neighbors_allow_four_hundred_ms_but_reject_four_hundred_and_one(self):
         for direction in ["previous", "next"]:
@@ -69,7 +72,11 @@ class PointSentenceGroupTests(TemporaryTest):
                         self.assertEqual(source["timing_adjustments"][0]["direction"], direction)
                         self.assertEqual(source["asr_sentence_indices"], [0, 1] if direction == "previous" else [1, 2])
                         self.assertEqual(source["words"], [])
-                        self.assertEqual(plan_display_timing(sources)[1], [])
+                        intervals, adjustments = plan_display_timing(sources)
+                        self.assertEqual([a['reason'] for a in adjustments],
+                                         ['minimum_reading_time'] if direction == 'next' else [])
+                        self.assertEqual(intervals[0]['end_ms'], 1000 if direction == 'next' else source['end_ms'])
+                        self.assertEqual(sources[0]['end_ms'], 640 if direction == 'next' else source['end_ms'])
                     self.assertEqual(raw, before)
 
     def test_nearby_previous_neighbor_keeps_short_point_direction_priority(self):

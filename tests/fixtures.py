@@ -70,6 +70,18 @@ def response(body, status=200, headers=None):
     return resp
 
 
+def request_stage(payload):
+    """Identify mock requests by their output contract, independently of prompt wording."""
+    messages = payload.get('messages', [])
+    if not messages or '输出必须符合此 JSON Schema：' not in messages[0]['content']:
+        return None
+    schema = json.loads(messages[0]['content'].split('输出必须符合此 JSON Schema：', 1)[1])
+    fields = set(schema['properties'])
+    return ('language' if 'decisions' in fields else 'glossary' if 'terms' in fields else
+            'judge' if {'issues', 'translations'} <= fields else
+            'review' if 'issues' in fields else 'translate' if 'translations' in fields else None)
+
+
 def timed_raw(tokens, *, word_ms=200, language="en", pauses=None, start=0):
     words, at = [], start
     for index, token in enumerate(tokens):
@@ -153,10 +165,8 @@ class FakeService:
                 raise requests.ConnectionError()
             return response(self.raw)
         if url.endswith("/chat/completions"):
-            from subtitle_tool.mt_quality import PROMPTS
             payload = kwargs['json']
-            stage = next((name for name, prompt in PROMPTS.items()
-                          if payload['messages'][0]['content'].startswith(prompt)), None)
+            stage = request_stage(payload)
             if stage is not None:
                 data = json.loads(payload['messages'][1]['content'])
                 targets = data['sentences'] if stage in {'glossary', 'language'} else data['fragments']
@@ -165,6 +175,8 @@ class FakeService:
                 value = ({'decisions': {item['id']: 'uncertain' for item in targets}} if stage == 'language' else
                          {'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
                          {'translations': {item['id']: '繁體譯文：' + item['text'] for item in targets}})
+                if stage == 'review' and '"checks"' in payload['messages'][0]['content']:
+                    value['checks'] = {item['id']: 'ok' for item in targets}
                 return response({'model': 'synthetic/' + stage, 'choices': [{'finish_reason': 'stop', 'message': {
                     'content': json.dumps(value, ensure_ascii=False)}}]})
         raise AssertionError("Unexpected request " + url)
@@ -221,6 +233,12 @@ class SubtitleJobFixture(TemporaryTest):
 
 
 class SavedResultFixture(SubtitleJobFixture):
+    def legacy_quality(self):
+        """Exercise the saved advisory-only contract, before fidelity_version."""
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['execution_snapshot'].pop('fidelity_version', None)
+        self.store.update(self.job_id, manifest=manifest)
+
     def setUp(self):
         super().setUp()
         self.source = self.path / "saved.mkv"

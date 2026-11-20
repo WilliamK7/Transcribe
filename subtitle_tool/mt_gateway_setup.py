@@ -14,7 +14,7 @@ from .magpie import bound_gateway, supplies_model, validate_role_pools
 from .mt_admission import ModelEvaluator, admission_key, current_role_members, select_admission_judge
 from .mt_catalog import read_registry, saved_catalog
 from .mt_identity import VSR_MEMBER, canonical_model, model_set
-from .mt_channel_policy import ROLES, load_policy, check_provider_policy
+from .mt_channel_policy import ROLES, load_policy, check_provider_policy, supplier_routing
 
 
 def _supplier_group(main, supplier, free):
@@ -332,9 +332,9 @@ class GatewaySetup:
                     if plan.set_group(name, models, 'order'):
                         output.append('group/' + name)
             paid = main + '-paid'
-            plan.set_group(paid, paid_members, 'weight')
+            plan.set_group(paid, paid_members, supplier_routing(role))
             free_name = 'transcribe-free' + ('' if role == 'translate' else '-' + role)
-            has_free = plan.set_group(free_name, free_members, 'weight')
+            has_free = plan.set_group(free_name, free_members, supplier_routing(role))
             ordered = (['group/' + free_name] if has_free else []) + ['group/' + paid]
             plan.set_group(main, ordered, 'order')
         entries = {r: 'group/transcribe' + ('' if r == 'translate' else '-' + r) for r in ROLES}

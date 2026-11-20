@@ -22,11 +22,12 @@ from .mt_planning import make_translation_unit, restore_group_plan, save_group_p
 from .mt_quality import (BatchValidationError, QUALITY_PROMPT_VERSION,
                          estimate_stage_output, make_stage_payload, manual_terms, parse_stage_response, plan_sentence_groups,
                          repetition_checks, review_with_checks, request_cache_key, term_appears, term_evidence,
-                         validate_stage_value, validate_judgment)
+                         validate_stage_value, validate_judgment, validate_translation_content)
 from .mt_routing import STAGE_TIMEOUT, MagpieRoute, RouteEntry, RouteExhausted, RouteFailure
 from .mt_runtime import service_failure
 from .mt_transport import TransportError
 from .mt_identity import canonical_model, resolve_model, dynamic_model
+from .mt_fidelity import FIDELITY_VERSION, source_anchors, anchor_checks
 from .review import decision_origin
 from .subtitles import (layout_warnings, plan_display_timing, plan_fragments, revise_layout, split_cues_for_translation,
                         validate_cue_coverage)
@@ -147,11 +148,19 @@ class StageRequest:
     ids: tuple
     originals: tuple
     forbidden_models: frozenset
+    check_content: bool = False
+    fidelity: bool = False
+
+    def validate_content(self, value):
+        if self.check_content and self.name in {'translate', 'judge'}:
+            validate_translation_content(value['translations'], self.originals)
+        if self.name == 'judge':
+            validate_judgment(value, self.data, fidelity=self.fidelity)
 
     def validate_record(self, record, identities):
-        value = validate_stage_value(self.name, record['value'], ids=self.ids, originals=self.originals)
-        if self.name == 'judge':
-            validate_judgment(value, self.data)
+        value = validate_stage_value(self.name, record['value'], ids=self.ids, originals=self.originals,
+                                     fidelity=self.fidelity)
+        self.validate_content(value)
         resolved = _record_model(record, identities)
         if not _independent_model(resolved, self.forbidden_models):
             return None
@@ -208,7 +217,18 @@ def check_pool(config, identity, route, cancel, *, magpie=None):
         store.close()
 
 
-def _validate_saved_reviews(final, history, source_hashes):
+def _quality_checks(translations, source_hashes, anchors=None):
+    checks = repetition_checks(translations, source_hashes)
+    return checks + (anchor_checks(translations, anchors) if anchors is not None else [])
+
+
+def _local_review_record(translations, source_hashes, anchors=None):
+    return {'stage': 'local_review', 'value': {'issues': _quality_checks(translations, source_hashes, anchors)},
+            'source_text_hashes': source_hashes, 'translations_digest': _digest(translations),
+            **({'source_anchors': anchors} if anchors is not None else {})}
+
+
+def _validate_saved_reviews(final, history, source_hashes, *, fidelity=False):
     reviews, corrections = final['review_stage_keys'], final['correction_stage_keys']
     if not len(corrections) <= len(reviews) <= len(corrections) + 1:
         raise ValueError()
@@ -220,24 +240,36 @@ def _validate_saved_reviews(final, history, source_hashes):
     if not isinstance(current, dict) or set(current) != ids:
         raise ValueError()
     unresolved = True
+    anchors = history[final['translation_stage_key']].get('source_anchors') if fidelity else None
+    if fidelity and (not isinstance(anchors, list) or len(anchors) != len(ids) or any(
+            not isinstance(group, list) or any(not isinstance(a, str) or not re.fullmatch(r'[a-z]{1,2}\d{1,3}', a)
+                                               for a in group) for group in anchors)):
+        raise ValueError()
     for index, review_key in enumerate(reviews):
-        review = validate_stage_value('review', history[review_key]['value'], ids=ids)
-        review = review_with_checks(review, repetition_checks(current, source_hashes))
+        record = history[review_key]
+        local = record['stage'] == 'local_review'
+        if local and (record != _local_review_record(current, source_hashes, anchors) or not record['value']['issues']):
+            raise ValueError()
+        review = validate_stage_value('review', record['value'], ids=ids, fidelity=fidelity and not local)
+        review = review_with_checks(review, _quality_checks(current, source_hashes, anchors))
         unresolved = bool(review['issues'])
         if index == len(corrections):
             break
         if not unresolved:
             raise ValueError()
         correction = history[corrections[index]]['value']
-        validate_stage_value('review', {'issues': correction['issues']}, ids=ids)
+        validate_stage_value('review', {'issues': correction['issues']}, ids=ids,
+                             fidelity=fidelity, review_coverage=False)
         if not isinstance(correction['translations'], dict) or set(correction['translations']) != ids:
             raise ValueError()
-        validate_judgment(correction, {**review, 'fragments': fragments, 'translations': current})
+        validate_judgment(correction, {**review, 'fragments': fragments, 'translations': current}, fidelity=fidelity)
         current = correction['translations']
-        unresolved = bool(correction['issues'])
-        if not unresolved and index + 1 < len(reviews):
+        # A local check covers its own signal only; a dismissed signal cannot
+        # certify the rest of the group as independently reviewed.
+        unresolved = bool(correction['issues']) or local
+        if not correction['issues'] and index + 1 < len(reviews):
             raise ValueError()
-    if final['warning'] != unresolved:
+    if final['warning'] != unresolved or fidelity and unresolved:
         raise ValueError()
 
 
@@ -246,6 +278,7 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
     route = saved_route(manifest)
     profiles = {entry['id']: entry for entry in route['entries']}
     checked, finals = set(), {}
+    fidelity = manifest.get('execution_snapshot', {}).get('fidelity_version') == FIDELITY_VERSION
     try:
         for cue in engine.store.cues(job_id):
             if not cue.get('translated'):
@@ -296,6 +329,12 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                         raise ValueError()
                     for stage_key in keys:
                         entry = engine.store.mt_stage_entry(job_id, stage_key)
+                        if (stage_name == 'review' and isinstance(entry, dict) and entry.get('stage') == 'local_review' and
+                                manifest['execution_snapshot'].get('local_review_version') == 1):
+                            if not isinstance(entry.get('record'), dict) or entry['record'].get('stage') != 'local_review':
+                                raise ValueError()
+                            history[stage_key] = entry['record']
+                            continue
                         if (not isinstance(entry, dict) or entry['stage'] != stage_name or
                                 not isinstance(entry['record'], dict) or entry['record'].get('stage') != stage_name):
                             raise ValueError()
@@ -313,15 +352,20 @@ def validate_provenance(engine, job_id, manifest, *, verify_credentials=True):
                 if (not isinstance(source_hashes, list) or len(source_hashes) != len(final['cue_ids']) or
                         any(not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) for digest in source_hashes)):
                     raise ValueError()
-                _validate_saved_reviews(final, history, source_hashes)
-                finals[key] = final, source_hashes
-            final, source_hashes = finals[key]
+                _validate_saved_reviews(final, history, source_hashes, fidelity=fidelity)
+                anchors = history[final['translation_stage_key']].get('source_anchors')
+                finals[key] = final, source_hashes, anchors
+            final, source_hashes, anchors = finals[key]
             if (final['backend'] != origin or final['request_model'] != profiles[origin]['backend']['model'] or
                     cue['cue_id'] not in final['cue_ids'] or
                     final['value']['translations'][str(final['cue_ids'].index(cue['cue_id']))] != cue['translated']):
                 raise ValueError()
             if source_hashes[final['cue_ids'].index(cue['cue_id'])] != _digest(cue['text'].strip()):
                 raise ValueError()
+            if fidelity and anchors[final['cue_ids'].index(cue['cue_id'])] != source_anchors([cue['text']])[0]:
+                raise ValueError()
+            if manifest.get('execution_snapshot', {}).get('content_validation_version') == 2:
+                validate_translation_content({'0': cue['translated']}, [cue['text']])
     except (KeyError, TypeError, ValueError, BatchValidationError):
         raise ToolError('译文阶段来源或底层型号与快照不一致；请用 --reflow 从原始转写重建。',
                         'cache_mismatch') from None
@@ -332,6 +376,10 @@ class Pipeline:
         from .policy import load_policy
         self.engine, self.store, self.job_id = engine, engine.store, job_id
         load_policy(manifest)
+        self.stream = manifest['execution_snapshot'].get('transport_version', 1) == 2
+        self.check_content = manifest['execution_snapshot'].get('content_validation_version', 1) == 2
+        self.local_review = manifest['execution_snapshot'].get('local_review_version') == 1
+        self.fidelity = manifest['execution_snapshot'].get('fidelity_version') == FIDELITY_VERSION
         self.context = threading.local()
         self.group_progress = None
         self.display_durations = {}
@@ -343,6 +391,8 @@ class Pipeline:
         self.snapshot = saved_route(manifest)
         self.identities = self.snapshot.get('identities', {})
         self.cache_scope = dict(scope)
+        if self.check_content:
+            self.cache_scope['content_validation'] = 2
         self.cache_scope['model_identity'] = _digest(self.identities)
         self.profiles = {profile['id']: profile for profile in self.snapshot['entries']}
         entries = []
@@ -426,7 +476,8 @@ class Pipeline:
     def _request_payload(self, stage, data, entry, *, repair=False):
         try:
             return make_stage_payload(stage, data, entry.backend,
-                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair)
+                                      capabilities=self.profiles[entry.id]['capabilities'], repair=repair, stream=self.stream,
+                                      fidelity=self.fidelity)
         except ToolError as error:
             if error.code != 'mt_input_budget':
                 raise
@@ -518,9 +569,8 @@ class Pipeline:
                 outcome, event['category'] = 'service_error', category
                 raise RouteFailure(category, diagnostic_scope=scope) from None
             try:
-                value = parse_stage_response(name, body, ids=request.ids, originals=request.originals)
-                if name == 'judge':
-                    validate_judgment(value, data)
+                value = parse_stage_response(name, body, ids=request.ids, originals=request.originals, fidelity=request.fidelity)
+                request.validate_content(value)
             except BatchValidationError as error:
                 outcome, event['validation_category'] = 'invalid', error.category
                 self.store.count(self.job_id, 'mt_invalid_response')
@@ -586,7 +636,7 @@ class Pipeline:
             # Reserve the fixed repair instruction without dropping evidence
             # between the initial request and its possible regeneration.
             make_stage_payload(stage, data, entry.backend, capabilities=capabilities,
-                               repair=stage in {'translate'})
+                               repair=stage in {'translate'}, stream=self.stream, fidelity=self.fidelity)
         while True:
             fits = bool(candidates)
             for entry in candidates:
@@ -609,7 +659,9 @@ class Pipeline:
 
     def _task_stage_key(self, name, data):
         return _digest({'strategy': 6, 'prompt': QUALITY_PROMPT_VERSION, 'stage': name, 'data': data,
-                        'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
+                        'scope': self.cache_scope, 'profiles': self.snapshot['entries'],
+                        **({'transport': 2} if self.stream else {}),
+                        **({'fidelity': FIDELITY_VERSION} if self.fidelity else {})})
 
     def _read_task_stage(self, request, stage_key, evidence):
         try:
@@ -647,7 +699,7 @@ class Pipeline:
         try:
             entry.backend.credential(self.engine.config)
             key = request_cache_key(request.name, request.data, entry.backend, capabilities=self.profiles[entry.id]['capabilities'],
-                                    scope=self.cache_scope)
+                                    scope=self.cache_scope, stream=self.stream, fidelity=self.fidelity)
         except ToolError as error:
             if error.code in {'mt_input_budget', 'credentials', 'mt_account_changed'}:
                 return None
@@ -690,7 +742,9 @@ class Pipeline:
                     if name in {'translate', 'language'} else {})
         if name == 'language':
             evidence['source_records'] = [_digest(item) for item in data['sentences']]
-        request = StageRequest(name, data, tuple(ids), tuple(originals), forbidden_models)
+        if name == 'translate' and self.fidelity:
+            evidence['source_anchors'] = source_anchors(originals)
+        request = StageRequest(name, data, tuple(ids), tuple(originals), forbidden_models, self.check_content, self.fidelity)
         saved = self._read_task_stage(request, stage_key, evidence)
         if saved is not None:
             return saved
@@ -734,7 +788,8 @@ class Pipeline:
             # Its cross-task cache still keys the exact fitted wire request.
             record['context'] = data.get('context', [])
         cache_key = request_cache_key(name, data, result.entry.backend,
-                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope)
+                                    capabilities=self.profiles[result.entry.id]['capabilities'], scope=self.cache_scope,
+                                    stream=self.stream, fidelity=self.fidelity)
         with self.engine.mt_control.lock:
             self.engine.mt_control.check_inflight()
             self.store.commit_mt_stage(self.job_id, stage_key, name, record,
@@ -893,6 +948,33 @@ class Pipeline:
             self.engine.mt_control.check_start()
             return None
 
+    def _review(self, data, ids, originals, forbidden_models):
+        """Keep local evidence resumable, without presenting it as a model review."""
+        key = self._task_stage_key('local_review', data)
+        expected = _local_review_record(data['translations'], [_digest(text.strip()) for text in originals],
+                                        source_anchors(originals) if self.fidelity else None)
+        saved = None
+        if self.local_review:
+            try:
+                saved = self.store.mt_stage_entry(self.job_id, key)
+                if saved is not None:
+                    if saved != {'stage': 'local_review', 'record': expected} or not expected['value']['issues']:
+                        raise ValueError()
+                    if not self.fidelity:
+                        return expected['value'], None, {'key': key, 'local': True}
+            except (ValueError, KeyError, TypeError):
+                raise ToolError('保存的本地复核依据与译文不一致，请用 --reflow 检查来源。', 'cache_mismatch') from None
+        result = self._advisory_stage('review', data, ids=ids, forbidden_models=forbidden_models)
+        if result is not None or not self.local_review or not expected['value']['issues']:
+            return result
+        if saved is not None:
+            return expected['value'], None, {'key': key, 'local': True}
+        with self.engine.mt_control.lock:
+            self.engine.mt_control.check_start()
+            self.store.commit_mt_stage(self.job_id, key, 'local_review', expected,
+                                       counts={'mt_local_review': 1})
+        return expected['value'], None, {'key': key, 'local': True}
+
     def translate_group(self, group, glossary, context):
         self.engine.mt_control.check_start()
         members = [cue for translation_unit in group for cue in translation_unit['cues']]
@@ -926,21 +1008,27 @@ class Pipeline:
             forbidden_models = {_proof_model(translation_proof)}
             if production is not translation_proof:
                 forbidden_models.add(_proof_model(production))
-            result = self._advisory_stage('review', review_data, ids=ids, forbidden_models=forbidden_models)
+            result = self._review(review_data, ids, originals, forbidden_models)
             if result is None:
                 warning = True
                 break
             review, _, review_proof = result
             review_keys.append(review_proof['key'])
             reviewed.append(current)
-            review = review_with_checks(review, repetition_checks(current, originals))
+            review = review_with_checks(review, _quality_checks(current, originals,
+                                        source_anchors(originals) if self.fidelity else None))
+            if self.fidelity and any(i['category'] == 'source_uncertain' for i in review['issues']):
+                warning = True
+                break
             if not review['issues']:
                 break
             if round_number == self.snapshot['quality']['max_revisions']:
                 warning = True
                 break
             correction_data = {**review_data, 'issues': review['issues']}
-            forbidden_models = {_proof_model(translation_proof), _proof_model(review_proof)}
+            forbidden_models = {_proof_model(translation_proof)}
+            if not review_proof.get('local'):
+                forbidden_models.add(_proof_model(review_proof))
             correction = self._advisory_stage('judge', correction_data, ids=ids, originals=originals,
                                               forbidden_models=forbidden_models)
             if correction is None:
@@ -950,7 +1038,11 @@ class Pipeline:
             correction_keys.append(production['key'])
             current = corrected['translations']
             if not corrected['issues']:
+                warning = bool(review_proof.get('local'))
                 break
+        if self.fidelity and warning:
+            raise ToolError('字幕逐屏复核尚未通过，完整草稿和阶段已保存，未发布。服务恢复后可用 --resume；'
+                            '持续的语义或原转写疑点须核对证据、调整人工术语或策略版本后 --reflow。', 'mt_quality_unresolved')
         final_key = _digest({'stage': 'final', 'strategy': 6, 'cues': [c['cue_id'] for c in members],
                              'data': data, 'scope': self.cache_scope, 'profiles': self.snapshot['entries']})
         record = {'backend': origin, 'request_model': production['request_model'],
@@ -978,6 +1070,7 @@ def groups_for_layout(engine, job_id, manifest, sources, cues, pipeline):
 
 
 def process_subtitles(engine, job_id, manifest, settings, scope, stage):
+    timing_version = manifest['display_timing_version']
     sources = engine.store.sources(job_id)
     if not sources:
         raise ToolError('任务缺少完整句来源记录。', 'cache_mismatch')
@@ -998,7 +1091,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                     parts = split_cues_for_translation(source, parts, fits=lambda cue: pipeline._fits_group(
                         [{'source': source, 'text': cue['text'], 'cues': [cue]}]))
                 cues.extend(parts)
-            plan_display_timing(cues)
+            plan_display_timing(cues, version=timing_version)
             candidate = copy.deepcopy(manifest)
             candidate.update(layout_planned=True, layout_round=0)
             engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, cues)
@@ -1006,7 +1099,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
             check_cancel(engine.cancel)
             stage('subtitle_translating')
             cues = engine.store.cues(job_id)
-            display_intervals, _ = plan_display_timing(cues)
+            display_intervals, _ = plan_display_timing(cues, version=timing_version)
             if pipeline is not None:
                 pipeline.display_durations = {item['cue_id']: item['end_ms'] - item['begin_ms'] for item in display_intervals}
             groups = groups_for_layout(engine, job_id, manifest, sources, cues, pipeline)
@@ -1049,7 +1142,7 @@ def process_subtitles(engine, job_id, manifest, settings, scope, stage):
                 return
             candidate = copy.deepcopy(manifest)
             candidate['layout_round'] = round_number + 1
-            plan_display_timing(revised)
+            plan_display_timing(revised, version=timing_version)
             engine.commit_local(job_id, manifest, candidate, engine.store.save_layout, revised)
     finally:
         if pipeline is not None:

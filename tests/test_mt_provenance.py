@@ -6,9 +6,8 @@ from unittest import mock
 
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
-from subtitle_tool.mt_quality import PROMPTS
 from subtitle_tool.subtitles import ALIGNMENT_VERSION
-from tests.fixtures import FakeService, SavedResultFixture, response, result, timed_raw
+from tests.fixtures import FakeService, SavedResultFixture, request_stage, response, result, timed_raw
 
 
 class ProductionService(FakeService):
@@ -24,8 +23,7 @@ class ProductionService(FakeService):
         if not url.endswith('/chat/completions'):
             return super().request(method, url, **kwargs)
         payload = kwargs['json']
-        stage = next(name for name, prompt in PROMPTS.items()
-                     if payload['messages'][0]['content'].startswith(prompt))
+        stage = request_stage(payload)
         data = json.loads(payload['messages'][1]['content'])
         self.stages.append((stage, data))
         if stage == 'glossary':
@@ -35,6 +33,9 @@ class ProductionService(FakeService):
                 return response({}, 400)
             value = {'issues': [{'id': '0', 'category': 'number', 'evidence': 'Synthetic issue.'}]
                      if self.review_issue else []}
+            if '"checks"' in payload['messages'][0]['content']:
+                flagged = {i['id'] for i in value['issues']}
+                value['checks'] = {f['id']: 'issue' if f['id'] in flagged else 'ok' for f in data['fragments']}
         else:
             items = data['fragments']
             value = {'translations': {item['id']: stage + ' 译文 ' + item['id'] for item in items}}
@@ -42,6 +43,8 @@ class ProductionService(FakeService):
             value['issues'] = data['issues']
             value['translations'] = {**data['translations'], **{issue['id']: 'judge 译文 ' + issue['id']
                                      for issue in value['issues']}}
+            # This fixture's one synthetic issue is resolved by its judge.
+            self.review_issue = False
         if self.cancel_stage == stage:
             self.cancel.set()
         return response({'model': 'synthetic/' + stage, 'choices': [{'finish_reason': 'stop', 'message': {
@@ -144,6 +147,7 @@ class ProductionProvenanceTests(SavedResultFixture):
         self.assertEqual(self.execute(), 'completed')
 
     def test_review_failure_preserves_draft_and_valid_issues_reach_judge(self):
+        self.legacy_quality()
         self.fake.fail_review = True
         self.assertEqual(self.execute(), 'completed')
         _, final = self.final()
@@ -155,7 +159,7 @@ class ProductionProvenanceTests(SavedResultFixture):
         Engine(self.config, self.store).reflow(self.job_id, overwrite=True)
         self.assertEqual(self.execute(), 'completed')
         _, final = self.final()
-        self.assertTrue(final['warning'])
+        self.assertFalse(final['warning'])
         self.assertEqual(self.store.mt_stage_entry(self.job_id, final['production_stage_key'])['stage'], 'judge')
 
     def test_direct_provenance_rejects_changed_source_mapping(self):

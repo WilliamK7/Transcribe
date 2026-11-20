@@ -57,7 +57,7 @@ class DisplayTimingPipelineTests(SavedResultFixture):
 
         self.assertEqual(engine.reflow(self.job_id), self.job_id)
         manifest = self.store.job(self.job_id)['manifest']
-        self.assertEqual(manifest['display_timing_version'], 3)
+        self.assertEqual(manifest['display_timing_version'], 4)
         self.assertTrue((self.config.root / manifest['reflow']['snapshot']).is_file())
         self.assertEqual(self.run_fake(fake), 'completed')
         self.assertEqual(raw_path.read_bytes(), raw_bytes)
@@ -71,7 +71,7 @@ class DisplayTimingPipelineTests(SavedResultFixture):
         content = self.source.with_suffix(".srt").read_bytes()
         self.assertEqual(srt_intervals(content), [(1000, 4960), (4960, 8320)])
         manifest = self.store.job(self.job_id)["manifest"]
-        self.assertEqual(manifest["display_timing_version"], 3)
+        self.assertEqual(manifest["display_timing_version"], 4)
         self.assertEqual(manifest["display_timing_adjustments"][0]["adjustment_ms"], 40)
         self.assertEqual(manifest["expected_srt_sha256"], hashlib.sha256(content).hexdigest())
         self.assertEqual(manifest["publication_intent"]["expected_srt_sha256"], manifest["expected_srt_sha256"])
@@ -117,7 +117,7 @@ class DisplayTimingPipelineTests(SavedResultFixture):
         self.assertEqual(self.run_fake(fake), "completed")
         self.assertEqual(fake.calls, [])
         self.assertEqual(self.store.job(self.job_id)["manifest"]["publication_intent"], intent)
-        self.assertEqual(self.store.job(self.job_id)['manifest']['display_timing_version'], 3)
+        self.assertEqual(self.store.job(self.job_id)['manifest']['display_timing_version'], 4)
         self.assertEqual(self.store.cues(self.job_id), cues)
         self.assertEqual(self.store.sources(self.job_id), sources)
         self.assertEqual(summary(self.store, self.job_id)["display_timing_adjustments"], manifest["display_timing_adjustments"])

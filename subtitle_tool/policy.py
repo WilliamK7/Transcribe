@@ -6,6 +6,7 @@ from .common import (ASR_MODEL, ASR_LANGUAGE_INFERENCE_VERSION, LEGACY_ASR_MODEL
                      NORMALIZER_VERSION, PROCESSING_VERSION, SUBTITLE_VERSION, ToolError, asr_contract)
 from .media import EXTRACT_RECIPE_VERSION
 from .mt_quality import GLOSSARY_SCHEDULE, QUALITY_PROMPT_VERSION
+from .mt_fidelity import FIDELITY_VERSION
 from .subtitles import ALIGNMENT_VERSION
 
 _LAYOUT_FIELDS = ('zh_line_width', 'other_line_width', 'chinese_first')
@@ -16,7 +17,11 @@ def current_execution_snapshot():
                 prompt_version=QUALITY_PROMPT_VERSION,
                 recovery_version=6,
                 context_version=3,
-                alignment_version=ALIGNMENT_VERSION)
+                alignment_version=ALIGNMENT_VERSION,
+                transport_version=2,
+                content_validation_version=2,
+                local_review_version=1,
+                fidelity_version=FIDELITY_VERSION)
 
 
 def subtitle_contract(settings):
@@ -77,7 +82,9 @@ def load_policy(manifest):
     """Validate the saved execution contract before reusing derived results."""
     validate_raw_contract(manifest)
     _version(manifest.get("subtitle_version"), SUBTITLE_VERSION)
-    _version(manifest.get('display_timing_version'), DISPLAY_TIMING_VERSION)
+    timing_version = manifest.get('display_timing_version')
+    if type(timing_version) is not int or timing_version not in (3, DISPLAY_TIMING_VERSION):
+        raise ToolError('任务显示时间版本不受支持，请用 --reflow 显式重排。', 'cache_version')
     _version(manifest.get("translation_strategy_version"), 6)
     saved_layout = manifest.get("subtitle_settings", {})
     if not isinstance(saved_layout, dict) or saved_layout.keys() != set(_LAYOUT_FIELDS):
@@ -91,6 +98,12 @@ def load_policy(manifest):
         _version(manifest["normalized_version"], NORMALIZER_VERSION)
     snapshot = manifest.get('execution_snapshot')
     expected = current_execution_snapshot()
+    # A missing transport field is the original whole-response contract. Its
+    # saved stage and request keys must remain byte-for-byte reproducible.
+    if isinstance(snapshot, dict):
+        for field in ('transport_version', 'content_validation_version', 'local_review_version', 'fidelity_version'):
+            if field not in snapshot:
+                expected.pop(field)
     if (not isinstance(snapshot, dict) or snapshot != expected or
             any(type(value) is not int for value in snapshot.values())):
         raise ToolError('任务执行版本已退役；请用 --reflow 从原始转写重建当前版本任务。', 'cache_version')

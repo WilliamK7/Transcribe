@@ -106,6 +106,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
         self.save_result(raw)
         Engine(self.config, self.store).reflow(self.job_id)
         self.review_issue = True
+        self.dismiss_review = self.no_change_correction = True
         self.assertEqual(self.run_pool(), 'completed')
         tail = [(stage, data) for stage, _, data in self.calls if len(data['sentences']) == 1]
         draft = next(data for stage, data in tail if stage == 'translate')
@@ -120,7 +121,7 @@ class SemanticPipelineTests(PoolPipelineFixture):
         Engine(self.config, self.store).reflow(self.job_id)
         manifest = self.store.job(self.job_id)['manifest']
         for entry in manifest['mt_route_snapshot']['entries']:
-            entry['capabilities']['input_bytes'] = 4000
+            entry['capabilities']['input_bytes'] = 6000
         self.store.update(self.job_id, manifest=manifest)
         self.assertEqual(self.run_pool(), 'completed')
         drafts = [data for stage, _, data in self.calls if stage == 'translate']

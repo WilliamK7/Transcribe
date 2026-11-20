@@ -13,6 +13,7 @@ from subtitle_tool.mt_pool import configured_route, saved_route
 from subtitle_tool.mt_quality import make_stage_payload
 from subtitle_tool.mt_routing import RouteExhausted
 from subtitle_tool.mt_transport import HTTPReply, TransportError
+from tests.fixtures import request_stage
 from tests.mt_fixtures import PoolPipelineFixture
 
 
@@ -53,6 +54,49 @@ class GatewayContractTests(PoolPipelineFixture):
                     self.assertEqual(payload.get('reasoning_effort'), 'low' if stage == 'judge' else 'none')
                     self.assertEqual(payload['max_tokens'], 4096)
                     self.assertEqual(payload['model'], entry.backend.model)
+
+    def test_every_stage_requests_streamed_delivery_and_final_usage(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        for stage in ('glossary', 'translate', 'review', 'judge'):
+            with self.subTest(stage=stage):
+                entry = pipeline.router_for(stage).entries[0]
+                payload = pipeline._request_payload(stage, self.data(stage), entry)
+                self.assertIs(payload['stream'], True)
+                self.assertEqual(payload.get('stream_options'), {'include_usage': True})
+
+    def test_old_task_keeps_whole_response_payload_and_saved_stage_identity(self):
+        pipeline = self.pipeline()
+        self.addCleanup(pipeline.close)
+        manifest = self.store.job(self.job_id)['manifest']
+        manifest['execution_snapshot'].pop('transport_version', None)
+        manifest['execution_snapshot'].pop('fidelity_version', None)
+        self.store.update(self.job_id, manifest=manifest)
+        engine = Engine(self.config, self.store)
+        _, scope = engine.identity(self.job_id, manifest, persist=False)
+        old = Pipeline(engine, self.job_id, manifest, scope)
+        self.addCleanup(old.close)
+        data = self.data()
+        entry = old.router_for('translate').entries[0]
+        payload = old._request_payload('translate', data, entry)
+        self.assertIs(payload['stream'], False)
+        self.assertNotIn('stream_options', payload)
+        from subtitle_tool.mt_pipeline import _digest
+        from subtitle_tool.mt_quality import QUALITY_PROMPT_VERSION
+        key = _digest({'strategy': 6, 'prompt': QUALITY_PROMPT_VERSION, 'stage': 'translate', 'data': data,
+                       'scope': old.cache_scope, 'profiles': old.snapshot['entries']})
+        self.assertEqual(old._task_stage_key('translate', data), key)
+        self.assertNotEqual(pipeline._task_stage_key('translate', data), key)
+        from subtitle_tool.mt_quality import request_cache_key
+        cache_key = request_cache_key('translate', data, entry.backend,
+            capabilities=old.profiles[entry.id]['capabilities'], scope=old.cache_scope, stream=False)
+        with self.store.db:
+            self.store.db.execute('INSERT INTO mt_cache VALUES(?, ?)', (cache_key, json.dumps({
+                'value': {'translations': {'0': '已保存的完整译文。'}}, 'actual_model': 'synthetic/accepted',
+                'resolved_model': 'accepted', 'usage': None})))
+        with mock.patch.object(old.transport, 'request', side_effect=AssertionError('Unexpected network')):
+            self.assertEqual(self.stage(old, data=data)[0]['translations']['0'], '已保存的完整译文。')
+            self.assertEqual(self.stage(old, data=data)[0]['translations']['0'], '已保存的完整译文。')
 
     def test_truncation_retains_cause_request_and_reasoning_usage_without_saving_text(self):
         pipeline = self.pipeline()
@@ -189,15 +233,13 @@ class GatewayContractTests(PoolPipelineFixture):
                          ['group/transcribe', 'group/transcribe', 'group/transcribe-paid'])
 
     def test_job_completes_with_paid_fallback_and_preserves_provenance(self):
-        from subtitle_tool.mt_quality import PROMPTS
         from subtitle_tool.mt_pipeline import validate_provenance
         self.install(split=True)
         calls = []
         def send(*args, **kwargs):
             kwargs['on_dispatch']()
             payload = kwargs['json']
-            stage = next(name for name, prompt in PROMPTS.items()
-                         if payload['messages'][0]['content'].startswith(prompt))
+            stage = request_stage(payload)
             data = json.loads(payload['messages'][1]['content'])
             calls.append((stage, payload['model']))
             if stage == 'translate' and payload['model'] == 'group/transcribe':
@@ -205,7 +247,9 @@ class GatewayContractTests(PoolPipelineFixture):
             value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
                      {'translations': {item['id']: '完整后备译文。' for item in
                                        data['fragments']}})
-            return reply(value, model='paid/accepted')
+            if stage == 'review':
+                value['checks'] = {item['id']: 'ok' for item in data['fragments']}
+            return reply(value, model='paid/accepted' if stage == 'translate' else 'synthetic/' + stage)
         with mock.patch('subtitle_tool.mt_transport.ProcessTransport') as transport:
             transport.return_value.request.side_effect = send
             engine = Engine(self.config, self.store)
@@ -267,16 +311,15 @@ class GatewayContractTests(PoolPipelineFixture):
         self.assertTrue(self.source.with_suffix('.srt').is_file())
 
     def test_truncated_advisory_stages_keep_complete_translation(self):
-        from subtitle_tool.mt_quality import PROMPTS
         for version, failed in enumerate(('glossary', 'review', 'judge'), 1):
             with self.subTest(stage=failed):
                 self.config.settings.mt_policy_version = version
                 self.install()
+                self.legacy_quality()
                 def send(*args, **kwargs):
                     kwargs['on_dispatch']()
                     payload = kwargs['json']
-                    stage = next(name for name, prompt in PROMPTS.items()
-                                 if payload['messages'][0]['content'].startswith(prompt))
+                    stage = request_stage(payload)
                     data = json.loads(payload['messages'][1]['content'])
                     if stage == failed:
                         return reply({}, finish='length')
@@ -400,7 +443,7 @@ class GatewayContractTests(PoolPipelineFixture):
         self.assertEqual(len(calls), 2)
         self.assertEqual({c['json']['model'] for c in calls}, {'group/transcribe'})
         self.assertEqual(calls[0]['json']['messages'][1], calls[1]['json']['messages'][1])
-        self.assertIn('重新生成', calls[1]['json']['messages'][0]['content'])
+        self.assertNotEqual(calls[0]['json']['messages'][0], calls[1]['json']['messages'][0])
         self.assertEqual(data, original)
         with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('unexpected HTTP')):
             self.assertEqual(self.stage(pipeline, data=data)[0], value)
@@ -424,7 +467,7 @@ class GatewayContractTests(PoolPipelineFixture):
         data['context'] = [{'position': 'before', 'text': 'Synthetic background. ' * 20}]
         entry = pipeline.router_for('translate').entries[0]
         capabilities = pipeline.profiles[entry.id]['capabilities']
-        initial = make_stage_payload('translate', data, entry.backend, capabilities=capabilities)
+        initial = make_stage_payload('translate', data, entry.backend, capabilities=capabilities, fidelity=pipeline.fidelity)
         budget = len(json.dumps(initial, ensure_ascii=False).encode('utf-8'))
         capabilities['input_bytes'] = budget
         calls = []

@@ -350,7 +350,9 @@ class BailianFreeGuard:
         placeholders.pop(trial_group, None)
         trial = 'group/' + trial_group
         if free_group not in groups:
-            self.admin.command('group', 'add', free_group, 'models=' + trial, 'routing=weight', 'stays=off')
+            from .mt_channel_policy import supplier_routing
+            self.admin.command('group', 'add', free_group, 'models=' + trial,
+                               'routing=' + supplier_routing(item['role']), 'stays=off')
         elif trial not in groups[free_group].get('members', []):
             self.admin.command('group', 'set', free_group, 'models+=' + trial)
         paid = 'group/' + main + '-paid'

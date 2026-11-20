@@ -332,7 +332,8 @@ class Store:
                         cache_key=None, cache_value=None):
         """Persist a complete private stage and, when present, all cue updates in one transaction."""
         if (not isinstance(key, str) or len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or
-                stage not in {'language', 'glossary', 'glossary_unavailable', 'semantic_input', 'translate', 'review', 'judge', 'final'} or not isinstance(record, dict) or
+                stage not in {'language', 'glossary', 'glossary_unavailable', 'semantic_input', 'translate', 'review',
+                              'local_review', 'judge', 'final'} or not isinstance(record, dict) or
                 (cache_key is None) != (cache_value is None) or
                 translations is not None and (not translations or
                     any(not isinstance(text, str) or not text.strip() for text in translations.values()))):

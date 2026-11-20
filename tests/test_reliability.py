@@ -7,7 +7,7 @@ from unittest import mock
 
 from subtitle_tool.common import ToolError
 from subtitle_tool.engine import Engine
-from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, response, result, timed_raw, seed_job_state
+from tests.fixtures import enqueue_current, FakeService, SavedResultFixture, request_stage, response, result, timed_raw, seed_job_state
 
 
 class TransactionRecoveryTests(SavedResultFixture):
@@ -23,6 +23,7 @@ class TransactionRecoveryTests(SavedResultFixture):
                         manifest = self.store.job(self.job_id)["manifest"]
                         manifest["subtitle_settings"].update(zh_line_width=22, other_line_width=42)
                         self.store.update(self.job_id, manifest=manifest)
+                        self.legacy_quality()  # Isolate transaction/layout faults from the publication quality gate.
                         raw = timed_raw(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], word_ms=1000)
                         self.save_result(raw, normalized=False)
                         fake = FakeService(raw)
@@ -30,9 +31,8 @@ class TransactionRecoveryTests(SavedResultFixture):
                         def request(method, url, **kwargs):
                             if url.endswith("/chat/completions"):
                                 fake.calls.append((method, url, kwargs))
-                                from subtitle_tool.mt_quality import PROMPTS
                                 body = kwargs['json']
-                                stage = next(name for name, prompt in PROMPTS.items() if body['messages'][0]['content'].startswith(prompt))
+                                stage = request_stage(body)
                                 data = json.loads(body['messages'][1]['content'])
                                 value = ({'terms': []} if stage == 'glossary' else {'issues': []} if stage == 'review' else
                                          {'translations': {item['id']: '中' * 50

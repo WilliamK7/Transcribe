@@ -47,7 +47,7 @@ class RetimeTests(SavedResultFixture):
         manifest = prepared["manifest"]
         self.assertEqual(prepared["state"], "queued")
         self.assertEqual(self.output.read_bytes(), self.old_content)
-        self.assertEqual(manifest["display_timing_version"], 3)
+        self.assertEqual(manifest["display_timing_version"], 4)
         self.assertEqual(manifest["subtitle_settings"], self.before["manifest"]["subtitle_settings"])
         self.assertEqual(manifest["execution_snapshot"], self.before["manifest"]["execution_snapshot"])
         self.assertEqual(manifest["contract"], self.before["manifest"]["contract"])
@@ -187,8 +187,8 @@ class RetimeTests(SavedResultFixture):
                 mock.patch("requests.post", side_effect=self.fake.upload):
             self.assertEqual(main(["--retime", self.job_id, "--output-dir", str(directory), "--non-interactive"]), 0)
             report = json.loads(stdout.getvalue())
-            self.assertEqual(report["retime"]["from_display_timing_version"], 3)
-            self.assertEqual(report["display_timing_version"], 3)
+            self.assertEqual(report["retime"]["from_display_timing_version"], 4)
+            self.assertEqual(report["display_timing_version"], 4)
         self.assertEqual(self.output.read_bytes(), self.old_content)
         self.assertTrue((directory / self.output.name).is_file())
         self.assertEqual(self.fake.calls, [])

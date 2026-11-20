@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from .common import ASR_MODEL, LEGACY_ASR_MODEL, ToolError
+from .common import ASR_MODEL, DISPLAY_TIMING_VERSION, LEGACY_ASR_MODEL, ToolError
 from .review import decision_origin
 
 SUPPORTED = {"zh", "yue", "en", "ja", "de", "ko", "ru", "fr", "pt", "ar", "it", "es", "hi",
@@ -820,7 +820,7 @@ def _display_trim_issue(original, remaining):
     return None
 
 
-def _trim_display_interval(interval, begin, end, reason):
+def _adjust_display_interval(interval, begin, end, reason):
     old_begin, old_end = interval['begin_ms'], interval['end_ms']
     interval.update(begin_ms=begin, end_ms=end)
     return {'cue_id': interval['cue_id'], 'old_begin_ms': old_begin, 'old_end_ms': old_end,
@@ -828,8 +828,16 @@ def _trim_display_interval(interval, begin, end, reason):
             'adjustment_ms': (begin - old_begin) + (old_end - end), 'reason': reason}
 
 
-def plan_display_timing(cues):
+def _source_position(cue):
+    identity = cue.get('sentence_id')
+    return (re.fullmatch(r'([A-Za-z0-9_-]{1,80}):(\d{8})', identity)
+            if isinstance(identity, str) else None)
+
+
+def plan_display_timing(cues, *, version=DISPLAY_TIMING_VERSION):
     """Derive bounded display adjustments without altering recognition evidence."""
+    if type(version) is not int or version not in (3, DISPLAY_TIMING_VERSION):
+        raise ToolError('字幕显示时间版本不受支持，请用 --reflow 显式重排。', 'cache_version')
     intervals, adjustments = [], []
     for index, cue in enumerate(cues):
         begin, end = cue["begin_ms"], cue["end_ms"]
@@ -840,9 +848,7 @@ def plan_display_timing(cues):
             previous = intervals[-1]
             prior_cue = cues[index - 1]
             if begin < previous["end_ms"]:
-                source_ids = [c.get("sentence_id") for c in (prior_cue, cue)]
-                parts = [re.fullmatch(r"([A-Za-z0-9_-]{1,80}):(\d{8})", sid) if isinstance(sid, str) else None
-                         for sid in source_ids]
+                parts = [_source_position(c) for c in (prior_cue, cue)]
                 overlap = previous["end_ms"] - begin
                 structure_ok = (all(parts) and parts[0][1] == parts[1][1] and int(parts[0][2]) < int(parts[1][2]) and
                                 previous['begin_ms'] < begin < previous['end_ms'] < end)
@@ -853,16 +859,34 @@ def plan_display_timing(cues):
                     raise _timeline_error(prior_cue, cue, detail=f'重叠超限：{overlap}ms，最多允许 500ms')
                 previous_issue = _display_trim_issue(prior_cue, begin - previous['begin_ms'])
                 if previous_issue is None:
-                    adjustments.append(_trim_display_interval(previous, previous['begin_ms'], begin,
+                    adjustments.append(_adjust_display_interval(previous, previous['begin_ms'], begin,
                                                               'bounded_sentence_overlap'))
                 else:
                     next_issue = _display_trim_issue(cue, end - previous['end_ms'])
                     if next_issue:
                         raise _timeline_error(prior_cue, cue, detail=f'前条{previous_issue}；后条{next_issue}')
-                    adjustments.append(_trim_display_interval(current, previous['end_ms'], end,
+                    adjustments.append(_adjust_display_interval(current, previous['end_ms'], end,
                                                               'bounded_sentence_overlap_start_delay'))
         intervals.append(current)
     validate_display_intervals(cues, intervals)
+    if version >= 4:
+        # Speech duration is not reading duration. Use only proven space before
+        # the next speech in this segment, after resolving original overlaps.
+        # Never move a start earlier, extend the last cue without an end bound,
+        # or reuse silence created by delaying the next cue's display start.
+        for index, (cue, following) in enumerate(zip(cues, cues[1:])):
+            current = intervals[index]
+            target_end = current['begin_ms'] + 1000
+            if current['end_ms'] >= target_end:
+                continue
+            parts = [_source_position(c) for c in (cue, following)]
+            if not (all(parts) and parts[0][1] == parts[1][1] and int(parts[0][2]) <= int(parts[1][2])):
+                continue
+            end = min(target_end, following['begin_ms'], intervals[index + 1]['begin_ms'])
+            if end > current['end_ms']:
+                adjustments.append(_adjust_display_interval(current, current['begin_ms'], end,
+                                                             'minimum_reading_time'))
+        validate_display_intervals(cues, intervals)
     return intervals, adjustments
 
 

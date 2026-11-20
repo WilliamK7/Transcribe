@@ -11,6 +11,8 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 
 在 Magpie 中配置渠道。在 `data/settings.json` 填入百炼工作空间和 Magpie 数据目录，其余设置可用默认值。
 
+设置文件只需保存与默认值不同的选项；任务的排版和翻译配置仍单独保存，供恢复使用。
+
 ```json
 {
   "workspace_id": "your-workspace-id",
@@ -38,7 +40,7 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 | 术语和复核 | `group/transcribe-review` | `group/transcribe-review-paid` |
 | 疑难裁决 | `group/transcribe-judge` | `group/transcribe-judge-paid` |
 
-主组按免费或试用、商业的顺序选择供应商。超时或输出校验失败时，字幕工具可调用该角色的商业后备。三个角色使用互相独立的底层型号。vLLM-SR `auto` 需在 Magpie 渠道的响应头透传中添加 `X-Vsr-Selected-Model`。
+主组优先使用免费或试用入口，其次使用商业入口。正文同档供应商等权；复核和裁决用 `fast` 按近期流式速度选入口。超时或输出校验失败时可切换本角色的商业后备。三个角色使用独立底层型号。vLLM-SR `auto` 需在 Magpie 中透传响应头 `X-Vsr-Selected-Model`。
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\manage-mt.py --status
@@ -48,11 +50,13 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 .\.venv\Scripts\python.exe scripts\manage-mt.py --disable
 ```
 
-`--status` 从本机记录列出每个角色的渠道、底层型号、费用分类、试用状态和成员归属。`--check-mt` 通过一次真实翻译检查网关。字幕任务会复用运行中的网关，也可自动启动并在退出时关闭本机便携版。默认组支持自动维护，自定义组和远程网关由用户管理。
+`--status` 查看本机渠道、型号、费用及试用状态；`--check-mt` 发起一次合成文本翻译。任务会复用现有网关，或自动启停本机便携版。默认组支持自动维护，自定义组和远程网关由用户管理。
 
-`data/mt-channels.json` 登记候选与费用规则。`preferred` 调整考察顺序，`price_exceptions` 逐个授权超价或价格未知的商业型号。Vercel 默认单价上限为每百万 token 输入 2 美元、输出 10 美元。`excluded_providers` 可暂停已登记渠道并保留其配置。Magpie 的 `listOff` 仅停止抓取目录，`noModels` 停止供应型号，`off` 停用整个渠道。实际费用按账单核对。[配置模板](subtitle_tool/mt-channels.default.json)
+`data/mt-channels.json` 登记候选与费用规则：`preferred` 调整考察顺序，`price_exceptions` 授权超价或价格未知的商业型号，`excluded_providers` 暂停渠道。Vercel 默认上限为每百万 token 输入 2 美元、输出 10 美元，实际费用以账单为准。[配置模板](subtitle_tool/mt-channels.default.json)
 
 普通渠道维护默认每 15 分钟刷新，单轮最多验收 1 个候选，UTC 当天最多 2 个。`--once` 共用预算。百炼试用从已绑定的查询账户获取额度，`bailian-trial-state.json` 的 `paused` 和 `excluded` 控制暂停与排除。`configure-mt.py --refresh-trial` 可立即刷新库存。
+
+字幕逐屏复核含义、术语和公式关系，代码、符号和名称可按原样保留。复核失败或疑点未解决时返回 `mt_quality_unresolved` 并保存草稿。服务恢复后用 `--resume` 续查；原转写或语义疑点需要核对音视频，调整人工术语或 `mt_policy_version` 后用 `--reflow` 重建。完整传输、校验及历史兼容规则见[接口与恢复契约](docs/API_CONTRACT.md)。
 
 ## 项目配置
 
@@ -76,11 +80,13 @@ Windows x64 自用字幕 CLI。新任务用北京百炼 `qwen-audio-3.1-asr-flas
 | `--review ID` | 确认音轨、声道或语种后继续 |
 | `--resume ID` | 沿原任务的排版、账户与翻译契约继续。已有转写就读本地，已有云端任务 ID 就查询原任务 |
 | `--reflow ID` | 从完整原始转写按当前配置重建，保留能对应到原句的人工决定，必要时重新翻译 |
-| `--retime ID` | 校验已保存的完整字幕和译文，只更新显示时间，全程在本机执行 |
+| `--retime ID` | 校验已保存的完整字幕和译文，按当前规则更新显示时间（含短句停留），全程在本机执行 |
 | `--cancel ID` | 停止本地任务。已提交的云端请求仍可能计费 |
 | `--export-archive ID --output-dir DIR` | 校验后按原字节导出归档字幕。归档也可用 `--reflow ID --output-dir DIR` 创建新任务 |
 
 重排和校时中断后都可用 `--resume` 继续，覆盖已有字幕需加 `--overwrite`。原媒体移走后，完整本地结果或已有云端任务 ID 仍可用于恢复。原路径被其他媒体占用时改用 `--output-dir`。提交结果未知时，使用 `--resume ID --bind-task-id 云端ID` 绑定原任务，或用 `--allow-resubmit` 明确接受重复计费后重发。
+
+短于 1 秒的字幕会利用同分段内下一句开口前的空隙延长停留。历史任务沿用保存的显示规则；`--retime ID --output-dir DIR` 可生成按当前规则校时的副本。
 
 `Ctrl+C` 保存进度。进度写入 stderr，stdout 每行一个 JSON 结果，`--report 路径` 可另存 JSON 数组。退出码 `0` 表示完成或跳过，`2` 表示任务失败或待复核，`3` 表示启动或本地异常，`130` 表示用户中断。
 

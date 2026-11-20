@@ -13,6 +13,12 @@ from .common import ToolError
 ROLES = ('translate', 'review', 'judge')
 
 
+def supplier_routing(role):
+    # Reviews gate completion of a group. Let Magpie use recent streamed
+    # latency within a billing tier; unknown suppliers still get probes.
+    return 'weight' if role == 'translate' else 'fast'
+
+
 def default_policy():
     return json.loads(Path(__file__).with_name('mt-channels.default.json').read_bytes())
 

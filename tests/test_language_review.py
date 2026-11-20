@@ -9,7 +9,7 @@ from subtitle_tool.common import Cancelled, ToolError
 from subtitle_tool.engine import Engine
 from subtitle_tool.mt_quality import BatchValidationError, parse_stage_response
 from subtitle_tool.review import ReviewDecision
-from tests.fixtures import FakeService, SavedResultFixture, result, unlabeled_result
+from tests.fixtures import FakeService, SavedResultFixture, request_stage, result, unlabeled_result
 
 
 class LanguageService(FakeService):
@@ -21,11 +21,10 @@ class LanguageService(FakeService):
         self.fail_targets = set()
 
     def request(self, method, url, **kwargs):
-        from subtitle_tool.mt_quality import PROMPTS
         from tests.fixtures import response
         payload = kwargs.get('json', {})
         messages = payload.get('messages', [])
-        if messages and messages[0]['content'].startswith(PROMPTS['language']):
+        if request_stage(payload) == 'language':
             self.calls.append((method, url, kwargs))
             data = json.loads(messages[1]['content'])
             self.language_requests.append(data)

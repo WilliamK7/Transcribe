@@ -1,10 +1,12 @@
 """Stage prompts, response validation and source-aware grouping."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
 import unicodedata
+import warnings
 from opencc import OpenCC
 
 from .common import ToolError
@@ -17,6 +19,7 @@ VALIDATION_CATEGORIES = {
     'id_out_of_range': '编号越界',
     'glossary_evidence': '术语缺少本次目标原文依据',
     'translation_invalid': '译文无效', 'unfinished': '非正常结束', 'output_truncated': '输出长度耗尽',
+    'translation_untranslated': '译文原样复制了需要翻译的英文叙述',
     'judge_evidence': '裁决没有保持已撤销疑点的译文',
     'judge_scope': '裁决超出已复核并确认的问题原句范围',
 }
@@ -70,12 +73,65 @@ def validate_translations(value, fragments):
     return {str(i): translated[str(i)] for i in range(len(fragments))}
 
 
+_EN_FUNCTION_WORDS = frozenset(('a an the of to and or for with from in on by as at '
+    'is are was were be been being has have had do does did can could will would should must '
+    'this that these those it we you they but if then not no so').split())
+
+
+def _python_code_fragment(source):
+    """Recognize syntax-bearing snippets without evaluating their contents."""
+    candidate = source.strip()
+    if candidate.startswith('`') and candidate.endswith('`'):
+        candidate = candidate[1:-1].strip()
+    if not any(char in candidate for char in ':=()[]{}.;'):
+        return False
+    if candidate.endswith(':'):
+        # A subtitle can contain just a block header, without its following body.
+        candidate += '\n    pass'
+    try:
+        with warnings.catch_warnings():
+            # Invalid string escapes can otherwise print private subtitle text.
+            warnings.simplefilter('ignore', SyntaxWarning)
+            statements = ast.parse(candidate).body
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    # Parsing alone is insufficient: "This is not cached" is a valid Python
+    # comparison, and quoted prose is a string literal. Neither proves code.
+    expressions = (ast.Call, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    return bool(statements) and all(not isinstance(statement, ast.Expr) or
+                                   isinstance(statement.value, expressions) for statement in statements)
+
+
+def untranslated_prose(source, translation):
+    """Conservative evidence of an English prose echo, not a language classifier.
+
+    Do not reject code, identifiers, symbolic formulae, Chinese text or title-cased
+    names merely because they are correctly retained. Ambiguous short pieces
+    remain the independent reviewer's responsibility.
+    """
+    source = unicodedata.normalize('NFKC', source)
+    normalize = lambda text: ''.join(c for c in unicodedata.normalize('NFKC', text).casefold() if c.isalnum())
+    if re.search(r'[\u3400-\u9fff\U00020000-\U0002ffff]', source) or normalize(source) != normalize(translation):
+        return False
+    words = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", source)
+    substantive = [w for w in words if w.casefold() not in _EN_FUNCTION_WORDS and len(w) >= 3]
+    return (len(words) >= 4 and sum(w.casefold() in _EN_FUNCTION_WORDS for w in words) >= 2 and
+            bool(substantive) and (any(w[0].islower() for w in substantive) or source.isupper()) and
+            not _python_code_fragment(source))
+
+
+def validate_translation_content(translations, originals):
+    if any(untranslated_prose(source, translations[str(index)]) for index, source in enumerate(originals)):
+        raise BatchValidationError('translation_untranslated', len(translations))
+
+
 QUALITY_PROMPT_VERSION = 7
 GLOSSARY_SCHEDULE = 'window-independent-v4'
 INPUT_BUDGET = 32 * 1024
 OUTPUT_TOKENS = 4096
 DEFAULT_CAPABILITIES = {'response_format': 'json_object', 'input_bytes': INPUT_BUDGET, 'output_tokens': OUTPUT_TOKENS}
-ISSUE_CATEGORIES = ('omission', 'addition', 'terminology', 'number', 'negation', 'condition', 'repetition', 'meaning')
+ISSUE_CATEGORIES = ('omission', 'addition', 'terminology', 'number', 'negation', 'condition', 'repetition', 'meaning',
+                    'source_uncertain')
 PROMPTS = {
     'language': ('判断每个 sentences 目标是否需要翻译为简体中文。ASR 语种标签缺失不代表内容有歧义。'
                  '结合目标本身和带时间的相邻 context，自动判断中文口语、方言、语气词和中外文混合。'
@@ -187,10 +243,10 @@ def repetition_checks(translations, source_keys):
 
 def review_with_checks(review, checks):
     existing = {(issue['id'], issue['category']) for issue in review['issues']}
-    return {'issues': [*review['issues'], *(issue for issue in checks if (issue['id'], issue['category']) not in existing)]}
+    return {**review, 'issues': [*review['issues'], *(issue for issue in checks if (issue['id'], issue['category']) not in existing)]}
 
 
-def _schema(stage, data):
+def _schema(stage, data, *, fidelity=False):
     if stage == 'language':
         ids = [item['id'] for item in data['sentences']]
         mapping = {'type': 'object', 'properties': {key: {'type': 'string',
@@ -200,7 +256,7 @@ def _schema(stage, data):
                 'required': ['decisions'], 'additionalProperties': False}
     if stage == 'judge':
         schema = _schema('translate', data)
-        schema['properties'].update(_schema('review', data)['properties'])
+        schema['properties']['issues'] = _schema('review', data, fidelity=fidelity)['properties']['issues']
         schema['required'].append('issues')
         return schema
     if stage == 'glossary':
@@ -212,11 +268,18 @@ def _schema(stage, data):
                 'required': ['terms'], 'additionalProperties': False}
     if stage == 'review':
         item = {'type': 'object', 'properties': {'id': {'type': 'string'},
-                'category': {'type': 'string', 'enum': list(ISSUE_CATEGORIES)}, 'evidence': {'type': 'string'}},
+                'category': {'type': 'string', 'enum': list(ISSUE_CATEGORIES if fidelity else ISSUE_CATEGORIES[:-1])}, 'evidence': {'type': 'string'}},
                 'required': ['id', 'category', 'evidence'], 'additionalProperties': False}
         item['properties']['id']['enum'] = [str(f['id']) for f in data['fragments']]
-        return {'type': 'object', 'properties': {'issues': {'type': 'array', 'items': item}},
-                'required': ['issues'], 'additionalProperties': False}
+        schema = {'type': 'object', 'properties': {'issues': {'type': 'array', 'items': item}},
+                  'required': ['issues'], 'additionalProperties': False}
+        if fidelity:
+            ids = [str(f['id']) for f in data['fragments']]
+            schema['properties']['checks'] = {'type': 'object', 'properties': {
+                key: {'type': 'string', 'enum': ['ok', 'issue', 'uncertain']} for key in ids},
+                'required': ids, 'additionalProperties': False}
+            schema['required'].append('checks')
+        return schema
     items = data['fragments']
     ids = [str(item['id']) for item in items]
     mapping = {'type': 'object', 'properties': {key: {'type': 'string'} for key in ids},
@@ -225,34 +288,41 @@ def _schema(stage, data):
             'required': ['translations'], 'additionalProperties': False}
 
 
-def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
+def make_stage_payload(stage, data, backend, *, capabilities, repair=False, stream=True, fidelity=False):
     if stage not in PROMPTS:
         raise ValueError('Unknown translation stage')
     if not valid_capabilities(capabilities):
         raise ToolError('翻译模型能力档案无效。', 'mt_config')
-    prompt = PROMPTS[stage] + CONTENT_PROMPTS.get(stage, '')
-    if stage == 'translate':
-        prompt += ('只给数字片段编号写译文：每条紧跟该时刻说出的内容，不要提前翻译下一原句，也不要把整句复制到每一片。'
-                   '参照 display_ms 用自然简明的中文，短问句简短译出，保留数字、条件和自我纠正的最终含义。'
-                   '术语、符号和单位按上下文保持一致；识别含混时不要编造技术结论。')
-    elif stage in {'review', 'judge'}:
-        prompt += '逐条对照 fragments 中同一编号的 text 与 translation；结合 display_ms 核对短屏是否错配长解释，以及连续多条是否串句、提前或重复。'
-    prompt += '直接返回所需 JSON，不附解释、Markdown 或思考过程。'
-    if data.get('context'):
-        prompt += ('context 只供消歧，不翻译或提取术语；same_sentence 的 sentence 指目标编号，'
-                   '文字属于同句其他范围。')
-    if data.get('glossary'):
-        prompt += ('术语表中 manual 为人工指定译法；model 条目附原文 evidence，仅供对应语境参考，'
-                   '同词可有多个译法，按当前语境选择，不因较早出现而强制统一。')
-    if repair:
-        if stage != 'translate':
-            raise ValueError('Only translation allows format repair')
-        prompt += ('上次响应未通过格式或编号校验。请从本次原始任务重新生成完整 JSON：'
-                   '每个目标编号恰好一次，译文完整且非空，不添加其他编号或说明。')
-    prompt += '输出必须符合此 JSON Schema：' + json.dumps(
-        _schema(stage, data), ensure_ascii=False, separators=(',', ':'))
-    # Retention priority is internal; model input always states the original order.
+    if repair and stage != 'translate':
+        raise ValueError('Only translation allows format repair')
     wire_data = dict(data)
+    if fidelity:
+        from .mt_fidelity import stage_prompt
+        if stage in {'review', 'judge'}:
+            wire_data['glossary'] = [term for term in data.get('glossary', []) if term.get('origin') == 'manual']
+        prompt = stage_prompt(stage, wire_data, repair=repair)
+    else:
+        # Retain the historical request bytes for existing stages and caches.
+        prompt = PROMPTS[stage] + CONTENT_PROMPTS.get(stage, '')
+        if stage == 'translate':
+            prompt += ('只给数字片段编号写译文：每条紧跟该时刻说出的内容，不要提前翻译下一原句，也不要把整句复制到每一片。'
+                       '参照 display_ms 用自然简明的中文，短问句简短译出，保留数字、条件和自我纠正的最终含义。'
+                       '术语、符号和单位按上下文保持一致；识别含混时不要编造技术结论。')
+        elif stage in {'review', 'judge'}:
+            prompt += '逐条对照 fragments 中同一编号的 text 与 translation；结合 display_ms 核对短屏是否错配长解释，以及连续多条是否串句、提前或重复。'
+        prompt += '直接返回所需 JSON，不附解释、Markdown 或思考过程。'
+        if data.get('context'):
+            prompt += ('context 只供消歧，不翻译或提取术语；same_sentence 的 sentence 指目标编号，'
+                       '文字属于同句其他范围。')
+        if data.get('glossary'):
+            prompt += ('术语表中 manual 为人工指定译法；model 条目附原文 evidence，仅供对应语境参考，'
+                       '同词可有多个译法，按当前语境选择，不因较早出现而强制统一。')
+        if repair:
+            prompt += ('上次响应未通过格式或编号校验。请从本次原始任务重新生成完整 JSON：'
+                       '每个目标编号恰好一次，译文完整且非空，不添加其他编号或说明。')
+    prompt += '输出必须符合此 JSON Schema：' + json.dumps(
+        _schema(stage, data, fidelity=fidelity), ensure_ascii=False, separators=(',', ':'))
+    # Retention priority is internal; model input always states the original order.
     if data.get('context'):
         context = data['context']
         if all(isinstance(item, dict) and 'source_position' in item for item in context):
@@ -288,11 +358,14 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
                 fragment['translation'] = data['translations'][fragment['id']]
             if stage == 'review':
                 del wire_data['translations']
-    payload = {'model': backend.model, 'stream': False, 'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
+    payload = {'model': backend.model, 'stream': stream,
+               'max_tokens': min(capabilities['output_tokens'], OUTPUT_TOKENS),
                'reasoning_effort': 'low' if stage == 'judge' else 'none',
                'messages': [{'role': 'system', 'content': prompt},
                              {'role': 'user', 'content': json.dumps(wire_data, ensure_ascii=False)}]}
     payload['response_format'] = {'type': 'json_object'}
+    if stream:
+        payload['stream_options'] = {'include_usage': True}
     try:
         size = len(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
     except (TypeError, UnicodeError, ValueError):
@@ -302,15 +375,15 @@ def make_stage_payload(stage, data, backend, *, capabilities, repair=False):
     return payload
 
 
-def request_cache_key(stage, data, backend, *, capabilities, scope):
+def request_cache_key(stage, data, backend, *, capabilities, scope, stream=True, fidelity=False):
     value = {'version': QUALITY_PROMPT_VERSION, 'strategy': 6, 'simplification': 'opencc-t2s-0.1.7',
              'backend': backend.snapshot(),
              'capabilities': capabilities, 'scope': scope,
-             'request': make_stage_payload(stage, data, backend, capabilities=capabilities)}
+             'request': make_stage_payload(stage, data, backend, capabilities=capabilities, stream=stream, fidelity=fidelity)}
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 
 
-def parse_stage_response(stage, body, *, ids=(), originals=()):
+def parse_stage_response(stage, body, *, ids=(), originals=(), fidelity=False):
     """Validate the wire envelope once; saved values use the same field validator."""
     try:
         if (not isinstance(body, dict) or body.get('error') is not None or
@@ -333,12 +406,12 @@ def parse_stage_response(stage, body, *, ids=(), originals=()):
             except BatchValidationError as error:
                 count = error.actual_count
             raise BatchValidationError('output_truncated' if truncated else 'unfinished', count)
-        return validate_stage_value(stage, parse_content(content), ids=ids, originals=originals)
+        return validate_stage_value(stage, parse_content(content), ids=ids, originals=originals, fidelity=fidelity)
     except (KeyError, TypeError, ValueError, RecursionError):
         raise BatchValidationError('response_structure') from None
 
 
-def validate_stage_value(stage, value, *, ids=(), originals=()):
+def validate_stage_value(stage, value, *, ids=(), originals=(), fidelity=False, review_coverage=True):
     """Validate generated fields from either a response or private saved records."""
     try:
         if stage == 'language':
@@ -354,7 +427,8 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
                 raise ValueError()
             return {**validate_stage_value('translate', {'translations': value['translations']},
                                            ids=ids, originals=originals),
-                    **validate_stage_value('review', {'issues': value['issues']}, ids=ids)}
+                    **validate_stage_value('review', {'issues': value['issues']}, ids=ids,
+                                           fidelity=fidelity, review_coverage=False)}
         if stage == 'translate':
             if list(ids) != [str(i) for i in range(len(ids))] or len(originals) != len(ids):
                 raise ValueError()
@@ -362,7 +436,8 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
             cc = OpenCC('t2s')
             return {'translations': {key: cc.convert(text) for key, text in translated.items()}}
         key = 'terms' if stage == 'glossary' else 'issues' if stage == 'review' else None
-        if key is None or not isinstance(value, dict) or set(value) != {key} or not isinstance(value[key], list):
+        expected_keys = {key, 'checks'} if stage == 'review' and fidelity and review_coverage else {key}
+        if key is None or not isinstance(value, dict) or set(value) != expected_keys or not isinstance(value[key], list):
             raise ValueError()
         if len(value[key]) > 200:
             raise ValueError()
@@ -377,7 +452,8 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
                     any(any(unicodedata.category(c) in {'Cc', 'Cs'} and c not in '\n\t\r' for c in item[k])
                         for k in expected)):
                 raise ValueError()
-            if stage == 'review' and (item['id'] not in ids or item['category'] not in ISSUE_CATEGORIES):
+            if stage == 'review' and (item['id'] not in ids or
+                    item['category'] not in (ISSUE_CATEGORIES if fidelity else ISSUE_CATEGORIES[:-1])):
                 raise ValueError()
             if stage == 'glossary' and (item['sentence'] not in targets or
                     not term_appears(item['source'], targets[item['sentence']])):
@@ -385,20 +461,31 @@ def validate_stage_value(stage, value, *, ids=(), originals=()):
         if stage == 'glossary':
             cc = OpenCC('t2s')
             return {'terms': [{**item, 'translation': cc.convert(item['translation'])} for item in value['terms']]}
+        if stage == 'review' and fidelity and review_coverage:
+            checks = value['checks']
+            if (not isinstance(checks, dict) or set(checks) != set(ids) or
+                    any(not isinstance(v, str) or v not in {'ok', 'issue', 'uncertain'} for v in checks.values()) or
+                    {i['id'] for i in value['issues']} != {key for key, status in checks.items() if status != 'ok'} or
+                    any(checks[i['id']] != 'uncertain' for i in value['issues'] if i['category'] == 'source_uncertain')):
+                raise ValueError()
         return value
     except (KeyError, TypeError, ValueError, RecursionError):
         raise BatchValidationError('response_structure') from None
 
 
-def validate_judgment(value, data):
+def validate_judgment(value, data, *, fidelity=False):
     if not value['issues'] and value['translations'] != data['translations']:
         raise BatchValidationError('judge_evidence')
     sentences = {fragment['id']: fragment['sentence'] for fragment in data['fragments']}
     reviewed = {sentences[issue['id']] for issue in data['issues']}
     confirmed = {sentences[issue['id']] for issue in value['issues']}
-    if (not confirmed <= reviewed or any(
-            text != data['translations'][identity] and sentences[identity] not in confirmed
-            for identity, text in value['translations'].items())):
+    if not confirmed <= reviewed:
+        raise BatchValidationError('judge_scope')
+    if fidelity:
+        actionable = {sentences[i['id']] for i in data['issues'] if i['category'] != 'source_uncertain'}
+        confirmed &= {sentences[i['id']] for i in value['issues'] if i['category'] != 'source_uncertain'} & actionable
+    if any(text != data['translations'][identity] and sentences[identity] not in confirmed
+           for identity, text in value['translations'].items()):
         raise BatchValidationError('judge_scope')
     return value
 

@@ -124,7 +124,7 @@ class ContentQualityPipelineTests(PoolPipelineFixture):
         evidence = {'value': {'issues': data['issues'][:1], 'translations': {**corrected, '3': '无关改写。'}},
                     'actual_model': 'synthetic/judge', 'resolved_model': 'judge', 'usage': None}
         cache_key = request_cache_key('judge', data, entry.backend, capabilities=pipeline.profiles[entry.id]['capabilities'],
-                                    scope=pipeline.cache_scope)
+                                    scope=pipeline.cache_scope, fidelity=pipeline.fidelity)
         stage_key = pipeline._task_stage_key('judge', data)
         with mock.patch.object(pipeline.transport, 'request', side_effect=AssertionError('Unexpected network')):
             for location in ('cache', 'saved'):
@@ -158,6 +158,7 @@ class ContentQualityPipelineTests(PoolPipelineFixture):
 
     def test_unrelated_correction_is_rejected_and_never_published_or_cached(self):
         self.install()
+        self.legacy_quality()
         self.review_issue = True
         self.corrected_translations = lambda data: {**data['translations'], '1': '未经复核的额外改写。'}
         self.assertEqual(self.run_pool(), 'completed')

@@ -73,7 +73,8 @@ class Config:
 
     def save(self):
         self.settings.validate()
-        atomic_json(self.data / "settings.json", {k: v for k, v in asdict(self.settings).items() if v is not None})
+        defaults = asdict(Settings())
+        atomic_json(self.data / "settings.json", {k: v for k, v in asdict(self.settings).items() if v != defaults[k]})
 
     def mt_settings(self):
         # Resolve only for new tasks/reflow: current choices cannot alter a saved resume.

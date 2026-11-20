@@ -100,6 +100,24 @@ class RoleChoiceTests(BailianFreeFixture):
         self.assertEqual(pools['review'], ['quiet'])
         self.assertEqual(len(set(assignments.values())), 3)
 
+    def test_review_and_judge_suppliers_use_recent_speed_within_each_billing_tier(self):
+        setup, evaluations, free, _ = self.gateway_setup()
+        for role in ('review', 'judge'):
+            member = 'transcribe-qiniu-free/qualified-' + role
+            evaluations[member] = {'roles': [role], 'actual_models': ['qualified-' + role]}
+            free.append(member)
+        setup.apply(evaluations, free)
+        groups = {g['id']: g for g in self.guard.admin.registry()['groups']}
+        for name in ('transcribe-review-paid', 'transcribe-free-review',
+                     'transcribe-judge-paid', 'transcribe-free-judge'):
+            self.assertEqual(groups[name]['routing'], 'fast')
+        self.assertEqual(groups['transcribe-paid']['routing'], 'weight')
+        self.assertEqual(groups['transcribe-free']['routing'], 'weight')
+        for role in ('review', 'judge'):
+            self.assertEqual(groups['transcribe-' + role]['routing'], 'order')
+            self.assertEqual(groups['transcribe-' + role]['members'],
+                             ['group/transcribe-free-' + role, 'group/transcribe-' + role + '-paid'])
+
     def test_incremental_update_preserves_manual_member_and_exclusion(self):
         ownership = {'groups': {'transcribe-free': ['manual/keep', 'project/a']}, 'excluded': []}
         current = [{'id': 'transcribe-free', 'members': ['manual/keep', 'manual/new']}]
